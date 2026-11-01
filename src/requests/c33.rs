@@ -5,9 +5,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::future::Future;
 
-use crate::MLSError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::{MessageRow, MlsAccountDb};
+use crate::MLSError;
 
 /// Minimum lifetime in seconds for a `direct-request` KeyPackage (`35 days`, `Spec §6.5`).
 pub const DIRECT_REQUEST_KP_MIN_LIFETIME_SECS: u64 = 35 * 86_400;

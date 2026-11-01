@@ -287,7 +287,9 @@ pub(crate) fn request_value_cas(
     checked_namespace(namespace)?;
     checked_id(id)?;
     if next.is_empty() || next.len() > 16 * 1024 * 1024 {
-        return Err(MLSError::invalid_input("Request value exceeds storage bound"));
+        return Err(MLSError::invalid_input(
+            "Request value exceeds storage bound",
+        ));
     }
     let key = format!("direct_request_value_v2:{namespace}:{id}");
     let changed = storage.with_connection(|conn| {
@@ -347,7 +349,9 @@ pub(crate) fn request_values_list(
     let pattern = format!("direct_request_value_v2:{namespace}:%");
     storage.with_connection(|conn| {
         let mut query = conn
-            .prepare("SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key LIKE ?1 ORDER BY key")
+            .prepare(
+                "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key LIKE ?1 ORDER BY key",
+            )
             .map_err(|_| MLSError::StorageFailed)?;
         let rows = query
             .query_map([&pattern], |r| r.get::<_, Vec<u8>>(0))
@@ -404,7 +408,10 @@ fn store_pages<M: MlsCryptoContext + ?Sized>(
             locator[6] = (locator[6] & 0x0f) | 0x40;
             locator[8] = (locator[8] & 0x3f) | 0x80;
             let id = uuid::Uuid::from_bytes(locator).to_string();
-            if let Some(existing) = ctx.read_request_value(namespace, &id).map_err(storage_err)? {
+            if let Some(existing) = ctx
+                .read_request_value(namespace, &id)
+                .map_err(storage_err)?
+            {
                 if existing != *raw {
                     return Err(invalid("page locator collision"));
                 }
@@ -533,7 +540,11 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
     let authority = endpoint
         .strip_prefix("wss://")
         .and_then(|rest| rest.strip_suffix(PATH))
-        .ok_or_else(|| invalid("Endpoint must be wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"))?;
+        .ok_or_else(|| {
+            invalid(
+                "Endpoint must be wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
+            )
+        })?;
     if !matches!(authority, "chat.catbird.blue" | "chat.catbird.blue:443") {
         return Err(invalid(format!("Invalid endpoint authority: {authority}")));
     }
@@ -666,7 +677,8 @@ where
             .get_auth_generation(&owner)
             .await?
             .ok_or_else(|| invalid("actor generation unavailable"))?;
-        self.verify_actor_identity(&owner, &actor, generation).await?;
+        self.verify_actor_identity(&owner, &actor, generation)
+            .await?;
 
         let namespace = format!("inventory:{owner}");
         let pages_namespace = format!("inventoryPages:{owner}");
@@ -689,10 +701,12 @@ where
         }) {
             restore(self.mls_context().as_ref(), &pages_namespace, journal)?
         } else {
-            self.fetch_scoped_inventory(&owner, &actor, generation).await?
+            self.fetch_scoped_inventory(&owner, &actor, generation)
+                .await?
         };
 
-        self.verify_actor_identity(&owner, &actor, generation).await?;
+        self.verify_actor_identity(&owner, &actor, generation)
+            .await?;
         fresh(&snapshot.expires_at)?;
 
         let mut journal = Journal {
@@ -736,7 +750,8 @@ where
             .ingest_authenticated_inventory_snapshot(&snapshot)
             .await?;
 
-        self.verify_actor_identity(&owner, &actor, generation).await?;
+        self.verify_actor_identity(&owner, &actor, generation)
+            .await?;
         fresh(&snapshot.expires_at)?;
         if !applied.matches_snapshot(&snapshot) {
             return Err(invalid("shared completion does not match exact snapshot"));
@@ -784,7 +799,8 @@ where
             .get_auth_generation(&owner)
             .await?
             .ok_or_else(|| invalid("actor generation unavailable"))?;
-        self.verify_actor_identity(&owner, actor_device_id, generation).await?;
+        self.verify_actor_identity(&owner, actor_device_id, generation)
+            .await?;
 
         let body = serde_json::to_vec(&serde_json::json!({
             "actorDeviceId": actor_device_id,
@@ -804,11 +820,16 @@ where
             })
             .await?;
 
-        self.verify_actor_identity(&owner, actor_device_id, generation).await?;
+        self.verify_actor_identity(&owner, actor_device_id, generation)
+            .await?;
         if response.status != 200 {
             // A rejected ticket names its protocol error only in the body.
-            let reason = String::from_utf8_lossy(&response.body[..response.body.len().min(256)]).into_owned();
-            return Err(OrchestratorError::Api(format!("ticket HTTP {}: {reason}", response.status)));
+            let reason = String::from_utf8_lossy(&response.body[..response.body.len().min(256)])
+                .into_owned();
+            return Err(OrchestratorError::Api(format!(
+                "ticket HTTP {}: {reason}",
+                response.status
+            )));
         }
 
         if response.body.len() > 16384 {
@@ -915,10 +936,17 @@ where
         let encoded = serde_json::to_vec(&fence).map_err(invalid_err)?;
         if !self
             .mls_context()
-            .compare_exchange_request_value("subscriptionCursor", &actor, previous.as_deref(), &encoded)
+            .compare_exchange_request_value(
+                "subscriptionCursor",
+                &actor,
+                previous.as_deref(),
+                &encoded,
+            )
             .map_err(storage_err)?
         {
-            return Err(OrchestratorError::Api("Concurrent subscription installation".into()));
+            return Err(OrchestratorError::Api(
+                "Concurrent subscription installation".into(),
+            ));
         }
 
         Ok(fence)
@@ -961,22 +989,30 @@ where
             })?;
             let next_u64 = next_str.parse::<u64>().map_err(invalid_err)?;
             if next_u64 <= cursor {
-                return Err(OrchestratorError::Api("Message cursor did not advance".into()));
+                return Err(OrchestratorError::Api(
+                    "Message cursor did not advance".into(),
+                ));
             }
-            self.mls_context().ensure_storage_durable().map_err(storage_err)?;
+            self.mls_context()
+                .ensure_storage_durable()
+                .map_err(storage_err)?;
             let raw = serde_json::to_vec(&next_u64).map_err(invalid_err)?;
             if !self
                 .mls_context()
                 .compare_exchange_request_value("entryCursor", cid, exact.as_deref(), &raw)
                 .map_err(storage_err)?
             {
-                return Err(OrchestratorError::Api("Entry progress changed concurrently".into()));
+                return Err(OrchestratorError::Api(
+                    "Entry progress changed concurrently".into(),
+                ));
             }
             exact = Some(raw);
             cursor = next_u64;
             output.extend(messages.into_iter().filter(|m| m.has_displayable_body()));
         }
-        Err(OrchestratorError::Api("Message catch-up exceeded page bound".into()))
+        Err(OrchestratorError::Api(
+            "Message catch-up exceeded page bound".into(),
+        ))
     }
 
     /// Decode a canonical subscribeEvents frame, enforce CAS cursor chain persistence,
@@ -999,7 +1035,9 @@ where
 
         let fence: CursorFence = serde_json::from_slice(&retained).map_err(invalid_err)?;
         if fence.owner != owner || fence.actor != actor || fence.generation != generation {
-            return Err(OrchestratorError::Api("Subscription device authority changed".into()));
+            return Err(OrchestratorError::Api(
+                "Subscription device authority changed".into(),
+            ));
         }
 
         let value = decode_subscription_frame(raw)?;
@@ -1007,7 +1045,10 @@ where
         // The strict decode guarantees every required typingEvent field.
         if value["$type"] == "blue.catbird.chat.defs#typingEvent" {
             return Ok(SubscriptionDispatchOutcome::Typing {
-                conversation_id: value["conversationId"].as_str().unwrap_or_default().to_string(),
+                conversation_id: value["conversationId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 sender_did: value["actorDid"].as_str().unwrap_or_default().to_string(),
                 is_typing: value["isTyping"] == true,
             });
@@ -1022,8 +1063,11 @@ where
             .and_then(|v| v.as_str())
             .ok_or_else(|| invalid("Missing event cursor"))?;
 
-        if previous_cursor != fence.cursor || next_cursor == fence.cursor || next_cursor.is_empty() {
-            return Err(OrchestratorError::Api("Subscription cursor chain changed".into()));
+        if previous_cursor != fence.cursor || next_cursor == fence.cursor || next_cursor.is_empty()
+        {
+            return Err(OrchestratorError::Api(
+                "Subscription cursor chain changed".into(),
+            ));
         }
 
         let payload = value
@@ -1064,10 +1108,18 @@ where
                 cursor: next_cursor.to_string(),
             }
         } else if kind == "blue.catbird.chat.defs#accessEndedEvent" {
-            let user_did = payload.get("userDid").and_then(|v| v.as_str()).unwrap_or("");
-            let device_id = payload.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+            let user_did = payload
+                .get("userDid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let device_id = payload
+                .get("deviceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if user_did != owner || device_id != actor {
-                return Err(OrchestratorError::Api("Foreign access-ended audience".into()));
+                return Err(OrchestratorError::Api(
+                    "Foreign access-ended audience".into(),
+                ));
             }
             self.synchronize_authenticated_inventory(true).await?;
             SubscriptionDispatchOutcome::AccessEnded {
@@ -1089,21 +1141,20 @@ where
         };
 
         // Advance cursor atomically in storage
-        self.mls_context().ensure_storage_durable().map_err(storage_err)?;
+        self.mls_context()
+            .ensure_storage_durable()
+            .map_err(storage_err)?;
         let mut new_fence = fence.clone();
         new_fence.cursor = next_cursor.to_string();
         let encoded = serde_json::to_vec(&new_fence).map_err(invalid_err)?;
         if !self
             .mls_context()
-            .compare_exchange_request_value(
-                "subscriptionCursor",
-                &actor,
-                Some(&retained),
-                &encoded,
-            )
+            .compare_exchange_request_value("subscriptionCursor", &actor, Some(&retained), &encoded)
             .map_err(storage_err)?
         {
-            return Err(OrchestratorError::Api("Subscription progress superseded".into()));
+            return Err(OrchestratorError::Api(
+                "Subscription progress superseded".into(),
+            ));
         }
 
         Ok(outcome)
@@ -1114,17 +1165,18 @@ where
         &self,
         raw: &[u8],
     ) -> Result<SubscriptionDispatchOutcome> {
-        let text = std::str::from_utf8(raw)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("Invalid UTF-8 in subscription frame: {e}")))?;
+        let text = std::str::from_utf8(raw).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("Invalid UTF-8 in subscription frame: {e}"))
+        })?;
         self.apply_subscription_frame(text).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::orchestrator::mls_provider::MlsCryptoContext;
+    use std::sync::Arc;
 
     struct NoopKeychain;
     #[async_trait::async_trait]
@@ -1144,7 +1196,11 @@ mod tests {
     #[test]
     fn request_value_cas_and_bounds_work_as_expected() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("request_val_test.db").to_string_lossy().to_string();
+        let db_path = dir
+            .path()
+            .join("request_val_test.db")
+            .to_string_lossy()
+            .to_string();
         let context = crate::MLSContext::new(
             db_path,
             "test-key-1234567890123456".to_string(),
@@ -1160,14 +1216,18 @@ mod tests {
 
         // Insert id1
         let val1 = b"first value payload";
-        assert!(context.compare_exchange_request_value(ns, id1, None, val1).unwrap());
+        assert!(context
+            .compare_exchange_request_value(ns, id1, None, val1)
+            .unwrap());
         assert_eq!(
             context.read_request_value(ns, id1).unwrap().as_deref(),
             Some(val1.as_slice())
         );
 
         // CAS with wrong expected fails
-        assert!(!context.compare_exchange_request_value(ns, id1, Some(b"wrong"), b"new val").unwrap());
+        assert!(!context
+            .compare_exchange_request_value(ns, id1, Some(b"wrong"), b"new val")
+            .unwrap());
         assert_eq!(
             context.read_request_value(ns, id1).unwrap().as_deref(),
             Some(val1.as_slice())
@@ -1175,7 +1235,9 @@ mod tests {
 
         // CAS with right expected updates
         let val1_updated = b"second value payload";
-        assert!(context.compare_exchange_request_value(ns, id1, Some(val1), val1_updated).unwrap());
+        assert!(context
+            .compare_exchange_request_value(ns, id1, Some(val1), val1_updated)
+            .unwrap());
         assert_eq!(
             context.read_request_value(ns, id1).unwrap().as_deref(),
             Some(val1_updated.as_slice())
@@ -1183,7 +1245,9 @@ mod tests {
 
         // Insert id2
         let val2 = b"third payload";
-        assert!(context.compare_exchange_request_value(ns, id2, None, val2).unwrap());
+        assert!(context
+            .compare_exchange_request_value(ns, id2, None, val2)
+            .unwrap());
 
         // List
         let list = context.list_request_values(ns).unwrap();
@@ -1222,7 +1286,10 @@ mod tests {
         // Canonical typing event decode
         let raw_typing = typing_frame("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
         let decoded_typing = decode_subscription_frame(&raw_typing).unwrap();
-        assert_eq!(decoded_typing["$type"], "blue.catbird.chat.defs#typingEvent");
+        assert_eq!(
+            decoded_typing["$type"],
+            "blue.catbird.chat.defs#typingEvent"
+        );
 
         // subscriptionMessage is the union itself, never a wrapper variant
         let wrapped = serde_json::json!({
@@ -1291,29 +1358,67 @@ mod tests {
 
     #[test]
     fn validate_endpoint_scenarios() {
-        assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
-        assert!(validate_endpoint("wss://chat.catbird.blue:443/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
+        assert!(validate_endpoint(
+            "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_ok());
+        assert!(validate_endpoint(
+            "wss://chat.catbird.blue:443/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_ok());
 
         // Fixture hosts and non-default ports are not admitted
-        assert!(validate_endpoint("wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents").is_err());
-        assert!(validate_endpoint("wss://127.0.0.1:443/xrpc/blue.catbird.chat.subscribeEvents").is_err());
-        assert!(validate_endpoint("wss://localhost/xrpc/blue.catbird.chat.subscribeEvents").is_err());
-        assert!(validate_endpoint("wss://chat.catbird.blue:8443/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint(
+            "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_err());
+        assert!(
+            validate_endpoint("wss://127.0.0.1:443/xrpc/blue.catbird.chat.subscribeEvents")
+                .is_err()
+        );
+        assert!(
+            validate_endpoint("wss://localhost/xrpc/blue.catbird.chat.subscribeEvents").is_err()
+        );
+        assert!(validate_endpoint(
+            "wss://chat.catbird.blue:8443/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_err());
 
         // Query and fragment rejected
-        assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents?x=1").is_err());
-        assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents#f").is_err());
+        assert!(validate_endpoint(
+            "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents?x=1"
+        )
+        .is_err());
+        assert!(validate_endpoint(
+            "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents#f"
+        )
+        .is_err());
 
         // Scheme must be wss
-        assert!(validate_endpoint("ws://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
-        assert!(validate_endpoint("https://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(
+            validate_endpoint("ws://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents")
+                .is_err()
+        );
+        assert!(validate_endpoint(
+            "https://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_err());
 
         // Host must be authorized
-        assert!(validate_endpoint("wss://evil.attacker.com/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint(
+            "wss://evil.attacker.com/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_err());
 
         // Credentials rejected
-        assert!(validate_endpoint("wss://user:pass@chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
-        assert!(validate_endpoint("wss://evil.test@chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint(
+            "wss://user:pass@chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_err());
+        assert!(validate_endpoint(
+            "wss://evil.test@chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
+        )
+        .is_err());
 
         // Path must be exact
         assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/other.endpoint").is_err());
@@ -1350,30 +1455,113 @@ mod tests {
     struct MockStorage;
     #[async_trait::async_trait]
     impl MLSStorageBackend for MockStorage {
-        async fn ensure_conversation_exists(&self, _: &str, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn update_join_info(&self, _: &str, _: &str, _: super::super::types::JoinMethod, _: u64) -> Result<()> { Ok(()) }
-        async fn get_conversation(&self, _: &str, _: &str) -> Result<Option<super::super::types::ConversationView>> { Ok(None) }
-        async fn list_conversations(&self, _: &str) -> Result<Vec<super::super::types::ConversationView>> { Ok(vec![]) }
-        async fn delete_conversations(&self, _: &str, _: &[&str]) -> Result<()> { Ok(()) }
-        async fn set_conversation_state(&self, _: &str, _: super::super::types::ConversationState) -> Result<()> { Ok(()) }
-        async fn mark_needs_rejoin(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn needs_rejoin(&self, _: &str) -> Result<bool> { Ok(false) }
-        async fn clear_rejoin_flag(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn store_message(&self, _: &Message) -> Result<()> { Ok(()) }
-        async fn get_messages(&self, _: &str, _: u32, _: Option<u64>) -> Result<Vec<Message>> { Ok(vec![]) }
-        async fn message_exists(&self, _: &str) -> Result<bool> { Ok(false) }
-        async fn get_sync_cursor(&self, _: &str) -> Result<super::super::types::SyncCursor> { Ok(super::super::types::SyncCursor { conversations_cursor: None, messages_cursor: None }) }
-        async fn set_sync_cursor(&self, _: &str, _: &super::super::types::SyncCursor) -> Result<()> { Ok(()) }
-        async fn set_group_state(&self, _: &super::super::types::GroupState) -> Result<()> { Ok(()) }
-        async fn get_group_state(&self, _: &str) -> Result<Option<super::super::types::GroupState>> { Ok(None) }
-        async fn delete_group_state(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn get_recovery_state(&self) -> Result<super::super::types::PersistedRecoveryState> { Ok(super::super::types::PersistedRecoveryState::default()) }
-        async fn set_recovery_backoff(&self, _: &super::super::types::PersistedRecoveryBackoff) -> Result<()> { Ok(()) }
-        async fn clear_recovery_backoff(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn set_last_global_rejoin_attempt_at(&self, _: i64) -> Result<()> { Ok(()) }
-        async fn get_conversation_state(&self, _: &str) -> Result<Option<super::super::types::ConversationState>> { Ok(None) }
+        async fn ensure_conversation_exists(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn update_join_info(
+            &self,
+            _: &str,
+            _: &str,
+            _: super::super::types::JoinMethod,
+            _: u64,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn get_conversation(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<super::super::types::ConversationView>> {
+            Ok(None)
+        }
+        async fn list_conversations(
+            &self,
+            _: &str,
+        ) -> Result<Vec<super::super::types::ConversationView>> {
+            Ok(vec![])
+        }
+        async fn delete_conversations(&self, _: &str, _: &[&str]) -> Result<()> {
+            Ok(())
+        }
+        async fn set_conversation_state(
+            &self,
+            _: &str,
+            _: super::super::types::ConversationState,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn mark_needs_rejoin(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn needs_rejoin(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn clear_rejoin_flag(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn store_message(&self, _: &Message) -> Result<()> {
+            Ok(())
+        }
+        async fn get_messages(&self, _: &str, _: u32, _: Option<u64>) -> Result<Vec<Message>> {
+            Ok(vec![])
+        }
+        async fn message_exists(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn get_sync_cursor(&self, _: &str) -> Result<super::super::types::SyncCursor> {
+            Ok(super::super::types::SyncCursor {
+                conversations_cursor: None,
+                messages_cursor: None,
+            })
+        }
+        async fn set_sync_cursor(
+            &self,
+            _: &str,
+            _: &super::super::types::SyncCursor,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn set_group_state(&self, _: &super::super::types::GroupState) -> Result<()> {
+            Ok(())
+        }
+        async fn get_group_state(
+            &self,
+            _: &str,
+        ) -> Result<Option<super::super::types::GroupState>> {
+            Ok(None)
+        }
+        async fn delete_group_state(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn get_recovery_state(&self) -> Result<super::super::types::PersistedRecoveryState> {
+            Ok(super::super::types::PersistedRecoveryState::default())
+        }
+        async fn set_recovery_backoff(
+            &self,
+            _: &super::super::types::PersistedRecoveryBackoff,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_recovery_backoff(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn set_last_global_rejoin_attempt_at(&self, _: i64) -> Result<()> {
+            Ok(())
+        }
+        async fn get_conversation_state(
+            &self,
+            _: &str,
+        ) -> Result<Option<super::super::types::ConversationState>> {
+            Ok(None)
+        }
         fn implemented_optional_methods(&self) -> &'static [&'static str] {
-            &["get_recovery_state", "set_recovery_backoff", "clear_recovery_backoff", "set_last_global_rejoin_attempt_at", "get_conversation_state"]
+            &[
+                "get_recovery_state",
+                "set_recovery_backoff",
+                "clear_recovery_backoff",
+                "set_last_global_rejoin_attempt_at",
+                "get_conversation_state",
+            ]
         }
     }
 
@@ -1384,17 +1572,43 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl CredentialStore for MockCreds {
-        async fn store_signing_key(&self, _: &str, _: &[u8]) -> Result<()> { Ok(()) }
-        async fn get_signing_key(&self, _: &str) -> Result<Option<Vec<u8>>> { Ok(None) }
-        async fn delete_signing_key(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn store_mls_did(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn get_mls_did(&self, _: &str) -> Result<Option<String>> { Ok(Some(self.owner.clone())) }
-        async fn store_device_uuid(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
-        async fn get_device_uuid(&self, _: &str) -> Result<Option<String>> { Ok(Some(self.actor.clone())) }
-        async fn get_auth_generation(&self, _: &str) -> Result<Option<i64>> { Ok(Some(self.gen)) }
-        async fn has_credentials(&self, _: &str) -> Result<bool> { Ok(true) }
-        async fn clear_all(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn verify_member_credential(&self, _: &str, _: &str) -> Result<super::super::credential_binding::CredentialVerification> { Ok(super::super::credential_binding::CredentialVerification::Verified) }
+        async fn store_signing_key(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn get_signing_key(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn delete_signing_key(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn store_mls_did(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn get_mls_did(&self, _: &str) -> Result<Option<String>> {
+            Ok(Some(self.owner.clone()))
+        }
+        async fn store_device_uuid(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn get_device_uuid(&self, _: &str) -> Result<Option<String>> {
+            Ok(Some(self.actor.clone()))
+        }
+        async fn get_auth_generation(&self, _: &str) -> Result<Option<i64>> {
+            Ok(Some(self.gen))
+        }
+        async fn has_credentials(&self, _: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn clear_all(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn verify_member_credential(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<super::super::credential_binding::CredentialVerification> {
+            Ok(super::super::credential_binding::CredentialVerification::Verified)
+        }
     }
 
     struct MockApi {
@@ -1402,26 +1616,72 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl MLSAPIClient for MockApi {
-        async fn is_authenticated_as(&self, did: &str) -> bool { did == self.did }
-        async fn current_did(&self) -> Option<String> { Some(self.did.clone()) }
-        async fn submit_prepared_request(&self, _: PreparedRequest) -> Result<super::super::canonical_transport::GatewayResponse> {
-            Ok(super::super::canonical_transport::GatewayResponse { status: 200, content_type: None, body: vec![] })
+        async fn is_authenticated_as(&self, did: &str) -> bool {
+            did == self.did
         }
-        async fn get_conversations(&self, _: u32, _: Option<&str>) -> Result<super::super::types::ConversationListPage> {
-            Ok(super::super::types::ConversationListPage { conversations: vec![], cursor: None })
+        async fn current_did(&self) -> Option<String> {
+            Some(self.did.clone())
         }
-        async fn get_messages(&self, _: &str, _: Option<&str>, _: u32, _: Option<&str>, _: Option<u32>, _: Option<u32>) -> Result<(Vec<super::super::types::IncomingEnvelope>, Option<String>)> {
+        async fn submit_prepared_request(
+            &self,
+            _: PreparedRequest,
+        ) -> Result<super::super::canonical_transport::GatewayResponse> {
+            Ok(super::super::canonical_transport::GatewayResponse {
+                status: 200,
+                content_type: None,
+                body: vec![],
+            })
+        }
+        async fn get_conversations(
+            &self,
+            _: u32,
+            _: Option<&str>,
+        ) -> Result<super::super::types::ConversationListPage> {
+            Ok(super::super::types::ConversationListPage {
+                conversations: vec![],
+                cursor: None,
+            })
+        }
+        async fn get_messages(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: u32,
+            _: Option<&str>,
+            _: Option<u32>,
+            _: Option<u32>,
+        ) -> Result<(Vec<super::super::types::IncomingEnvelope>, Option<String>)> {
             Ok((vec![], None))
         }
-        async fn get_key_packages(&self, _: &str, _: &[String]) -> Result<Vec<super::super::types::KeyPackageRef>> { Ok(vec![]) }
+        async fn get_key_packages(
+            &self,
+            _: &str,
+            _: &[String],
+        ) -> Result<Vec<super::super::types::KeyPackageRef>> {
+            Ok(vec![])
+        }
         async fn get_key_package_stats(&self) -> Result<super::super::types::KeyPackageStats> {
-            Ok(super::super::types::KeyPackageStats { available: 10, total: 10 })
+            Ok(super::super::types::KeyPackageStats {
+                available: 10,
+                total: 10,
+            })
         }
-        async fn sync_key_packages(&self, _: &[String], _: &str) -> Result<super::super::types::KeyPackageSyncResult> {
-            Ok(super::super::types::KeyPackageSyncResult { orphaned_count: 0, deleted_count: 0 })
+        async fn sync_key_packages(
+            &self,
+            _: &[String],
+            _: &str,
+        ) -> Result<super::super::types::KeyPackageSyncResult> {
+            Ok(super::super::types::KeyPackageSyncResult {
+                orphaned_count: 0,
+                deleted_count: 0,
+            })
         }
-        async fn list_devices(&self, _: &str) -> Result<Vec<super::super::types::DeviceInfo>> { Ok(vec![]) }
-        async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> { Ok(vec![]) }
+        async fn list_devices(&self, _: &str) -> Result<Vec<super::super::types::DeviceInfo>> {
+            Ok(vec![])
+        }
+        async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
     }
 
     /// Serves one inventory snapshot, numbered `snapshot`. Like the server, which keeps one
@@ -1439,13 +1699,21 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl MLSAPIClient for MockInventoryApi {
-        async fn is_authenticated_as(&self, did: &str) -> bool { did == self.did }
-        async fn current_did(&self) -> Option<String> { Some(self.did.clone()) }
-        async fn submit_prepared_request(&self, req: PreparedRequest) -> Result<super::super::canonical_transport::GatewayResponse> {
+        async fn is_authenticated_as(&self, did: &str) -> bool {
+            did == self.did
+        }
+        async fn current_did(&self) -> Option<String> {
+            Some(self.did.clone())
+        }
+        async fn submit_prepared_request(
+            &self,
+            req: PreparedRequest,
+        ) -> Result<super::super::canonical_transport::GatewayResponse> {
             let expires = self.expires.as_str();
             let scope_bytes = STANDARD.encode([3u8; 32]);
             if req.operation == CanonicalOperation::GetSubscriptionTicket {
-                let asked: serde_json::Value = serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                let asked: serde_json::Value =
+                    serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
                 if asked["inventorySessionId"] != self.session().as_str() {
                     return Ok(super::super::canonical_transport::GatewayResponse {
                         status: 400,
@@ -1485,28 +1753,67 @@ mod tests {
                 body: serde_json::to_vec(&page).unwrap(),
             })
         }
-        async fn get_conversations(&self, _: u32, _: Option<&str>) -> Result<super::super::types::ConversationListPage> {
-            Ok(super::super::types::ConversationListPage { conversations: vec![], cursor: None })
+        async fn get_conversations(
+            &self,
+            _: u32,
+            _: Option<&str>,
+        ) -> Result<super::super::types::ConversationListPage> {
+            Ok(super::super::types::ConversationListPage {
+                conversations: vec![],
+                cursor: None,
+            })
         }
-        async fn get_messages(&self, _: &str, _: Option<&str>, _: u32, _: Option<&str>, _: Option<u32>, _: Option<u32>) -> Result<(Vec<super::super::types::IncomingEnvelope>, Option<String>)> {
+        async fn get_messages(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: u32,
+            _: Option<&str>,
+            _: Option<u32>,
+            _: Option<u32>,
+        ) -> Result<(Vec<super::super::types::IncomingEnvelope>, Option<String>)> {
             Ok((vec![], None))
         }
-        async fn get_key_packages(&self, _: &str, _: &[String]) -> Result<Vec<super::super::types::KeyPackageRef>> { Ok(vec![]) }
+        async fn get_key_packages(
+            &self,
+            _: &str,
+            _: &[String],
+        ) -> Result<Vec<super::super::types::KeyPackageRef>> {
+            Ok(vec![])
+        }
         async fn get_key_package_stats(&self) -> Result<super::super::types::KeyPackageStats> {
-            Ok(super::super::types::KeyPackageStats { available: 10, total: 10 })
+            Ok(super::super::types::KeyPackageStats {
+                available: 10,
+                total: 10,
+            })
         }
-        async fn sync_key_packages(&self, _: &[String], _: &str) -> Result<super::super::types::KeyPackageSyncResult> {
-            Ok(super::super::types::KeyPackageSyncResult { orphaned_count: 0, deleted_count: 0 })
+        async fn sync_key_packages(
+            &self,
+            _: &[String],
+            _: &str,
+        ) -> Result<super::super::types::KeyPackageSyncResult> {
+            Ok(super::super::types::KeyPackageSyncResult {
+                orphaned_count: 0,
+                deleted_count: 0,
+            })
         }
-        async fn list_devices(&self, _: &str) -> Result<Vec<super::super::types::DeviceInfo>> { Ok(vec![]) }
-        async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> { Ok(vec![]) }
+        async fn list_devices(&self, _: &str) -> Result<Vec<super::super::types::DeviceInfo>> {
+            Ok(vec![])
+        }
+        async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn subscription_orchestrator_cursor_lifecycle_and_cas() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("sub_orch_test.db").to_string_lossy().to_string();
+        let db_path = dir
+            .path()
+            .join("sub_orch_test.db")
+            .to_string_lossy()
+            .to_string();
         let context = crate::MLSContext::new(
             db_path,
             "test-key-1234567890123456".to_string(),
@@ -1541,11 +1848,18 @@ mod tests {
         };
 
         // 1. Initialize cursor fence
-        let fence = orchestrator.initialize_subscription_cursor(&ticket).await.unwrap();
+        let fence = orchestrator
+            .initialize_subscription_cursor(&ticket)
+            .await
+            .unwrap();
         assert_eq!(fence.cursor, "cursor-1");
         assert_eq!(fence.session, "session-1");
 
-        let current = orchestrator.current_subscription_cursor().await.unwrap().unwrap();
+        let current = orchestrator
+            .current_subscription_cursor()
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(current.cursor, "cursor-1");
 
         // 2. Apply watermark event: cursor-1 -> cursor-2
@@ -1558,12 +1872,22 @@ mod tests {
                 "$type": "blue.catbird.chat.defs#watermarkEvent",
                 "issuedAt": "2026-09-23T00:00:00.000Z"
             }
-        }).to_string();
+        })
+        .to_string();
 
-        let outcome = orchestrator.apply_subscription_frame(&watermark_frame).await.unwrap();
-        assert!(matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-2"));
+        let outcome = orchestrator
+            .apply_subscription_frame(&watermark_frame)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-2")
+        );
 
-        let current = orchestrator.current_subscription_cursor().await.unwrap().unwrap();
+        let current = orchestrator
+            .current_subscription_cursor()
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(current.cursor, "cursor-2");
 
         // 3. Gap frame: expected previousCursor cursor-2, but received cursor-1 -> rejected!
@@ -1576,18 +1900,45 @@ mod tests {
                 "$type": "blue.catbird.chat.defs#watermarkEvent",
                 "issuedAt": "2026-09-23T00:00:00.000Z"
             }
-        }).to_string();
-        let err = orchestrator.apply_subscription_frame(&gap_frame).await.unwrap_err();
-        assert!(err.to_string().contains("Subscription cursor chain changed"));
+        })
+        .to_string();
+        let err = orchestrator
+            .apply_subscription_frame(&gap_frame)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Subscription cursor chain changed"));
         // Cursor must remain cursor-2
-        assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-2");
+        assert_eq!(
+            orchestrator
+                .current_subscription_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "cursor-2"
+        );
 
         // 4. Typing event does NOT advance cursor
         let bob = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
-        let outcome = orchestrator.apply_subscription_frame(&typing_frame(bob)).await.unwrap();
-        assert!(matches!(outcome, SubscriptionDispatchOutcome::Typing { ref conversation_id, ref sender_did, is_typing: true } if conversation_id == "00000000-0000-4000-8000-00000000000b" && sender_did == bob));
+        let outcome = orchestrator
+            .apply_subscription_frame(&typing_frame(bob))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SubscriptionDispatchOutcome::Typing { ref conversation_id, ref sender_did, is_typing: true } if conversation_id == "00000000-0000-4000-8000-00000000000b" && sender_did == bob)
+        );
         // Cursor must remain cursor-2
-        assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-2");
+        assert_eq!(
+            orchestrator
+                .current_subscription_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "cursor-2"
+        );
 
         // 5. Valid advance cursor-2 -> cursor-3
         let advance_frame = serde_json::json!({
@@ -1599,10 +1950,24 @@ mod tests {
                 "$type": "blue.catbird.chat.defs#watermarkEvent",
                 "issuedAt": "2026-09-23T00:00:00.000Z"
             }
-        }).to_string();
-        let outcome = orchestrator.apply_subscription_frame(&advance_frame).await.unwrap();
-        assert!(matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-3"));
-        assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-3");
+        })
+        .to_string();
+        let outcome = orchestrator
+            .apply_subscription_frame(&advance_frame)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-3")
+        );
+        assert_eq!(
+            orchestrator
+                .current_subscription_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "cursor-3"
+        );
 
         // 6. Foreign access-ended event is rejected
         let foreign_access_ended = serde_json::json!({
@@ -1618,10 +1983,22 @@ mod tests {
                 "deviceId": "00000000-0000-4000-8000-000000000999",
                 "terminalSeq": 1
             }
-        }).to_string();
-        let err = orchestrator.apply_subscription_frame(&foreign_access_ended).await.unwrap_err();
+        })
+        .to_string();
+        let err = orchestrator
+            .apply_subscription_frame(&foreign_access_ended)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Foreign access-ended audience"));
-        assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-3");
+        assert_eq!(
+            orchestrator
+                .current_subscription_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "cursor-3"
+        );
 
         // 6b. Unknown payload variant is rejected before the cursor moves
         let unknown_variant = serde_json::json!({
@@ -1633,9 +2010,21 @@ mod tests {
                 "$type": "blue.catbird.chat.defs#unknownEvent",
                 "issuedAt": "2026-09-23T00:00:00.000Z"
             }
-        }).to_string();
-        assert!(orchestrator.apply_subscription_frame(&unknown_variant).await.is_err());
-        assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-3");
+        })
+        .to_string();
+        assert!(orchestrator
+            .apply_subscription_frame(&unknown_variant)
+            .await
+            .is_err());
+        assert_eq!(
+            orchestrator
+                .current_subscription_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor,
+            "cursor-3"
+        );
 
         // 7. Concurrent CAS modification: another process updates subscriptionCursor
         let competing_fence = CursorFence {
@@ -1646,9 +2035,19 @@ mod tests {
             connection: "conn-competing".into(),
             cursor: "cursor-competing".into(),
         };
-        let raw_current = context.read_request_value("subscriptionCursor", actor).unwrap().unwrap();
+        let raw_current = context
+            .read_request_value("subscriptionCursor", actor)
+            .unwrap()
+            .unwrap();
         let competing_bytes = serde_json::to_vec(&competing_fence).unwrap();
-        assert!(context.compare_exchange_request_value("subscriptionCursor", actor, Some(&raw_current), &competing_bytes).unwrap());
+        assert!(context
+            .compare_exchange_request_value(
+                "subscriptionCursor",
+                actor,
+                Some(&raw_current),
+                &competing_bytes
+            )
+            .unwrap());
 
         // Now apply_subscription_frame fails with authority changed or superseded
         let advance_frame_4 = serde_json::json!({
@@ -1660,8 +2059,12 @@ mod tests {
                 "$type": "blue.catbird.chat.defs#watermarkEvent",
                 "issuedAt": "2026-09-23T00:00:00.000Z"
             }
-        }).to_string();
-        assert!(orchestrator.apply_subscription_frame(&advance_frame_4).await.is_err());
+        })
+        .to_string();
+        assert!(orchestrator
+            .apply_subscription_frame(&advance_frame_4)
+            .await
+            .is_err());
     }
 
     /// An initialized orchestrator over the mock inventory API serving `snapshot`
@@ -1672,7 +2075,11 @@ mod tests {
         dir: &tempfile::TempDir,
         snapshot: u8,
     ) -> MLSOrchestrator<MockStorage, MockInventoryApi, MockCreds, crate::MLSContext> {
-        let db_path = dir.path().join("sub_inv_test.db").to_string_lossy().to_string();
+        let db_path = dir
+            .path()
+            .join("sub_inv_test.db")
+            .to_string_lossy()
+            .to_string();
         let context = crate::MLSContext::new(
             db_path,
             "test-key-1234567890123456".to_string(),
@@ -1688,7 +2095,11 @@ mod tests {
         });
         let expires = (chrono::Utc::now() + chrono::Duration::minutes(10))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let api = Arc::new(MockInventoryApi { did: owner.into(), expires, snapshot });
+        let api = Arc::new(MockInventoryApi {
+            did: owner.into(),
+            expires,
+            snapshot,
+        });
         let orchestrator = MLSOrchestrator::new(
             context,
             Arc::new(MockStorage),
@@ -1708,28 +2119,53 @@ mod tests {
         let actor = "00000000-0000-4000-8000-000000000001";
 
         // 1. Synchronize inventory
-        let fence = orchestrator.synchronize_authenticated_inventory(false).await.unwrap();
-        assert_eq!(fence.inventory_session_id(), "session-inv-1234567890123456789012");
+        let fence = orchestrator
+            .synchronize_authenticated_inventory(false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fence.inventory_session_id(),
+            "session-inv-1234567890123456789012"
+        );
         assert_eq!(fence.event_cursor(), "cursor-inv-1");
 
         // 2. Prepare subscription ticket
         let ticket = orchestrator.prepare_subscription().await.unwrap();
-        assert_eq!(ticket.inventory_session_id, "session-inv-1234567890123456789012");
+        assert_eq!(
+            ticket.inventory_session_id,
+            "session-inv-1234567890123456789012"
+        );
         assert_eq!(ticket.event_cursor, "cursor-inv-1");
-        assert_eq!(ticket.endpoint, "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents");
+        assert_eq!(
+            ticket.endpoint,
+            "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
+        );
         assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
 
         // 2b. A ticket whose inventory scope differs from the snapshot is refused
         let foreign_scope = STANDARD.encode([4u8; 32]);
         let err = orchestrator
-            .prepare_subscription_ticket(actor, &ticket.inventory_session_id, &ticket.event_cursor, &foreign_scope)
+            .prepare_subscription_ticket(
+                actor,
+                &ticket.inventory_session_id,
+                &ticket.event_cursor,
+                &foreign_scope,
+            )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("ticket inventory scope does not match snapshot"));
+        assert!(err
+            .to_string()
+            .contains("ticket inventory scope does not match snapshot"));
 
         // 3. Second call with force_fresh=false restores from cached journal
-        let fence2 = orchestrator.synchronize_authenticated_inventory(false).await.unwrap();
-        assert_eq!(fence2.inventory_session_id(), "session-inv-1234567890123456789012");
+        let fence2 = orchestrator
+            .synchronize_authenticated_inventory(false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fence2.inventory_session_id(),
+            "session-inv-1234567890123456789012"
+        );
         assert_eq!(fence2.event_cursor(), "cursor-inv-1");
     }
 
@@ -1746,13 +2182,19 @@ mod tests {
         let pending = orchestrator.prepare_subscription();
         tokio::pin!(pending);
         let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending).await;
-        assert!(early.is_err(), "ticket must wait for the in-flight pass, got {early:?}");
+        assert!(
+            early.is_err(),
+            "ticket must wait for the in-flight pass, got {early:?}"
+        );
 
         *orchestrator.sync_in_progress().lock().await = false;
         orchestrator.sync_finished().notify_waiters();
         let ticket = pending.await.expect("ticket after the pass finished");
         assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
-        assert!(!*orchestrator.sync_in_progress().lock().await, "ingest released the sync flag");
+        assert!(
+            !*orchestrator.sync_in_progress().lock().await,
+            "ingest released the sync flag"
+        );
     }
 
     /// F71: after any newer event the server replaces the device's inventory session
@@ -1773,7 +2215,10 @@ mod tests {
             .prepare_subscription()
             .await
             .expect("ticket minted from the fresh inventory");
-        assert_eq!(ticket.inventory_session_id, "session-inv-2234567890123456789012");
+        assert_eq!(
+            ticket.inventory_session_id,
+            "session-inv-2234567890123456789012"
+        );
         assert_eq!(ticket.event_cursor, "cursor-inv-2");
     }
 }

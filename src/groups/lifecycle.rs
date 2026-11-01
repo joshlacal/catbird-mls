@@ -6,6 +6,7 @@ use crate::MLSError;
 
 /// Conversation membership role (`Spec §3.1 D3`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
     Admin,

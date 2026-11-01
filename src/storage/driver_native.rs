@@ -48,7 +48,7 @@ pub enum OpenMode {
 }
 
 /// Telemetry returned by [`MlsAccountDb::prepare_for_background`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct BackgroundCheckpointReport {
     pub busy: i64,
     pub log_frames: i64,
@@ -88,16 +88,18 @@ pub(crate) fn map_rusqlite_err(context: &str, err: &rusqlite::Error) -> MLSError
                 ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
                     MLSError::ThreadSafety(format!("{context}: SQLITE_BUSY/LOCKED {msg}"))
                 }
-                ErrorCode::NotADatabase => {
-                    MLSError::invalid_input(format!("{context}: SQLITE_NOTADB (wrong key or corrupt header) {msg}"))
-                }
+                ErrorCode::NotADatabase => MLSError::invalid_input(format!(
+                    "{context}: SQLITE_NOTADB (wrong key or corrupt header) {msg}"
+                )),
                 ErrorCode::ApiMisuse => {
                     MLSError::Internal(format!("{context}: SQLITE_MISUSE {msg}"))
                 }
                 ErrorCode::OutOfMemory => {
                     MLSError::Internal(format!("{context}: SQLITE_NOMEM {msg}"))
                 }
-                _ => MLSError::invalid_input(format!("{context}: sqlite failure {ffi_err:?} {msg}")),
+                _ => {
+                    MLSError::invalid_input(format!("{context}: sqlite failure {ffi_err:?} {msg}"))
+                }
             }
         }
         _ => MLSError::invalid_input(format!("{context}: sqlite error {err}")),
@@ -120,14 +122,15 @@ fn open_configured_connection(
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    MLSError::invalid_input(format!("failed to create DB parent dir {parent:?}: {e}"))
+                    MLSError::invalid_input(format!(
+                        "failed to create DB parent dir {parent:?}: {e}"
+                    ))
                 })?;
             }
         }
     }
 
-    let conn = Connection::open(path)
-        .map_err(|e| map_rusqlite_err("Connection::open", &e))?;
+    let conn = Connection::open(path).map_err(|e| map_rusqlite_err("Connection::open", &e))?;
 
     let key_spec = Zeroizing::new(derive_sqlcipher_96hex_key_spec(db_key_32));
 
@@ -272,10 +275,7 @@ impl MlsAccountDb {
         if self.suspended.load(Ordering::SeqCst) {
             return false;
         }
-        self.state
-            .lock()
-            .map(|g| g.conn.is_some())
-            .unwrap_or(false)
+        self.state.lock().map(|g| g.conn.is_some()).unwrap_or(false)
     }
 
     /// Obtain a SQLite interrupt handle if the connection is currently open.
@@ -571,7 +571,9 @@ impl KvBackend for RusqliteKvBackend<'_> {
             .prepare("SELECT key_bytes FROM openmls_kv WHERE version = ?1 AND scope = ?2")
             .map_err(|e| OpenMlsKvError::Sql(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![i64::from(version), scope], |row| row.get(0))
+            .query_map(rusqlite::params![i64::from(version), scope], |row| {
+                row.get(0)
+            })
             .map_err(|e| OpenMlsKvError::Sql(e.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| OpenMlsKvError::Sql(e.to_string()))
@@ -743,7 +745,10 @@ impl<'a> SqlReadTx<'a> {
             .map_err(|e| map_rusqlite_err("get_account_meta", &e))
     }
 
-    pub fn list_account_meta_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, MLSError> {
+    pub fn list_account_meta_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, MLSError> {
         let pattern = format!("{prefix}%");
         let mut stmt = self
             .conn
@@ -756,7 +761,10 @@ impl<'a> SqlReadTx<'a> {
             .map_err(|e| map_rusqlite_err("list_account_meta_prefix.collect", &e))
     }
 
-    pub fn get_conversation(&self, conversation_id: &str) -> Result<Option<ConversationRow>, MLSError> {
+    pub fn get_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRow>, MLSError> {
         self.conn
             .query_row(
                 "SELECT conversation_id, group_id, generation, epoch, last_seq, sequencer_did, \
@@ -1308,10 +1316,7 @@ impl<'a> SqlTx<'a> {
         } else {
             self.read
                 .conn
-                .execute(
-                    "DELETE FROM messages WHERE sender_did = ?1",
-                    [sender_did],
-                )
+                .execute("DELETE FROM messages WHERE sender_did = ?1", [sender_did])
                 .map_err(|e| map_rusqlite_err("purge_messages_from_sender(all)", &e))
         }
     }

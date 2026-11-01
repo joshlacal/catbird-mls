@@ -127,7 +127,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_v2::transcript::direct_request::{direct_request_signing_bytes, DirectRequestKind};
+    use crate::chat_v2::transcript::direct_request::{
+        direct_request_signing_bytes, DirectRequestKind,
+    };
 
     const OWNER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const PEER: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
@@ -156,9 +158,13 @@ mod tests {
         let bare = legacy_origin(&state(|b| json!(STANDARD.encode(b))), OWNER, PEER)
             .unwrap()
             .unwrap();
-        let wrapped = legacy_origin(&state(|b| json!({"$bytes":STANDARD.encode(b)})), OWNER, PEER)
-            .unwrap()
-            .unwrap();
+        let wrapped = legacy_origin(
+            &state(|b| json!({"$bytes":STANDARD.encode(b)})),
+            OWNER,
+            PEER,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(bare, wrapped);
         assert_eq!(bare["exactPrior"]["groupId"], STANDARD.encode([1u8; 32]));
         let body = json!({

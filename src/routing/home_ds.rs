@@ -126,12 +126,13 @@ impl HomeDsSpaceRelayClient {
         }
 
         let mac_header = resp.space_mac_header.as_deref().ok_or_else(|| {
-            MLSError::Cryptography("Gate 7: relayed getRecord missing Atproto-Space-Mac header".into())
+            MLSError::Cryptography(
+                "Gate 7: relayed getRecord missing Atproto-Space-Mac header".into(),
+            )
         })?;
 
-        let parsed: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| {
-            MLSError::Internal(format!("relayed getRecord invalid JSON: {e}"))
-        })?;
+        let parsed: serde_json::Value = serde_json::from_slice(&resp.body)
+            .map_err(|e| MLSError::Internal(format!("relayed getRecord invalid JSON: {e}")))?;
 
         let uri = parsed["uri"]
             .as_str()
@@ -139,8 +140,9 @@ impl HomeDsSpaceRelayClient {
         let cid_str = parsed["cid"]
             .as_str()
             .ok_or_else(|| MLSError::Internal("relayed getRecord missing cid".into()))?;
-        let (_base, cid_bytes) = multibase::decode(cid_str)
-            .map_err(|e| MLSError::Internal(format!("relayed getRecord invalid multibase CID: {e}")))?;
+        let (_base, cid_bytes) = multibase::decode(cid_str).map_err(|e| {
+            MLSError::Internal(format!("relayed getRecord invalid multibase CID: {e}"))
+        })?;
 
         let uri_with_space = if uri.contains("?space=") {
             uri.to_owned()

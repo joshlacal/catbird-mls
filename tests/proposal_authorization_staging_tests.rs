@@ -4,6 +4,7 @@
 //! sender DID is bound by the orchestrator afterwards. The proposal must not be
 //! visible to OpenMLS's commit queue in that interval.
 
+#![allow(clippy::type_complexity)]
 #[path = "epoch_secret_test_support.rs"]
 mod epoch_secret_test_support;
 

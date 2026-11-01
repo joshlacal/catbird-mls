@@ -6,9 +6,9 @@
 use labyrinth::store::{MaybeSend, MaybeSync};
 use serde::{Deserialize, Serialize};
 
-use crate::MLSError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::{MlsAccountDb, MutationJournalRow};
+use crate::MLSError;
 
 pub const LABYRINTH_ROTATION_OP_TYPE: &str = "labyrinth_epoch_rotation";
 

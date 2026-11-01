@@ -21,10 +21,7 @@ use catbird_mls::orchestrator::credential_binding::{
 };
 use catbird_mls::orchestrator::error::OrchestratorError;
 use catbird_mls::orchestrator::types::{CommitKind, CommitPlan, IncomingEnvelope};
-use catbird_mls::orchestrator::{
-    MLSAPIClient, MLSStorageBackend, MlsCryptoContext, MlsDecryptOutcome,
-};
-use catbird_mls::DecryptContentType;
+use catbird_mls::orchestrator::{MLSStorageBackend, MlsCryptoContext};
 use e2e_harness::TestWorld;
 
 /// Drive `stage_commit` on Alice's side for a fresh add-members operation.
@@ -124,7 +121,7 @@ async fn test_stage_then_confirm_advances_epoch() {
     let group_id = convo.group_id.clone();
     let epoch_before = epoch_for_group(alice, &group_id);
 
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
     assert_eq!(
         plan.source_epoch, epoch_before,
         "plan must capture current epoch"
@@ -145,13 +142,13 @@ async fn test_stage_then_confirm_advances_epoch() {
     // Ship the commit to the mock DS. The wrapper-style code would do this;
     // we call the mock API directly here to keep the test focused on the
     // sender-side three-phase API.
-    use catbird_mls::orchestrator::MLSAPIClient;
+
     let server_result = alice
         .orchestrator
         .api_client()
         .add_members(
             &convo.conversation_id,
-            &[bob.did.clone()],
+            std::slice::from_ref(&bob.did),
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
         )
@@ -196,7 +193,7 @@ async fn own_commit_echo_requires_durable_local_confirmation() {
         .create_group("own-echo-durable-fence", None, None)
         .await
         .expect("create group");
-    let plan = stage_add_members(&alice, &convo.group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &convo.group_id, std::slice::from_ref(&bob.did)).await;
     let tracked_before = alice.orchestrator.own_commits().lock().await.len();
 
     let error = alice
@@ -250,15 +247,14 @@ async fn test_confirm_projection_failure_withholds_success_and_cache_advance() {
         .expect("create_group failed");
     let group_id = convo.group_id.clone();
     let epoch_before = epoch_for_group(alice, &group_id);
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
 
-    use catbird_mls::orchestrator::MLSAPIClient;
     alice
         .orchestrator
         .api_client()
         .add_members(
             &convo.conversation_id,
-            &[bob.did.clone()],
+            std::slice::from_ref(&bob.did),
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
         )
@@ -332,7 +328,7 @@ async fn test_stage_then_discard_no_epoch_change() {
     let group_id = convo.group_id.clone();
     let epoch_before = epoch_for_group(alice, &group_id);
 
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
 
     alice
         .orchestrator
@@ -348,7 +344,7 @@ async fn test_stage_then_discard_no_epoch_change() {
 
     // And the pending map must be empty — a second stage for the same
     // group should succeed.
-    let plan2 = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan2 = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
     // Clean up so the test doesn't leave OpenMLS pending state leaking.
     alice
         .orchestrator
@@ -380,17 +376,17 @@ async fn test_double_confirm_errors() {
         .unwrap();
     let group_id = convo.group_id.clone();
 
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
     let handle = plan.handle.clone();
 
     // Ship the commit first.
-    use catbird_mls::orchestrator::MLSAPIClient;
+
     alice
         .orchestrator
         .api_client()
         .add_members(
             &convo.conversation_id,
-            &[bob.did.clone()],
+            std::slice::from_ref(&bob.did),
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
         )
@@ -447,7 +443,7 @@ async fn test_confirm_wrong_server_epoch_errors() {
     let group_id = convo.group_id.clone();
     let epoch_before = epoch_for_group(alice, &group_id);
 
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
     let handle = plan.handle.clone();
     let bogus_server_epoch = plan.target_epoch.wrapping_add(42);
 
@@ -504,16 +500,15 @@ async fn test_discard_after_confirm_errors() {
         .unwrap();
     let group_id = convo.group_id.clone();
 
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
     let handle = plan.handle.clone();
 
-    use catbird_mls::orchestrator::MLSAPIClient;
     alice
         .orchestrator
         .api_client()
         .add_members(
             &convo.conversation_id,
-            &[bob.did.clone()],
+            std::slice::from_ref(&bob.did),
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
         )
@@ -561,7 +556,7 @@ async fn test_stage_while_pending_errors() {
         .unwrap();
     let group_id = convo.group_id.clone();
 
-    let plan1 = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    let plan1 = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob.did)).await;
 
     // Try to stage a second commit while the first is still pending.
     let err = alice
@@ -1636,7 +1631,7 @@ async fn test_stage_commit_mismatched_identity_withholds_cursor() {
         .expect("create group 2");
 
     // Alice stages a commit on group 1
-    let plan = stage_add_members(&alice, &convo1.group_id, &[bob.did.clone()]).await;
+    let plan = stage_add_members(&alice, &convo1.group_id, std::slice::from_ref(&bob.did)).await;
 
     // An envelope arrives claiming to be for convo2 but containing convo1's commit
     let error = alice

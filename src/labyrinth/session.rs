@@ -172,7 +172,9 @@ impl SessionDeps {
         match saved {
             None => Ok(Placement::Space),
             Some(b) => Placement::parse(&b).ok_or_else(|| {
-                OrchestratorError::Storage("labyrinth: unsupported non-Space mailbox placement".into())
+                OrchestratorError::Storage(
+                    "labyrinth: unsupported non-Space mailbox placement".into(),
+                )
             }),
         }
     }
@@ -227,8 +229,9 @@ impl SessionDeps {
         else {
             return Ok(vec![]);
         };
-        let pins: std::collections::BTreeMap<String, ThreadPlacement> = serde_json::from_slice(&raw)
-            .map_err(|_| labyrinth::Error::Malformed("saved conversation placements"))?;
+        let pins: std::collections::BTreeMap<String, ThreadPlacement> =
+            serde_json::from_slice(&raw)
+                .map_err(|_| labyrinth::Error::Malformed("saved conversation placements"))?;
         let mut spaces = std::collections::BTreeSet::new();
         for placement in pins.into_values() {
             placement.validate()?;
@@ -653,7 +656,11 @@ impl LabyrinthSession {
         self.lab.discard_pending(conversation_id);
     }
 
-    pub async fn load_history(&mut self, conversation_id: &str, range: TimeRange) -> Result<HistoryPage> {
+    pub async fn load_history(
+        &mut self,
+        conversation_id: &str,
+        range: TimeRange,
+    ) -> Result<HistoryPage> {
         let raw = async {
             self.lab.sync_epochs().await?;
             self.lab.load_thread(conversation_id, range).await
@@ -679,7 +686,9 @@ impl LabyrinthSession {
             if sync {
                 self.lab.sync_epochs().await?;
             }
-            self.lab.load_thread_page(conversation_id, before, limit).await
+            self.lab
+                .load_thread_page(conversation_id, before, limit)
+                .await
         }
         .await;
         let p = self.finish(raw)?;

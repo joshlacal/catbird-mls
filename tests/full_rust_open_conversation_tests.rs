@@ -161,7 +161,7 @@ async fn missing_local_group_uses_welcome_before_external_commit() {
         .expect("create_group failed");
     alice
         .orchestrator
-        .swap_members(&convo.conversation_id, &[], &[bob_did.clone()])
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add bob");
 
@@ -490,7 +490,11 @@ async fn join_or_rejoin_failure_returns_non_ready_non_healthy_result() {
     let bob = world.client("Bob");
     let convo = alice
         .orchestrator
-        .create_group("Recovery failure", Some(&[bob_did.clone()]), None)
+        .create_group(
+            "Recovery failure",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
         .await
         .expect("create_group failed");
 

@@ -414,10 +414,87 @@ pub(crate) fn verify_request_publication_entry(
     Ok(hash)
 }
 
+impl<S, A, C, M> crate::orchestrator::MLSOrchestrator<S, A, C, M>
+where
+    S: crate::orchestrator::MLSStorageBackend + 'static,
+    A: crate::orchestrator::MLSAPIClient + 'static,
+    C: crate::orchestrator::CredentialStore + 'static,
+    M: crate::orchestrator::MlsCryptoContext + 'static,
+{
+    pub(super) async fn authorize_direct_request_projection(
+        &self,
+        raw: &mut Vec<u8>,
+        owner: &str,
+        device: &str,
+    ) -> Result<DirectRequestProjection> {
+        // Keep migration state on the heap: this gate is nested in already
+        // large request/acceptance/terminal async state machines on app threads.
+        Box::pin(async {
+            let mut projection =
+                DirectRequestProjection::decode_for_reauthorization(raw, owner, device)?;
+            if projection.authorization_version == REQUEST_AUTHORIZATION_VERSION {
+                return Ok(projection);
+            }
+            let publication: Value =
+                serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
+            let mut actors = vec![(&publication["body"], &projection.sender_public_key)];
+            let acceptance: Option<Value> = projection
+                .acceptance_proof
+                .as_ref()
+                .map(|raw| serde_json::from_slice(raw).map_err(|_| invalid()))
+                .transpose()?;
+            if let Some(acceptance) = &acceptance {
+                actors.push((
+                    &acceptance["entry"]["signedRequest"]["body"],
+                    projection
+                        .recipient_public_key
+                        .as_ref()
+                        .ok_or_else(invalid)?,
+                ));
+            }
+            if let Some(close) = &projection.close_proof {
+                actors.push((
+                    &close.entry["signedRequest"]["body"],
+                    &close.actor_public_key,
+                ));
+            }
+            for (body, retained_key) in actors {
+                let key = self
+                    .request_authorized_device_key(
+                        body["actorDid"].as_str().ok_or_else(invalid)?,
+                        body["actorDeviceId"].as_str().ok_or_else(invalid)?,
+                        body["keyId"].as_str().ok_or_else(invalid)?,
+                    )
+                    .await?;
+                if key != *retained_key {
+                    return Err(invalid());
+                }
+            }
+            projection.authorization_version = REQUEST_AUTHORIZATION_VERSION;
+            let next = projection.encode()?;
+            let cid = publication["body"]["conversationId"]
+                .as_str()
+                .ok_or_else(invalid)?;
+            if !self
+                .mls_context()
+                .compare_exchange_direct_request_projection(cid, Some(raw), &next)?
+            {
+                return Err(OrchestratorError::Storage(
+                    "Request authorization migration raced".into(),
+                ));
+            }
+            // Downstream updates must compare against the exact upgraded bytes.
+            *raw = next;
+            Ok(projection)
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
     fn sample_close_entry() -> Value {
@@ -523,82 +600,5 @@ mod tests {
         forged_tag["signedRequest"]["body"]["$type"] =
             json!("blue.catbird.chat.defs#directRequestBody");
         assert!(normalized_close_entry(forged_tag).is_err());
-    }
-}
-
-impl<S, A, C, M> crate::orchestrator::MLSOrchestrator<S, A, C, M>
-where
-    S: crate::orchestrator::MLSStorageBackend + 'static,
-    A: crate::orchestrator::MLSAPIClient + 'static,
-    C: crate::orchestrator::CredentialStore + 'static,
-    M: crate::orchestrator::MlsCryptoContext + 'static,
-{
-    pub(super) async fn authorize_direct_request_projection(
-        &self,
-        raw: &mut Vec<u8>,
-        owner: &str,
-        device: &str,
-    ) -> Result<DirectRequestProjection> {
-        // Keep migration state on the heap: this gate is nested in already
-        // large request/acceptance/terminal async state machines on app threads.
-        Box::pin(async {
-            let mut projection =
-                DirectRequestProjection::decode_for_reauthorization(raw, owner, device)?;
-            if projection.authorization_version == REQUEST_AUTHORIZATION_VERSION {
-                return Ok(projection);
-            }
-            let publication: Value =
-                serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
-            let mut actors = vec![(&publication["body"], &projection.sender_public_key)];
-            let acceptance: Option<Value> = projection
-                .acceptance_proof
-                .as_ref()
-                .map(|raw| serde_json::from_slice(raw).map_err(|_| invalid()))
-                .transpose()?;
-            if let Some(acceptance) = &acceptance {
-                actors.push((
-                    &acceptance["entry"]["signedRequest"]["body"],
-                    projection
-                        .recipient_public_key
-                        .as_ref()
-                        .ok_or_else(invalid)?,
-                ));
-            }
-            if let Some(close) = &projection.close_proof {
-                actors.push((
-                    &close.entry["signedRequest"]["body"],
-                    &close.actor_public_key,
-                ));
-            }
-            for (body, retained_key) in actors {
-                let key = self
-                    .request_authorized_device_key(
-                        body["actorDid"].as_str().ok_or_else(invalid)?,
-                        body["actorDeviceId"].as_str().ok_or_else(invalid)?,
-                        body["keyId"].as_str().ok_or_else(invalid)?,
-                    )
-                    .await?;
-                if key != *retained_key {
-                    return Err(invalid());
-                }
-            }
-            projection.authorization_version = REQUEST_AUTHORIZATION_VERSION;
-            let next = projection.encode()?;
-            let cid = publication["body"]["conversationId"]
-                .as_str()
-                .ok_or_else(invalid)?;
-            if !self
-                .mls_context()
-                .compare_exchange_direct_request_projection(cid, Some(raw), &next)?
-            {
-                return Err(OrchestratorError::Storage(
-                    "Request authorization migration raced".into(),
-                ));
-            }
-            // Downstream updates must compare against the exact upgraded bytes.
-            *raw = next;
-            Ok(projection)
-        })
-        .await
     }
 }

@@ -334,7 +334,10 @@ async fn add_members_rejects_duplicate_dids_and_self_add() {
     // Self add fails closed
     let self_err = alice
         .orchestrator
-        .add_members(&conversation.conversation_id, &[alice.did.clone()])
+        .add_members(
+            &conversation.conversation_id,
+            std::slice::from_ref(&alice.did),
+        )
         .await
         .expect_err("cannot add self");
     assert!(matches!(self_err, OrchestratorError::InvalidInput(_)));

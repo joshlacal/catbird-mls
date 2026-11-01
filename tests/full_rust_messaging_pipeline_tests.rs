@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::duplicate_mod)]
 
 mod e2e_harness;
 #[path = "epoch_secret_test_support.rs"]
@@ -316,7 +316,7 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
         .expect("create_group failed");
     alice
         .orchestrator
-        .swap_members(&convo.conversation_id, &[], &[bob_did.clone()])
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add bob");
 

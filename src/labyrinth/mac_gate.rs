@@ -48,8 +48,9 @@ impl SpaceResponseMacVerifier for AtprotoSpaceMacVerifier {
             "com.atproto.space.getRecord" => {
                 let header = mac_header
                     .ok_or_else(|| "Gate 7: missing Atproto-Space-Mac on getRecord".to_owned())?;
-                let space_uri = query_param(&request.path, "space")
-                    .ok_or_else(|| "Gate 7: getRecord request missing space query param".to_owned())?;
+                let space_uri = query_param(&request.path, "space").ok_or_else(|| {
+                    "Gate 7: getRecord request missing space query param".to_owned()
+                })?;
                 let secret = self
                     .secrets
                     .shared_secret_for_space(&space_uri)
@@ -83,7 +84,9 @@ impl SpaceResponseMacVerifier for AtprotoSpaceMacVerifier {
                     .ok_or_else(|| format!("Gate 7: {} missing space query param", request.nsid))?;
                 let repo_did = query_param(&request.path, "repo")
                     .or_else(|| query_param(&request.path, "did"))
-                    .ok_or_else(|| format!("Gate 7: {} missing repo/did query param", request.nsid))?;
+                    .ok_or_else(|| {
+                        format!("Gate 7: {} missing repo/did query param", request.nsid)
+                    })?;
                 let secret = self
                     .secrets
                     .shared_secret_for_space(&space_uri)
@@ -94,9 +97,9 @@ impl SpaceResponseMacVerifier for AtprotoSpaceMacVerifier {
                 let rev = parsed["rev"]
                     .as_str()
                     .ok_or_else(|| format!("Gate 7: {} response missing rev", request.nsid))?;
-                let data_b64 = parsed["data"]["$bytes"]
-                    .as_str()
-                    .ok_or_else(|| format!("Gate 7: {} response missing data.$bytes", request.nsid))?;
+                let data_b64 = parsed["data"]["$bytes"].as_str().ok_or_else(|| {
+                    format!("Gate 7: {} response missing data.$bytes", request.nsid)
+                })?;
                 let data_vec = base64::engine::general_purpose::STANDARD
                     .decode(data_b64)
                     .map_err(|e| format!("Gate 7: invalid commit data.$bytes base64: {e}"))?;

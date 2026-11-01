@@ -35,7 +35,7 @@
 mod e2e_harness;
 
 use catbird_mls::chat_v2::transcript::direct_request as protocol;
-use catbird_mls::orchestrator::{CredentialStore, MlsCryptoContext, MLSStorageBackend, OrchestratorError};
+use catbird_mls::orchestrator::{CredentialStore, MlsCryptoContext, OrchestratorError};
 use catbird_mls::{DirectRequestInput, MLSError};
 use e2e_harness::TestWorld;
 use serde_json::json;
@@ -152,7 +152,10 @@ async fn c33_unsupported_cross_authority_refused_before_any_reservation() {
     let input = draft_input();
     let before = world.delivery_service().submitted_prepared_requests().len();
 
-    let result = client.orchestrator.start_direct_request(input.clone()).await;
+    let result = client
+        .orchestrator
+        .start_direct_request(input.clone())
+        .await;
 
     // Clause 1: typed unsupported capability — not a generic storage failure,
     // not an input-validation rejection, and not a silent success.
@@ -233,12 +236,11 @@ async fn c33_foreign_authority_document_never_accepted() {
     let method = parsed["verificationMethod"][0]["id"].as_str().unwrap();
     assert!(
         protocol::direct_request_receipt_key_id(
-            &p256::ecdsa::SigningKey::from_slice(&[0x5c; 32])
+            p256::ecdsa::SigningKey::from_slice(&[0x5c; 32])
                 .unwrap()
                 .verifying_key()
                 .to_encoded_point(true)
                 .as_bytes()
-                .to_vec()
         )
         .unwrap()
             == method
@@ -250,7 +252,10 @@ async fn c33_foreign_authority_document_never_accepted() {
 
     let input = draft_input();
     let before = world.delivery_service().submitted_prepared_requests().len();
-    let result = client.orchestrator.start_direct_request(input.clone()).await;
+    let result = client
+        .orchestrator
+        .start_direct_request(input.clone())
+        .await;
 
     // Refused, and refused before any ownership record exists.
     assert!(
@@ -284,10 +289,13 @@ async fn c33_foreign_authority_document_never_accepted() {
 
     // A malformed document is not a federation question: it keeps the
     // ownership-record refusal, so the typed capability is not a catch-all.
-    client
-        .credentials
-        .set_request_authority_document(b"{\"id\":\"did:web:chat.federation.catbird.blue\"}".to_vec());
-    let malformed = client.orchestrator.start_direct_request(draft_input()).await;
+    client.credentials.set_request_authority_document(
+        b"{\"id\":\"did:web:chat.federation.catbird.blue\"}".to_vec(),
+    );
+    let malformed = client
+        .orchestrator
+        .start_direct_request(draft_input())
+        .await;
     assert!(
         matches!(malformed, Err(OrchestratorError::Storage(_))),
         "malformed authority document must not be reported as unsupported federation: {malformed:?}"
@@ -485,17 +493,21 @@ fn foreign_valid_authority_vs_forged_receipt_and_retained_trust() {
 
     // Retained foreign trust resolves only for the independently expected authority.
     let retained_document: serde_json::Value = serde_json::from_slice(&foreign_doc).unwrap();
-    let retained_method = retained_document["verificationMethod"][0]["id"].as_str().unwrap();
+    let retained_method = retained_document["verificationMethod"][0]["id"]
+        .as_str()
+        .unwrap();
     assert!(protocol::resolve_direct_request_receipt_key_for_authority(
         FOREIGN_AUTHORITY,
         &foreign_doc,
         retained_method,
-    ).is_ok());
+    )
+    .is_ok());
     assert!(protocol::resolve_direct_request_receipt_key_for_authority(
         "did:web:chat.catbird.blue",
         &foreign_doc,
         retained_method,
-    ).is_err());
+    )
+    .is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -511,11 +523,16 @@ async fn c33_declaration_coordinator_derivation_and_fail_closed_boundaries() {
     client
         .credentials
         .set_chat_declaration_failure("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", true);
-    let result = client.orchestrator.start_direct_request(draft_input()).await;
+    let result = client
+        .orchestrator
+        .start_direct_request(draft_input())
+        .await;
     assert!(
         matches!(
             result,
-            Err(OrchestratorError::Mls(MLSError::OperationNotSupported { .. }))
+            Err(OrchestratorError::Mls(
+                MLSError::OperationNotSupported { .. }
+            ))
         ),
         "declaration resolution failure must fail closed as OperationNotSupported: {result:?}"
     );
@@ -535,7 +552,10 @@ async fn c33_declaration_coordinator_derivation_and_fail_closed_boundaries() {
 
     // Expected coordinator is min(a, b) = did:web:chat-a.catbird.blue.
     // Without that authority document, no request is reserved.
-    let result = client.orchestrator.start_direct_request(draft_input()).await;
+    let result = client
+        .orchestrator
+        .start_direct_request(draft_input())
+        .await;
     match &result {
         Err(OrchestratorError::Mls(MLSError::OperationNotSupported { reason })) => {
             assert_eq!(
@@ -560,14 +580,15 @@ async fn c33_declaration_coordinator_derivation_and_fail_closed_boundaries() {
         a_authority,
         &a_doc,
         a_method,
-    ).is_ok());
+    )
+    .is_ok());
     let b_key = p256::ecdsa::SigningKey::from_slice(&[0x22; 32]).unwrap();
     let b_doc = authority_doc_for_authority(b_authority, &b_key);
     let b_document: serde_json::Value = serde_json::from_slice(&b_doc).unwrap();
     let b_method = b_document["verificationMethod"][0]["id"].as_str().unwrap();
-    assert!(protocol::resolve_direct_request_receipt_key_for_authority(
-        a_authority,
-        &b_doc,
-        b_method,
-    ).is_err(), "a foreign document cannot substitute for the coordinator");
+    assert!(
+        protocol::resolve_direct_request_receipt_key_for_authority(a_authority, &b_doc, b_method,)
+            .is_err(),
+        "a foreign document cannot substitute for the coordinator"
+    );
 }

@@ -109,15 +109,15 @@ fn engine_sync_tracks_lifecycle_transitions() {
     let engine = fixture.engine();
 
     let before_init = engine.sync(false).expect("sync before init");
-    assert_eq!(
-        before_init.performed_sync, false,
+    assert!(
+        !before_init.performed_sync,
         "sync should be a no-op before initialization"
     );
 
     engine.initialize_user("did:plc:test").expect("initialize");
     let after_init = engine.sync(false).expect("sync after init");
-    assert_eq!(
-        after_init.performed_sync, true,
+    assert!(
+        after_init.performed_sync,
         "sync should run once the engine is initialized"
     );
 
@@ -125,8 +125,8 @@ fn engine_sync_tracks_lifecycle_transitions() {
         .shutdown(ShutdownReason::AppSuspend)
         .expect("shutdown to suspended");
     let after_suspend = engine.sync(false).expect("sync after suspend");
-    assert_eq!(
-        after_suspend.performed_sync, false,
+    assert!(
+        !after_suspend.performed_sync,
         "sync should be skipped while suspended"
     );
 }
@@ -170,8 +170,8 @@ fn prepare_for_suspend_blocks_new_work_and_interrupts_storage() {
         .prepare_for_suspend("unit-test", std::time::Duration::from_millis(250))
         .expect("prepare for suspend");
 
-    assert_eq!(
-        result.accepting_new_work, false,
+    assert!(
+        !result.accepting_new_work,
         "engine should reject new work once suspension starts"
     );
     assert!(
@@ -184,8 +184,8 @@ fn prepare_for_suspend_blocks_new_work_and_interrupts_storage() {
     );
 
     let sync_while_suspended = engine.sync(false).expect("sync while suspended");
-    assert_eq!(
-        sync_while_suspended.performed_sync, false,
+    assert!(
+        !sync_while_suspended.performed_sync,
         "post-suspend work must stay gated until resume"
     );
 }
@@ -229,8 +229,8 @@ fn resume_from_suspend_restores_initialized_phase_without_replaying_startup() {
     );
 
     let sync_after_resume = engine.sync(false).expect("sync after resume");
-    assert_eq!(
-        sync_after_resume.performed_sync, true,
+    assert!(
+        sync_after_resume.performed_sync,
         "resume should restore initialized engine state"
     );
 }
@@ -257,8 +257,8 @@ fn emergency_close_requires_fresh_initialize_before_resume() {
     );
 
     let sync_after_emergency_close = engine.sync(false).expect("sync after emergency close");
-    assert_eq!(
-        sync_after_emergency_close.performed_sync, false,
+    assert!(
+        !sync_after_emergency_close.performed_sync,
         "shutdown engine must keep work gated until a fresh initialize"
     );
 }
@@ -324,8 +324,8 @@ fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_sta
     );
 
     let sync_after_reattach = second_engine.sync(false).expect("sync after reattach");
-    assert_eq!(
-        sync_after_reattach.performed_sync, true,
+    assert!(
+        sync_after_reattach.performed_sync,
         "reattach should restore initialized engine state on a fresh runtime"
     );
 }

@@ -362,8 +362,12 @@ async fn setup_target_group(
         )
         .unwrap(),
     );
-    world.delivery_service().set_conversation_view_for_test(&cid, view);
-    world.delivery_service().set_lifecycle_state_for_test(&cid, group_state.clone());
+    world
+        .delivery_service()
+        .set_conversation_view_for_test(&cid, view);
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(&cid, group_state.clone());
 
     (cid, group_state, invitation_entry, alice_device)
 }
@@ -897,7 +901,10 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
         .resume_direct_request(&input.draft_id)
         .await
         .unwrap();
-    assert!(matches!(second, DirectRequestOutcome::OutcomeUnknown { .. }));
+    assert!(matches!(
+        second,
+        DirectRequestOutcome::OutcomeUnknown { .. }
+    ));
 
     let lost_publish = submissions(&world, Op::PublishDirectRequest);
     assert_eq!(lost_publish.len(), 1, "first publish reached the transport");
@@ -934,13 +941,21 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
     // 3a. Transport-observed retry: the same two requests replayed byte-for-byte.
     //     The retry minted no second request identity and no second introduction.
     let publish_bodies = submissions(&world, Op::PublishDirectRequest);
-    assert_eq!(publish_bodies.len(), 2, "publish retried through the outbox");
+    assert_eq!(
+        publish_bodies.len(),
+        2,
+        "publish retried through the outbox"
+    );
     assert_eq!(
         publish_bodies[0], publish_bodies[1],
         "lost-response retry must replay the identical publication"
     );
     let prepare_bodies = submissions(&world, Op::PrepareDirectRequest);
-    assert_eq!(prepare_bodies.len(), 2, "prepare retried through the outbox");
+    assert_eq!(
+        prepare_bodies.len(),
+        2,
+        "prepare retried through the outbox"
+    );
     assert_eq!(prepare_bodies[0], prepare_bodies[1]);
 
     // 3b. The retry submitted no new invitation-bearing mutation to the target

@@ -1,4 +1,5 @@
 //! In-memory mock implementation of `CredentialStore` for testing.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -187,7 +188,12 @@ impl CredentialStore for MockCredentials {
         Ok(self.request_authority_document.lock().unwrap().clone())
     }
     async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
-        if self.chat_declaration_failures.lock().unwrap().contains(user_did) {
+        if self
+            .chat_declaration_failures
+            .lock()
+            .unwrap()
+            .contains(user_did)
+        {
             return Err(OrchestratorError::Mls(
                 catbird_mls::MLSError::OperationNotSupported {
                     reason: "Chat declaration resolution unavailable".into(),
@@ -307,7 +313,7 @@ impl CredentialStore for MockCredentials {
         let map = self.state.lock().unwrap();
         Ok(map
             .get(user_did)
-            .map_or(false, |c| c.mls_did.is_some() && c.device_uuid.is_some()))
+            .is_some_and(|c| c.mls_did.is_some() && c.device_uuid.is_some()))
     }
 
     async fn clear_all(&self, user_did: &str) -> Result<()> {

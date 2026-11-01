@@ -215,7 +215,7 @@ fn typed_convo_view_sequencer_did_flows_through() {
 
     let typed: TypedConvoView = serde_json::from_str(wire).expect("typed wire parse");
     assert_eq!(
-        typed.sequencer_did.as_ref().map(|d| d.as_str()),
+        typed.sequencer_did.as_deref(),
         Some("did:web:ds-b.example"),
         "generated ConvoView must expose sequencerDid as a typed Did field"
     );

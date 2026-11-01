@@ -6,7 +6,6 @@ use serde_json::Value;
 
 use super::*;
 use crate::chat_v2::ids::{BareDid, CanonicalTimestamp, CanonicalUuid, MAX_SAFE_INTEGER};
-use crate::orchestrator::canonical_transport::CanonicalOperation;
 use crate::orchestrator::groups::pending_leaf_recovery_request_id;
 use crate::orchestrator::lifecycle::lifecycle_coordinates;
 use crate::orchestrator::reset_flow::ServerConversationState;

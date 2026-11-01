@@ -20,8 +20,7 @@ use catbird_mls::labyrinth::journal::{
     RotationJournalStage,
 };
 use catbird_mls::labyrinth::mac_gate::{
-    verify_mek_conversation_binding, AtprotoSpaceMacVerifier, BoundMekContext,
-    SharedSecretLookup,
+    verify_mek_conversation_binding, AtprotoSpaceMacVerifier, BoundMekContext, SharedSecretLookup,
 };
 use catbird_mls::labyrinth::{
     LabyrinthSpaceGateway, LabyrinthSpaceRequest, LabyrinthSpaceResponse, SpaceResponseMacVerifier,
@@ -128,12 +127,9 @@ async fn gate4_crash_mid_rotation_rolls_forward_from_mutation_journal_on_reopen(
         assert!(err.to_string().contains("publishEpochHead"));
 
         // Verify journal persisted intermediate `MailboxSwapped` state so CAS isn't lost.
-        let pending = db
-            .read_tx(|tx| tx.list_mutation_journal_pending())
-            .unwrap();
+        let pending = db.read_tx(|tx| tx.list_mutation_journal_pending()).unwrap();
         assert_eq!(pending.len(), 1);
-        let saved: RotationJournalPayload =
-            serde_json::from_str(&pending[0].state_json).unwrap();
+        let saved: RotationJournalPayload = serde_json::from_str(&pending[0].state_json).unwrap();
         assert_eq!(saved.stage, RotationJournalStage::MailboxSwapped);
         assert_eq!(
             saved.committed_swap_cid.as_deref(),
@@ -150,9 +146,7 @@ async fn gate4_crash_mid_rotation_rolls_forward_from_mutation_journal_on_reopen(
             .expect("reopen recovery must roll forward cleanly");
         assert_eq!(completed, 1);
 
-        let pending = db
-            .read_tx(|tx| tx.list_mutation_journal_pending())
-            .unwrap();
+        let pending = db.read_tx(|tx| tx.list_mutation_journal_pending()).unwrap();
         assert!(
             pending.is_empty(),
             "completed rotation journal entry must be removed"
@@ -181,11 +175,13 @@ impl LabyrinthSpaceGateway for MockMacSpaceGateway {
         _request: LabyrinthSpaceRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse, String> {
         let r = self.response.lock().unwrap().clone();
-        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-            status: r.status,
-            content_type: r.content_type,
-            body: r.body,
-        })
+        Ok(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status: r.status,
+                content_type: r.content_type,
+                body: r.body,
+            },
+        )
     }
 
     async fn submit_space_with_headers(
@@ -217,8 +213,7 @@ async fn gate7_space_mac_verifier_and_mek_conversation_group_binding() {
     }))
     .unwrap();
 
-    let valid_record_mac =
-        compute_record_mac(&secret, &record_uri_with_query, &cid_bytes).unwrap();
+    let valid_record_mac = compute_record_mac(&secret, &record_uri_with_query, &cid_bytes).unwrap();
     let valid_header = format_record_mac_header(&valid_record_mac);
 
     let gateway = Arc::new(MockMacSpaceGateway {
@@ -275,8 +270,7 @@ async fn gate7_space_mac_verifier_and_mek_conversation_group_binding() {
 
     // 4. Commit MAC (`listRepoOps` / `atproto-space-repo`) verification:
     let data_32 = [0x55u8; 32];
-    let commit_mac =
-        compute_commit_mac(&secret, space_uri, repo_did, "3klmno", &data_32).unwrap();
+    let commit_mac = compute_commit_mac(&secret, space_uri, repo_did, "3klmno", &data_32).unwrap();
     let commit_body = serde_json::to_vec(&serde_json::json!({
         "rev": "3klmno",
         "data": { "$bytes": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data_32) },
@@ -418,7 +412,9 @@ async fn gate5_staged_to_space_attachment_promotion_and_cb22_rearchive_before_le
         move |cid| {
             let ls2 = Arc::clone(&ls2);
             async move {
-                ls2.lock().unwrap().push(format!("clear_space_records:{cid}"));
+                ls2.lock()
+                    .unwrap()
+                    .push(format!("clear_space_records:{cid}"));
                 Ok(())
             }
         },

@@ -1,6 +1,5 @@
 use base64::Engine as _;
 use openmls::component::ComponentData;
-use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::tls_codec::{Deserialize, Serialize};
 use openmls::prelude::*;
@@ -3639,7 +3638,6 @@ impl MLSContext {
         Ok(result)
     }
 
-
     /// Create `count` key packages with a SINGLE persistence pass: one bundle-row
     /// transaction and one WAL checkpoint at the end of the batch, instead of a
     /// full manifest rewrite + checkpoint per package.
@@ -3708,10 +3706,12 @@ impl MLSContext {
         if let Some(hook) = hook {
             drop(guard);
             hook();
-            guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+            guard = self
+                .inner
+                .lock()
+                .map_err(|_| MLSError::ContextNotInitialized)?;
             inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
         }
-
 
         // Single persistence pass for the whole batch (one small transaction —
         // per-row inserts, NOT a rewrite of every stored bundle).
@@ -8119,10 +8119,7 @@ impl MlsCryptoContext for MLSContext {
             .lock()
             .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
-        crate::orchestrator::subscription::request_values_list(
-            &inner.manifest_storage,
-            namespace,
-        )
+        crate::orchestrator::subscription::request_values_list(&inner.manifest_storage, namespace)
     }
 
     fn delete_request_value(&self, namespace: &str, id: &str) -> Result<bool, MLSError> {
@@ -8207,13 +8204,19 @@ impl MlsCryptoContext for MLSContext {
     }
 
     fn record_replenish_intent(&self, needed: u32, identity: &str) -> Result<String, MLSError> {
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         inner.record_replenish_intent(needed, identity)
     }
 
     fn clear_replenish_intent(&self) -> Result<(), MLSError> {
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         inner.clear_replenish_intent()
     }
@@ -8282,14 +8285,19 @@ impl MlsCryptoContext for MLSContext {
             .lock()
             .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
-        inner.with_group(&GroupId::from_slice(&group_id), |group, provider, _signer| {
-            Ok(crate::orchestrator::direct_request_bootstrap::request_metadata_key(
-                group,
-                provider,
-                coordinates,
-            )?
-            .to_vec())
-        })
+        inner.with_group(
+            &GroupId::from_slice(&group_id),
+            |group, provider, _signer| {
+                Ok(
+                    crate::orchestrator::direct_request_bootstrap::request_metadata_key(
+                        group,
+                        provider,
+                        coordinates,
+                    )?
+                    .to_vec(),
+                )
+            },
+        )
     }
     fn export_canonical_metadata_key_from_pending(
         &self,
@@ -8301,11 +8309,13 @@ impl MlsCryptoContext for MLSContext {
             .lock()
             .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
-        inner.with_group(&GroupId::from_slice(&group_id), |group, provider, _signer| {
-            let staged = group
-                .pending_commit()
-                .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
-            Ok(
+        inner.with_group(
+            &GroupId::from_slice(&group_id),
+            |group, provider, _signer| {
+                let staged = group
+                    .pending_commit()
+                    .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
+                Ok(
                 crate::orchestrator::direct_request_bootstrap::request_metadata_key_from_staged(
                     staged,
                     provider.crypto(),
@@ -8313,7 +8323,8 @@ impl MlsCryptoContext for MLSContext {
                 )?
                 .to_vec(),
             )
-        })
+            },
+        )
     }
 
     fn get_current_metadata(

@@ -82,9 +82,9 @@ fn snapshot_bytes(value: &Value, field: &str) -> Result<Vec<u8>> {
         .and_then(Value::as_str)
         .or_else(|| value.as_str())
         .ok_or_else(|| invalid(format!("metadataSnapshot.{field} is not bytes")))?;
-    STANDARD
-        .decode(encoded)
-        .map_err(|error| OrchestratorError::Serialization(format!("metadataSnapshot.{field}: {error}")))
+    STANDARD.decode(encoded).map_err(|error| {
+        OrchestratorError::Serialization(format!("metadataSnapshot.{field}: {error}"))
+    })
 }
 
 fn key32(key: Vec<u8>) -> Result<[u8; 32]> {
@@ -125,9 +125,17 @@ where
         let ciphertext = snapshot_bytes(&snapshot["ciphertext"], "ciphertext")?;
         match scheme {
             MetadataScheme::Legacy => {
-                let key = key32(self.mls_context().export_metadata_key(group_id.to_vec(), epoch)?)?;
+                let key = key32(
+                    self.mls_context()
+                        .export_metadata_key(group_id.to_vec(), epoch)?,
+                )?;
                 let metadata = crate::metadata::decrypt_metadata_snapshot(
-                    &key, group_id, epoch, version, &nonce, &ciphertext,
+                    &key,
+                    group_id,
+                    epoch,
+                    version,
+                    &nonce,
+                    &ciphertext,
                 )
                 .map_err(|error| mls("decrypt prior metadata snapshot", error))?;
                 Ok(OpenedMetadata {
@@ -142,11 +150,14 @@ where
                 let coordinates = canonical::canonical_metadata_coordinates(
                     conversation_id,
                     &snapshot_bytes(&coordinate["groupId"], "coordinate.groupId")?,
-                    coordinate["generation"]
-                        .as_u64()
-                        .ok_or_else(|| invalid("metadataSnapshot.coordinate.generation missing".into()))?,
+                    coordinate["generation"].as_u64().ok_or_else(|| {
+                        invalid("metadataSnapshot.coordinate.generation missing".into())
+                    })?,
                     epoch,
-                    &snapshot_bytes(&coordinate["groupContextHash"], "coordinate.groupContextHash")?,
+                    &snapshot_bytes(
+                        &coordinate["groupContextHash"],
+                        "coordinate.groupContextHash",
+                    )?,
                     &snapshot_bytes(&coordinate["confirmationTag"], "coordinate.confirmationTag")?,
                 );
                 let key = key32(
@@ -212,7 +223,10 @@ where
                 );
                 let key = key32(
                     self.mls_context()
-                        .export_canonical_metadata_key_from_pending(group_id.to_vec(), &coordinates)?,
+                        .export_canonical_metadata_key_from_pending(
+                            group_id.to_vec(),
+                            &coordinates,
+                        )?,
                 )?;
                 canonical::seal_request_metadata(
                     &key,
@@ -241,7 +255,16 @@ mod tests {
     }
 
     /// A server-shaped snapshot sealed at the group's current coordinate.
-    fn snapshot(cid: &str, gid: &[u8], epoch: u64, gch: &[u8], tag: &[u8], nonce: &[u8; 12], ct: &[u8], origin: &str) -> Value {
+    fn snapshot(
+        cid: &str,
+        gid: &[u8],
+        epoch: u64,
+        gch: &[u8],
+        tag: &[u8],
+        nonce: &[u8; 12],
+        ct: &[u8],
+        origin: &str,
+    ) -> Value {
         let cid_bytes = uuid::Uuid::parse_str(cid).unwrap();
         json!({
             "coordinate": {"conversationId": STANDARD.encode(cid_bytes.as_bytes()), "groupId": b(gid),
@@ -264,7 +287,11 @@ mod tests {
             content_signature: String,
         }
         serde_ipld_dagcbor::to_vec(&Signed {
-            content: Content { protocol: "blue.catbird.chat.metadata", title, description: "first contact" },
+            content: Content {
+                protocol: "blue.catbird.chat.metadata",
+                title,
+                description: "first contact",
+            },
             content_signature: STANDARD.encode([7u8; 64]),
         })
         .unwrap()
@@ -278,12 +305,33 @@ mod tests {
         world.add_client("Bob").await;
         world.register_device("Alice").await.unwrap();
         world.register_device("Bob").await.unwrap();
-        let created = world.client("Alice").orchestrator.create_group("t", None, None).await.unwrap();
+        let created = world
+            .client("Alice")
+            .orchestrator
+            .create_group("t", None, None)
+            .await
+            .unwrap();
         let bob = world.client("Bob");
-        let bob_identity = format!("{}#{}", bob.did, bob.orchestrator.require_actor_device_id().await.unwrap());
-        let package = bob.orchestrator.mls_context().create_key_package(bob_identity.as_bytes().to_vec()).unwrap();
+        let bob_identity = format!(
+            "{}#{}",
+            bob.did,
+            bob.orchestrator.require_actor_device_id().await.unwrap()
+        );
+        let package = bob
+            .orchestrator
+            .mls_context()
+            .create_key_package(bob_identity.as_bytes().to_vec())
+            .unwrap();
         let gid = hex::decode(&created.group_id).unwrap();
-        (world, created.conversation_id.to_string(), gid, KeyPackageData { data: package.key_package_data }, bob_identity)
+        (
+            world,
+            created.conversation_id.to_string(),
+            gid,
+            KeyPackageData {
+                data: package.key_package_data,
+            },
+            bob_identity,
+        )
     }
 
     #[test]
@@ -293,14 +341,22 @@ mod tests {
         request["directRequest"] = json!({"requestId": REQUEST});
         assert_eq!(
             MetadataScheme::recorded(&request),
-            MetadataScheme::Canonical { origin_transition_id: REQUEST.into() }
+            MetadataScheme::Canonical {
+                origin_transition_id: REQUEST.into()
+            }
         );
         // A later transition re-authored the snapshot under its own origin.
         let mut reauthored = snapshot("11111111-2222-4333-8444-555555555555");
         reauthored["directRequest"] = json!({"requestId": REQUEST});
-        assert_eq!(MetadataScheme::recorded(&reauthored), MetadataScheme::Legacy);
+        assert_eq!(
+            MetadataScheme::recorded(&reauthored),
+            MetadataScheme::Legacy
+        );
         // Ordinary groups carry no direct request.
-        assert_eq!(MetadataScheme::recorded(&snapshot(REQUEST)), MetadataScheme::Legacy);
+        assert_eq!(
+            MetadataScheme::recorded(&snapshot(REQUEST)),
+            MetadataScheme::Legacy
+        );
     }
 
     /// Request-born snapshot through a real Add Commit (the leaf-recovery
@@ -316,22 +372,31 @@ mod tests {
         let gch = ctx.get_group_context_hash(gid.clone()).unwrap();
         let tag = ctx.get_confirmation_tag(gid.clone()).unwrap();
         let coords = canonical::canonical_metadata_coordinates(&cid, &gid, 0, epoch, &gch, &tag);
-        let key: [u8; 32] = ctx.export_canonical_metadata_key(gid.clone(), &coords).unwrap().try_into().unwrap();
+        let key: [u8; 32] = ctx
+            .export_canonical_metadata_key(gid.clone(), &coords)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let plaintext = signed_plaintext("Request title");
         let nonce = [1; 12];
-        let ct = canonical::seal_request_metadata(&key, &coords, REQUEST, &nonce, &plaintext).unwrap();
+        let ct =
+            canonical::seal_request_metadata(&key, &coords, REQUEST, &nonce, &plaintext).unwrap();
         let prior = snapshot(&cid, &gid, epoch, &gch, &tag, &nonce, &ct, REQUEST);
         let state = json!({"metadataSnapshot": prior, "directRequest": {"requestId": REQUEST}});
 
         // The pre-fix path: the legacy codec cannot open a request-born snapshot.
-        assert!(alice.open_metadata_snapshot(&prior, &MetadataScheme::Legacy, &cid, &gid).is_err());
+        assert!(alice
+            .open_metadata_snapshot(&prior, &MetadataScheme::Legacy, &cid, &gid)
+            .is_err());
         let opened = alice
             .open_metadata_snapshot(&prior, &MetadataScheme::recorded(&state), &cid, &gid)
             .unwrap();
         assert_eq!(opened.metadata.title, "Request title");
         assert_eq!(opened.metadata.description, "first contact");
 
-        let added = ctx.add_members_with_aad(gid.clone(), vec![package], None).unwrap();
+        let added = ctx
+            .add_members_with_aad(gid.clone(), vec![package], None)
+            .unwrap();
         let next_gch = added.next_group_context_hash.unwrap();
         let next_tag = added.next_confirmation_tag.unwrap();
         let next_nonce = [2; 12];
@@ -357,11 +422,22 @@ mod tests {
             .process_welcome(added.welcome_data, bob_identity.into_bytes(), None)
             .unwrap();
         assert_eq!(bob.mls_context().get_epoch(gid.clone()).unwrap(), epoch + 1);
-        let successor = snapshot(&cid, &gid, epoch + 1, &next_gch, &next_tag, &next_nonce, &resealed, REQUEST);
+        let successor = snapshot(
+            &cid,
+            &gid,
+            epoch + 1,
+            &next_gch,
+            &next_tag,
+            &next_nonce,
+            &resealed,
+            REQUEST,
+        );
         let reopened = bob
             .open_metadata_snapshot(
                 &successor,
-                &MetadataScheme::Canonical { origin_transition_id: REQUEST.into() },
+                &MetadataScheme::Canonical {
+                    origin_transition_id: REQUEST.into(),
+                },
                 &cid,
                 &gid,
             )
@@ -393,16 +469,36 @@ mod tests {
             avatar_content_type: None,
             space_avatar: None,
         };
-        let key: [u8; 32] = ctx.export_metadata_key(gid.clone(), epoch).unwrap().try_into().unwrap();
+        let key: [u8; 32] = ctx
+            .export_metadata_key(gid.clone(), epoch)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let nonce = [3; 12];
-        let ct = crate::metadata::encrypt_metadata_snapshot_with_nonce(&key, &gid, epoch, 1, &nonce, &metadata).unwrap();
-        let prior = snapshot(&cid, &gid, epoch, &gch, &tag, &nonce, &ct, "11111111-2222-4333-8444-555555555555");
+        let ct = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+            &key, &gid, epoch, 1, &nonce, &metadata,
+        )
+        .unwrap();
+        let prior = snapshot(
+            &cid,
+            &gid,
+            epoch,
+            &gch,
+            &tag,
+            &nonce,
+            &ct,
+            "11111111-2222-4333-8444-555555555555",
+        );
         let scheme = MetadataScheme::recorded(&json!({"metadataSnapshot": prior}));
         assert_eq!(scheme, MetadataScheme::Legacy);
-        let opened = alice.open_metadata_snapshot(&prior, &scheme, &cid, &gid).unwrap();
+        let opened = alice
+            .open_metadata_snapshot(&prior, &scheme, &cid, &gid)
+            .unwrap();
         assert_eq!(opened.metadata, metadata);
 
-        let added = ctx.add_members_with_aad(gid.clone(), vec![package], None).unwrap();
+        let added = ctx
+            .add_members_with_aad(gid.clone(), vec![package], None)
+            .unwrap();
         let next_gch = added.next_group_context_hash.unwrap();
         let next_tag = added.next_confirmation_tag.unwrap();
         let resealed = alice
@@ -424,7 +520,16 @@ mod tests {
         bob.mls_context()
             .process_welcome(added.welcome_data, bob_identity.into_bytes(), None)
             .unwrap();
-        let successor = snapshot(&cid, &gid, epoch + 1, &next_gch, &next_tag, &[4; 12], &resealed, "x");
+        let successor = snapshot(
+            &cid,
+            &gid,
+            epoch + 1,
+            &next_gch,
+            &next_tag,
+            &[4; 12],
+            &resealed,
+            "x",
+        );
         let reopened = bob
             .open_metadata_snapshot(&successor, &MetadataScheme::Legacy, &cid, &gid)
             .unwrap();

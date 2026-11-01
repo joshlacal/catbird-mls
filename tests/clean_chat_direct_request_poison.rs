@@ -9,7 +9,7 @@ use base64::{
 use catbird_mls::chat_v2::transcript::direct_request as protocol;
 use catbird_mls::orchestrator::{
     canonical_transport::CanonicalOperation as Op, direct_request_bootstrap::*, CredentialStore,
-    MLSStorageBackend, MlsCryptoContext,
+    MlsCryptoContext,
 };
 use catbird_mls::{RequestConsent, RequestCrypto, RequestPreview};
 use e2e_harness::TestWorld;
@@ -82,7 +82,11 @@ impl Proof {
         );
         let mut outcome = serde_json::from_slice::<Value>(&self.welcome.published_receipt).unwrap();
         outcome["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
-        world.delivery_service().queue_request_operation_response(Op::GetDirectRequestOutcome, 200, json!({"outcome": outcome}));
+        world.delivery_service().queue_request_operation_response(
+            Op::GetDirectRequestOutcome,
+            200,
+            json!({"outcome": outcome}),
+        );
         offline_state(world);
     }
 }
@@ -473,7 +477,8 @@ async fn c17_invalid_welcome_final_tree_provenance_rolls_back_every_native_row()
     let original = bad.welcome.clone();
     bad.body["next"]["confirmationTag"] = json!(STANDARD.encode([99; 32]));
     bad.welcome.bootstrap.coordinates = bad.body["next"].clone();
-    bad.body["artifacts"]["metadataSnapshot"]["coordinate"] = metadata_coordinate(&bad.welcome.bootstrap.coordinates).unwrap();
+    bad.body["artifacts"]["metadataSnapshot"]["coordinate"] =
+        metadata_coordinate(&bad.welcome.bootstrap.coordinates).unwrap();
     bad.resign(&world);
     let before = native_snapshot(&world);
     assert!(world

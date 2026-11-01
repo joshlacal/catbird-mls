@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ConversationRow {
     pub conversation_id: String,
     pub group_id: Vec<u8>,
@@ -17,6 +18,7 @@ pub struct ConversationRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct MessageRow {
     pub message_id: String,
     pub conversation_id: String,
@@ -31,6 +33,7 @@ pub struct MessageRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct RequestRow {
     pub request_id: String,
     pub conversation_id: String,
@@ -45,6 +48,7 @@ pub struct RequestRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct GroupMetadataRow {
     pub conversation_id: String,
     pub metadata_version: i64,

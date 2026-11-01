@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::duplicate_mod)]
 
 mod e2e_harness;
 #[path = "epoch_secret_test_support.rs"]

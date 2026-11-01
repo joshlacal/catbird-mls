@@ -11,7 +11,7 @@
 //!   - state-machine-groups.md     (group lifecycle bugs)
 //!   - state-machine-recovery.md   (recovery / sync bugs)
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_variables, unused_mut)]
 
 mod e2e_harness;
 
@@ -209,7 +209,7 @@ async fn test_commit_messages_advance_epoch() {
         .expect("alice create_group failed");
     alice
         .orchestrator
-        .swap_members(&convo.conversation_id, &[], &[bob_did.clone()])
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("alice add_members failed");
     let group_id = convo.group_id.clone();
@@ -444,7 +444,7 @@ async fn test_add_members_server_rejection_cleanup() {
     // Alice tries to add Bob — should fail with MemberSyncFailed
     let result = alice
         .orchestrator
-        .swap_members(group_id, &[], &[bob.did.clone()])
+        .swap_members(group_id, &[], std::slice::from_ref(&bob.did))
         .await;
     assert!(
         result.is_err(),
@@ -456,7 +456,7 @@ async fn test_add_members_server_rejection_cleanup() {
     // add is still lingering in OpenMLS.
     let result2 = alice
         .orchestrator
-        .swap_members(group_id, &[], &[bob.did.clone()])
+        .swap_members(group_id, &[], std::slice::from_ref(&bob.did))
         .await;
 
     assert!(

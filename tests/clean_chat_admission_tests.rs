@@ -1,5 +1,5 @@
 //! Canonical pending consent survives inventory, startup, and cryptographic recovery.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::type_complexity)]
 mod e2e_harness;
 
 use base64::{

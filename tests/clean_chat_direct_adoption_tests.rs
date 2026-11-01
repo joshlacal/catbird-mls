@@ -75,7 +75,7 @@ async fn existing_group_object_with_stale_coordinates_is_recoverable_instead_of_
     let bob = world.client("Bob");
     let initial = alice
         .orchestrator
-        .create_group("existing", Some(&[bob.did.clone()]), None)
+        .create_group("existing", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     let snapshot = json!({
@@ -103,7 +103,7 @@ async fn existing_group_object_with_stale_coordinates_is_recoverable_instead_of_
     }}));
     let reopened = alice
         .orchestrator
-        .create_group("reopen", Some(&[bob.did.clone()]), None)
+        .create_group("reopen", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     assert_eq!(reopened.conversation_id, initial.conversation_id);
@@ -131,7 +131,7 @@ async fn duplicate_from_pending_invitee_accepts_exact_authorized_pair() {
     let alice_device = alice.orchestrator.require_actor_device_id().await.unwrap();
     let initial = alice
         .orchestrator
-        .create_group("existing", Some(&[bob.did.clone()]), None)
+        .create_group("existing", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     world
@@ -152,7 +152,7 @@ async fn duplicate_from_pending_invitee_accepts_exact_authorized_pair() {
         .set_next_create_custom_response(400, json!({"error":"ConversationAlreadyExists"}));
     let reopened = bob
         .orchestrator
-        .create_group("reopen", Some(&[alice.did.clone()]), None)
+        .create_group("reopen", Some(std::slice::from_ref(&alice.did)), None)
         .await
         .expect("adopt visible pending invitation");
     assert_eq!(reopened.conversation_id, initial.conversation_id);
@@ -215,7 +215,7 @@ async fn typed_duplicate_without_local_keys_requests_device_access_and_stays_rec
     let bob_did = world.client("Bob").did.clone();
     let initial = alice
         .orchestrator
-        .create_group("existing", Some(&[bob_did.clone()]), None)
+        .create_group("existing", Some(std::slice::from_ref(&bob_did)), None)
         .await
         .unwrap();
     let did = alice.did.clone();
@@ -264,7 +264,7 @@ async fn duplicate_400_with_one_peer_discovers_and_reuses_healthy_conversation()
     let bob = world.client("Bob");
     let initial = alice
         .orchestrator
-        .create_group("existing", Some(&[bob.did.clone()]), None)
+        .create_group("existing", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     let inventory_before = count(&world, CanonicalOperation::GetConversations);
@@ -280,7 +280,7 @@ async fn duplicate_400_with_one_peer_discovers_and_reuses_healthy_conversation()
 
     let reopened = alice
         .orchestrator
-        .create_group("reopen", Some(&[bob.did.clone()]), None)
+        .create_group("reopen", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .expect("duplicate response must discover the authorized existing direct");
 
@@ -326,7 +326,7 @@ async fn assert_duplicate_inventory_rate_limit_is_preserved(callback_failure: bo
     let bob = world.client("Bob");
     let initial = alice
         .orchestrator
-        .create_group("existing", Some(&[bob.did.clone()]), None)
+        .create_group("existing", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     let groups_before = alice
@@ -360,7 +360,7 @@ async fn assert_duplicate_inventory_rate_limit_is_preserved(callback_failure: bo
 
     let error = alice
         .orchestrator
-        .create_group("reopen", Some(&[bob.did.clone()]), None)
+        .create_group("reopen", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .expect_err("inventory cooldown must not claim successful adoption");
     match error {

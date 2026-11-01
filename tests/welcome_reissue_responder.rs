@@ -195,7 +195,7 @@ async fn rotated_reissue_keeps_cleanup_bound_to_stable_conversation() {
         .expect("refresh rotated mapping");
     let cleanup_count_before = admin.storage.epoch_cleanup_calls().len();
 
-    for attempt in 0..6 {
+    for _attempt in 0..6 {
         admin
             .orchestrator
             .respond_to_welcome_reissue(

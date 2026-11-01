@@ -70,8 +70,8 @@ fn i7_paged_select_before_begin_immediate_still_evicts_stale_group_cache() {
     let db_path = dir.path().join("i7_paged_select.db");
     let db_key_32 = [0x77u8; 32];
 
-    let proc_a = MlsAccountDb::open_native(&db_path, &db_key_32, OpenMode::App)
-        .expect("open proc_a");
+    let proc_a =
+        MlsAccountDb::open_native(&db_path, &db_key_32, OpenMode::App).expect("open proc_a");
     let proc_b = MlsAccountDb::open_native(&db_path, &db_key_32, OpenMode::PushExtension)
         .expect("open proc_b (NSE)");
 
@@ -88,8 +88,7 @@ fn i7_paged_select_before_begin_immediate_still_evicts_stale_group_cache() {
     }
 
     // 1. Process A creates an X-Wing group at epoch 0 and caches it in memory.
-    let signer =
-        SignatureKeyPair::new(SignatureScheme::from(CIPHERSUITE)).expect("ed25519 keygen");
+    let signer = SignatureKeyPair::new(SignatureScheme::from(CIPHERSUITE)).expect("ed25519 keygen");
     let group_id = proc_a
         .write_tx(|tx| {
             let provider = tx.openmls_provider();
@@ -209,8 +208,8 @@ fn i9_prepare_for_background_completes_under_50ms_with_active_reader_and_closes_
     let db_path = dir.path().join("i9_suspend_0xdead10cc.db");
     let db_key_32 = [0x55u8; 32];
 
-    let app_db = MlsAccountDb::open_native(&db_path, &db_key_32, OpenMode::App)
-        .expect("open app_db");
+    let app_db =
+        MlsAccountDb::open_native(&db_path, &db_key_32, OpenMode::App).expect("open app_db");
 
     // Populate several WAL frames so there is real WAL work pending.
     for idx in 1..=8 {
@@ -271,7 +270,10 @@ fn i9_prepare_for_background_completes_under_50ms_with_active_reader_and_closes_
         elapsed < Duration::from_millis(50),
         "0xdead10cc hazard: prepare_for_background took {elapsed:?} (>= 50ms) while reader held snapshot!"
     );
-    assert!(!app_db.is_open(), "app_db handle must be closed after prepare_for_background");
+    assert!(
+        !app_db.is_open(),
+        "app_db handle must be closed after prepare_for_background"
+    );
     assert!(report.handle_closed);
 
     // Release the NSE reader thread so ONLY app_db's FDs (if any leaked!) remain.

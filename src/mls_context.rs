@@ -22,7 +22,6 @@ use crate::error::MLSError;
 use crate::message_limits::validate_inbound_mls_message_len;
 use crate::metadata;
 use crate::orchestrator::mls_provider::OwnEchoProof;
-use openmls::component::ComponentData;
 use uuid::Uuid;
 
 /// Internal result from `MLSContext::create_group` carrying the group ID
@@ -210,9 +209,7 @@ fn is_process_alive(pid: u32) -> bool {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-    unsafe {
-        kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
-    }
+    unsafe { kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1) }
 }
 
 #[cfg(not(unix))]
@@ -292,16 +289,24 @@ impl ManifestStorage {
         } else {
             OpenMode::App
         };
-        Ok(Arc::new(MlsAccountDb::open_native(&db_path, &key_32, mode)?))
+        Ok(Arc::new(MlsAccountDb::open_native(
+            &db_path, &key_32, mode,
+        )?))
     }
 
     fn new(db_path: PathBuf, encryption_key: &str) -> Result<Self, MLSError> {
-        Ok(Self::from_account_db(Self::open_db(db_path, encryption_key)?))
+        Ok(Self::from_account_db(Self::open_db(
+            db_path,
+            encryption_key,
+        )?))
     }
 
     #[allow(dead_code)]
     fn open_existing(db_path: PathBuf, encryption_key: &str) -> Result<Self, MLSError> {
-        Ok(Self::from_account_db(Self::open_db(db_path, encryption_key)?))
+        Ok(Self::from_account_db(Self::open_db(
+            db_path,
+            encryption_key,
+        )?))
     }
 
     pub(crate) fn get_interrupt_handle(&self) -> Option<rusqlite::InterruptHandle> {
@@ -827,7 +832,8 @@ fn validate_existing_sqlite_storage(
     keychain: Arc<dyn KeychainAccess>,
 ) -> Result<(), MLSError> {
     let db_key_32 = derive_db_key_32_from_str(encryption_key);
-    let key_spec = zeroize::Zeroizing::new(crate::storage::derive_sqlcipher_96hex_key_spec(&db_key_32));
+    let key_spec =
+        zeroize::Zeroizing::new(crate::storage::derive_sqlcipher_96hex_key_spec(&db_key_32));
 
     let conn = Connection::open(path)
         .map_err(|e| MLSError::invalid_input(format!("Failed to open existing DB: {e}")))?;
@@ -873,7 +879,9 @@ fn validate_existing_sqlite_storage(
     // 1. Validate exact 15-table unified schema (and forbid retired openmls_sqlite_storage tables)
     let existing_tables: HashSet<String> = {
         let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
             .map_err(|e| MLSError::invalid_input(format!("Failed to query sqlite_master: {e}")))?;
         let names: HashSet<String> = stmt
             .query_map([], |row| row.get(0))
@@ -960,9 +968,9 @@ fn validate_existing_sqlite_storage(
             let hash_ref: String = row
                 .get(0)
                 .map_err(|e| MLSError::invalid_input(format!("Corrupt op_key column: {e}")))?;
-            let bundle_b64: String = row
-                .get(1)
-                .map_err(|e| MLSError::invalid_input(format!("Corrupt payload_json column: {e}")))?;
+            let bundle_b64: String = row.get(1).map_err(|e| {
+                MLSError::invalid_input(format!("Corrupt payload_json column: {e}"))
+            })?;
             let decoded_bytes =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &bundle_b64)
                     .map_err(|e| MLSError::invalid_input(format!("Corrupt bundle base64: {e}")))?;
@@ -1016,9 +1024,7 @@ fn validate_existing_sqlite_storage(
         drop(stmt);
 
         let mut kp_stmt = conn
-            .prepare(
-                "SELECT version, key_bytes, value_bytes FROM openmls_kv WHERE scope = ?1",
-            )
+            .prepare("SELECT version, key_bytes, value_bytes FROM openmls_kv WHERE scope = ?1")
             .map_err(|e| {
                 MLSError::invalid_input(format!(
                     "Failed to prepare openmls_kv KeyPackage query: {e}"
@@ -1177,7 +1183,9 @@ fn validate_existing_sqlite_storage(
             |r| r.get(0),
         )
         .map_err(|e| {
-            MLSError::invalid_input(format!("Failed to count SignatureKeyPair in openmls_kv: {e}"))
+            MLSError::invalid_input(format!(
+                "Failed to count SignatureKeyPair in openmls_kv: {e}"
+            ))
         })?;
     if sig_keys_count != 0 {
         return Err(MLSError::invalid_input(format!(
@@ -1234,7 +1242,9 @@ fn validate_existing_sqlite_storage(
                 continue;
             }
             let mut stmt = conn
-                .prepare("SELECT DISTINCT key_bytes FROM openmls_kv WHERE version = 1 AND scope = ?1")
+                .prepare(
+                    "SELECT DISTINCT key_bytes FROM openmls_kv WHERE version = 1 AND scope = ?1",
+                )
                 .map_err(|e| {
                     MLSError::invalid_input(format!(
                         "Failed to prepare openmls_kv distinct group query for {scope}: {e}"
@@ -1252,8 +1262,8 @@ fn validate_existing_sqlite_storage(
                     MLSError::invalid_input(format!("Corrupt group_id in openmls_kv {scope}: {e}"))
                 })?;
             for gid_blob in db_group_rows {
-                let group_id: openmls::prelude::GroupId =
-                    serde_json::from_slice(&gid_blob).map_err(|e| {
+                let group_id: openmls::prelude::GroupId = serde_json::from_slice(&gid_blob)
+                    .map_err(|e| {
                         MLSError::invalid_input(format!(
                             "Corrupt GroupId JSON in openmls_kv {scope}: {e}"
                         ))
@@ -1334,9 +1344,7 @@ fn validate_existing_sqlite_storage(
         for gid_blob in db_leaf_rows {
             let group_id: openmls::prelude::GroupId =
                 serde_json::from_slice(&gid_blob).map_err(|e| {
-                    MLSError::invalid_input(format!(
-                        "Corrupt GroupId JSON in OwnLeafNodes: {e}"
-                    ))
+                    MLSError::invalid_input(format!("Corrupt GroupId JSON in OwnLeafNodes: {e}"))
                 })?;
             db_leaf_gids.insert(hex::encode(group_id.as_slice()));
         }
@@ -1379,10 +1387,8 @@ fn validate_existing_sqlite_storage(
         }
     }
 
-    let preflight_storage = OpenMlsKvStorage::with_keychain(
-        crate::storage::RusqliteKvBackend(&conn),
-        keychain,
-    );
+    let preflight_storage =
+        OpenMlsKvStorage::with_keychain(crate::storage::RusqliteKvBackend(&conn), keychain);
 
     if let Some(signers_str) = signers_opt {
         let signers_map: HashMap<String, String> = serde_json::from_str(&signers_str)
@@ -1528,10 +1534,8 @@ impl MLSContext {
             }));
         }
 
-        let kv_storage = OpenMlsKvStorage::with_keychain(
-            SharedAccountDbKvBackend(db.clone()),
-            keychain_arc,
-        );
+        let kv_storage =
+            OpenMlsKvStorage::with_keychain(SharedAccountDbKvBackend(db.clone()), keychain_arc);
         let provider = SqliteLibcruxProvider::new(kv_storage)?;
         let manifest_storage = ManifestStorage::from_account_db(db.clone());
 
@@ -1568,12 +1572,8 @@ impl MLSContext {
                 else {
                     return Err(MLSError::StorageFailed);
                 };
-                if SignatureKeyPair::read(
-                    provider.storage(),
-                    &public_key,
-                    SignatureScheme::ED25519,
-                )
-                .is_none()
+                if SignatureKeyPair::read(provider.storage(), &public_key, SignatureScheme::ED25519)
+                    .is_none()
                 {
                     return Err(MLSError::StorageFailed);
                 }
@@ -1595,11 +1595,9 @@ impl MLSContext {
                     let raw_id = request.bootstrap.coordinates["groupId"]
                         .as_str()
                         .ok_or(MLSError::StorageFailed)?;
-                    let request_group = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        raw_id,
-                    )
-                    .map_err(|_| MLSError::StorageFailed)?;
+                    let request_group =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw_id)
+                            .map_err(|_| MLSError::StorageFailed)?;
                     if hex::encode(request_group) == *hex_id
                         && !matches!(
                             request.phase,
@@ -1711,7 +1709,9 @@ impl MLSContext {
 
     /// Reopen `<did_hash>.db` on foreground resume after [`Self::prepare_for_background`].
     pub fn resume_from_background(&mut self) -> Result<(), MLSError> {
-        self.manifest_storage.account_db().resume_from_background()?;
+        self.manifest_storage
+            .account_db()
+            .resume_from_background()?;
         self.needs_group_reload.store(true, Ordering::Release);
         self.reconcile_cached_groups_if_needed()
     }
@@ -1719,7 +1719,10 @@ impl MLSContext {
     /// Reconcile `PRAGMA data_version` (`I7`) and reload cached `MlsGroup`s if another process
     /// (such as iOS NSE) committed state transitions since our last reconciled write.
     pub(crate) fn reconcile_cached_groups_if_needed(&mut self) -> Result<(), MLSError> {
-        let _ = self.manifest_storage.account_db().reconcile_before_group_op();
+        let _ = self
+            .manifest_storage
+            .account_db()
+            .reconcile_before_group_op();
         if !self.needs_group_reload.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
@@ -3745,13 +3748,15 @@ impl MLSContext {
 
         self.with_group(&gid, |group, provider, signer| {
             // Deserialize and validate key package
-            let kp_in = crate::mls_engine_context::deserialize_exact_key_package_in(
-                key_package_data,
-            )
-            .map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] Failed to deserialize key package: {:?}", e);
-                e
-            })?;
+            let kp_in =
+                crate::mls_engine_context::deserialize_exact_key_package_in(key_package_data)
+                    .map_err(|e| {
+                        crate::error_log!(
+                            "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                            e
+                        );
+                        e
+                    })?;
 
             let key_package = kp_in
                 .validate(provider.crypto(), ProtocolVersion::default())

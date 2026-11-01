@@ -1019,6 +1019,12 @@ pub struct SequencerFailoverTracker {
     failures: HashMap<String, FailoverState>,
 }
 
+impl Default for SequencerFailoverTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SequencerFailoverTracker {
     pub fn new() -> Self {
         Self {
@@ -1097,6 +1103,12 @@ pub struct GroupInfo404Tracker {
     counts: HashMap<String, u32>,
 }
 
+impl Default for GroupInfo404Tracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GroupInfo404Tracker {
     pub fn new() -> Self {
         Self {
@@ -1128,7 +1140,7 @@ where
     M: MlsCryptoContext + 'static,
 {
     pub(crate) async fn attempt_fork_readd(&self, convo_id: &str) -> Result<()> {
-        let user_did = self.require_user_did().await?;
+        let _user_did = self.require_user_did().await?;
         let lock = self.rejoin_lock(convo_id).await;
         let _g = match lock.try_lock() {
             Ok(g) => g,
@@ -1383,7 +1395,7 @@ where
                     "groupId": { "$bytes": STANDARD.encode(&gid) }
                 },
                 "metadataVersion": metadata_version,
-                "nonce": { "$bytes": STANDARD.encode(&nonce) },
+                "nonce": { "$bytes": STANDARD.encode(nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
@@ -1811,8 +1823,7 @@ where
             }
         }
 
-        Box::pin(self.run_deferred_recovery_inner(reason, conversations, report))
-            .await
+        Box::pin(self.run_deferred_recovery_inner(reason, conversations, report)).await
     }
 
     async fn run_deferred_recovery_inner(
@@ -1872,9 +1883,9 @@ where
                 continue;
             }
 
-            let outcome = Box::pin(self
-                .consume_deferred_recovery_for_conversation(&convo_id, None, None))
-                .await;
+            let outcome =
+                Box::pin(self.consume_deferred_recovery_for_conversation(&convo_id, None, None))
+                    .await;
             match outcome {
                 Ok(DeferredRecoveryOutcome::ClearedStale | DeferredRecoveryOutcome::Skipped) => {
                     report.skipped += 1;
@@ -1983,7 +1994,7 @@ where
             // `is_remote_data_error` below; remaining failures are typically
             // network / OpenMLS storage issues that should self-heal via
             // §6.6 / §8.4 instead of triggering a global reset.
-            let authenticator = self.epoch_authenticator_hex(convo_id).await;
+            let _authenticator = self.epoch_authenticator_hex(convo_id).await;
             let _ = self
                 .submit_reset_request_prepared(convo_id, "external_commit_exhausted")
                 .await;
@@ -2275,7 +2286,7 @@ where
     /// Root cause: a sticky `needs_rejoin` flag is re-projected to NeedsRejoin
     /// at startup with no health probe, dragging a healthy local group through
     /// `ensure_conversation_ready -> join_or_rejoin -> force_rejoin` (delete_group
-    /// + External Commit) — the ADR-001 anti-pattern. Each no-op EC + GroupInfo
+    /// plus External Commit) — the ADR-001 anti-pattern. Each no-op EC + GroupInfo
     /// upload bumps the server's cosmetic `group_info_epoch` counter, producing
     /// the visible "epoch inflation" with no underlying crypto advance.
     ///
@@ -2878,11 +2889,11 @@ where
             .api_client()
             .get_key_packages(
                 &self.require_actor_device_id().await?,
-                &[recipient_user_did.clone()],
+                std::slice::from_ref(&recipient_user_did),
             )
             .await?;
         self.verify_fetched_key_packages(
-            &[recipient_user_did.clone()],
+            std::slice::from_ref(&recipient_user_did),
             &key_packages,
             "respond_to_welcome_reissue",
             Some(&resolved.conversation_id),
@@ -3048,7 +3059,7 @@ where
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": metadata_version,
-                "nonce": { "$bytes": STANDARD.encode(&nonce) },
+                "nonce": { "$bytes": STANDARD.encode(nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
@@ -3296,7 +3307,7 @@ where
                     // a `remote_data_error` is by definition Mode B (the
                     // server-side ratchet/GroupInfo is malformed), so this
                     // report SHOULD count toward server-side quorum auto-reset.
-                    let authenticator = self.epoch_authenticator_hex(convo_id).await;
+                    let _authenticator = self.epoch_authenticator_hex(convo_id).await;
                     let _ = self
                         .submit_reset_request_prepared(convo_id, "remote_data_error")
                         .await;
@@ -3332,7 +3343,7 @@ where
         .await;
 
         // Get confirmation tag from the new local group state
-        let tag_b64 = self
+        let _tag_b64 = self
             .mls_context()
             .get_confirmation_tag(ext_commit_result.group_id.clone())
             .map(|tag| base64::engine::general_purpose::STANDARD.encode(&tag))
@@ -5298,7 +5309,7 @@ where
         &self,
         convo_id: &str,
         payload: &ResetPendingPayload,
-        user_did: &str,
+        _user_did: &str,
     ) -> Result<u64> {
         let new_group_id_bytes = hex::decode(&payload.new_group_id).map_err(|e| {
             OrchestratorError::InvalidInput(format!(
@@ -5382,7 +5393,7 @@ where
         // existing create_conversation hardcoding (catmos
         // src-tauri/src/api_client.rs:776). When per-convo cipher_suite
         // plumbing lands, swap to derive from convo state.
-        let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+        let _cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
         let result = self
             .submit_activate_reset_prepared(convo_id, payload, &group_info)
             .await;
@@ -6023,7 +6034,7 @@ where
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": metadata_plaintext.version,
-                "nonce": { "$bytes": STANDARD.encode(&nonce) },
+                "nonce": { "$bytes": STANDARD.encode(nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
@@ -6278,7 +6289,7 @@ where
                     "groupId": base64::engine::general_purpose::STANDARD.encode(&new_group_id_bytes)
                 },
                 "metadataVersion": metadata_plaintext.version,
-                "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
+                "nonce": base64::engine::general_purpose::STANDARD.encode(nonce),
                 "originTransitionId": transition_id
             },
             "prior": {
@@ -7231,7 +7242,7 @@ mod tests {
 
         t.clear("convo-a");
         assert!(
-            t.failed_rejoins.get("convo-a").is_none(),
+            !t.failed_rejoins.contains_key("convo-a"),
             "clear must remove failure tracking for the convo"
         );
         assert!(

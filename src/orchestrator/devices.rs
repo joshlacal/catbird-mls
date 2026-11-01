@@ -378,11 +378,9 @@ where
             .as_ref()
             .and_then(|d| d.signature_public_key.as_deref())
             .and_then(|k| k.try_into().ok());
-        let target_auth_generation = target
-            .and_then(|d| d.auth_generation)
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput("target device auth generation unavailable".into())
-            })?;
+        let target_auth_generation = target.and_then(|d| d.auth_generation).ok_or_else(|| {
+            OrchestratorError::InvalidInput("target device auth generation unavailable".into())
+        })?;
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#deviceRevocationBody",
             "actorDid": user_did,
@@ -416,7 +414,10 @@ where
         if let Some(key) = target_chat_key {
             match self.labyrinth_revoke_chat_device(key).await {
                 Ok(epochs) if !epochs.is_empty() => {
-                    tracing::info!(?epochs, "labyrinth: revoked the removed device's backup key")
+                    tracing::info!(
+                        ?epochs,
+                        "labyrinth: revoked the removed device's backup key"
+                    )
                 }
                 Ok(_) => {}
                 Err(error) => {

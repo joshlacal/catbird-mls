@@ -19,9 +19,9 @@ use super::state::StateVault;
 use super::status::ArchiveStatus;
 use super::transport::{GatewayXrpcTransport, LabyrinthGateway};
 use super::LabyrinthRequest;
-use crate::MLSError;
 use crate::orchestrator::canonical_transport::{GatewayResponse, PreparedRequest};
 use crate::orchestrator::error::Result as OrchResult;
+use crate::MLSError;
 
 struct TestChatSigner {
     signing: SigningKey,
@@ -182,8 +182,8 @@ impl LabyrinthGateway for MockSixEndpointGateway {
             }
             "blue.catbird.labyrinth.getEpochHead" => {
                 let did = query_param(&request.path, "did").unwrap_or_default();
-                let seq = query_param(&request.path, "epochNumber")
-                    .and_then(|s| s.parse::<u64>().ok());
+                let seq =
+                    query_param(&request.path, "epochNumber").and_then(|s| s.parse::<u64>().ok());
                 let list = st.heads.get(&did).cloned().unwrap_or_default();
                 let found = match seq {
                     Some(n) => list.iter().find(|e| e.epoch_number == n).cloned(),
@@ -364,11 +364,12 @@ async fn spaces_only_enable_archive_flush_restore_and_rearchive_before_leave() {
         )]),
     }));
 
-    let authority: Arc<dyn LocalConversationAuthority> = Arc::new(StaticAuthority(LocalGroupSnapshot {
-        group_id_hex: "aa11".into(),
-        epoch: 1,
-        member_dids: vec![alice.to_owned(), bob.to_owned()],
-    }));
+    let authority: Arc<dyn LocalConversationAuthority> =
+        Arc::new(StaticAuthority(LocalGroupSnapshot {
+            group_id_hex: "aa11".into(),
+            epoch: 1,
+            member_dids: vec![alice.to_owned(), bob.to_owned()],
+        }));
 
     let alice_d1 = build_deps(
         alice,
@@ -391,7 +392,10 @@ async fn spaces_only_enable_archive_flush_restore_and_rearchive_before_leave() {
 
     let mut alice_s1 = alice_d1.clone().enable().await.expect("alice enable");
     let mut bob_s1 = bob_d1.clone().enable().await.expect("bob enable");
-    let recovery_code = alice_s1.create_recovery_code().await.expect("recovery code");
+    let recovery_code = alice_s1
+        .create_recovery_code()
+        .await
+        .expect("recovery code");
 
     let queue = MemoryQueueStore::default();
     let row = PendingArchive::new(alice, conv_id, "msg-1", 1_700_000_001_000, b"hello spaces")

@@ -24,7 +24,7 @@ pub fn validate_conversation_policy(state: &CanonicalState) -> Result<()> {
         coordinate.state_version,
         state.snapshot_seq,
     ] {
-        if number < 0 || number > MAX_SAFE_INTEGER {
+        if !(0..=MAX_SAFE_INTEGER).contains(&number) {
             return Err(invalid("coordinate range"));
         }
     }

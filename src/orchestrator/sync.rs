@@ -1860,7 +1860,7 @@ mod projection_ingestion_tests {
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_batch_continues_for_other_conversations_when_one_fenced_by_reset() {
-        let (mut world, view1) = fixture().await;
+        let (world, view1) = fixture().await;
         world.register_device("Alice").await.unwrap();
         let alice = world.client("Alice");
         let convo1_id = view1.conversation_id.clone();

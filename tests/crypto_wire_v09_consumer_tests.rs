@@ -36,6 +36,7 @@ use catbird_mls::chat_v2::transcript::{
 static PINNED_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec_compat) -> i32 {
     let pinned = PINNED_TIME.load(std::sync::atomic::Ordering::Relaxed);
     if pinned != 0 && clk_id == 0 && !tp.is_null() {
@@ -47,14 +48,16 @@ pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec_compat) ->
         std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let mut real_ptr = REAL.load(std::sync::atomic::Ordering::Relaxed);
     if real_ptr.is_null() {
-        real_ptr = dlsym(RTLD_NEXT, b"clock_gettime\0".as_ptr() as *const _);
+        real_ptr = dlsym(RTLD_NEXT, c"clock_gettime".as_ptr());
         REAL.store(real_ptr, std::sync::atomic::Ordering::Relaxed);
     }
-    let real_fn: unsafe extern "C" fn(i32, *mut timespec_compat) -> i32 = std::mem::transmute(real_ptr);
+    let real_fn: unsafe extern "C" fn(i32, *mut timespec_compat) -> i32 =
+        std::mem::transmute(real_ptr);
     real_fn(clk_id, tp)
 }
 
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn gettimeofday(tp: *mut timeval_compat, tzp: *mut std::ffi::c_void) -> i32 {
     let pinned = PINNED_TIME.load(std::sync::atomic::Ordering::Relaxed);
     if pinned != 0 && !tp.is_null() {
@@ -66,7 +69,7 @@ pub unsafe extern "C" fn gettimeofday(tp: *mut timeval_compat, tzp: *mut std::ff
         std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
     let mut real_ptr = REAL.load(std::sync::atomic::Ordering::Relaxed);
     if real_ptr.is_null() {
-        real_ptr = dlsym(RTLD_NEXT, b"gettimeofday\0".as_ptr() as *const _);
+        real_ptr = dlsym(RTLD_NEXT, c"gettimeofday".as_ptr());
         REAL.store(real_ptr, std::sync::atomic::Ordering::Relaxed);
     }
     let real_fn: unsafe extern "C" fn(*mut timeval_compat, *mut std::ffi::c_void) -> i32 =
@@ -77,7 +80,10 @@ pub unsafe extern "C" fn gettimeofday(tp: *mut timeval_compat, tzp: *mut std::ff
 const RTLD_NEXT: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
 
 extern "C" {
-    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        symbol: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
 }
 
 #[repr(C)]
@@ -475,7 +481,7 @@ fn coordinate_from_public_group(
         tls_codec::VLBytes::tls_deserialize_exact(&confirmation_tag_tls).unwrap();
     let confirmation_tag: [u8; 32] = confirmation_tag_bytes.as_slice().try_into().unwrap();
     Coordinate {
-        conversation_id: convo_id.clone(),
+        conversation_id: *convo_id,
         generation: SafeInteger::ZERO,
         state_version: SafeInteger::new(state_version).unwrap(),
         group_id,

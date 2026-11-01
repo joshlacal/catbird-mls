@@ -240,10 +240,7 @@ impl<B: WasmSqlBackend> WasmAccountDb<B> {
         OpenMlsKvStorage::new(&self.backend)
     }
 
-    pub fn write_tx<T>(
-        &self,
-        f: impl FnOnce(&B) -> Result<T, MLSError>,
-    ) -> Result<T, MLSError> {
+    pub fn write_tx<T>(&self, f: impl FnOnce(&B) -> Result<T, MLSError>) -> Result<T, MLSError> {
         self.backend.begin_immediate()?;
         match f(&self.backend) {
             Ok(val) => {

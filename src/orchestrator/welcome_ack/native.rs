@@ -161,9 +161,10 @@ fn archive_inactive_group(
         )
         .map_err(storage_error)?;
     let own_leaves = own_query
-        .query_map(rusqlite::params![SCOPE_OWN_LEAF_NODES, &encoded_group], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
+        .query_map(
+            rusqlite::params![SCOPE_OWN_LEAF_NODES, &encoded_group],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
         .map_err(storage_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
@@ -268,170 +269,167 @@ pub(crate) fn adopt(
             .build();
 
         let crypto = inner.provider.crypto();
-        let (group, package_ref, last_resort) =
-            inner.manifest_storage.with_connection(|conn| {
-                let tx = conn.unchecked_transaction().map_err(storage_error)?;
-                let provider = WelcomeProvider {
-                    storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
-                    crypto,
-                };
-                let prior_group = MlsGroup::load(provider.storage(), &gid).map_err(storage_error)?;
-                if let Some(prior) = &prior_group {
-                    if prior.is_active() || prior.epoch().as_u64() >= delivery.epoch() {
-                        return Err(MLSError::invalid_input(
-                            "Welcome cannot replace this existing group incarnation",
-                        ));
+        let (group, package_ref, last_resort) = inner.manifest_storage.with_connection(|conn| {
+            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let provider = WelcomeProvider {
+                storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
+                crypto,
+            };
+            let prior_group = MlsGroup::load(provider.storage(), &gid).map_err(storage_error)?;
+            if let Some(prior) = &prior_group {
+                if prior.is_active() || prior.epoch().as_u64() >= delivery.epoch() {
+                    return Err(MLSError::invalid_input(
+                        "Welcome cannot replace this existing group incarnation",
+                    ));
+                }
+            }
+            let opaque = bytes(&delivery.envelope["opaqueWelcome"]).map_err(storage_error)?;
+            let (message, remainder) =
+                MlsMessageIn::tls_deserialize_bytes(&opaque).map_err(storage_error)?;
+            if !remainder.is_empty() {
+                return Err(MLSError::SerializationError);
+            }
+            let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
+                return Err(MLSError::SerializationError);
+            };
+            let package_ref =
+                bytes(&delivery.envelope["provenance"]["keyPackageRef"]).map_err(storage_error)?;
+            if welcome.secrets().len() != 1
+                || welcome.secrets()[0].new_member().as_slice() != package_ref
+            {
+                return Err(MLSError::invalid_input(
+                    "Welcome KeyPackage does not match its delivery provenance",
+                ));
+            }
+            let bundle: KeyPackageBundle = provider
+                .storage()
+                .key_package(&welcome.secrets()[0].new_member())
+                .map_err(storage_error)?
+                .ok_or_else(|| MLSError::no_matching_key_package("Welcome KeyPackage not found"))?;
+            let not_after = bundle.key_package().life_time().not_after();
+            let last_resort = bundle.key_package().last_resort();
+            let expires = chrono::DateTime::parse_from_rfc3339(
+                delivery.envelope["expiresAt"].as_str().unwrap(),
+            )
+            .map_err(storage_error)?;
+            if expires.timestamp() < 0
+                || expires.timestamp() as u64 != not_after
+                || expires.timestamp_subsec_nanos() != 0
+            {
+                return Err(MLSError::invalid_input(
+                    "Welcome expiry differs from its exact KeyPackage lifetime",
+                ));
+            }
+            if let Some(prior) = &prior_group {
+                archive_inactive_group(&tx, prior, delivery)?;
+                provider
+                    .storage()
+                    .delete_own_leaf_nodes(&gid)
+                    .map_err(storage_error)?;
+                provider
+                    .storage()
+                    .clear_proposal_queue::<GroupId, ProposalRef>(&gid)
+                    .map_err(storage_error)?;
+            }
+            let group = StagedWelcome::build_from_welcome(&provider, &join_config, welcome)
+                .and_then(|builder| {
+                    if prior_group.is_some() {
+                        builder.replace_old_group().build()
+                    } else {
+                        builder.build()
                     }
-                }
-                let opaque = bytes(&delivery.envelope["opaqueWelcome"]).map_err(storage_error)?;
-                let (message, remainder) =
-                    MlsMessageIn::tls_deserialize_bytes(&opaque).map_err(storage_error)?;
-                if !remainder.is_empty() {
-                    return Err(MLSError::SerializationError);
-                }
-                let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
-                    return Err(MLSError::SerializationError);
-                };
-                let package_ref =
-                    bytes(&delivery.envelope["provenance"]["keyPackageRef"]).map_err(storage_error)?;
-                if welcome.secrets().len() != 1
-                    || welcome.secrets()[0].new_member().as_slice() != package_ref
-                {
-                    return Err(MLSError::invalid_input(
-                        "Welcome KeyPackage does not match its delivery provenance",
-                    ));
-                }
-                let bundle: KeyPackageBundle = provider
-                    .storage()
-                    .key_package(&welcome.secrets()[0].new_member())
+                })
+                .and_then(|staged| staged.into_group(&provider))
+                .map_err(|error| {
+                    MLSError::OpenMLS(format!("Welcome verification failed: {error:?}"))
+                })?;
+            if group.group_id() != &gid
+                || group.epoch().as_u64() != delivery.epoch()
+                || !group.is_active()
+                || !group.own_leaf_node().is_some_and(|leaf| {
+                    leaf.credential().serialized_content() == identity
+                        && leaf.signature_key().as_slice() == signer_public_key
+                })
+            {
+                return Err(MLSError::invalid_input(
+                    "Welcome native coordinate or recipient mismatch",
+                ));
+            }
+            let context: GroupContext = provider
+                .storage()
+                .group_context(&gid)
+                .map_err(storage_error)?
+                .ok_or(MLSError::StorageFailed)?;
+            let tag: ConfirmationTag = provider
+                .storage()
+                .confirmation_tag(&gid)
+                .map_err(storage_error)?
+                .ok_or(MLSError::StorageFailed)?;
+            let tag = tag.tls_serialize_detached().map_err(storage_error)?;
+            let tag = if tag.len() == 33 && tag[0] == 32 {
+                &tag[1..]
+            } else {
+                &tag
+            };
+            if bytes(&delivery.envelope["coordinates"]["groupContextHash"])
+                .map_err(storage_error)?
+                != Sha256::digest(context.tls_serialize_detached().map_err(storage_error)?)
+                    .as_slice()
+                || bytes(&delivery.envelope["coordinates"]["confirmationTag"])
                     .map_err(storage_error)?
-                    .ok_or_else(|| {
-                        MLSError::no_matching_key_package("Welcome KeyPackage not found")
-                    })?;
-                let not_after = bundle.key_package().life_time().not_after();
-                let last_resort = bundle.key_package().last_resort();
-                let expires = chrono::DateTime::parse_from_rfc3339(
-                    delivery.envelope["expiresAt"].as_str().unwrap(),
-                )
-                .map_err(storage_error)?;
-                if expires.timestamp() < 0
-                    || expires.timestamp() as u64 != not_after
-                    || expires.timestamp_subsec_nanos() != 0
-                {
-                    return Err(MLSError::invalid_input(
-                        "Welcome expiry differs from its exact KeyPackage lifetime",
-                    ));
-                }
-                if let Some(prior) = &prior_group {
-                    archive_inactive_group(&tx, prior, delivery)?;
-                    provider
-                        .storage()
-                        .delete_own_leaf_nodes(&gid)
-                        .map_err(storage_error)?;
-                    provider
-                        .storage()
-                        .clear_proposal_queue::<GroupId, ProposalRef>(&gid)
-                        .map_err(storage_error)?;
-                }
-                let group = StagedWelcome::build_from_welcome(&provider, &join_config, welcome)
-                    .and_then(|builder| {
-                        if prior_group.is_some() {
-                            builder.replace_old_group().build()
-                        } else {
-                            builder.build()
-                        }
-                    })
-                    .and_then(|staged| staged.into_group(&provider))
-                    .map_err(|error| {
-                        MLSError::OpenMLS(format!("Welcome verification failed: {error:?}"))
-                    })?;
-                if group.group_id() != &gid
-                    || group.epoch().as_u64() != delivery.epoch()
-                    || !group.is_active()
-                    || !group.own_leaf_node().is_some_and(|leaf| {
-                        leaf.credential().serialized_content() == identity
-                            && leaf.signature_key().as_slice() == signer_public_key
-                    })
-                {
-                    return Err(MLSError::invalid_input(
-                        "Welcome native coordinate or recipient mismatch",
-                    ));
-                }
-                let context: GroupContext = provider
-                    .storage()
-                    .group_context(&gid)
-                    .map_err(storage_error)?
-                    .ok_or(MLSError::StorageFailed)?;
-                let tag: ConfirmationTag = provider
-                    .storage()
-                    .confirmation_tag(&gid)
-                    .map_err(storage_error)?
-                    .ok_or(MLSError::StorageFailed)?;
-                let tag = tag.tls_serialize_detached().map_err(storage_error)?;
-                let tag = if tag.len() == 33 && tag[0] == 32 {
-                    &tag[1..]
-                } else {
-                    &tag
-                };
-                if bytes(&delivery.envelope["coordinates"]["groupContextHash"])
-                    .map_err(storage_error)?
-                    != Sha256::digest(context.tls_serialize_detached().map_err(storage_error)?)
-                        .as_slice()
-                    || bytes(&delivery.envelope["coordinates"]["confirmationTag"])
-                        .map_err(storage_error)?
-                        != tag
-                {
-                    return Err(MLSError::invalid_input(
-                        "Welcome cryptographic coordinate mismatch",
-                    ));
-                }
-                if !last_resort {
-                    tx.execute(
-                        "DELETE FROM pending_ops WHERE op_kind = 'kp_bundle' AND op_key = ?1",
-                        [hex::encode(&package_ref)],
-                    )
-                    .map_err(storage_error)?;
-                }
-                let raw: Option<String> = tx
-                    .query_row(
-                        "SELECT value_json FROM account_meta WHERE key='group_ids'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(storage_error)?;
-                let mut ids: Vec<String> = raw
-                    .map(|raw| serde_json::from_str(&raw))
-                    .transpose()
-                    .map_err(storage_error)?
-                    .unwrap_or_default();
-                let hex_group = hex::encode(&group_id);
-                if !ids.contains(&hex_group) {
-                    ids.push(hex_group);
-                }
+                    != tag
+            {
+                return Err(MLSError::invalid_input(
+                    "Welcome cryptographic coordinate mismatch",
+                ));
+            }
+            if !last_resort {
                 tx.execute(
-                    "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES('group_ids', ?1)",
-                    [serde_json::to_string(&ids).map_err(storage_error)?],
+                    "DELETE FROM pending_ops WHERE op_kind = 'kp_bundle' AND op_key = ?1",
+                    [hex::encode(&package_ref)],
                 )
                 .map_err(storage_error)?;
-                let record = WelcomeAcceptance {
-                    delivery: delivery.clone(),
-                    projection_completed: false,
-                    request_body: None,
-                    terminal_response: None,
-                };
-                tx.execute(
-                    "INSERT INTO account_meta(key, value_json) VALUES(?1, ?2)",
-                    [
-                        key(delivery.welcome_id()),
-                        serde_json::to_string(&record).map_err(storage_error)?,
-                    ],
+            }
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM account_meta WHERE key='group_ids'",
+                    [],
+                    |row| row.get(0),
                 )
+                .optional()
                 .map_err(storage_error)?;
-                drop(provider);
-                tx.commit().map_err(storage_error)?;
-                Ok((group, package_ref, last_resort))
-            })?;
+            let mut ids: Vec<String> = raw
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()
+                .map_err(storage_error)?
+                .unwrap_or_default();
+            let hex_group = hex::encode(&group_id);
+            if !ids.contains(&hex_group) {
+                ids.push(hex_group);
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES('group_ids', ?1)",
+                [serde_json::to_string(&ids).map_err(storage_error)?],
+            )
+            .map_err(storage_error)?;
+            let record = WelcomeAcceptance {
+                delivery: delivery.clone(),
+                projection_completed: false,
+                request_body: None,
+                terminal_response: None,
+            };
+            tx.execute(
+                "INSERT INTO account_meta(key, value_json) VALUES(?1, ?2)",
+                [
+                    key(delivery.welcome_id()),
+                    serde_json::to_string(&record).map_err(storage_error)?,
+                ],
+            )
+            .map_err(storage_error)?;
+            drop(provider);
+            tx.commit().map_err(storage_error)?;
+            Ok((group, package_ref, last_resort))
+        })?;
 
         inner.publish_welcome_group(group, signer_public_key);
         if !last_resort {

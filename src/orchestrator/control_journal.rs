@@ -14,6 +14,7 @@ use super::types::GroupState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::manual_non_exhaustive)]
 pub struct PreparedControlRecord {
     pub conversation_id: String,
     pub group_id: String,
@@ -335,16 +336,16 @@ impl PreparedControlRecord {
         if error["error"].as_str() == Some("SignedOperationExpired") {
             return true;
         }
-        match (self.expected_entry_type.as_str(), error["error"].as_str()) {
+        matches!(
+            (self.expected_entry_type.as_str(), error["error"].as_str()),
             (
                 "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
                 Some("LeafRecoveryExpired" | "LeafRecoverySuperseded"),
+            ) | (
+                "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+                Some("LeaveRequestExpired"),
             )
-            | ("blue.catbird.chat.defs#leaveCommitFulfillmentEntry", Some("LeaveRequestExpired")) => {
-                true
-            }
-            _ => false,
-        }
+        )
     }
 
     pub fn validate_response(&self, bytes: &[u8]) -> Result<Value> {

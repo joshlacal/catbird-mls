@@ -15,7 +15,7 @@
 //! modules `local_delete_persistence_tests` and `quarantine_persistence_tests`;
 //! the public/startup replay cases remain here.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::duplicate_mod)]
 
 mod e2e_harness;
 #[path = "epoch_secret_test_support.rs"]
@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use catbird_mls::orchestrator::recovery::RecoveryTracker;
 use catbird_mls::orchestrator::{
-    constants, ConversationState, CredentialStore, IncomingEnvelope, MLSOrchestrator,
-    MLSStorageBackend, OrchestratorConfig, OrchestratorError, PendingLocalDelete,
-    PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
+    constants, ConversationState, IncomingEnvelope, MLSOrchestrator, MLSStorageBackend,
+    OrchestratorConfig, PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState,
+    ResetRecordOutcome,
 };
 use e2e_harness::TestWorld;
 #[path = "support/ws5_recovery.rs"]
@@ -77,7 +77,7 @@ async fn restart_orchestrator(
 ) {
     let client = world.client(name);
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-    let temp_path = temp_dir.into_path();
+    let temp_path = temp_dir.keep();
     let db_path = temp_path.join("mls.db");
 
     struct NoopKeychain;

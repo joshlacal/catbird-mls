@@ -77,7 +77,7 @@ async fn engine_add_invites_without_adding_a_leaf_until_recipient_accepts() {
         .unwrap();
     let before = world.delivery_service().submitted_prepared_requests().len();
     let invited = engine
-        .add_members(cid, &[bob.did.clone()])
+        .add_members(cid, std::slice::from_ref(&bob.did))
         .expect("UI add should submit an invitation policy");
     assert_eq!(
         invited.conversation.epoch, 0,
@@ -182,8 +182,7 @@ async fn engine_add_invites_without_adding_a_leaf_until_recipient_accepts() {
     let submissions = world.delivery_service().submitted_prepared_requests();
     let fulfilled = submissions
         .iter()
-        .filter(|request| request.operation == CanonicalOperation::SubmitTransition)
-        .last()
+        .rfind(|request| request.operation == CanonicalOperation::SubmitTransition)
         .unwrap();
     let fulfilled: Value = serde_json::from_slice(fulfilled.body.as_ref().unwrap()).unwrap();
     assert_eq!(
@@ -324,7 +323,7 @@ async fn engine_add_preserves_crypto_when_server_rejects_a_non_admin() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_crypto_mutation() {
     let mut world = world().await;
-    let alice = world.client("Alice");
+    let _alice = world.client("Alice");
     let bob = world.client("Bob");
     let engine = engine_for(&world, "Alice");
     let created = engine
@@ -340,7 +339,7 @@ async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_c
 
     // Alice invites Bob via UI add, creating a policy invitation (status == "pending", leafCount == 0)
     engine
-        .add_members(cid, &[bob.did.clone()])
+        .add_members(cid, std::slice::from_ref(&bob.did))
         .expect("UI add should submit an invitation policy");
 
     // Bob is a fresh recipient: no local MLS group, no stored conversation rows
@@ -455,7 +454,7 @@ async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_c
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_recipient_live_batch_yields_durable_pending_invitation_with_restart_visibility() {
     let mut world = world().await;
-    let alice = world.client("Alice");
+    let _alice = world.client("Alice");
     let bob = world.client("Bob");
     let engine = engine_for(&world, "Alice");
     let created = engine
@@ -470,7 +469,7 @@ async fn fresh_recipient_live_batch_yields_durable_pending_invitation_with_resta
     let gid = hex::decode(&created.group_id).unwrap();
 
     engine
-        .add_members(cid, &[bob.did.clone()])
+        .add_members(cid, std::slice::from_ref(&bob.did))
         .expect("UI add should submit an invitation policy");
 
     // Bob processes an inventoryHintBatch event

@@ -4,10 +4,7 @@
 
 mod e2e_harness;
 
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine as _,
-};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_mls::chat_v2::transcript::direct_request as protocol;
 use catbird_mls::orchestrator::{
     canonical_transport::CanonicalOperation as Op,
@@ -22,7 +19,6 @@ use catbird_mls::{
 use e2e_harness::TestWorld;
 use p256::ecdsa::signature::Signer;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 fn receipt_authority() -> (p256::ecdsa::SigningKey, Vec<u8>, String) {
     let key = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
@@ -97,7 +93,11 @@ async fn test_c14_crossed_starts_loser_retains_draft_and_does_not_silently_accep
     let alice = world.client("Alice");
     let mut view = alice
         .orchestrator
-        .create_group("Crossed Direct Winner", Some(&[bob.did.clone()]), None)
+        .create_group(
+            "Crossed Direct Winner",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
         .await
         .unwrap();
     let requests = world.delivery_service().submitted_prepared_requests();
@@ -158,7 +158,10 @@ async fn test_c14_crossed_starts_loser_retains_draft_and_does_not_silently_accep
         .start_direct_request(input.clone())
         .await
         .unwrap();
-    assert!(matches!(unknown, DirectRequestOutcome::OutcomeUnknown { .. }));
+    assert!(matches!(
+        unknown,
+        DirectRequestOutcome::OutcomeUnknown { .. }
+    ));
 
     // Extract the exact signed prepare request from delivery service
     let requests = world.delivery_service().submitted_prepared_requests();
@@ -274,8 +277,14 @@ async fn test_c14_crossed_starts_loser_retains_draft_and_does_not_silently_accep
         RequestCrypto::WelcomeAvailable,
         true,
     );
-    assert!(!capabilities.can_send, "Losing recipient cannot send messages before acceptance");
-    assert!(capabilities.can_accept, "Recipient retains the option to explicitly accept");
+    assert!(
+        !capabilities.can_send,
+        "Losing recipient cannot send messages before acceptance"
+    );
+    assert!(
+        capabilities.can_accept,
+        "Recipient retains the option to explicitly accept"
+    );
 }
 
 // ============================================================================
@@ -444,7 +453,7 @@ async fn test_c18_pending_direct_request_refuses_orchestrator_sends_and_reaction
     world.register_device("Alice").await.unwrap();
     world.register_device("Bob").await.unwrap();
 
-    let (authority, doc, method) = receipt_authority();
+    let (_authority, doc, _method) = receipt_authority();
     for name in ["Alice", "Bob"] {
         world
             .client(name)
@@ -458,7 +467,7 @@ async fn test_c18_pending_direct_request_refuses_orchestrator_sends_and_reaction
     // Create group where Bob is pending
     let mut view = alice
         .orchestrator
-        .create_group("Pending Direct", Some(&[bob.did.clone()]), None)
+        .create_group("Pending Direct", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     let requests = world.delivery_service().submitted_prepared_requests();
@@ -539,7 +548,12 @@ async fn test_c18_pending_direct_request_refuses_orchestrator_sends_and_reaction
     // 2. Sending reaction while pending MUST FAIL with typed error
     let reaction_result = alice
         .orchestrator
-        .send_reaction(&cid, "msg-1", "👍", catbird_mls::orchestrator::ReactionAction::Add)
+        .send_reaction(
+            &cid,
+            "msg-1",
+            "👍",
+            catbird_mls::orchestrator::ReactionAction::Add,
+        )
         .await;
     assert!(
         matches!(&reaction_result, Err(OrchestratorError::InvalidInput(msg)) if msg.contains("Accept this invitation before sending messages.")),
@@ -547,8 +561,15 @@ async fn test_c18_pending_direct_request_refuses_orchestrator_sends_and_reaction
     );
 
     // 3. Readiness check MUST report send_allowed == false
-    let ready = alice.orchestrator.ensure_conversation_ready(&cid).await.unwrap();
-    assert!(!ready.send_allowed, "send_allowed must be false for pending conversation");
+    let ready = alice
+        .orchestrator
+        .ensure_conversation_ready(&cid)
+        .await
+        .unwrap();
+    assert!(
+        !ready.send_allowed,
+        "send_allowed must be false for pending conversation"
+    );
 
     // 4. Assert zero graph effect: delivery service received zero SendMessage requests
     assert!(
@@ -587,7 +608,7 @@ async fn test_unaccepted_direct_request_with_needs_rejoin_or_epoch_behind_projec
     // Create group where Bob is pending
     let view = alice
         .orchestrator
-        .create_group("Pending Direct", Some(&[bob.did.clone()]), None)
+        .create_group("Pending Direct", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     let cid = view.conversation_id.clone();
@@ -721,7 +742,10 @@ async fn test_unaccepted_direct_request_with_needs_rejoin_or_epoch_behind_projec
 #[test]
 fn test_c19_preview_fetch_import_ack_never_emits_peer_visible_signals() {
     // 1. Initial pending view
-    let initial = pending_view(RequestConsent::IncomingPending, RequestCrypto::WelcomeAvailable);
+    let initial = pending_view(
+        RequestConsent::IncomingPending,
+        RequestCrypto::WelcomeAvailable,
+    );
     assert!(!initial.capabilities.can_send);
     assert!(!initial.capabilities.can_emit_receipts);
     assert!(!initial.capabilities.can_preview);
@@ -788,7 +812,10 @@ fn test_c19_preview_fetch_import_ack_never_emits_peer_visible_signals() {
 fn test_c20_close_and_block_monotonicity_prevents_late_event_resurrection() {
     // 1. Start from an active pending preview with decrypted introduction
     let ready = reduce_request_preview(
-        &pending_view(RequestConsent::IncomingPending, RequestCrypto::WelcomeAvailable),
+        &pending_view(
+            RequestConsent::IncomingPending,
+            RequestCrypto::WelcomeAvailable,
+        ),
         RequestPreviewUpdate::Decrypted {
             invitation: None,
             text: "Confidential introduction".into(),
@@ -801,13 +828,25 @@ fn test_c20_close_and_block_monotonicity_prevents_late_event_resurrection() {
     // 2. Terminal close transition: user declines / closes request
     let mut closed_view = ready.clone();
     closed_view.consent = RequestConsent::Closed;
-    closed_view.capabilities =
-        RequestCapabilities::derive(RequestConsent::Closed, ready.crypto, ready.preview.is_some());
+    closed_view.capabilities = RequestCapabilities::derive(
+        RequestConsent::Closed,
+        ready.crypto,
+        ready.preview.is_some(),
+    );
 
     assert_eq!(closed_view.consent, RequestConsent::Closed);
-    assert!(!closed_view.capabilities.can_close, "Cannot close an already-closed request");
-    assert!(!closed_view.capabilities.can_accept, "Cannot accept a closed request");
-    assert!(!closed_view.capabilities.can_send, "Cannot send in a closed request");
+    assert!(
+        !closed_view.capabilities.can_close,
+        "Cannot close an already-closed request"
+    );
+    assert!(
+        !closed_view.capabilities.can_accept,
+        "Cannot accept a closed request"
+    );
+    assert!(
+        !closed_view.capabilities.can_send,
+        "Cannot send in a closed request"
+    );
     assert!(!closed_view.capabilities.can_emit_receipts);
     assert!(!closed_view.capabilities.can_administer);
 

@@ -167,13 +167,17 @@ fn an_application_entry_with_lexicon_dollar_bytes_normalizes_and_verifies() {
 
     // Once normalized via the schema-directed normalizer, it verifies byte-identically:
     let raw = serde_json::to_vec(&presented).unwrap();
-    let mut normalized = super::direct_request::normalize_read_presentation(&raw, "applicationEntry", false)
-        .expect("applicationEntry normalizes cleanly");
+    let mut normalized =
+        super::direct_request::normalize_read_presentation(&raw, "applicationEntry", false)
+            .expect("applicationEntry normalizes cleanly");
     normalized.as_object_mut().unwrap().remove("$type");
     let verified = VerifiedApplicationEntry::verify(&strict(&normalized), &public_key())
         .expect("normalized application entry must verify end-to-end");
     assert_eq!(verified.seq(), 42);
-    assert_eq!(verified.mutation().kind(), SignedMutationKind::ApplicationSend);
+    assert_eq!(
+        verified.mutation().kind(),
+        SignedMutationKind::ApplicationSend
+    );
 }
 
 #[test]

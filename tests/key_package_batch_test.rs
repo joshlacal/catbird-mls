@@ -9,7 +9,6 @@
 use async_trait::async_trait;
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use openmls::prelude::{DeserializeBytes, KeyPackageIn, ProtocolVersion};
-use openmls_traits::OpenMlsProvider;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

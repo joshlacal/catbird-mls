@@ -8,7 +8,7 @@ use base64::{
     Engine as _,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -117,10 +117,10 @@ pub(crate) mod native {
         orchestrator::direct_request_journal::native::{error, Provider},
         storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage},
     };
-    use openmls::prelude::*;
-    use openmls_traits::{signatures::Signer, OpenMlsProvider};
+
+    use openmls_traits::OpenMlsProvider;
     use rusqlite::OptionalExtension;
-    use tls_codec::Serialize as _;
+
     fn key(device: &str) -> Result<String, MLSError> {
         crate::chat_v2::ids::CanonicalUuid::parse(device).map_err(|_| invalid())?;
         Ok(format!("direct_request_key_publication_v2:{device}"))
@@ -243,7 +243,7 @@ pub(crate) mod native {
                 .map_err(error)?;
             }
             let provider = Provider {
-                storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+                storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
                 crypto,
             };
             let (raw, bundles) =

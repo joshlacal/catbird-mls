@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[path = "epoch_secret_test_support.rs"]
 mod epoch_secret_test_support;
 

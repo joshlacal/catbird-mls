@@ -10,9 +10,6 @@
 //! it across the `MLSAPIClient::publish_key_package` edge.
 
 mod e2e_harness;
-mod mock_api_client;
-mod mock_credentials;
-mod mock_storage;
 
 use e2e_harness::TestWorld;
 

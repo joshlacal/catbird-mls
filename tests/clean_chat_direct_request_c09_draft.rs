@@ -24,9 +24,11 @@ fn receipt_authority() -> (p256::ecdsa::SigningKey, Vec<u8>, String) {
     let id = protocol::direct_request_receipt_key_id(point.as_bytes()).unwrap();
     let mut multikey = vec![0x80, 0x24];
     multikey.extend(point.as_bytes());
-    let doc = serde_json::to_vec(&json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{
+    let doc = serde_json::to_vec(
+        &json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{
         "id":id,"controller":"did:web:chat.catbird.blue","type":"Multikey",
-        "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)}]}))
+        "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)}]}),
+    )
     .unwrap();
     (key, doc, id)
 }
@@ -61,15 +63,26 @@ async fn c09_no_eligible_recipient_retains_draft_and_emits_no_invitation() {
 
     // First delivery is lost so the exact persisted prepare can be bound by the
     // server receipt; the resume retries those exact bytes.
-    world
-        .delivery_service()
-        .queue_request_operation_response(Op::PrepareDirectRequest, 503, json!({"error":"lost"}));
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        503,
+        json!({"error":"lost"}),
+    );
     assert!(matches!(
-        alice.orchestrator.start_direct_request(input.clone()).await.unwrap(),
+        alice
+            .orchestrator
+            .start_direct_request(input.clone())
+            .await
+            .unwrap(),
         DirectRequestOutcome::OutcomeUnknown { .. }
     ));
     let prepare = last_prepare(&world);
-    let device = alice.credentials.get_device_uuid(&alice.did).await.unwrap().unwrap();
+    let device = alice
+        .credentials
+        .get_device_uuid(&alice.did)
+        .await
+        .unwrap()
+        .unwrap();
     let public = alice
         .orchestrator
         .mls_context()
@@ -119,18 +132,30 @@ async fn c09_no_eligible_recipient_retains_draft_and_emits_no_invitation() {
         }
         other => panic!("expected terminal not-published outcome, got {other:?}"),
     }
-    assert_eq!(prepare, last_prepare(&world), "resume retried the exact prepare");
+    assert_eq!(
+        prepare,
+        last_prepare(&world),
+        "resume retried the exact prepare"
+    );
 
     // No invitation: nothing was published, no bootstrap crypto/Welcome was
     // built, and no local request projection (conversation) exists.
     let requests = world.delivery_service().submitted_prepared_requests();
-    assert!(requests.iter().all(|r| r.operation != Op::PublishDirectRequest));
+    assert!(requests
+        .iter()
+        .all(|r| r.operation != Op::PublishDirectRequest));
     let context = alice.orchestrator.mls_context();
     assert!(context.list_direct_request_journal().unwrap().is_empty());
-    assert!(context.list_direct_request_projections().unwrap().is_empty());
+    assert!(context
+        .list_direct_request_projections()
+        .unwrap()
+        .is_empty());
 
     // The authored draft is retained in durable core storage with its terminal proof.
-    let raw = context.read_direct_request_intent(&input.draft_id).unwrap().unwrap();
+    let raw = context
+        .read_direct_request_intent(&input.draft_id)
+        .unwrap()
+        .unwrap();
     let intent = DirectRequestIntent::decode(&raw, &alice.did, &device).unwrap();
     assert_eq!(intent.input.text, draft_text);
     assert_eq!(intent.input.recipient_did, input.recipient_did);
@@ -144,7 +169,10 @@ async fn c09_no_eligible_recipient_retains_draft_and_emits_no_invitation() {
     let alice = world.client("Alice");
     let context = alice.orchestrator.mls_context();
     assert_eq!(
-        context.read_direct_request_intent(&input.draft_id).unwrap().unwrap(),
+        context
+            .read_direct_request_intent(&input.draft_id)
+            .unwrap()
+            .unwrap(),
         raw
     );
     // Identical input replays the retained terminal proof without a new RPC.
@@ -153,21 +181,33 @@ async fn c09_no_eligible_recipient_retains_draft_and_emits_no_invitation() {
         alice.orchestrator.start_direct_request(input.clone()).await.unwrap(),
         DirectRequestOutcome::TerminalNotPublished { ref code, .. } if code == "RecipientKeysUnavailable"
     ));
-    assert_eq!(world.delivery_service().submitted_prepared_requests().len(), submitted);
+    assert_eq!(
+        world.delivery_service().submitted_prepared_requests().len(),
+        submitted
+    );
     // Sending the (edited) draft again opens a fresh attempt.
     let mut edited = input.clone();
     edited.text = format!("{draft_text} (retry)");
-    world
-        .delivery_service()
-        .queue_request_operation_response(Op::PrepareDirectRequest, 503, json!({"error":"lost"}));
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        503,
+        json!({"error":"lost"}),
+    );
     assert!(matches!(
-        alice.orchestrator.start_direct_request(edited.clone()).await.unwrap(),
+        alice
+            .orchestrator
+            .start_direct_request(edited.clone())
+            .await
+            .unwrap(),
         DirectRequestOutcome::OutcomeUnknown { .. }
     ));
     let retry = last_prepare(&world);
     assert_ne!(retry["signedRequest"]["body"]["requestId"], p["requestId"]);
     let intent = DirectRequestIntent::decode(
-        &context.read_direct_request_intent(&input.draft_id).unwrap().unwrap(),
+        &context
+            .read_direct_request_intent(&input.draft_id)
+            .unwrap()
+            .unwrap(),
         &alice.did,
         &device,
     )

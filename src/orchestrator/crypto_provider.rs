@@ -77,20 +77,6 @@ impl Default for CryptoGroupConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::CryptoGroupConfig;
-    use crate::orchestrator::constants::MAX_PAST_EPOCHS_TO_RETAIN;
-
-    #[test]
-    fn crypto_group_config_default_uses_epoch_retention_constant() {
-        assert_eq!(
-            CryptoGroupConfig::default().max_past_epochs,
-            MAX_PAST_EPOCHS_TO_RETAIN as u32
-        );
-    }
-}
-
 /// Platform-agnostic MLS cryptographic operations.
 ///
 /// Implemented by the FFI layer (wrapping openmls) on each platform.
@@ -173,4 +159,18 @@ pub trait MLSCryptoProvider: Send + Sync {
 
     /// Create a key package for the given identity.
     fn create_key_package(&self, identity: Vec<u8>) -> Result<CryptoKeyPackageResult>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CryptoGroupConfig;
+    use crate::orchestrator::constants::MAX_PAST_EPOCHS_TO_RETAIN;
+
+    #[test]
+    fn crypto_group_config_default_uses_epoch_retention_constant() {
+        assert_eq!(
+            CryptoGroupConfig::default().max_past_epochs,
+            MAX_PAST_EPOCHS_TO_RETAIN as u32
+        );
+    }
 }

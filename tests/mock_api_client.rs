@@ -3,7 +3,7 @@
 //! Simulates the delivery service in-memory so multiple `MLSOrchestrator`
 //! instances can share the same mock server via `Arc`.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::too_many_arguments, clippy::type_complexity)]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -1145,6 +1145,28 @@ impl MockDeliveryService {
                     .welcomes
                     .insert((new_convo_id.to_string(), did), welcomes);
             }
+        }
+        for delivery in &mut guard.welcome_deliveries {
+            if delivery["conversationId"].as_str() == Some(old_convo_id)
+                || delivery["conversationId"].as_str() == Some(matched_cid.as_str())
+            {
+                delivery["conversationId"] = serde_json::json!(new_convo_id);
+                if delivery["coordinates"].is_object() {
+                    delivery["coordinates"]["conversationId"] = serde_json::json!(new_convo_id);
+                }
+            }
+        }
+        if let Some(mut state) = guard
+            .lifecycle_state_overrides
+            .remove(old_convo_id)
+            .or_else(|| guard.lifecycle_state_overrides.remove(&matched_cid))
+        {
+            if state["coordinates"].is_object() {
+                state["coordinates"]["conversationId"] = serde_json::json!(new_convo_id);
+            }
+            guard
+                .lifecycle_state_overrides
+                .insert(new_convo_id.to_string(), state);
         }
     }
 
@@ -2543,7 +2565,7 @@ impl MLSAPIClient for MockDeliveryService {
                         })]);
                     }
                 }
-                let participants: Vec<serde_json::Value> = res
+                let _participants: Vec<serde_json::Value> = res
                     .conversation
                     .members
                     .iter()
@@ -3093,7 +3115,15 @@ impl MLSAPIClient for MockDeliveryService {
                     }
                     return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse { status:200, content_type:Some("application/json".into()), body:response });
                 }
-                if recovery_request_id.is_some() {
+                let has_inbox_recovery = recovery_request_id.as_ref().is_some_and(|req_id| {
+                    guard
+                        .leaf_recovery_inbox_items
+                        .iter()
+                        .any(|r| r["recoveryRequestId"].as_str() == Some(req_id.as_str()))
+                });
+                if has_inbox_recovery
+                    || (recovery_request_id.is_some() && !guard.recovery_custom_rejections.is_empty())
+                {
                     if !guard.recovery_custom_rejections.is_empty() {
                         let (status, error) = guard.recovery_custom_rejections.remove(0);
                         if error == "LeafRecoveryExpired" {
@@ -3209,23 +3239,57 @@ impl MLSAPIClient for MockDeliveryService {
                                     if let Some(leaves) = &mut stored.leaves {
                                         leaves.retain(|leaf| !(leaf["userDid"] == user_did && leaf["deviceId"] == device_id));
                                         if !is_remove {
-                                            leaves.push(serde_json::json!({"userDid": user_did, "deviceId": device_id}));
+                                            let mut leaf_obj = serde_json::json!({
+                                                "userDid": user_did,
+                                                "deviceId": device_id,
+                                                "deviceStatus": "active",
+                                                "leafOrigin": change.get("leafOrigin").and_then(|o| o.as_str()).unwrap_or("keyPackage"),
+                                            });
+                                            if let Some(key_id) = change.get("keyId").and_then(|k| k.as_str()) {
+                                                leaf_obj["keyId"] = serde_json::json!(key_id);
+                                            }
+                                            if let Some(pkg_ref) = change.get("joinKeyPackageRef") {
+                                                leaf_obj["joinKeyPackageRef"] = pkg_ref.clone();
+                                            }
+                                            leaves.push(leaf_obj);
                                         }
                                     }
-                                    if !is_remove && !stored.members.contains(&user_did.to_string()) {
-                                        stored.members.push(user_did.to_string());
-                                        stored.view.members.push(MemberView { did: user_did.to_string(), role: MemberRole::Member });
+                                    if !is_remove {
+                                        if !stored.members.contains(&user_did.to_string()) {
+                                            stored.members.push(user_did.to_string());
+                                            stored.view.members.push(MemberView { did: user_did.to_string(), role: MemberRole::Member });
+                                        }
+                                        if let Some(participants) = &mut stored.participants {
+                                            if !participants.iter().any(|p| p["userDid"].as_str() == Some(user_did)) {
+                                                participants.push(serde_json::json!({
+                                                    "userDid": user_did,
+                                                    "role": "member",
+                                                    "status": "active",
+                                                }));
+                                            }
+                                        }
                                     }
                                 }
                             }
                         } else {
                             for k in key_pkg_dids {
-                                if !stored.members.contains(&k) {
-                                    stored.members.push(k.clone());
-                                    stored.view.members.push(MemberView {
-                                        did: k,
-                                        role: MemberRole::Member,
-                                    });
+                                if !k.contains('#') {
+                                    if !stored.members.contains(&k) {
+                                        stored.members.push(k.clone());
+                                        stored.view.members.push(MemberView {
+                                            did: k.clone(),
+                                            role: MemberRole::Member,
+                                        });
+                                    }
+                                    if let Some(participants) = &mut stored.participants {
+                                        if !participants.iter().any(|p| p["userDid"].as_str() == Some(k.as_str())) {
+                                            participants.push(serde_json::json!({
+                                                "userDid": k,
+                                                "role": "member",
+                                                "status": "active",
+                                            }));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3234,19 +3298,17 @@ impl MLSAPIClient for MockDeliveryService {
                 let commit_bytes = inner_body
                     .get("commit")
                     .and_then(|c| c.get("bytes"))
-                    .and_then(|b| b.as_str())
+                    .and_then(|b| b.as_str().or_else(|| b.get("$bytes").and_then(|inner| inner.as_str())))
                     .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                     .unwrap_or_default();
                 let is_commit_transition = inner_body
                     .get("$type")
-                    .and_then(|t| t.as_str())
-                    .map_or(false, |t| t == "blue.catbird.chat.defs#commitTransitionBody");
+                    .and_then(|t| t.as_str()) == Some("blue.catbird.chat.defs#commitTransitionBody");
                 let is_external = is_commit_transition
-                    && inner_body
+                    && (inner_body
                         .get("next")
                         .and_then(|n| n.get("stateVersion"))
-                        .and_then(|v| v.as_i64())
-                        .map_or(false, |sv| sv == 0);
+                        .and_then(|v| v.as_i64()) == Some(0));
                 if is_external {
                     *guard.external_commit_counts.entry(convo_id.to_string()).or_default() += 1;
                     let group_id_opt = if let Some(c) = guard.conversations.get(&convo_id) {
@@ -3278,7 +3340,7 @@ impl MLSAPIClient for MockDeliveryService {
                     .and_then(|m| m.get("welcomeBundle"))
                     .or_else(|| inner_body.get("welcomeBundle"))
                     .and_then(|w| w.get("opaqueWelcome").or_else(|| w.get("bytes")))
-                    .and_then(|b| b.as_str())
+                    .and_then(|b| b.as_str().or_else(|| b.get("$bytes").and_then(|inner| inner.as_str())))
                     .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                     .or_else(|| {
                         inner_body
@@ -3311,6 +3373,43 @@ impl MLSAPIClient for MockDeliveryService {
                             }
                         }
                     }
+                    if !has_inbox_recovery {
+                        if let Some(bundle) = inner_body.pointer("/manifest/welcomeBundle") {
+                            if let Some(deliveries) = bundle.get("deliveries").and_then(|d| d.as_array()) {
+                                let next_seq = guard
+                                    .lifecycle_state_overrides
+                                    .get(&convo_id)
+                                    .and_then(|state| state["snapshotSeq"].as_u64())
+                                    .unwrap_or(1)
+                                    + 1;
+                                let expires_at = (Utc::now() + chrono::Duration::days(30))
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                                let mut normalized_next = inner_body["next"].clone();
+                                for key in ["groupId", "confirmationTag", "groupContextHash"] {
+                                    if let Some(bytes) = normalized_next[key]["$bytes"].as_str() {
+                                        normalized_next[key] = serde_json::json!(bytes);
+                                    }
+                                }
+                                for delivery in deliveries {
+                                    let welcome = serde_json::json!({
+                                        "$type": "blue.catbird.chat.defs#welcomeView",
+                                        "welcomeId": bundle["welcomeId"],
+                                        "conversationId": convo_id,
+                                        "transitionSeq": next_seq,
+                                        "coordinates": normalized_next,
+                                        "recipientDid": delivery["recipientDid"],
+                                        "recipientDeviceId": delivery["recipientDeviceId"],
+                                        "opaqueWelcome": bundle["opaqueWelcome"],
+                                        "sha256": bundle["sha256"],
+                                        "provenance": delivery["provenance"],
+                                        "expiresAt": expires_at,
+                                        "status": "pending",
+                                    });
+                                    guard.welcome_deliveries.push(welcome);
+                                }
+                            }
+                        }
+                    }
                 }
                 let receipt = if guard.issue_external_commit_receipts {
                     use sha2::{Digest, Sha256};
@@ -3326,7 +3425,7 @@ impl MLSAPIClient for MockDeliveryService {
                 } else {
                     None
                 };
-                let output = if recovery_request_id.is_some() {
+                let output = if has_inbox_recovery {
                     let next_seq = guard.lifecycle_state_overrides.get(&convo_id)
                         .and_then(|state| state["snapshotSeq"].as_u64()).unwrap_or(1) + 1;
                     // Canonical admission reads the full device-addressed
@@ -3400,7 +3499,7 @@ impl MLSAPIClient for MockDeliveryService {
                         receipt: receipt.clone(),
                     });
                 }
-                if recovery_request_id.is_some() {
+                if has_inbox_recovery {
                     let transition_id = idempotency_key.as_ref().unwrap();
                     guard.recovery_transition_responses.insert(transition_id.clone(), serde_json::to_vec(&output).unwrap());
                     guard.recovery_transition_requests.insert(transition_id.clone(), body_bytes.to_vec());
@@ -3816,12 +3915,33 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetPendingWelcomes => {
-                let guard = self.state.lock().unwrap();
+                let mut guard = self.state.lock().unwrap();
+                let effective_did = self.effective_did_from_guard(&guard);
+                if let Some(ref caller_did) = effective_did {
+                    let cids: Vec<String> = guard
+                        .conversations
+                        .iter()
+                        .filter(|(_, c)| {
+                            c.members.contains(caller_did)
+                                || c.participants.as_ref().is_some_and(|ps| {
+                                    ps.iter().any(|p| p["userDid"].as_str() == Some(caller_did.as_str()))
+                                })
+                        })
+                        .map(|(cid, _)| cid.clone())
+                        .collect();
+                    for cid in cids {
+                        *guard.get_welcome_calls.entry(cid).or_default() += 1;
+                    }
+                }
+                check_fail(
+                    &mut guard.failures.fail_next_get_welcome,
+                    "injected get_welcome failure",
+                )?;
                 let actor_device_id = request.path.split_once('?').map(|(_, query)| query)
                     .and_then(|query| query.split('&').find_map(|part| part.strip_prefix("actorDeviceId=")));
                 let output = serde_json::json!({
                     "items": guard.welcome_deliveries.iter().filter(|delivery|
-                        delivery["status"] == "pending" && delivery["recipientDid"].as_str() == self.effective_did_from_guard(&guard).as_deref()
+                        delivery["status"] == "pending" && delivery["recipientDid"].as_str() == effective_did.as_deref()
                             && delivery["recipientDeviceId"].as_str() == actor_device_id
                     ).cloned().collect::<Vec<_>>(),
                     "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
@@ -4473,14 +4593,18 @@ mod tests {
     /// trait method is the one product code actually reaches.
     #[tokio::test]
     async fn refuse_all_transport_covers_every_transport_method() {
-        use catbird_mls::orchestrator::canonical_transport::{
-            CanonicalOperation, PreparedRequest,
-        };
+        use catbird_mls::orchestrator::canonical_transport::{CanonicalOperation, PreparedRequest};
 
         let svc = MockDeliveryService::new("did:plc:alice");
-        svc.create_conversation("conv-1", Some(&["did:plc:bob".to_string()]), None, None, None)
-            .await
-            .unwrap();
+        svc.create_conversation(
+            "conv-1",
+            Some(&["did:plc:bob".to_string()]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         svc.publish_group_info("conv-1", b"gi").await.unwrap();
         svc.publish_key_package(b"kp", "suite", "2099-01-01", None)
             .await
@@ -4502,7 +4626,9 @@ mod tests {
                 .map(|_| ()),
             MLSAPIClient::publish_group_info(&svc, "conv-1", b"gi2").await,
             MLSAPIClient::publish_welcome(&svc, "conv-1", b"w").await,
-            MLSAPIClient::get_conversations(&svc, 10, None).await.map(|_| ()),
+            MLSAPIClient::get_conversations(&svc, 10, None)
+                .await
+                .map(|_| ()),
             MLSAPIClient::get_messages(&svc, "conv-1", None, 10, None, None, None)
                 .await
                 .map(|_| ()),
@@ -4514,7 +4640,9 @@ mod tests {
                 .await
                 .map(|_| ()),
             MLSAPIClient::list_devices(&svc, "dev").await.map(|_| ()),
-            MLSAPIClient::get_group_info(&svc, "conv-1").await.map(|_| ()),
+            MLSAPIClient::get_group_info(&svc, "conv-1")
+                .await
+                .map(|_| ()),
             MLSAPIClient::get_welcome(&svc, "conv-1").await.map(|_| ()),
             MLSAPIClient::get_delivery_status(&svc, "conv-1", &["m".to_string()])
                 .await
@@ -4541,7 +4669,9 @@ mod tests {
 
         // Restoring transport must return the service to normal operation.
         svc.allow_transport();
-        let page = MLSAPIClient::get_conversations(&svc, 10, None).await.unwrap();
+        let page = MLSAPIClient::get_conversations(&svc, 10, None)
+            .await
+            .unwrap();
         assert_eq!(page.conversations.len(), 1);
         assert_eq!(svc.refused_transport_calls(), refused.len());
     }

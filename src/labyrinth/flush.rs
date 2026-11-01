@@ -307,7 +307,10 @@ fn drop_rows(
     Ok(())
 }
 
-async fn conversation_roster(deps: &SessionDeps, conversation: &str) -> labyrinth::Result<Vec<String>> {
+async fn conversation_roster(
+    deps: &SessionDeps,
+    conversation: &str,
+) -> labyrinth::Result<Vec<String>> {
     let body = deps
         .transport
         .query(

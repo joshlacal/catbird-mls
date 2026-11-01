@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::duplicate_mod, clippy::type_complexity)]
 
 mod e2e_harness;
 #[path = "epoch_secret_test_support.rs"]
@@ -2616,7 +2616,11 @@ async fn receive_uses_resolved_group_id_but_stores_under_stable_conversation_id(
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator
-        .swap_members(&conversation.conversation_id, &[], &[bob_did.clone()])
+        .swap_members(
+            &conversation.conversation_id,
+            &[],
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add bob");
     let bob_api = world.delivery_service().clone_as(&bob.did);
@@ -2701,13 +2705,21 @@ async fn welcome_join_persists_history_under_stable_conversation_id() {
 
     let conversation = alice
         .orchestrator
-        .create_group("rotated welcome", Some(&[bob_did.clone()]), None)
+        .create_group(
+            "rotated welcome",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
         .await
         .expect("create group with bob");
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator
-        .swap_members(&conversation.conversation_id, &[], &[bob_did.clone()])
+        .swap_members(
+            &conversation.conversation_id,
+            &[],
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add bob");
     world

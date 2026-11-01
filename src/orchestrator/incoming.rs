@@ -263,8 +263,12 @@ mod tests {
         bare["signedRequest"]["body"]["applicationMessage"]["bytes"] =
             json!(STANDARD.encode([1, 2, 3]));
         bare["signedRequest"]["signature"] = json!(STANDARD.encode([9u8; 64]));
-        let lexicon = IncomingEnvelope::from_canonical_entry(&row(), CID).unwrap().unwrap();
-        let bare = IncomingEnvelope::from_canonical_entry(&bare, CID).unwrap().unwrap();
+        let lexicon = IncomingEnvelope::from_canonical_entry(&row(), CID)
+            .unwrap()
+            .unwrap();
+        let bare = IncomingEnvelope::from_canonical_entry(&bare, CID)
+            .unwrap()
+            .unwrap();
         assert_eq!(lexicon.ciphertext, [1, 2, 3]);
         assert_eq!(lexicon.ciphertext, bare.ciphertext);
         // Byte objects outside declared bytes fields and non-canonical base64

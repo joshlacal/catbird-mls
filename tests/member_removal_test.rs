@@ -11,6 +11,8 @@
 // - Removed members CANNOT decrypt messages after removal
 // - This is the proper MLS cryptographic removal (not server-side soft removal)
 
+#![allow(dead_code, unused_variables, unused_mut)]
+
 #[path = "epoch_secret_test_support.rs"]
 mod epoch_secret_test_support;
 
@@ -1307,7 +1309,7 @@ fn test_remove_nonexistent_member_graceful() {
 fn parse_public_commit_wire(
     bytes: &[u8],
 ) -> (Vec<u8>, Vec<openmls::messages::proposals_in::ProposalIn>) {
-    use openmls::messages::proposals_in::{ProposalIn, ProposalOrRefIn};
+    use openmls::messages::proposals_in::ProposalOrRefIn;
     use openmls::prelude::tls_codec::Deserialize;
     let mut inner = &bytes[4..]; // skip 2 bytes wire format + 2 bytes version
     let _group_id = VLBytes::tls_deserialize(&mut inner).unwrap();
@@ -1352,12 +1354,12 @@ fn test_removal_commit_aad_and_coordinates_regression() {
     let prior_gid = [0x33u8; 32];
 
     let aad_prior = serde_json::json!({
-        "confirmationTag": STANDARD.encode(&prior_tag),
+        "confirmationTag": STANDARD.encode(prior_tag),
         "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
         "epoch": 1,
         "generation": 0,
-        "groupContextHash": STANDARD.encode(&prior_gch),
-        "groupId": STANDARD.encode(&prior_gid),
+        "groupContextHash": STANDARD.encode(prior_gch),
+        "groupId": STANDARD.encode(prior_gid),
         "lifecycle": "active",
         "stateVersion": 1
     });

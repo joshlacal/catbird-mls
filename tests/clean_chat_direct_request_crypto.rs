@@ -5,34 +5,74 @@ use base64::{
     Engine as _,
 };
 use catbird_mls::orchestrator::direct_request_bootstrap::*;
+use catbird_mls::storage::{
+    driver_native::RusqliteKvBackend,
+    openmls_kv::{KvBackend, OpenMlsKvError, OpenMlsKvStorage},
+    schema::UNIFIED_SCHEMA_DDL,
+};
 use openmls::prelude::*;
 use openmls::treesync::LeafNodeSource;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_sqlite_storage::{Codec, SqliteStorageProvider};
 use openmls_traits::OpenMlsProvider;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize, Serialize};
 
-#[derive(Default)]
-struct Json;
-impl Codec for Json {
-    type Error = serde_json::Error;
-    fn to_vec<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Self::Error> {
-        serde_json::to_vec(v)
+struct OwnedRusqliteKv(Connection);
+
+impl KvBackend for OwnedRusqliteKv {
+    fn kv_get(
+        &self,
+        version: u16,
+        scope: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, OpenMlsKvError> {
+        RusqliteKvBackend(&self.0).kv_get(version, scope, key)
     }
-    fn from_slice<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T, Self::Error> {
-        serde_json::from_slice(v)
+
+    fn kv_put(
+        &self,
+        version: u16,
+        scope: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), OpenMlsKvError> {
+        RusqliteKvBackend(&self.0).kv_put(version, scope, key, value)
+    }
+
+    fn kv_delete(&self, version: u16, scope: &str, key: &[u8]) -> Result<(), OpenMlsKvError> {
+        RusqliteKvBackend(&self.0).kv_delete(version, scope, key)
+    }
+
+    fn kv_list_keys_in_scope(
+        &self,
+        version: u16,
+        scope: &str,
+    ) -> Result<Vec<Vec<u8>>, OpenMlsKvError> {
+        RusqliteKvBackend(&self.0).kv_list_keys_in_scope(version, scope)
+    }
+
+    fn kv_list_entries_in_scope(
+        &self,
+        version: u16,
+        scope: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, OpenMlsKvError> {
+        RusqliteKvBackend(&self.0).kv_list_entries_in_scope(version, scope)
+    }
+
+    fn kv_count_all(&self) -> Result<usize, OpenMlsKvError> {
+        RusqliteKvBackend(&self.0).kv_count_all()
     }
 }
+
 struct Provider {
-    storage: SqliteStorageProvider<Json, Connection>,
+    storage: OpenMlsKvStorage<OwnedRusqliteKv>,
     crypto: openmls_libcrux_crypto::CryptoProvider,
 }
 impl OpenMlsProvider for Provider {
     type CryptoProvider = openmls_libcrux_crypto::CryptoProvider;
     type RandProvider = openmls_libcrux_crypto::CryptoProvider;
-    type StorageProvider = SqliteStorageProvider<Json, Connection>;
+    type StorageProvider = OpenMlsKvStorage<OwnedRusqliteKv>;
     fn storage(&self) -> &Self::StorageProvider {
         &self.storage
     }
@@ -50,8 +90,8 @@ impl Provider {
             .unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         conn.pragma_update(None, "synchronous", "FULL").unwrap();
-        let mut storage = SqliteStorageProvider::new(conn);
-        storage.run_migrations().unwrap();
+        conn.execute_batch(UNIFIED_SCHEMA_DDL).unwrap();
+        let storage = OpenMlsKvStorage::new(OwnedRusqliteKv(conn));
         Self {
             storage,
             crypto: openmls_libcrux_crypto::CryptoProvider::new().unwrap(),
@@ -516,24 +556,17 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
     // separate SQLCipher connection. Rejection must precede ALL mutations.
     let snapshot = || {
         let connection = Connection::open(&alice_path).unwrap();
-        for (name, value) in [
-            ("cipher_memory_security", "OFF".to_string()),
-            ("key", "request-native-test-key".to_string()),
-            ("cipher_plaintext_header_size", "32".to_string()),
-            (
-                "cipher_salt",
-                format!(
-                    "x'{}'",
-                    hex::encode(&Sha256::digest(b"request-native-test-key")[..16])
-                ),
-            ),
-            ("cipher_page_size", "4096".to_string()),
-            ("kdf_iter", "256000".to_string()),
-            ("cipher_hmac_algorithm", "HMAC_SHA512".to_string()),
-            ("cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512".to_string()),
-        ] {
-            connection.pragma_update(None, name, value).unwrap();
-        }
+        let key_32 = catbird_mls::storage::derive_db_key_32_from_str("request-native-test-key");
+        let key_spec = catbird_mls::storage::derive_sqlcipher_96hex_key_spec(&key_32);
+        connection
+            .execute_batch(&format!(
+                "PRAGMA cipher_memory_security = OFF;\n\
+                 PRAGMA key = \"{key_spec}\";\n\
+                 PRAGMA cipher_plaintext_header_size = 32;\n\
+                 PRAGMA cipher_page_size = 4096;\n\
+                 PRAGMA journal_mode = WAL;"
+            ))
+            .unwrap();
         let tables: Vec<String> = connection
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()

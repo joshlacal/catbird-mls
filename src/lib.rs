@@ -1,12 +1,21 @@
+#![allow(
+    dead_code,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::module_inception
+)]
 pub mod blob_crypto;
 /// Clean chat protocol (`blue.catbird.chat.*`). Isolated from `orchestrator`;
 /// the two protocols never interoperate.
 pub mod chat_v2;
+pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
 #[cfg(not(target_arch = "wasm32"))]
 mod epoch_storage;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ffi;
 pub mod field_encryption;
 pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,6 +33,7 @@ mod mls_engine_context;
 pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform_lifecycle;
+pub mod push;
 pub mod recovery;
 pub mod requests;
 pub mod routing;
@@ -38,6 +48,8 @@ pub mod voice;
 pub mod atproto_bytes;
 
 pub use catbird_atproto as atproto;
+#[cfg(not(target_arch = "wasm32"))]
+pub use client::CatbirdMlsClient;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::*;
 pub use error::*;
@@ -56,6 +68,8 @@ pub use orchestrator::direct_request_types::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use platform_lifecycle::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use push::process_push_notification;
 pub use types::*;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -97,20 +111,26 @@ pub fn get_ffi_build_info() -> String {
 // Synchronous FFI/CLI -> async bridging without a background worker pool (`Spec §6.5` / `G1`).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod async_runtime {
-    /// Execute an async operation from synchronous code using a zero-pool
-    /// single-thread reactor when outside Tokio, `block_in_place` when inside
-    /// a multi-thread runtime, or a short-lived scoped current-thread runtime
-    /// when nested inside a current-thread runtime.
+    /// Execute an async operation from synchronous code without a persistent
+    /// global Tokio pool (`Spec §4` / `G1`; NSE push decryption never calls this
+    /// module). Uses `block_in_place` when already on a multi-thread runtime, or
+    /// an ephemeral 2-worker runtime torn down on return so nested synchronous
+    /// `block_on` calls inside spawned tasks never starve the outer future.
     pub fn block_on<F>(f: F) -> F::Output
     where
         F: std::future::Future + Send,
         F::Output: Send,
     {
-        let build_current_thread = || {
-            tokio::runtime::Builder::new_current_thread()
+        let run_ephemeral = |fut: F| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(4)
                 .enable_all()
                 .build()
-                .expect("Failed to create current-thread async runtime")
+                .expect("Failed to create ephemeral async runtime");
+            let out = rt.block_on(fut);
+            rt.shutdown_background();
+            out
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -119,13 +139,13 @@ pub(crate) mod async_runtime {
                     tokio::task::block_in_place(|| handle.block_on(f))
                 }
                 _ => std::thread::scope(|s| {
-                    s.spawn(|| build_current_thread().block_on(f))
+                    s.spawn(|| run_ephemeral(f))
                         .join()
                         .expect("async_runtime::block_on worker panicked")
                 }),
             }
         } else {
-            build_current_thread().block_on(f)
+            run_ephemeral(f)
         }
     }
 }

@@ -921,9 +921,7 @@ pub fn decode_clean_chat_error(
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RegisterPushGateway(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
-        }
+        CleanChatError::RegisterPushGateway(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::RelaySpaceCredential(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -4216,12 +4214,21 @@ mod variable_request_authority_tests {
             "prior": coordinates, "next": coordinates,
             "recordedAt": "2026-09-28T08:15:52.893Z"
         });
-        let first = canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).unwrap();
+        let first =
+            canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false)
+                .unwrap();
         receipt["authorityDid"] = serde_json::json!("did:web:ds2.fixture.catbird.blue");
-        let second = canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).unwrap();
+        let second =
+            canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false)
+                .unwrap();
         assert_ne!(first, second);
         receipt["authorityDid"] = serde_json::json!("not-a-did");
-        assert!(canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).is_err());
+        assert!(canonical_cbor_for_schema(
+            "directRequestAcceptanceCommitReceiptBody",
+            &receipt,
+            false
+        )
+        .is_err());
     }
 }
 
@@ -4285,10 +4292,7 @@ mod read_routing_extension_tests {
                 generated.sequencer_did.as_ref().map(|d| d.as_ref()),
                 wire["sequencerDid"].as_str()
             );
-            assert_eq!(
-                generated.sequencer_term,
-                wire["sequencerTerm"].as_i64()
-            );
+            assert_eq!(generated.sequencer_term, wire["sequencerTerm"].as_i64());
             assert_eq!(
                 decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
                 expected

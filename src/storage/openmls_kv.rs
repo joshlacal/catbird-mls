@@ -892,7 +892,8 @@ impl<B: KvBackend> StorageProvider<CURRENT_VERSION> for OpenMlsKvStorage<B> {
     ) -> Result<(), Self::Error> {
         let key = epoch_key_pairs_id(group_id, epoch, leaf_index)?;
         let bytes = serde_json::to_vec(key_pairs)?;
-        self.backend.kv_put(CURRENT_VERSION, SCOPE_EPOCH_KEY_PAIRS, &key, &bytes)
+        self.backend
+            .kv_put(CURRENT_VERSION, SCOPE_EPOCH_KEY_PAIRS, &key, &bytes)
     }
 
     fn encryption_epoch_key_pairs<
@@ -906,7 +907,10 @@ impl<B: KvBackend> StorageProvider<CURRENT_VERSION> for OpenMlsKvStorage<B> {
         leaf_index: u32,
     ) -> Result<Vec<HpkeKeyPair>, Self::Error> {
         let key = epoch_key_pairs_id(group_id, epoch, leaf_index)?;
-        match self.backend.kv_get(CURRENT_VERSION, SCOPE_EPOCH_KEY_PAIRS, &key)? {
+        match self
+            .backend
+            .kv_get(CURRENT_VERSION, SCOPE_EPOCH_KEY_PAIRS, &key)?
+        {
             Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
             None => Ok(Vec::new()),
         }

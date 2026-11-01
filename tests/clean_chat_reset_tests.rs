@@ -13,7 +13,6 @@ mod e2e_harness;
 use std::time::{Duration, Instant};
 
 use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
-use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
 use catbird_mls::orchestrator::reset_flow::ResetOutcome;
 use catbird_mls::orchestrator::types::{ConversationState, QuarantineReason};
 use e2e_harness::TestWorld;

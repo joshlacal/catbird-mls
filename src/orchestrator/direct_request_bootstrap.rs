@@ -597,7 +597,9 @@ pub fn open_request_metadata(
         .map_err(crypto_error)
 }
 /// Display fields of a signed canonical metadata plaintext.
-pub fn decode_request_metadata(plaintext: &[u8]) -> Result<crate::metadata::GroupMetadataV1, MLSError> {
+pub fn decode_request_metadata(
+    plaintext: &[u8],
+) -> Result<crate::metadata::GroupMetadataV1, MLSError> {
     #[derive(Deserialize)]
     struct Content {
         title: String,
@@ -736,7 +738,7 @@ pub(crate) fn adopt_request_welcome(
             return Ok(None);
         }
         let provider = Provider {
-            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
             crypto,
         };
         if MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
@@ -880,7 +882,7 @@ pub(crate) fn decrypt_introduction(
             )
             .map_err(error)?;
         let provider = Provider {
-            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
             crypto,
         };
         let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))

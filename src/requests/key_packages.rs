@@ -24,7 +24,11 @@ impl KeyPackageUsageScope {
         }
     }
 
-    pub fn validate_lifetime(self, not_before_sec: u64, not_after_sec: u64) -> Result<(), MLSError> {
+    pub fn validate_lifetime(
+        self,
+        not_before_sec: u64,
+        not_after_sec: u64,
+    ) -> Result<(), MLSError> {
         match self {
             Self::DirectRequest => {
                 validate_direct_request_key_package_lifetime(not_before_sec, not_after_sec)

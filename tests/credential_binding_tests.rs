@@ -1486,7 +1486,7 @@ async fn device_key_mismatch_rejects_add_without_epoch_change() {
     let error = world
         .client("Alice")
         .orchestrator
-        .swap_members(&convo.group_id, &[], &[bob_did.clone()])
+        .swap_members(&convo.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect_err("unauthorized device key must reject add_members");
     assert!(matches!(error, OrchestratorError::InvalidInput(_)));
@@ -1731,7 +1731,10 @@ async fn device_key_match_is_silent_and_cached_within_ttl() {
     let refs = alice
         .orchestrator
         .api_client()
-        .get_key_packages("00000000-0000-4000-8000-000000000001", &[bob_did.clone()])
+        .get_key_packages(
+            "00000000-0000-4000-8000-000000000001",
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("get_key_packages failed");
     assert!(!refs.is_empty(), "Bob should have published key packages");
@@ -1759,7 +1762,7 @@ async fn device_key_match_is_silent_and_cached_within_ttl() {
     world
         .client("Alice")
         .orchestrator
-        .swap_members(&convo1.group_id, &[], &[bob_did.clone()])
+        .swap_members(&convo1.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add_members 1 failed");
 
@@ -1784,7 +1787,7 @@ async fn device_key_match_is_silent_and_cached_within_ttl() {
         .expect("create_group 2 failed");
     alice
         .orchestrator
-        .swap_members(&convo2.group_id, &[], &[bob_did.clone()])
+        .swap_members(&convo2.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add_members 2 failed");
 

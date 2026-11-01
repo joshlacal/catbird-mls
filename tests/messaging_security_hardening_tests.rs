@@ -524,7 +524,7 @@ async fn external_join_authorization_rejection_does_not_advance_fork_or_rejoin_s
         .iter()
         .all(|transition| !matches!(
             transition.to,
-            ConversationState::ForkDetected { .. } | ConversationState::NeedsRejoin
+            ConversationState::ForkDetected | ConversationState::NeedsRejoin
         )));
 }
 
@@ -1509,7 +1509,7 @@ async fn response_lost_or_unrecorded_proof_withholds_cursor() {
     world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
-    let bob = world.client("Bob");
+    let _bob = world.client("Bob");
     let convo = alice
         .orchestrator
         .create_group("response-lost-cursor-withholding", None, None)
@@ -1619,7 +1619,7 @@ async fn post_set_aad_failure_restores_aad_and_echo_matches_exact_proof() {
     );
     // A failed Add must not contaminate the canonical application AAD chosen by
     // the next send. The protected proof and echoed wire header must match it.
-    let sent = alice
+    let _sent = alice
         .orchestrator
         .send_message(group_id, "hello with restored AAD")
         .await
@@ -2833,7 +2833,7 @@ async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lack
         .await
         .expect("create_group");
     let group_id = &convo.group_id;
-    let convo_id = &convo.conversation_id;
+    let _convo_id = &convo.conversation_id;
 
     let send_count_before = world
         .delivery_service()

@@ -9,9 +9,7 @@ use labyrinth::records::{
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::space::{SpaceError, SpaceMailboxStore, SpaceRpc};
-use labyrinth::store::{
-    AtomicEnrollBundle, MailboxStore, MaybeSend, MaybeSync, Stored, TimeRange,
-};
+use labyrinth::store::{AtomicEnrollBundle, MailboxStore, MaybeSend, MaybeSync, Stored, TimeRange};
 use serde::{Deserialize, Serialize};
 
 use super::state::StateVault;
@@ -99,7 +97,8 @@ pub trait SpaceResponseMacVerifier: MaybeSend + MaybeSync {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait LabyrinthSpaceGateway: MaybeSend + MaybeSync {
-    async fn submit_space(&self, request: LabyrinthSpaceRequest) -> Result<GatewayResponse, String>;
+    async fn submit_space(&self, request: LabyrinthSpaceRequest)
+        -> Result<GatewayResponse, String>;
 
     async fn submit_space_with_headers(
         &self,
@@ -666,7 +665,9 @@ impl ResolvingSpaceThreadStore {
     }
 
     /// Lists conversation Space URIs owned/participated in according to `com.atproto.space.listSpaces`.
-    pub async fn owned_conversation_spaces(space_rpc: &dyn SpaceRpc) -> labyrinth::Result<Vec<String>> {
+    pub async fn owned_conversation_spaces(
+        space_rpc: &dyn SpaceRpc,
+    ) -> labyrinth::Result<Vec<String>> {
         let body = space_rpc
             .query("com.atproto.space.listSpaces", &[])
             .await
@@ -715,10 +716,7 @@ impl labyrinth::store::ThreadStore for ResolvingSpaceThreadStore {
         self.inner.author()
     }
 
-    async fn create_mek(
-        &self,
-        mek: &labyrinth::records::MekDistribution,
-    ) -> labyrinth::Result<()> {
+    async fn create_mek(&self, mek: &labyrinth::records::MekDistribution) -> labyrinth::Result<()> {
         self.ensure_thread_space(&mek.thread_id).await?;
         self.inner.create_mek(mek).await
     }
@@ -763,7 +761,9 @@ impl labyrinth::store::ThreadStore for ResolvingSpaceThreadStore {
         redaction: &labyrinth::deletion::Redaction,
     ) -> labyrinth::Result<usize> {
         self.ensure_thread_space(thread_id).await?;
-        self.inner.redact_item(thread_id, message_id, redaction).await
+        self.inner
+            .redact_item(thread_id, message_id, redaction)
+            .await
     }
 
     async fn upload_and_commit_attachment(

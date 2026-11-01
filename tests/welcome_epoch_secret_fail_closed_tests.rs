@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use async_trait::async_trait;
 use catbird_mls::{
     EpochSecretStorage, GroupConfig, KeyPackageData, KeychainAccess, MLSContext, MLSError,
@@ -265,13 +266,15 @@ fn post_export_welcome_failure_deletes_the_exact_epoch_secret() {
         )
         .expect("install post-export failure trigger");
 
-    match bob.process_welcome(
-        add.welcome_data,
-        b"did:plc:bob".to_vec(),
-        Some(GroupConfig::default()),
-    ) {
-        Ok(_) => panic!("post-export manifest failure must reject Welcome adoption"),
-        Err(_) => {}
+    if bob
+        .process_welcome(
+            add.welcome_data,
+            b"did:plc:bob".to_vec(),
+            Some(GroupConfig::default()),
+        )
+        .is_ok()
+    {
+        panic!("post-export manifest failure must reject Welcome adoption")
     }
 
     assert_eq!(epoch_state.delete_calls.load(Ordering::SeqCst), 1);

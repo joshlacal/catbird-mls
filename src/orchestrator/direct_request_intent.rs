@@ -123,9 +123,8 @@ impl DirectRequestIntent {
                 value["receiptKeyId"].as_str().ok_or_else(invalid)?,
             )
             .map_err(|_| invalid())?;
-            let snapshot =
-                verify_direct_request_preparation_for_authority(&auth_did, raw, &key)
-                    .map_err(|_| invalid())?;
+            let snapshot = verify_direct_request_preparation_for_authority(&auth_did, raw, &key)
+                .map_err(|_| invalid())?;
             for field in [
                 "requestId",
                 "firstMessageId",
@@ -498,4 +497,3 @@ pub(super) fn merge_trusted_documents(previous: &[u8], current: &[u8]) -> Result
     let auth = prev_val["id"].as_str().ok_or_else(invalid)?;
     merge_trusted_documents_for_expected_authority(previous, current, auth)
 }
-

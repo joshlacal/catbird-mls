@@ -704,7 +704,7 @@ mod tests {
             .clone();
         metadata_snapshot["coordinate"]["epoch"] = serde_json::json!(1);
         metadata_snapshot["nonce"] =
-            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&nonce));
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(nonce));
         metadata_snapshot["ciphertext"] =
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&ciphertext));
         metadata_snapshot["ciphertextSha256"] = serde_json::json!(
@@ -857,8 +857,8 @@ mod tests {
             .orchestrator
             .swap_members(
                 &conversation.group_id,
-                &[bob_did.clone()],
-                &[carol_did.clone()],
+                std::slice::from_ref(&bob_did),
+                std::slice::from_ref(&carol_did),
             )
             .await
             .expect_err("higher DS epoch must not authorize merge");
@@ -1270,7 +1270,7 @@ mod tests {
 
         let initial = alice
             .orchestrator
-            .create_group("initial direct", Some(&[bob.did.clone()]), None)
+            .create_group("initial direct", Some(std::slice::from_ref(&bob.did)), None)
             .await
             .expect("create initial direct conversation");
 
@@ -1312,7 +1312,7 @@ mod tests {
 
         let duplicate = alice
             .orchestrator
-            .create_group("duplicate direct", Some(&[bob.did.clone()]), None)
+            .create_group("duplicate direct", Some(std::slice::from_ref(&bob.did)), None)
             .await
             .expect("duplicate create with existingDirectConversationResult must succeed by returning existing");
 
@@ -1364,7 +1364,11 @@ mod tests {
         );
         let err_missing = alice
             .orchestrator
-            .create_group("test missing type", Some(&[bob.did.clone()]), None)
+            .create_group(
+                "test missing type",
+                Some(std::slice::from_ref(&bob.did)),
+                None,
+            )
             .await
             .expect_err("missing $type must fail");
         assert!(
@@ -1389,7 +1393,11 @@ mod tests {
         );
         let err_shorthand = alice
             .orchestrator
-            .create_group("test shorthand type", Some(&[bob.did.clone()]), None)
+            .create_group(
+                "test shorthand type",
+                Some(std::slice::from_ref(&bob.did)),
+                None,
+            )
             .await
             .expect_err("shorthand $type must fail");
         assert!(
@@ -1415,7 +1423,7 @@ mod tests {
         // Server has the authoritative group
         let auth_convo = bob
             .orchestrator
-            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .create_group("direct convo", Some(std::slice::from_ref(&alice.did)), None)
             .await
             .expect("bob creates convo");
         let auth_group_hex = auth_convo.group_id.clone();
@@ -1462,7 +1470,11 @@ mod tests {
 
         let adopted = alice
             .orchestrator
-            .create_group("duplicate direct", Some(&[bob.did.clone()]), None)
+            .create_group(
+                "duplicate direct",
+                Some(std::slice::from_ref(&bob.did)),
+                None,
+            )
             .await
             .expect("must adopt authoritative existing conversation");
 
@@ -1499,7 +1511,7 @@ mod tests {
         // Bob creates the initial direct conversation
         let bob_convo = bob
             .orchestrator
-            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .create_group("direct convo", Some(std::slice::from_ref(&alice.did)), None)
             .await
             .expect("bob creates convo");
         let convo_id = bob_convo.conversation_id.clone();
@@ -1543,7 +1555,11 @@ mod tests {
 
         let res = alice
             .orchestrator
-            .create_group("alice create direct", Some(&[bob.did.clone()]), None)
+            .create_group(
+                "alice create direct",
+                Some(std::slice::from_ref(&bob.did)),
+                None,
+            )
             .await
             .expect("resolves from server and persists locally");
 
@@ -1588,7 +1604,7 @@ mod tests {
         // Bob creates the authoritative direct conversation on server
         let bob_convo = bob
             .orchestrator
-            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .create_group("direct convo", Some(std::slice::from_ref(&alice.did)), None)
             .await
             .expect("bob creates convo");
         let convo_id = bob_convo.conversation_id.clone();
@@ -1667,7 +1683,11 @@ mod tests {
 
         let adopted = alice
             .orchestrator
-            .create_group("alice duplicate direct", Some(&[bob.did.clone()]), None)
+            .create_group(
+                "alice duplicate direct",
+                Some(std::slice::from_ref(&bob.did)),
+                None,
+            )
             .await
             .expect("must adopt authoritative existing conversation");
 
@@ -1709,7 +1729,7 @@ mod tests {
         // Bob creates the authoritative direct conversation on server
         let bob_convo = bob
             .orchestrator
-            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .create_group("direct convo", Some(std::slice::from_ref(&alice.did)), None)
             .await
             .expect("bob creates convo");
         let convo_id = bob_convo.conversation_id.clone();
@@ -1768,7 +1788,11 @@ mod tests {
 
         let res = alice
             .orchestrator
-            .create_group("alice duplicate direct", Some(&[bob.did.clone()]), None)
+            .create_group(
+                "alice duplicate direct",
+                Some(std::slice::from_ref(&bob.did)),
+                None,
+            )
             .await
             .expect("must resolve from storage");
 
@@ -1811,7 +1835,7 @@ mod tests {
 
         let created = alice
             .orchestrator
-            .create_group("alice group", Some(&[bob.did.clone()]), None)
+            .create_group("alice group", Some(std::slice::from_ref(&bob.did)), None)
             .await
             .expect("create conversation");
         world
@@ -1905,7 +1929,7 @@ mod tests {
 
         let created = alice
             .orchestrator
-            .create_group("a", Some(&[bob.did.clone()]), None)
+            .create_group("a", Some(std::slice::from_ref(&bob.did)), None)
             .await
             .expect("create conversation");
 
@@ -2970,7 +2994,7 @@ mod tests {
             .expect("register alice device 1");
         let alice = world.client("Alice");
 
-        let created = alice
+        let _created = alice
             .orchestrator
             .create_group("alice group", None, None)
             .await
@@ -3654,23 +3678,23 @@ where
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
+                    "confirmationTag": { "$bytes": STANDARD.encode(confirmation_tag) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": 0,
                     "generation": 0,
-                    "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
+                    "groupContextHash": { "$bytes": STANDARD.encode(group_context_hash) },
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": 1,
-                "nonce": { "$bytes": STANDARD.encode(&nonce) },
+                "nonce": { "$bytes": STANDARD.encode(nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
-                "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
+                "confirmationTag": { "$bytes": STANDARD.encode(confirmation_tag) },
                 "conversationId": conversation_id,
                 "epoch": 0,
                 "generation": 0,
-                "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
+                "groupContextHash": { "$bytes": STANDARD.encode(group_context_hash) },
                 "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
@@ -3848,10 +3872,7 @@ where
             }
         }
 
-        let bootstrap_target_epoch = if initial_members
-            .dids
-            .as_ref()
-            .map_or(false, |d| !d.is_empty())
+        let bootstrap_target_epoch = if initial_members.dids.as_ref().is_some_and(|d| !d.is_empty())
         {
             Some(1)
         } else {
@@ -4667,7 +4688,7 @@ where
             ));
         }
         self.verify_fetched_key_packages(
-            &[requester_did.clone()],
+            std::slice::from_ref(&requester_did),
             &[KeyPackageRef {
                 did: requester_did.clone(),
                 key_package_data: kp_bytes.clone(),
@@ -4843,7 +4864,7 @@ where
             },
             "originTransitionId": origin_transition_id,
             "metadataVersion": metadata_version,
-            "nonce": { "$bytes": STANDARD.encode(&nonce) },
+            "nonce": { "$bytes": STANDARD.encode(nonce) },
             "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
             "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
             "ciphertextSize": ciphertext.len(),
@@ -5517,7 +5538,7 @@ where
             if let Some(existing) = existing_participants {
                 if existing
                     .iter()
-                    .any(|p| p.get("userDid").and_then(|v| v.as_str()) == Some(&root_did))
+                    .any(|p| p.get("userDid").and_then(|v| v.as_str()) == Some(root_did))
                 {
                     return Err(OrchestratorError::InvalidInput(format!(
                         "participant {root_did} is already a member of conversation {conversation_id}"
@@ -5959,7 +5980,7 @@ where
     /// Commit pending self-remove proposals for a group.
     pub async fn commit_self_remove_proposals(&self, convo_id: &str) -> Result<()> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
+        let _user_did = self.require_user_did().await?;
 
         tracing::info!(convo_id, "Committing pending self-remove proposals");
 
@@ -6112,7 +6133,7 @@ where
         description: Option<&str>,
         avatar_blob_locator: Option<&str>,
         avatar_content_type: Option<&str>,
-        avatar_bytes: Option<&[u8]>,
+        _avatar_bytes: Option<&[u8]>,
     ) -> Result<()> {
         self.check_shutdown().await?;
 
@@ -6233,16 +6254,16 @@ where
 
         let metadata_snapshot = serde_json::json!({
             "coordinate": {
-                "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+                "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "epoch": prior_epoch,
                 "generation": 0,
-                "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-                "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) }
+                "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+                "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) }
             },
             "originTransitionId": transition_id,
             "metadataVersion": target_metadata_version,
-            "nonce": { "$bytes": STANDARD.encode(&nonce) },
+            "nonce": { "$bytes": STANDARD.encode(nonce) },
             "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
             "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
             "ciphertextSize": ciphertext.len(),
@@ -6260,23 +6281,23 @@ where
         });
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+            "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
+            "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
 
         let next_coord = serde_json::json!({
-            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+            "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
+            "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv + 1
         });
@@ -6598,10 +6619,7 @@ where
                 ))
             })?;
             match self.mls_context().get_epoch(group_id) {
-                Ok(current_epoch)
-                    if allowed_epochs
-                        .iter()
-                        .any(|epoch| *epoch == Some(current_epoch)) => {}
+                Ok(current_epoch) if allowed_epochs.contains(&Some(current_epoch)) => {}
                 Ok(_) => return Ok(false),
                 Err(crate::MLSError::GroupNotFound { .. }) => {}
                 Err(error) => return Err(error.into()),
@@ -6633,11 +6651,7 @@ where
                 ))
             })?;
             match self.mls_context().get_epoch(group_id.clone()) {
-                Ok(current_epoch)
-                    if allowed_epochs
-                        .iter()
-                        .any(|epoch| *epoch == Some(current_epoch)) =>
-                {
+                Ok(current_epoch) if allowed_epochs.contains(&Some(current_epoch)) => {
                     match self.mls_context().delete_group(group_id) {
                         Ok(()) | Err(crate::MLSError::GroupNotFound { .. }) => {
                             cleaned.insert(group_id_hex.to_string());
@@ -7105,12 +7119,12 @@ where
         });
 
         let aad_prior = serde_json::json!({
-            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+            "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
             "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
+            "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -7127,12 +7141,12 @@ where
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+            "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
+            "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -7313,7 +7327,7 @@ where
             }
         }
 
-        let (prior_coord, prior_mv, next_entry_seq) = match self
+        let (prior_coord, _prior_mv, next_entry_seq) = match self
             .fetch_current_conversation_coordinates(conversation_id)
             .await
         {
@@ -7360,12 +7374,12 @@ where
         });
 
         let aad_prior = serde_json::json!({
-            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+            "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
             "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
+            "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -7379,12 +7393,12 @@ where
         });
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
+            "confirmationTag": { "$bytes": STANDARD.encode(prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
-            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
+            "groupContextHash": { "$bytes": STANDARD.encode(prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -7445,7 +7459,7 @@ where
                     "groupId": { "$bytes": STANDARD.encode(group_id) }
                 },
                 "metadataVersion": target_metadata_version,
-                "nonce": { "$bytes": STANDARD.encode(&nonce) },
+                "nonce": { "$bytes": STANDARD.encode(nonce) },
                 "originTransitionId": transition_id
             },
             "next": next_clean,

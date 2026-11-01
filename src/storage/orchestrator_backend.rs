@@ -70,7 +70,7 @@ fn now_ms() -> i64 {
 
 fn encode_group_id_blob(group_id_str: &str) -> Vec<u8> {
     if !group_id_str.is_empty()
-        && group_id_str.len() % 2 == 0
+        && group_id_str.len().is_multiple_of(2)
         && group_id_str.bytes().all(|b| b.is_ascii_hexdigit())
     {
         if let Ok(decoded) = hex::decode(group_id_str) {
@@ -113,7 +113,20 @@ fn load_conversation_envelope(
     rx: &SqlReadTx<'_>,
     conversation_id: &str,
 ) -> Result<Option<StoredConversationEnvelope>, MLSError> {
-    let row: Option<(Vec<u8>, i64, i64, String, i64, String, Option<String>, i64, String, Option<String>, Option<String>, i64)> = rx
+    let row: Option<(
+        Vec<u8>,
+        i64,
+        i64,
+        String,
+        i64,
+        String,
+        Option<String>,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+    )> = rx
         .conn()
         .query_row(
             "SELECT group_id, generation, epoch, join_method, join_epoch, state_tag, state_json, \
@@ -160,8 +173,9 @@ fn load_conversation_envelope(
 
     if let Some(json) = state_json {
         if !json.is_empty() {
-            let mut env: StoredConversationEnvelope = serde_json::from_str(&json)
-                .map_err(|e| MLSError::invalid_input(format!("corrupt state_json for {conversation_id}: {e}")))?;
+            let mut env: StoredConversationEnvelope = serde_json::from_str(&json).map_err(|e| {
+                MLSError::invalid_input(format!("corrupt state_json for {conversation_id}: {e}"))
+            })?;
             env.needs_rejoin = needs_rejoin_col != 0;
             return Ok(Some(env));
         }
@@ -242,7 +256,7 @@ fn save_conversation_envelope(
         .view
         .canonical_state
         .as_ref()
-        .map(|s| s.coordinates.generation as i64)
+        .map(|s| s.coordinates.generation)
         .unwrap_or(0);
     let epoch = env.view.epoch as i64;
     let join_method = join_method_str(env.join_method);
@@ -725,13 +739,13 @@ impl MLSStorageBackend for MlsAccountDb {
         attempted_at_ms: i64,
     ) -> OrchResult<()> {
         self.write_tx(|tx| {
-            let mut ts_list: Vec<i64> =
-                if let Some(raw) = load_pending_op(tx.conn(), OP_WELCOME_REISSUE, conversation_id)?
-                {
-                    serde_json::from_str(&raw).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+            let mut ts_list: Vec<i64> = if let Some(raw) =
+                load_pending_op(tx.conn(), OP_WELCOME_REISSUE, conversation_id)?
+            {
+                serde_json::from_str(&raw).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             ts_list.push(attempted_at_ms);
             let json = serde_json::to_string(&ts_list)
                 .map_err(|e| MLSError::invalid_input(format!("serialize welcome_reissue: {e}")))?;
@@ -762,7 +776,12 @@ impl MLSStorageBackend for MlsAccountDb {
             };
             let payload_json = serde_json::to_string(&payload)
                 .map_err(|e| MLSError::invalid_input(format!("serialize reset_pending: {e}")))?;
-            tx.put_pending_op(OP_RESET_PENDING, conversation_id, &payload_json, notified_at_ms)?;
+            tx.put_pending_op(
+                OP_RESET_PENDING,
+                conversation_id,
+                &payload_json,
+                notified_at_ms,
+            )?;
 
             let prev_high = load_reset_high_water(tx.conn(), conversation_id)?.unwrap_or(0);
             let next_high = prev_high.max(reset_generation);
@@ -1085,24 +1104,24 @@ impl MLSStorageBackend for MlsAccountDb {
             )?;
             let mut out = Vec::with_capacity(rows.len());
             for row in rows.into_iter().rev() {
-                let (text, payload_json, delivery_status, timestamp) =
-                    if let Ok(env) = serde_json::from_str::<StoredMessageEnvelope>(&row.plaintext_json)
-                    {
-                        let ts = DateTime::parse_from_rfc3339(&env.timestamp_rfc3339)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| {
-                                Utc.timestamp_millis_opt(row.created_at_ms)
-                                    .single()
-                                    .unwrap_or_else(Utc::now)
-                            });
-                        (env.text, env.payload_json, env.delivery_status, ts)
-                    } else {
-                        let ts = Utc
-                            .timestamp_millis_opt(row.created_at_ms)
-                            .single()
-                            .unwrap_or_else(Utc::now);
-                        (row.plaintext_json, None, None, ts)
-                    };
+                let (text, payload_json, delivery_status, timestamp) = if let Ok(env) =
+                    serde_json::from_str::<StoredMessageEnvelope>(&row.plaintext_json)
+                {
+                    let ts = DateTime::parse_from_rfc3339(&env.timestamp_rfc3339)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| {
+                            Utc.timestamp_millis_opt(row.created_at_ms)
+                                .single()
+                                .unwrap_or_else(Utc::now)
+                        });
+                    (env.text, env.payload_json, env.delivery_status, ts)
+                } else {
+                    let ts = Utc
+                        .timestamp_millis_opt(row.created_at_ms)
+                        .single()
+                        .unwrap_or_else(Utc::now);
+                    (row.plaintext_json, None, None, ts)
+                };
                 out.push(Message {
                     id: row.message_id,
                     conversation_id: row.conversation_id,
@@ -1395,7 +1414,10 @@ impl MLSStorageBackend for MlsAccountDb {
         let scope_key = format!("{CONVO_RECOVERY_PREFIX}{conversation_id}");
         self.write_tx(|tx| {
             tx.conn()
-                .execute("DELETE FROM recovery_state WHERE scope_key = ?1", [scope_key])
+                .execute(
+                    "DELETE FROM recovery_state WHERE scope_key = ?1",
+                    [scope_key],
+                )
                 .map_err(|e| map_rusqlite_err("clear_recovery_backoff", &e))?;
             Ok(())
         })

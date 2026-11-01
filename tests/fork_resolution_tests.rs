@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::type_complexity)]
 
 mod e2e_harness;
 
@@ -20,8 +20,6 @@ use e2e_harness::mock_api_client::MockDeliveryService;
 use e2e_harness::mock_credentials::MockCredentials;
 use e2e_harness::mock_storage::MockStorage;
 use e2e_harness::{TestClient, TestWorld};
-use openmls::prelude::{MlsMessageIn, Welcome};
-use tls_codec::Deserialize;
 
 /// Canonical requests carry their payload as `{"signedRequest": {"body": …}}`, `{"body": …}`,
 /// or as the bare payload itself.
@@ -441,7 +439,6 @@ async fn conversation_id_for(client: &TestClient, group_id: &str) -> String {
         .conversation_id
         .clone()
 }
-
 
 async fn build_recording_orchestrator(
     source: &TestClient,

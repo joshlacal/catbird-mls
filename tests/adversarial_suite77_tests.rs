@@ -17,7 +17,6 @@ use catbird_mls::orchestrator::{
 use catbird_mls::MLSError;
 use e2e_harness::TestWorld;
 
-use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;

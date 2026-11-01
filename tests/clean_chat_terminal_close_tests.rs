@@ -26,7 +26,7 @@ async fn closed_pair_with_closing_device(new_device: bool) -> (TestWorld, String
     let bob = world.client("Bob");
     let created = alice
         .orchestrator
-        .create_group("", Some(&[bob.did.clone()]), None)
+        .create_group("", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .unwrap();
     let cid = created.conversation_id;

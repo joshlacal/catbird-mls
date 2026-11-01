@@ -9,7 +9,7 @@
 
 mod e2e_harness;
 
-use catbird_mls::orchestrator::{MLSAPIClient, MLSStorageBackend};
+use catbird_mls::orchestrator::MLSStorageBackend;
 use chrono::{Duration, Utc};
 use e2e_harness::TestWorld;
 

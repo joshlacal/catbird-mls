@@ -17,6 +17,7 @@ pub const MAX_METADATA_SNAPSHOT_BYTES: usize = 16 * 1024;
 /// Pointer inside `GroupMetadataV1` to an encrypted group avatar blob stored in
 /// `setter_did`'s repo inside the conversation's ATProto Space (`1A`, zero `mls-ds` blobs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
 pub struct SpaceAvatarPointer {
     pub setter_did: String,
@@ -80,11 +81,8 @@ where
         return Ok(None);
     }
 
-    let ciphertext = fetch_encrypted_avatar(
-        pointer.setter_did.clone(),
-        pointer.space_blob_cid.clone(),
-    )
-    .await?;
+    let ciphertext =
+        fetch_encrypted_avatar(pointer.setter_did.clone(), pointer.space_blob_cid.clone()).await?;
 
     let computed_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
     if pointer.sha256.as_slice() != computed_sha256.as_slice() {

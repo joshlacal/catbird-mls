@@ -11,6 +11,7 @@
 //
 // NO custom serialization, NO FFI, NO JSON - just the documented OpenMLS flow.
 
+#![allow(dead_code)]
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -29,7 +30,7 @@ struct TestUser {
 fn create_test_user(
     name: &str,
     ciphersuite: Ciphersuite,
-    provider: &OpenMlsRustCrypto,
+    _provider: &OpenMlsRustCrypto,
 ) -> TestUser {
     let identity = name.as_bytes().to_vec();
     let credential = BasicCredential::new(identity.clone());
@@ -357,7 +358,7 @@ fn test_serialize_at_different_stages() {
     )
     .unwrap();
 
-    let snapshot1 = alice_provider.storage().values.read().unwrap().clone();
+    let _snapshot1 = alice_provider.storage().values.read().unwrap().clone();
     let count1 = alice_provider.storage().values.read().unwrap().len();
     println!("📊 Stage 1 (after group creation): {} entries", count1);
 
@@ -367,7 +368,7 @@ fn test_serialize_at_different_stages() {
         .add_members(&alice_provider, &alice.signer, &[bob_key_package])
         .unwrap();
 
-    let snapshot2 = alice_provider.storage().values.read().unwrap().clone();
+    let _snapshot2 = alice_provider.storage().values.read().unwrap().clone();
     let count2 = alice_provider.storage().values.read().unwrap().len();
     println!(
         "📊 Stage 2 (after add_members, before merge): {} entries",

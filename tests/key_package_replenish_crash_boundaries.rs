@@ -404,8 +404,16 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
             )
             .unwrap();
 
-        assert_eq!(count_openmls_kps(&conn), 1, "openmls_kv KeyPackage must have 1 row");
-        assert_eq!(count_kp_bundles(&conn), 1, "pending_ops kp_bundle must have 1 row");
+        assert_eq!(
+            count_openmls_kps(&conn),
+            1,
+            "openmls_kv KeyPackage must have 1 row"
+        );
+        assert_eq!(
+            count_kp_bundles(&conn),
+            1,
+            "pending_ops kp_bundle must have 1 row"
+        );
         assert_eq!(quarantined_count, 0, "Quarantined count must be 0");
     }
 }

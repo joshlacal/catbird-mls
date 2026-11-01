@@ -17,7 +17,7 @@ use super::session::{
     SessionDeps,
 };
 use super::signer::ChatKeySigner;
-use super::space::{MlsPlacementVault, Placement, SpaceXrpcTransport, thread_placement_key};
+use super::space::{thread_placement_key, MlsPlacementVault, Placement, SpaceXrpcTransport};
 use super::state::MlsStateVault;
 use super::status::{now_ms, PendingDeletion};
 use super::transport::{ApiGateway, GatewayXrpcTransport};
@@ -197,7 +197,8 @@ where
             } else {
                 None
             };
-        let space: Option<Arc<dyn SpaceRpc>> = if self.api_client().labyrinth_space_enabled().await {
+        let space: Option<Arc<dyn SpaceRpc>> = if self.api_client().labyrinth_space_enabled().await
+        {
             Some(Arc::new(SpaceXrpcTransport::new(gateway.clone())))
         } else {
             None
@@ -237,10 +238,10 @@ where
         *self.labyrinth_slot().lock().await = None;
     }
 
-    async fn ensure_opened_in_slot<'a>(
-        guard: &'a mut Option<LabyrinthSession>,
+    async fn ensure_opened_in_slot(
+        guard: &mut Option<LabyrinthSession>,
         deps: SessionDeps,
-    ) -> Result<Option<&'a mut LabyrinthSession>> {
+    ) -> Result<Option<&mut LabyrinthSession>> {
         let key = deps.signer.public_key();
         if !guard.as_ref().is_some_and(|s| s.is_for(&deps.did, &key)) {
             *guard = None;
@@ -252,7 +253,9 @@ where
     pub async fn labyrinth_is_enabled(&self) -> Result<bool> {
         let deps = self.labyrinth_deps().await?;
         let mut guard = self.labyrinth_slot().lock().await;
-        Ok(Self::ensure_opened_in_slot(&mut guard, deps).await?.is_some())
+        Ok(Self::ensure_opened_in_slot(&mut guard, deps)
+            .await?
+            .is_some())
     }
 
     pub async fn labyrinth_enable(&self) -> Result<String> {
@@ -665,12 +668,13 @@ where
             if !enabled {
                 return Ok(());
             }
-            let (group_id_hex, mls_epoch, expected_member_dids) = mls_snapshot.ok_or_else(|| {
-                OrchestratorError::Storage(
+            let (group_id_hex, mls_epoch, expected_member_dids) =
+                mls_snapshot.ok_or_else(|| {
+                    OrchestratorError::Storage(
                     "labyrinth: cannot archive sent message without local OpenMLS roster snapshot"
                         .into(),
                 )
-            })?;
+                })?;
             if expected_member_dids.is_empty() {
                 return Err(OrchestratorError::Storage(
                     "labyrinth: local OpenMLS roster snapshot is empty".into(),
@@ -701,7 +705,10 @@ where
             let deps = self.labyrinth_deps().await?;
             let mut guard = self.labyrinth_slot().lock().await;
             match Self::ensure_opened_in_slot(&mut guard, deps).await? {
-                Some(session) => session.rearchive_before_leave(conversation_id).await.map(Some),
+                Some(session) => session
+                    .rearchive_before_leave(conversation_id)
+                    .await
+                    .map(Some),
                 None => Ok(None),
             }
         }

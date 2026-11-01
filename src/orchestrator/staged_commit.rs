@@ -165,7 +165,7 @@ where
         kind: CommitKind,
     ) -> Result<CommitPlan> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
+        let _user_did = self.require_user_did().await?;
 
         let group_id_bytes = hex::decode(group_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
@@ -484,7 +484,7 @@ where
         // pending metadata before consuming the nonce-bearing handle. A
         // concurrent lifecycle transition or malformed group id must leave
         // the caller able to confirm or discard the same staged commit.
-        let user_did = self.require_user_did().await?;
+        let _user_did = self.require_user_did().await?;
         let group_id_bytes = hex::decode(&handle.group_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 

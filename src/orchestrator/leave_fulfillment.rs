@@ -273,7 +273,7 @@ where
         let mut snapshot = state["metadataSnapshot"].clone();
         let opened = self.open_metadata_snapshot(
             &snapshot,
-            &super::metadata_snapshot::MetadataScheme::recorded(&state),
+            &super::metadata_snapshot::MetadataScheme::recorded(state),
             conversation_id,
             &group,
         )?;

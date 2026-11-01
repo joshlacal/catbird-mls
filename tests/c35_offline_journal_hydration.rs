@@ -24,8 +24,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use catbird_mls::chat_v2::transcript::direct_request as protocol;
 use catbird_mls::orchestrator::{
-    canonical_transport::CanonicalOperation as Op, CredentialStore, MlsCryptoContext,
-    MLSOrchestrator, OrchestratorConfig, OrchestratorError,
+    canonical_transport::CanonicalOperation as Op, CredentialStore, MLSOrchestrator,
+    MlsCryptoContext, OrchestratorConfig, OrchestratorError,
 };
 use catbird_mls::{DirectRequestInput, DirectRequestOutcome, MLSContext};
 use e2e_harness::TestWorld;
@@ -132,7 +132,12 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
     );
 
     let prepare = last_prepare(&world);
-    let device = alice.credentials.get_device_uuid(&alice.did).await.unwrap().unwrap();
+    let device = alice
+        .credentials
+        .get_device_uuid(&alice.did)
+        .await
+        .unwrap()
+        .unwrap();
     let public = alice
         .orchestrator
         .mls_context()
@@ -248,10 +253,9 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
         "Foreign DID (with own device {mallory_device}) initialization result: {:?}",
         foreign_init
     );
-    let foreign_error = foreign_init
-        .as_ref()
-        .err()
-        .unwrap_or_else(|| panic!("initializing {mallory_did} on Alice's journal must fail closed"));
+    let foreign_error = foreign_init.as_ref().err().unwrap_or_else(|| {
+        panic!("initializing {mallory_did} on Alice's journal must fail closed")
+    });
     // Must NOT be the missing-device branch: Mallory has a credential.
     assert!(
         !matches!(foreign_error, OrchestratorError::Credential(_)),
@@ -289,10 +293,7 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
         unregistered_init
     );
     assert!(
-        matches!(
-            unregistered_init,
-            Err(OrchestratorError::Credential(_))
-        ),
+        matches!(unregistered_init, Err(OrchestratorError::Credential(_))),
         "a foreign DID without a device credential must fail at the missing-device branch"
     );
 
@@ -398,7 +399,10 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
         .unwrap();
     println!("Online resolution result: {:?}", online_resolution);
     match online_resolution {
-        DirectRequestOutcome::TerminalNotPublished { code, request_id: res_id } => {
+        DirectRequestOutcome::TerminalNotPublished {
+            code,
+            request_id: res_id,
+        } => {
             assert_eq!(code, "RecipientKeysUnavailable");
             assert_eq!(res_id, request_id);
         }
@@ -439,17 +443,20 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
         .await
         .expect("reopen reaches Ready");
     // Refusals and submissions before durable reopen recorded above
-    let durable_outcome = durable_orch
-        .resume_direct_request(&draft_id)
-        .await
-        .unwrap();
+    let durable_outcome = durable_orch.resume_direct_request(&draft_id).await.unwrap();
     println!("Durable outcome after reopen: {:?}", durable_outcome);
     match durable_outcome {
-        DirectRequestOutcome::TerminalNotPublished { code, request_id: res_id } => {
+        DirectRequestOutcome::TerminalNotPublished {
+            code,
+            request_id: res_id,
+        } => {
             assert_eq!(code, "RecipientKeysUnavailable");
             assert_eq!(res_id, request_id);
         }
-        other => panic!("expected the durable TerminalNotPublished, got: {:?}", other),
+        other => panic!(
+            "expected the durable TerminalNotPublished, got: {:?}",
+            other
+        ),
     }
     assert_eq!(
         world.delivery_service().refused_transport_calls(),

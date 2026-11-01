@@ -101,6 +101,12 @@ pub struct TestWorld {
     authorized_device_keys: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
 }
 
+impl Default for TestWorld {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestWorld {
     /// Create a new test world with a shared mock delivery service.
     pub fn new() -> Self {

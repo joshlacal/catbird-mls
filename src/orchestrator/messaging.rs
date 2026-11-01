@@ -2659,7 +2659,8 @@ where
             })?;
             Ok::<_, OrchestratorError>(value)
         };
-        let accepted_signed_request = canonical_signed(resp_signed_request, "send_message response")?;
+        let accepted_signed_request =
+            canonical_signed(resp_signed_request, "send_message response")?;
         if canonical_signed(submitted_signed_request, "submitted")? != accepted_signed_request {
             return Err(OrchestratorError::Serialization(
                 "send_message response signedRequest does not match submitted signedRequest".into(),

@@ -17,15 +17,17 @@ use catbird_mls::groups::metadata_v1::{
     maybe_rehost_avatar_on_setter_leave, validate_metadata_snapshot_size, SpaceAvatarPointer,
     MAX_METADATA_SNAPSHOT_BYTES,
 };
-use catbird_mls::metadata::{decrypt_metadata_blob, encrypt_metadata_blob, GroupMetadataV1};
 use catbird_mls::messaging::receive::{
     compute_archive_commitment, handle_account_deleted_event, verify_archive_commitment,
 };
+use catbird_mls::metadata::{decrypt_metadata_blob, encrypt_metadata_blob, GroupMetadataV1};
 use catbird_mls::requests::c33::{
     archive_accepted_opening_messages, validate_direct_request_key_package_lifetime,
     DIRECT_REQUEST_KP_MIN_LIFETIME_SECS, RECOVERY_KP_MAX_LIFETIME_SECS,
 };
-use catbird_mls::routing::home_ds::{HomeDsRelayTransport, HomeDsSpaceRelayClient, RelayedSpaceResponse};
+use catbird_mls::routing::home_ds::{
+    HomeDsRelayTransport, HomeDsSpaceRelayClient, RelayedSpaceResponse,
+};
 use catbird_mls::storage::{MessageRow, MlsAccountDb, OpenMode, RequestRow};
 use catbird_mls::sync::reconcile::persist_entries_then_acknowledge;
 use sha2::{Digest, Sha256};
@@ -47,8 +49,8 @@ async fn c33_direct_request_35d_keypackage_and_opening_message_space_archival() 
     // 2. When sender observes `consent == 'accepted'`, `first_message_id` is archived to the
     // conversation Space and marked `first_message_archived = true` idempotently.
     let dir = tempfile::tempdir().unwrap();
-    let db = MlsAccountDb::open_native(dir.path().join("c33.db"), &[0x33; 32], OpenMode::App)
-        .unwrap();
+    let db =
+        MlsAccountDb::open_native(dir.path().join("c33.db"), &[0x33; 32], OpenMode::App).unwrap();
 
     db.write_tx(|tx| {
         tx.insert_message(&MessageRow {
@@ -86,7 +88,10 @@ async fn c33_direct_request_35d_keypackage_and_opening_message_space_archival() 
         let calls_ref = Arc::clone(&calls_ref);
         async move {
             calls_ref.fetch_add(1, Ordering::SeqCst);
-            panic!("must not archive while pending: {convo_id} {}", msg.message_id);
+            panic!(
+                "must not archive while pending: {convo_id} {}",
+                msg.message_id
+            );
         }
     })
     .await
@@ -221,8 +226,8 @@ async fn metadata_1a_space_avatar_rehost_on_setter_leave_and_d3_admin_only_remov
 #[tokio::test]
 async fn i13_archive_commitment_account_deleted_purge_post_commit_ack_and_3a_relay() {
     let dir = tempfile::tempdir().unwrap();
-    let db = MlsAccountDb::open_native(dir.path().join("sync.db"), &[0x66; 32], OpenMode::App)
-        .unwrap();
+    let db =
+        MlsAccountDb::open_native(dir.path().join("sync.db"), &[0x66; 32], OpenMode::App).unwrap();
 
     // 1. I13 `archive_commitment` in OpenMLS PrivateMessage AAD:
     let commitment = compute_archive_commitment(
@@ -383,8 +388,7 @@ async fn i13_archive_commitment_account_deleted_purge_post_commit_ack_and_3a_rel
     let relay_client = HomeDsSpaceRelayClient::new(Arc::new(MockHomeDsRelay {
         shared_secret: secret,
     }));
-    let space_uri =
-        "at://did:web:remote-ds.example/space/blue.catbird.labyrinth.conversation/c1-0";
+    let space_uri = "at://did:web:remote-ds.example/space/blue.catbird.labyrinth.conversation/c1-0";
     let cred = relay_client
         .fetch_remote_space_credential("did:web:remote-ds.example", space_uri, "delegation-jws")
         .await

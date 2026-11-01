@@ -521,7 +521,7 @@ async fn test_burst_of_passes_over_five_absent_conversations_shares_inbox() {
         dev2.orchestrator
             .sync_with_server(false)
             .await
-            .expect(&format!("pass {pass} succeeds"));
+            .unwrap_or_else(|_| panic!("pass {pass} succeeds"));
     }
 
     let recovery_mints_total = count_operations(&world, CanonicalOperation::RequestLeafRecovery);

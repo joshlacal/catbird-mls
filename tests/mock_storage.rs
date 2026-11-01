@@ -1,4 +1,5 @@
 //! In-memory mock implementation of `MLSStorageBackend` for testing.
+#![allow(dead_code, clippy::too_many_arguments, clippy::type_complexity)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -210,6 +211,12 @@ impl ResetCompletionBarrier {
 
     pub fn release(&self) {
         self.release.add_permits(1);
+    }
+}
+
+impl Default for MockStorage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -885,7 +892,10 @@ impl MLSStorageBackend for MockStorage {
                     ..
                 } => {
                     request.canonical_lifecycle.reset_generation == Some(*reset_generation)
-                        && request.canonical_lifecycle.reset_pending_target_group_id.as_deref()
+                        && request
+                            .canonical_lifecycle
+                            .reset_pending_target_group_id
+                            .as_deref()
                             == Some(new_group_id)
                         && &view.group_id == new_group_id
                 }
@@ -896,7 +906,8 @@ impl MLSStorageBackend for MockStorage {
                     old.state,
                     ConversationState::Closed | ConversationState::DeviceRemoved
                 )
-                || (matches!(old.state, ConversationState::ResetPending { .. }) && !reset_authorized)
+                || (matches!(old.state, ConversationState::ResetPending { .. })
+                    && !reset_authorized)
             {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });
             }
@@ -1149,12 +1160,9 @@ impl MLSStorageBackend for MockStorage {
             .map(|c| c.state.clone());
 
         if let Some(record) = inner.conversations.get_mut(conversation_id) {
-            match &state {
-                ConversationState::Active => {
-                    record.is_active = true;
-                    record.needs_rejoin = false;
-                }
-                _ => {}
+            if state == ConversationState::Active {
+                record.is_active = true;
+                record.needs_rejoin = false;
             }
             record.state = state.clone();
         }
@@ -1802,7 +1810,7 @@ impl MLSStorageBackend for MockStorage {
 
         // Sort descending by sequence_number, then take `limit`, then reverse
         // to return in ascending order (oldest first).
-        filtered.sort_by(|a, b| b.sequence_number.cmp(&a.sequence_number));
+        filtered.sort_by_key(|b| std::cmp::Reverse(b.sequence_number));
         filtered.truncate(limit as usize);
         filtered.reverse();
 

@@ -113,10 +113,9 @@ impl DirectRequestJournal {
         }
         if let (Some(receipt), Some(key)) = (&self.terminal_receipt, &self.terminal_authority_key) {
             use base64::{engine::general_purpose::STANDARD, Engine as _};
-            let verified = super::direct_request_shared_crypto::verify_pinned_terminal_receipt(
-                receipt, key,
-            )
-            .map_err(|_| MLSError::StorageFailed)?;
+            let verified =
+                super::direct_request_shared_crypto::verify_pinned_terminal_receipt(receipt, key)
+                    .map_err(|_| MLSError::StorageFailed)?;
             let proof = &verified.body()["receipt"];
             let published = matches!(
                 self.phase,
@@ -276,7 +275,7 @@ pub(crate) fn retire_published_group(
     inner.manifest_storage.with_connection(|conn| {
         let tx = conn.unchecked_transaction().map_err(error)?;
         let provider = Provider {
-            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
             crypto,
         };
         let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id))
@@ -365,7 +364,7 @@ pub(crate) fn prepare(
     let record = inner.manifest_storage.with_connection(|conn| {
         let tx = conn.unchecked_transaction().map_err(error)?;
         let provider = Provider {
-            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
             crypto,
         };
         if MlsGroup::load(provider.storage(), &GroupId::from_slice(&input.group_id))
@@ -463,7 +462,7 @@ pub(crate) fn resolve(
             return Ok((record, None));
         }
         let provider = Provider {
-            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&tx)),
             crypto,
         };
         let group_id = STANDARD
@@ -952,7 +951,7 @@ pub(crate) fn commit_closed_projection(
         }
         let provider = Provider {
             storage: crate::storage::openmls_kv::OpenMlsKvStorage::new(
-                crate::storage::driver_native::RusqliteKvBackend(&*tx),
+                crate::storage::driver_native::RusqliteKvBackend(&tx),
             ),
             crypto: inner.provider.crypto(),
         };

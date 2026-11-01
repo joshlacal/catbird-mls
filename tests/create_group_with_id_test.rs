@@ -217,9 +217,11 @@ fn direct_discard_preserves_handle_when_crypto_cleanup_fails() {
     let plan = alice
         .stage_commit(
             hex::encode(&created.group_id),
-            catbird_mls::orchestrator_bridge::FFICommitKind::AddMembers {
+            CommitKind::AddMembers {
                 member_dids: vec!["did:plc:bob".to_string()],
-                key_packages: vec![bob_key_package.key_package_data],
+                key_packages: vec![catbird_mls::KeyPackageData {
+                    data: bob_key_package.key_package_data,
+                }],
             },
             b"did:plc:alice".to_vec(),
         )
@@ -258,9 +260,11 @@ fn direct_stage_rejects_substituted_add_did_before_openmls_and_allows_retry() {
 
     let error = match alice.stage_commit(
         group_id.clone(),
-        catbird_mls::orchestrator_bridge::FFICommitKind::AddMembers {
+        CommitKind::AddMembers {
             member_dids: vec!["did:plc:bob".to_string()],
-            key_packages: vec![key_package_bytes.clone()],
+            key_packages: vec![catbird_mls::KeyPackageData {
+                data: key_package_bytes.clone(),
+            }],
         },
         b"did:plc:alice".to_vec(),
     ) {
@@ -276,9 +280,11 @@ fn direct_stage_rejects_substituted_add_did_before_openmls_and_allows_retry() {
     let valid = alice
         .stage_commit(
             group_id,
-            catbird_mls::orchestrator_bridge::FFICommitKind::AddMembers {
+            CommitKind::AddMembers {
                 member_dids: vec!["did:plc:mallory".to_string()],
-                key_packages: vec![key_package_bytes],
+                key_packages: vec![catbird_mls::KeyPackageData {
+                    data: key_package_bytes,
+                }],
             },
             b"did:plc:alice".to_vec(),
         )
@@ -304,9 +310,11 @@ fn direct_stage_rejects_substituted_swap_did_before_openmls_and_allows_retry() {
     let add_bob = alice
         .stage_commit(
             group_id.clone(),
-            catbird_mls::orchestrator_bridge::FFICommitKind::AddMembers {
+            CommitKind::AddMembers {
                 member_dids: vec!["did:plc:bob".to_string()],
-                key_packages: vec![bob_key_package.key_package_data],
+                key_packages: vec![catbird_mls::KeyPackageData {
+                    data: bob_key_package.key_package_data,
+                }],
             },
             b"did:plc:alice".to_vec(),
         )
@@ -323,10 +331,12 @@ fn direct_stage_rejects_substituted_swap_did_before_openmls_and_allows_retry() {
 
     let error = match alice.stage_commit(
         group_id.clone(),
-        catbird_mls::orchestrator_bridge::FFICommitKind::SwapMembers {
+        CommitKind::SwapMembers {
             remove_dids: vec!["did:plc:bob".to_string()],
             add_dids: vec!["did:plc:eve".to_string()],
-            add_key_packages: vec![key_package_bytes.clone()],
+            add_key_packages: vec![catbird_mls::KeyPackageData {
+                data: key_package_bytes.clone(),
+            }],
         },
         b"did:plc:alice".to_vec(),
     ) {
@@ -343,10 +353,12 @@ fn direct_stage_rejects_substituted_swap_did_before_openmls_and_allows_retry() {
     let valid = alice
         .stage_commit(
             group_id,
-            catbird_mls::orchestrator_bridge::FFICommitKind::SwapMembers {
+            CommitKind::SwapMembers {
                 remove_dids: vec!["did:plc:bob".to_string()],
                 add_dids: vec!["did:plc:mallory".to_string()],
-                add_key_packages: vec![key_package_bytes],
+                add_key_packages: vec![catbird_mls::KeyPackageData {
+                    data: key_package_bytes,
+                }],
             },
             b"did:plc:alice".to_vec(),
         )
@@ -371,9 +383,11 @@ fn direct_group_info_export_failure_clears_untracked_commit_and_allows_retry() {
 
     let error = match alice.stage_commit(
         group_id.clone(),
-        catbird_mls::orchestrator_bridge::FFICommitKind::AddMembers {
+        CommitKind::AddMembers {
             member_dids: vec!["did:plc:bob".to_string()],
-            key_packages: vec![key_package_bytes.clone()],
+            key_packages: vec![catbird_mls::KeyPackageData {
+                data: key_package_bytes.clone(),
+            }],
         },
         b"did:plc:unknown-signer".to_vec(),
     ) {
@@ -389,9 +403,11 @@ fn direct_group_info_export_failure_clears_untracked_commit_and_allows_retry() {
     let retried = alice
         .stage_commit(
             group_id,
-            catbird_mls::orchestrator_bridge::FFICommitKind::AddMembers {
+            CommitKind::AddMembers {
                 member_dids: vec!["did:plc:bob".to_string()],
-                key_packages: vec![key_package_bytes],
+                key_packages: vec![catbird_mls::KeyPackageData {
+                    data: key_package_bytes,
+                }],
             },
             b"did:plc:alice".to_vec(),
         )
@@ -459,7 +475,7 @@ async fn orchestrator_group_info_export_failure_clears_untracked_commit_and_allo
     let retry = context
         .stage_commit(
             group_id,
-            catbird_mls::orchestrator_bridge::FFICommitKind::UpdateMetadata {
+            CommitKind::UpdateMetadata {
                 group_info_extension: Vec::new(),
             },
             GROUP_SIGNER_DID.to_vec(),

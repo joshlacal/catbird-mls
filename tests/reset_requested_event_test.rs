@@ -1501,12 +1501,20 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
 
     let original = alice
         .orchestrator
-        .create_group("reset welcome baseline", Some(&[bob.did.clone()]), None)
+        .create_group(
+            "reset welcome baseline",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
         .await
         .expect("create baseline conversation");
     alice
         .orchestrator
-        .swap_members(&original.conversation_id, &[], &[bob.did.clone()])
+        .swap_members(
+            &original.conversation_id,
+            &[],
+            std::slice::from_ref(&bob.did),
+        )
         .await
         .expect("add bob to baseline");
     let baseline_welcome = world
@@ -1523,7 +1531,7 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .set_epoch_pair_for_test(&original.conversation_id, 741, 742);
 
     let loser_target = vec![0x91; 32];
-    let loser_target_hex = hex::encode(&loser_target);
+    let _loser_target_hex = hex::encode(&loser_target);
     bob.orchestrator
         .record_group_reset(&original.conversation_id, loser_target.clone(), 23)
         .await
@@ -1539,12 +1547,12 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
 
     let winner = alice
         .orchestrator
-        .create_group("reset winner", Some(&[bob.did.clone()]), None)
+        .create_group("reset winner", Some(std::slice::from_ref(&bob.did)), None)
         .await
         .expect("winner creates replacement group and Welcome");
     alice
         .orchestrator
-        .swap_members(&winner.conversation_id, &[], &[bob.did.clone()])
+        .swap_members(&winner.conversation_id, &[], std::slice::from_ref(&bob.did))
         .await
         .expect("add bob to winner");
     world
@@ -1770,12 +1778,20 @@ async fn setup_winner_welcome_adoption_fixture(
     let bob = world.client("Bob");
     let original = alice
         .orchestrator
-        .create_group("winner adoption baseline", Some(&[bob.did.clone()]), None)
+        .create_group(
+            "winner adoption baseline",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
         .await
         .expect("create baseline");
     alice
         .orchestrator
-        .swap_members(&original.conversation_id, &[], &[bob.did.clone()])
+        .swap_members(
+            &original.conversation_id,
+            &[],
+            std::slice::from_ref(&bob.did),
+        )
         .await
         .expect("add bob to baseline");
     let baseline_welcome = world
@@ -1803,12 +1819,16 @@ async fn setup_winner_welcome_adoption_fixture(
         .expect("materialize loser");
     let winner = alice
         .orchestrator
-        .create_group("authoritative winner", Some(&[bob.did.clone()]), None)
+        .create_group(
+            "authoritative winner",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
         .await
         .expect("create winner");
     alice
         .orchestrator
-        .swap_members(&winner.conversation_id, &[], &[bob.did.clone()])
+        .swap_members(&winner.conversation_id, &[], std::slice::from_ref(&bob.did))
         .await
         .expect("add bob to winner");
     world

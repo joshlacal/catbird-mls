@@ -274,7 +274,6 @@ pub fn verify_signed_request_for_authority(
     })
 }
 
-
 pub fn direct_request_context_hash(raw_context_json: &[u8]) -> Result<[u8; 32]> {
     let mut bytes = b"CATBIRD-DIRECT-REQUEST-CONTEXT\0".to_vec();
     bytes.extend(project(raw_context_json, "directRequestContext", false)?);
@@ -539,10 +538,7 @@ pub fn direct_request_receipt_key_id_for_authority(
 }
 
 pub fn direct_request_receipt_key_id(public_key: &[u8]) -> Result<String> {
-    direct_request_receipt_key_id_for_authority(
-        CANONICAL_DIRECT_REQUEST_AUTHORITY,
-        public_key,
-    )
+    direct_request_receipt_key_id_for_authority(CANONICAL_DIRECT_REQUEST_AUTHORITY, public_key)
 }
 
 /// Verify the complete immutable snapshot with an independently trusted method.
@@ -616,7 +612,8 @@ pub fn resolve_direct_request_receipt_key_for_authority(
     authenticated_document: &[u8],
     method_id: &str,
 ) -> Result<Vec<u8>> {
-    crate::chat_v2::ids::BareDid::parse(expected_authority_did).map_err(|e| error(e.to_string()))?;
+    crate::chat_v2::ids::BareDid::parse(expected_authority_did)
+        .map_err(|e| error(e.to_string()))?;
     if authenticated_document.len() > 1024 * 1024 {
         return Err(error("DID document byte cap"));
     }
@@ -667,7 +664,6 @@ pub fn resolve_direct_request_receipt_key(
         method_id,
     )
 }
-
 
 fn strict_document(raw: &[u8]) -> Result<()> {
     super::decode_strict_json(raw).map_err(error)?;
@@ -787,7 +783,6 @@ pub fn verify_direct_request_acceptance_proof_for_authority(
     }
     Ok(proof)
 }
-
 
 /// Strict introduction plaintext profile. This function must run before encryption
 /// and after decryption; it never authorizes bot forwarding or account acceptance.
@@ -1174,11 +1169,7 @@ fn read_definition(name: &str) -> Result<&'static Value> {
 /// the strict signing and ingress APIs remain unchanged.
 /// Duplicate raw fields are rejected before JSON values can discard evidence.
 /// The returned value still passes the complete closed contract projection.
-pub fn normalize_read_presentation(
-    raw: &[u8],
-    name: &str,
-    tagged: bool,
-) -> Result<Value> {
+pub fn normalize_read_presentation(raw: &[u8], name: &str, tagged: bool) -> Result<Value> {
     if raw.len() > MAX_PUBLISH_HTTP_BODY_BYTES {
         return Err(error("JSON body cap"));
     }
@@ -1295,8 +1286,7 @@ pub fn verify_received_signed_request_for_authority(
     strict_document(raw_wrapper)?;
     let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
     let tagged = kind == DirectRequestKind::Outcome && wrapper.get("$type").is_some();
-    let normalized =
-        normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
+    let normalized = normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
     let mut verified = verify_signed_request_for_authority(
         expected_authority,
         kind,
@@ -1326,11 +1316,7 @@ pub fn verify_received_direct_request_acceptance_proof_for_authority(
     trusted_authority_key: &[u8],
     recipient_device_key: &[u8],
 ) -> Result<Value> {
-    let proof = normalize_read_presentation(
-        raw_proof,
-        "directRequestAcceptanceProof",
-        false,
-    )?;
+    let proof = normalize_read_presentation(raw_proof, "directRequestAcceptanceProof", false)?;
     verify_direct_request_acceptance_proof_for_authority(
         expected_authority,
         &serde_json::to_vec(&proof).map_err(error)?,
@@ -1338,7 +1324,6 @@ pub fn verify_received_direct_request_acceptance_proof_for_authority(
         recipient_device_key,
     )
 }
-
 
 #[cfg(test)]
 mod read_presentation_tests {

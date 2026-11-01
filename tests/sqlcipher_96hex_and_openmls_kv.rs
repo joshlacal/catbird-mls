@@ -184,7 +184,10 @@ fn i8_sqlcipher_96hex_plaintext_header_cold_reopen_never_bricks() {
     // Opening with a wrong key MUST fail cleanly (authentication failure, never silent corruption).
     let wrong_key = [0x99u8; 32];
     let wrong_open = MlsAccountDb::open_native(&db_path, &wrong_key, OpenMode::App);
-    assert!(wrong_open.is_err(), "wrong 32-byte DB key must fail to open");
+    assert!(
+        wrong_open.is_err(),
+        "wrong 32-byte DB key must fail to open"
+    );
 }
 
 #[test]
@@ -250,9 +253,15 @@ fn openmls_kv_and_app_tables_rollback_atomically_on_write_tx_error() {
             let provider = tx.openmls_provider();
             let loaded = MlsGroup::load(provider.storage(), &GroupId::from_slice(&created_gid))
                 .expect("MlsGroup::load");
-            assert!(loaded.is_none(), "OpenMLS group in openmls_kv must roll back");
+            assert!(
+                loaded.is_none(),
+                "OpenMLS group in openmls_kv must roll back"
+            );
             tx.count_openmls_kv_rows()
         })
         .expect("verify openmls_kv empty");
-    assert_eq!(kv_count, 0, "all openmls_kv writes from failed tx must roll back");
+    assert_eq!(
+        kv_count, 0,
+        "all openmls_kv writes from failed tx must roll back"
+    );
 }

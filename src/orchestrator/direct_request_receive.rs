@@ -608,7 +608,7 @@ where
             candidate.acceptance_proof =
                 Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
             candidate.recipient_public_key = Some(key);
-            candidate.view(&owner, &device)?;
+            candidate.view(owner, device)?;
             candidate.pending_acceptance = None;
             self.save_received_request(cid, &candidate, raw)?;
             *projection = candidate;

@@ -117,7 +117,7 @@ where
                             .any(|p| p["userDid"].as_str() == Some(&user_did))
                         || !participants
                             .iter()
-                            .any(|p| p["userDid"].as_str() == Some(&peer_did))
+                            .any(|p| p["userDid"].as_str() == Some(peer_did))
                     {
                         continue;
                     }
@@ -200,7 +200,7 @@ where
                         .any(|p| p["userDid"].as_str() == Some(&user_did))
                     || !participants
                         .iter()
-                        .any(|p| p["userDid"].as_str() == Some(&peer_did))
+                        .any(|p| p["userDid"].as_str() == Some(peer_did))
                 {
                     continue;
                 }

@@ -48,21 +48,33 @@ async fn not_entitled_request_entry_projects_unaddressed_unavailable_state() {
         captured["getConversationState"].clone(),
     );
     let client = world.client("Late");
-    let view = client.orchestrator.refresh_request_preview(&cid).await.unwrap();
+    let view = client
+        .orchestrator
+        .refresh_request_preview(&cid)
+        .await
+        .unwrap();
     let coordinates = &captured["getConversationState"]["state"]["coordinates"];
     assert_eq!(view.conversation_id, cid);
     assert_eq!(view.consent, RequestConsent::Accepted);
     assert_eq!(view.crypto, RequestCrypto::Unavailable);
     assert_eq!(
         view.preview,
-        Some(RequestPreview::Unavailable { code: "DeviceNotAddressed".into() })
+        Some(RequestPreview::Unavailable {
+            code: "DeviceNotAddressed".into()
+        })
     );
-    assert_eq!(view.introduction, None, "no introduction without the publication");
+    assert_eq!(
+        view.introduction, None,
+        "no introduction without the publication"
+    );
     assert_eq!(view.first_message_id, None);
     assert!(!view.capabilities.can_preview && !view.capabilities.can_send);
     assert!(!view.capabilities.can_emit_receipts && !view.capabilities.can_administer);
     assert!(view.capabilities.can_close, "account close stays available");
-    assert_eq!(Some(view.state_version), coordinates["stateVersion"].as_u64());
+    assert_eq!(
+        Some(view.state_version),
+        coordinates["stateVersion"].as_u64()
+    );
     assert_eq!(Some(view.generation), coordinates["generation"].as_u64());
     // Derived, never retained: later recovery cannot inherit a projection.
     assert!(client
@@ -77,7 +89,10 @@ async fn not_entitled_request_entry_projects_unaddressed_unavailable_state() {
 async fn other_entry_failures_still_propagate() {
     let (captured, owner, cid) = captured();
     for (status, body) in [
-        (400, json!({"error":"InvalidRequest","message":"InvalidRequest"})),
+        (
+            400,
+            json!({"error":"InvalidRequest","message":"InvalidRequest"}),
+        ),
         (503, json!({"error":"Unavailable"})),
     ] {
         let world = world_for(&owner).await;

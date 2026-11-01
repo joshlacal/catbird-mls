@@ -110,7 +110,7 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
     // 2. Prepare Alice's request and build Bob's grant
     let original = last_request(&world, Op::PrepareDirectRequest);
     let prepare = &original["signedRequest"]["body"];
-    let (device, pubkey) = {
+    let (_device, pubkey) = {
         let alice = world.client("Alice");
         let dev = alice
             .credentials
@@ -311,7 +311,10 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
         .unwrap();
 
     // 3. INJECT FAULT: Publication succeeds, but host projection write fails!
-    world.client("Alice").storage.fail_next_ensure_conversation_exists();
+    world
+        .client("Alice")
+        .storage
+        .fail_next_ensure_conversation_exists();
 
     let crash_result = world
         .client("Alice")
@@ -352,7 +355,11 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
 
     // - First message in host storage is 0
     assert_eq!(
-        world.client("Alice").storage.get_conversation_messages(&cid).len(),
+        world
+            .client("Alice")
+            .storage
+            .get_conversation_messages(&cid)
+            .len(),
         0,
         "No messages should be in host storage yet"
     );
@@ -469,9 +476,16 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
     );
 
     // Inject host write failure on Bob during Welcome import projection
-    world.client("Bob").storage.fail_next_ensure_conversation_exists();
+    world
+        .client("Bob")
+        .storage
+        .fail_next_ensure_conversation_exists();
 
-    let bob_crash = world.client("Bob").orchestrator.refresh_request_preview(&cid).await;
+    let bob_crash = world
+        .client("Bob")
+        .orchestrator
+        .refresh_request_preview(&cid)
+        .await;
     assert!(
         matches!(&bob_crash, Err(OrchestratorError::Storage(msg)) if msg.contains("ensure_conversation_exists")),
         "Expected storage failure on Bob during host projection write: {bob_crash:?}"
@@ -479,7 +493,12 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
 
     // Bob's native MLS context has already imported the group at epoch 1
     assert_eq!(
-        world.client("Bob").orchestrator.mls_context().get_epoch(gid.clone()).unwrap(),
+        world
+            .client("Bob")
+            .orchestrator
+            .mls_context()
+            .get_epoch(gid.clone())
+            .unwrap(),
         1,
         "Bob's native group must be imported at epoch 1 before host write"
     );
@@ -489,13 +508,23 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
 
     // Bob's native ratchet never rolled back
     assert_eq!(
-        world.client("Bob").orchestrator.mls_context().get_epoch(gid.clone()).unwrap(),
+        world
+            .client("Bob")
+            .orchestrator
+            .mls_context()
+            .get_epoch(gid.clone())
+            .unwrap(),
         1,
         "Bob's native ratchet must stay at epoch 1 across reopen"
     );
 
     // Replay projection on Bob
-    let bob_preview = world.client("Bob").orchestrator.refresh_request_preview(&cid).await.unwrap();
+    let bob_preview = world
+        .client("Bob")
+        .orchestrator
+        .refresh_request_preview(&cid)
+        .await
+        .unwrap();
     assert_eq!(bob_preview.consent, RequestConsent::IncomingPending);
     assert_eq!(bob_preview.crypto, RequestCrypto::Ready);
     assert_eq!(bob_preview.first_message_id, Some(first_msg_id.clone()));

@@ -8,8 +8,7 @@ mod epoch_secret_test_support;
 use async_trait::async_trait;
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use openmls::prelude::{
-    KeyPackageIn, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
-    VerifiableCiphersuite,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion, VerifiableCiphersuite,
 };
 use openmls_libcrux_crypto::Provider as LibcruxProvider;
 use openmls_traits::OpenMlsProvider;
