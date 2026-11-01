@@ -1,5 +1,6 @@
 //! Authenticated admission policy is distinct from cryptographic MLS access.
 use catbird_atproto::blue_catbird::chat::ConversationState as CanonicalState;
+#[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
 use super::{

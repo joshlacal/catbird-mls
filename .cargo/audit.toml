@@ -1,0 +1,10 @@
+# Risk-accepted upstream-pinned advisories for `catbird-mls` (tracked in `docs/DECISIONS.md`).
+[advisories]
+ignore = [
+    # OpenMLS 0.9.0-rc.3 / `jacquard 0.13` transitive pin on `elliptic-curve 0.13` -> `crypto-bigint 0.5.5`.
+    "RUSTSEC-2026-0387",
+    # OpenMLS 0.9.0-rc.3 `openmls_libcrux_crypto 0.4.0-rc.3` pins `libcrux-hmac-drbg 0.0.1` and `libcrux-kem 0.0.9`.
+    "RUSTSEC-2026-0329",
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+]

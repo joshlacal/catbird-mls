@@ -346,10 +346,14 @@ impl ArchiveWorker {
     }
 
     pub fn flushed(&self, n: usize) {
-        let _ = self
-            .pending
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
-                Some(p.saturating_sub(n))
-            });
+        let mut current = self.pending.load(Ordering::SeqCst);
+        while let Err(actual) = self.pending.compare_exchange_weak(
+            current,
+            current.saturating_sub(n),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            current = actual;
+        }
     }
 }
