@@ -224,8 +224,8 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// keyed by the conversation's `sequencerDid` under federation.
     ///
     /// Defaults to [`Self::labyrinth_sequencer_key`] ONLY when `sequencer_did`
-    /// is unspecified or matches the home DS DID — never returning a home DS
-    /// key for a foreign federated `sequencer_did`.
+    /// is explicitly known and matches the home DS DID — never returning a home
+    /// DS key for an unknown (`None`) or foreign federated `sequencer_did`.
     #[cfg(feature = "labyrinth")]
     async fn labyrinth_sequencer_key_for(
         &self,
@@ -237,9 +237,8 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         }
         let home = self.labyrinth_sequencer_key().await?;
         match sequencer_did {
-            None => Some(home),
             Some(expected) if normalize_ds_did(&home.0) == normalize_ds_did(expected) => Some(home),
-            Some(_) => None,
+            None | Some(_) => None,
         }
     }
 

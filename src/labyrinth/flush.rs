@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::hooks::roster_members;
 use super::queue::{ArchiveQueueStore, PendingArchive, MAX_FAILURES};
 use super::session::{LabyrinthSession, SessionDeps};
-use super::status::{now_ms, DroppedArchive, MemberExclusion};
+use super::status::{now_ms, MemberExclusion};
 use super::transport::map_xrpc_error;
 use crate::orchestrator::error::Result;
 
@@ -162,24 +162,12 @@ async fn flush_conversation(
                     "xrpc 503: conversation missing on mls-ds while local MLS group exists".into(),
                 )));
             }
-            match rescue_as_owner(session, store, report, &did, conversation, &todo).await? {
-                Ok(()) => return Ok(Ok(())),
-                Err(e) => {
-                    tracing::warn!(
-                        conversation,
-                        %e,
-                        "labyrinth: owner fallback failed for missing conversation; dropping queued rows"
-                    );
-                    drop_rows(
-                        store,
-                        &did,
-                        &todo,
-                        "conversation no longer exists on mls-ds",
-                    )?;
-                    report.dropped += todo.len();
-                    return Ok(Ok(()));
-                }
-            }
+            tracing::info!(
+                conversation,
+                count = todo.len(),
+                "labyrinth: conversation deleted on mls-ds; rescuing queued messages into personal mailbox Space"
+            );
+            return rescue_as_owner(session, store, report, &did, conversation, &todo).await;
         }
         Err(e) => return Ok(Err(e)),
     };
@@ -241,11 +229,13 @@ async fn flush_conversation(
             .await?
         {
             Ok(x) => x,
-            Err(labyrinth::Error::Forbidden) => {
+            Err(
+                labyrinth::Error::Forbidden | labyrinth::Error::NotFound("space" | "conversation"),
+            ) => {
                 tracing::info!(
                     conversation,
                     count = chunk_rows.len(),
-                    "labyrinth: Space write forbidden (kicked mid-flush); rescuing chunk into personal mailbox Space"
+                    "labyrinth: Space write forbidden/missing (kicked or deleted mid-flush); rescuing chunk into personal mailbox Space"
                 );
                 let owner_items = chunk_rows
                     .iter()
@@ -374,30 +364,6 @@ fn fail_rows(
         }
         store.put(&row)?;
     }
-    Ok(())
-}
-
-fn drop_rows(
-    store: &dyn ArchiveQueueStore,
-    did: &str,
-    rows: &[PendingArchive],
-    reason: &str,
-) -> Result<()> {
-    let at_ms = now_ms();
-    store.update_status(did, &mut |s| {
-        for r in rows {
-            s.drop_row(DroppedArchive {
-                conversation_id: r.conversation_id.clone(),
-                message_id: r.message_id.clone(),
-                reason: reason.to_owned(),
-                at_ms,
-            });
-        }
-    })?;
-    for r in rows {
-        store.remove(did, &r.message_id)?;
-    }
-    tracing::warn!(n = rows.len(), reason, "labyrinth: archive rows dropped");
     Ok(())
 }
 

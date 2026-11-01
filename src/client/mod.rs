@@ -88,6 +88,8 @@ pub struct QueuedLabyrinthArchivePayload {
     pub plaintext_json: String,
     pub labyrinth_frame_json: String,
     pub mls_ciphertext_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_nonce_b64: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -194,8 +196,10 @@ mod native_client {
     use openmls::prelude::tls_codec::Serialize as TlsSerialize;
     use openmls::prelude::*;
     use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::signatures::Signer as _;
     use openmls_traits::OpenMlsProvider;
     use rand::RngCore;
+    use sha2::{Digest as _, Sha256};
     use zeroize::Zeroizing;
 
     use crate::error::MLSError;
@@ -223,8 +227,8 @@ mod native_client {
         probe_and_check_spaces_eligibility, wipe_pre_cutover_local_artifacts,
         CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus, OtcPairingCompletion,
         OtcPairingOffer, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
-        PlatformHttpRequest, PlatformKeyStore, PlatformTransport, PreCutoverWipeReport,
-        QueuedLabyrinthArchivePayload, SpacesEligibilityStatus,
+        PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+        PreCutoverWipeReport, QueuedLabyrinthArchivePayload, SpacesEligibilityStatus,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
@@ -250,6 +254,179 @@ mod native_client {
         Ok(fresh)
     }
 
+    #[cfg(feature = "labyrinth")]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct StoredLabyrinthDeviceSecrets {
+        device_key_hex: String,
+        storage_hex: String,
+        storage_auth_hex: String,
+        public_device_json: String,
+    }
+
+    #[cfg(feature = "labyrinth")]
+    fn decode_stored_device_secrets(raw_dev: &[u8]) -> Option<labyrinth::device::DeviceSecrets> {
+        let stored: StoredLabyrinthDeviceSecrets = serde_json::from_slice(raw_dev).ok()?;
+        let dk = hex::decode(&stored.device_key_hex).ok()?;
+        let st = hex::decode(&stored.storage_hex).ok()?;
+        let sa = hex::decode(&stored.storage_auth_hex).ok()?;
+        let dev_rec: labyrinth::records::Device =
+            serde_json::from_str(&stored.public_device_json).ok()?;
+        let dk_arr = <[u8; 32]>::try_from(dk.as_slice()).ok()?;
+        let st_arr =
+            <[u8; labyrinth::hpke::hawk::HAWK_ENC_SECRET_LEN]>::try_from(st.as_slice()).ok()?;
+        let sa_arr = <[u8; 32]>::try_from(sa.as_slice()).ok()?;
+        let pub_dev = dev_rec.to_public().ok()?;
+        labyrinth::device::DeviceSecrets::from_parts(
+            labyrinth::sign::XSigningKey::from_bytes(dk_arr),
+            labyrinth::hpke::hawk::HawkEncSecret::from_bytes(st_arr),
+            Some(labyrinth::hpke::X25519Secret::from_bytes(sa_arr)),
+            pub_dev,
+        )
+        .ok()
+    }
+
+    #[cfg(feature = "labyrinth")]
+    fn ensure_device_secrets_and_salt(
+        tx: &SqlTx<'_>,
+        now_ms: i64,
+    ) -> Result<(labyrinth::device::DeviceSecrets, [u8; 32]), MLSError> {
+        let salt = match tx
+            .get_labyrinth_state("mailbox_root_salt")?
+            .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
+        {
+            Some(arr) => arr,
+            None => {
+                let mut fresh_salt = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut fresh_salt);
+                tx.put_labyrinth_state("mailbox_root_salt", &fresh_salt, now_ms)?;
+                fresh_salt
+            }
+        };
+
+        if let Some(raw_dev) = tx.get_labyrinth_state("physical_device_secrets_json")? {
+            if let Some(rebuilt) = decode_stored_device_secrets(&raw_dev) {
+                return Ok((rebuilt, salt));
+            }
+        }
+
+        let fresh = labyrinth::device::DeviceSecrets::generate_physical().map_err(|e| {
+            MLSError::Cryptography(format!("generate Labyrinth physical DeviceSecrets: {e}"))
+        })?;
+        let auth_bytes = fresh
+            .storage_auth
+            .as_ref()
+            .map(|a| a.to_bytes())
+            .ok_or_else(|| {
+                MLSError::Internal("physical device missing storage_auth".to_string())
+            })?;
+        let dev_rec = labyrinth::records::Device::from_public(
+            fresh.public(),
+            labyrinth::records::datetime_from_ms(now_ms.max(0) as u64),
+        );
+        let stored = StoredLabyrinthDeviceSecrets {
+            device_key_hex: hex::encode(Zeroizing::new(fresh.device_key.to_bytes()).as_slice()),
+            storage_hex: hex::encode(Zeroizing::new(fresh.storage.to_bytes()).as_slice()),
+            storage_auth_hex: hex::encode(Zeroizing::new(auth_bytes).as_slice()),
+            public_device_json: serde_json::to_string(&dev_rec)
+                .map_err(|e| MLSError::Internal(format!("serialize Device record: {e}")))?,
+        };
+        let bytes = serde_json::to_vec(&stored).map_err(|e| {
+            MLSError::Internal(format!("serialize StoredLabyrinthDeviceSecrets: {e}"))
+        })?;
+        tx.put_labyrinth_state("physical_device_secrets_json", &bytes, now_ms)?;
+        Ok((fresh, salt))
+    }
+
+    #[cfg(feature = "labyrinth")]
+    struct ClientTransportSigner {
+        public_key: [u8; 32],
+        sign_fn: Box<dyn Fn(&[u8]) -> [u8; 64] + Send + Sync>,
+    }
+
+    #[cfg(feature = "labyrinth")]
+    impl labyrinth::sign::TransportSigner for ClientTransportSigner {
+        fn transport_public_key(&self) -> [u8; 32] {
+            self.public_key
+        }
+        fn sign_transport(&self, msg: &[u8]) -> [u8; 64] {
+            (self.sign_fn)(msg)
+        }
+    }
+
+    #[cfg(feature = "labyrinth")]
+    fn load_or_create_transport_signer(
+        db: &MlsAccountDb,
+        now_ms: i64,
+    ) -> Result<ClientTransportSigner, MLSError> {
+        let enrolled_opt = db.read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?;
+        if let Some(signer_json) = enrolled_opt {
+            let signer: SignatureKeyPair = serde_json::from_str(&signer_json)
+                .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?;
+            if let Ok(pk) = <[u8; 32]>::try_from(signer.public()) {
+                return Ok(ClientTransportSigner {
+                    public_key: pk,
+                    sign_fn: Box::new(move |msg: &[u8]| {
+                        let sig = signer.sign(msg).unwrap_or_else(|_| vec![0u8; 64]);
+                        <[u8; 64]>::try_from(sig.as_slice()).unwrap_or([0u8; 64])
+                    }),
+                });
+            }
+        }
+        let seed: Zeroizing<[u8; 32]> = db.write_tx(|tx| {
+            if let Some(existing) = tx.get_labyrinth_state("transport_ed25519_seed")? {
+                if let Ok(arr) = <[u8; 32]>::try_from(existing.as_slice()) {
+                    return Ok(Zeroizing::new(arr));
+                }
+            }
+            let mut fresh = Zeroizing::new([0u8; 32]);
+            rand::rngs::OsRng.fill_bytes(&mut *fresh);
+            tx.put_labyrinth_state("transport_ed25519_seed", fresh.as_slice(), now_ms)?;
+            Ok(fresh)
+        })?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
+        Ok(ClientTransportSigner {
+            public_key,
+            sign_fn: Box::new(move |msg: &[u8]| {
+                use ed25519_dalek::Signer as _;
+                signing_key.sign(msg).to_bytes()
+            }),
+        })
+    }
+
+    #[cfg(feature = "labyrinth")]
+    fn ensure_convo_sender_mek(
+        db: &MlsAccountDb,
+        conversation_id: &str,
+        transport_pub: [u8; 32],
+        now_ms: i64,
+    ) -> Result<labyrinth::mek::Mek, MLSError> {
+        let state_key = format!("convo_sender_mek:{conversation_id}");
+        let secret: Zeroizing<[u8; 32]> = db.write_tx(|tx| {
+            if let Some(existing) = tx.get_labyrinth_state(&state_key)? {
+                if let Ok(arr) = <[u8; 32]>::try_from(existing.as_slice()) {
+                    return Ok(Zeroizing::new(arr));
+                }
+            }
+            let mut fresh = Zeroizing::new([0u8; 32]);
+            rand::rngs::OsRng.fill_bytes(&mut *fresh);
+            tx.put_labyrinth_state(&state_key, fresh.as_slice(), now_ms)?;
+            Ok(fresh)
+        })?;
+        let head = Sha256::digest(format!("catbird.convo.mek:{conversation_id}").as_bytes());
+        let mut head_arr = [0u8; 32];
+        head_arr.copy_from_slice(&head);
+        let r_hash = labyrinth::mek::roster_hash(&[head_arr]);
+        Ok(labyrinth::mek::Mek::from_secret(
+            secret,
+            r_hash,
+            labyrinth::mek::MekProvenance::Transport {
+                transport_pub,
+                created_here: true,
+            },
+        ))
+    }
+
     fn canonical_labyrinth_frame_json(plaintext_json: &str) -> String {
         if serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(plaintext_json).is_ok() {
             return plaintext_json.to_string();
@@ -266,29 +443,48 @@ mod native_client {
         plaintext_json.to_string()
     }
 
-    fn sanitize_rkey(raw: &str) -> String {
-        let mut out = String::with_capacity(raw.len().min(48));
-        for ch in raw.chars() {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                out.push(ch);
-            } else {
-                out.push('_');
-            }
-            if out.len() >= 48 {
-                break;
-            }
-        }
-        if out.is_empty() {
-            "item".to_string()
-        } else {
-            out
-        }
+    /// Deterministic valid 13-character ATProto base32-sortable TID (`234567abcdefghijklmnopqrstuvwxyz`,
+    /// top bit `0`) derived from `(timestamp_ms, sub_seq, discriminator)` so idempotent retries of
+    /// `com.atproto.space.applyWrites#create` hit the exact same `rkey`.
+    fn deterministic_tid(timestamp_ms: i64, sub_seq: u64, discriminator: &str) -> String {
+        const S32: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
+        let micros = (timestamp_ms.max(0) as u64)
+            .saturating_mul(1_000)
+            .saturating_add(sub_seq)
+            & ((1u64 << 53) - 1);
+        let digest = Sha256::digest(discriminator.as_bytes());
+        let clock_id = (u16::from_be_bytes([digest[0], digest[1]]) as u64) & 0x3ff;
+        let v = (micros << 10) | clock_id;
+        (0..13)
+            .rev()
+            .map(|i| S32[((v >> (5 * i)) & 31) as usize] as char)
+            .collect()
     }
 
-    fn rfc3339_from_ms(ms: i64) -> String {
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    fn percent_encode_query_component(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len() + 16);
+        for &b in raw.as_bytes() {
+            if matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    fn is_space_write_committed(resp: &PlatformHttpResponse) -> bool {
+        if (200..300).contains(&resp.status) || resp.status == 409 {
+            return true;
+        }
+        if resp.status == 400 {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
+                if parsed.get("error").and_then(|v| v.as_str()) == Some("RecordAlreadyExists") {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     struct ClientKeychainBridge {
@@ -411,6 +607,10 @@ mod native_client {
                     1
                 };
                 let _ = ensure_owner_epoch_root(tx, epoch_seq, now_ms)?;
+                #[cfg(feature = "labyrinth")]
+                {
+                    let _ = ensure_device_secrets_and_salt(tx, now_ms)?;
+                }
                 Ok(())
             })?;
 
@@ -875,6 +1075,7 @@ mod native_client {
                     plaintext_json: canonical_json.clone(),
                     labyrinth_frame_json: canonical_labyrinth_frame_json(&canonical_json),
                     mls_ciphertext_b64: BASE64_STANDARD.encode(&ciphertext_bytes),
+                    frame_nonce_b64: Some(BASE64_STANDARD.encode(frame_nonce)),
                     created_at_ms: now_ms,
                 };
                 let queued_bytes = serde_json::to_vec(&queued_payload).map_err(|e| {
@@ -1085,13 +1286,106 @@ mod native_client {
             })
         }
 
-        /// Generate and bind a GF(32) 40-character recovery code (`Spec §2 D4`, `Spec §6.7`).
+        /// Generate and bind a GF(32) 40-character recovery code (`Spec §2 D4`, `Spec §6.7`),
+        /// sealing the account's `owner_epoch_root` and `mailbox_root_salt` into a canonical
+        /// `blue.catbird.labyrinth.virtualDevice` record in the personal mailbox Space (`com.atproto.space.applyWrites`).
+        #[cfg(feature = "labyrinth")]
         pub fn setup_recovery_code(&self) -> Result<String, MLSError> {
             let code = labyrinth::recovery_code::RecoveryCode::generate()
                 .map_err(|e| MLSError::Cryptography(format!("generate RecoveryCode: {e}")))?;
-            let (vdev_id, _vdev_key) = code.derive(&self.normalized_did);
             let grouped = code.format_grouped();
             let now_ms = unix_now_ms();
+            let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
+
+            let (st_snapshot, owner_root, me_secrets, salt) = self.db.write_tx(|tx| {
+                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                })?;
+                let st: LabyrinthBackupStatus =
+                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                let root = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                let (me, salt) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                Ok((st, root, me, salt))
+            })?;
+
+            let current_epoch = labyrinth::epoch::EpochSecret::from_parts(
+                st_snapshot.epoch_seq,
+                format!("{:012}", st_snapshot.epoch_seq),
+                *owner_root,
+            );
+            let (vdev_bundle, member_rec) = labyrinth::virtual_device::create(
+                &self.normalized_did,
+                &code,
+                &me_secrets,
+                &current_epoch,
+                &salt,
+                labyrinth::virtual_device::Mechanism::Code,
+            )
+            .map_err(|e| MLSError::Cryptography(format!("virtual_device::create: {e}")))?;
+
+            let phys_dev_doc =
+                labyrinth::records::Device::from_public(me_secrets.public(), created_at.clone());
+            let phys_dev_rkey = hex::encode(me_secrets.public().device_key_pub.0);
+            let phys_dev_val = serde_json::to_value(&phys_dev_doc)
+                .map_err(|e| MLSError::Internal(format!("serialize Device: {e}")))?;
+
+            let vdev_doc = labyrinth::records::VirtualDevice::from_bundle(
+                &vdev_bundle,
+                None,
+                created_at.clone(),
+            );
+            let vdev_rkey = vdev_doc.rkey();
+            let vdev_doc_bytes = serde_json::to_vec(&vdev_doc)
+                .map_err(|e| MLSError::Internal(format!("serialize VirtualDevice: {e}")))?;
+            let vdev_val = serde_json::to_value(&vdev_doc)
+                .map_err(|e| MLSError::Internal(format!("serialize VirtualDevice Value: {e}")))?;
+
+            let epoch_member_doc =
+                labyrinth::records::EpochMember::from_record(&member_rec, created_at);
+            let epoch_member_rkey = epoch_member_doc.rkey();
+            let epoch_member_val = serde_json::to_value(&epoch_member_doc)
+                .map_err(|e| MLSError::Internal(format!("serialize EpochMember: {e}")))?;
+
+            // Publish physical device (idempotent) + virtual device bundle + epochMember outside write_tx.
+            let dev_resp = self.apply_space_writes(
+                &st_snapshot.mailbox_space_uri,
+                &[serde_json::json!({
+                    "$type": "com.atproto.space.applyWrites#create",
+                    "collection": labyrinth::records::nsid::DEVICE,
+                    "rkey": phys_dev_rkey,
+                    "value": phys_dev_val,
+                })],
+            )?;
+            if !is_space_write_committed(&dev_resp) {
+                return Err(MLSError::Internal(format!(
+                    "setup_recovery_code device applyWrites returned HTTP {}",
+                    dev_resp.status
+                )));
+            }
+
+            let bundle_resp = self.apply_space_writes(
+                &st_snapshot.mailbox_space_uri,
+                &[
+                    serde_json::json!({
+                        "$type": "com.atproto.space.applyWrites#create",
+                        "collection": labyrinth::records::nsid::VIRTUAL_DEVICE,
+                        "rkey": vdev_rkey,
+                        "value": vdev_val,
+                    }),
+                    serde_json::json!({
+                        "$type": "com.atproto.space.applyWrites#create",
+                        "collection": labyrinth::records::nsid::EPOCH_MEMBER,
+                        "rkey": epoch_member_rkey,
+                        "value": epoch_member_val,
+                    }),
+                ],
+            )?;
+            if !is_space_write_committed(&bundle_resp) {
+                return Err(MLSError::Internal(format!(
+                    "setup_recovery_code virtualDevice applyWrites returned HTTP {}",
+                    bundle_resp.status
+                )));
+            }
 
             let status = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
@@ -1100,7 +1394,8 @@ mod native_client {
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 st.has_recovery_code = true;
-                tx.put_labyrinth_state("recovery_vdevice_id", &vdev_id, now_ms)?;
+                tx.put_labyrinth_state("recovery_vdevice_id", &vdev_bundle.vdevice_id, now_ms)?;
+                tx.put_labyrinth_state("recovery_vdev_doc_json", &vdev_doc_bytes, now_ms)?;
                 tx.put_labyrinth_state(
                     "status_json",
                     &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
@@ -1116,43 +1411,109 @@ mod native_client {
         }
 
         /// Restore mailbox using a 40-character GF(32) recovery code (with up to 3-character
-        /// erasure/typo correction) and journal epoch rotation `E -> E+1` (`Gate 3`, `Gate 4`).
+        /// erasure/typo correction), decrypting the enrolled `blue.catbird.labyrinth.virtualDevice`
+        /// bundle from the personal mailbox Space to recover `owner_epoch_root` across devices
+        /// and journaling epoch rotation `E -> E+1` (`Gate 3`, `Gate 4`).
+        #[cfg(feature = "labyrinth")]
         pub fn restore_with_recovery_code(
             &self,
             recovery_code_input: &str,
         ) -> Result<LabyrinthBackupStatus, MLSError> {
-            let candidates = labyrinth::recovery_code::RecoveryCode::candidates(
+            use labyrinth::epoch::EpochKeys as _;
+
+            let _ = labyrinth::recovery_code::RecoveryCode::candidates(recovery_code_input)
+                .map_err(|_| {
+                    MLSError::invalid_input("invalid 40-character Labyrinth recovery code")
+                })?;
+
+            let (mailbox_space_uri, local_vdev_doc) = self.db.read_tx(|tx| {
+                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                })?;
+                let st: LabyrinthBackupStatus =
+                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                let local_doc = tx.get_labyrinth_state("recovery_vdev_doc_json")?;
+                Ok((st.mailbox_space_uri, local_doc))
+            })?;
+
+            let mut bundles: std::collections::HashMap<
+                [u8; 16],
+                labyrinth::virtual_device::VirtualDeviceRecord,
+            > = std::collections::HashMap::new();
+
+            if let Some(remote_records) = self.list_space_records_if_supported(
+                &mailbox_space_uri,
+                labyrinth::records::nsid::VIRTUAL_DEVICE,
+            )? {
+                for rec_val in remote_records {
+                    if let Ok(vdev_doc) =
+                        serde_json::from_value::<labyrinth::records::VirtualDevice>(rec_val)
+                    {
+                        if let Ok((bundle, _)) = vdev_doc.to_bundle() {
+                            bundles.insert(bundle.vdevice_id, bundle);
+                        }
+                    }
+                }
+            } else if let Some(raw_doc) = local_vdev_doc {
+                // Stub transport compatibility fallback when HTTP listRecords returns `{}` without `"records"`.
+                if let Ok(vdev_doc) =
+                    serde_json::from_slice::<labyrinth::records::VirtualDevice>(&raw_doc)
+                {
+                    if let Ok((bundle, _)) = vdev_doc.to_bundle() {
+                        bundles.insert(bundle.vdevice_id, bundle);
+                    }
+                }
+            }
+
+            if bundles.is_empty() {
+                return Err(MLSError::insufficient_permissions(
+                    "no enrolled Labyrinth virtual device found in personal mailbox Space",
+                ));
+            }
+
+            let matched_code = labyrinth::virtual_device::find_code(
                 recovery_code_input,
+                &self.normalized_did,
+                |cand_id| bundles.contains_key(cand_id),
             )
-            .map_err(|_| MLSError::invalid_input("invalid 40-character Labyrinth recovery code"))?;
+            .map_err(|_| {
+                MLSError::insufficient_permissions(
+                    "recovery code does not match enrolled Labyrinth virtual device",
+                )
+            })?;
+            let (matched_vdev_id, _) = matched_code.derive(&self.normalized_did);
+            let bundle = bundles.get(&matched_vdev_id).ok_or_else(|| {
+                MLSError::insufficient_permissions(
+                    "recovery code does not match enrolled Labyrinth virtual device",
+                )
+            })?;
+            let restored =
+                labyrinth::virtual_device::open(bundle, &matched_code, &self.normalized_did)
+                    .map_err(|e| {
+                        MLSError::insufficient_permissions(format!(
+                            "failed to decrypt Labyrinth virtual device bundle: {e}"
+                        ))
+                    })?;
+            let recovered_seq = restored.epoch.seq();
+            let recovered_root = Zeroizing::new(*restored.epoch.root());
+            let recovered_salt = restored.mailbox_root_salt;
 
             let now_ms = unix_now_ms();
             let status = self.db.write_tx(|tx| {
-                let expected_vdev = tx.get_labyrinth_state("recovery_vdevice_id")?;
-                let mut matched = false;
-                for candidate in candidates {
-                    let (cand_id, _cand_key) = candidate.derive(&self.normalized_did);
-                    if match expected_vdev.as_deref() {
-                        Some(exp) => exp == cand_id.as_slice(),
-                        None => true,
-                    } {
-                        matched = true;
-                        tx.put_labyrinth_state("recovery_vdevice_id", &cand_id, now_ms)?;
-                        break;
-                    }
-                }
-                if !matched {
-                    return Err(MLSError::insufficient_permissions(
-                        "recovery code does not match enrolled Labyrinth virtual device",
-                    ));
-                }
+                tx.put_labyrinth_state("recovery_vdevice_id", &matched_vdev_id, now_ms)?;
+                tx.put_labyrinth_state("mailbox_root_salt", &recovered_salt, now_ms)?;
+                tx.put_labyrinth_state(
+                    &owner_epoch_root_key(recovered_seq),
+                    recovered_root.as_slice(),
+                    now_ms,
+                )?;
 
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
                 })?;
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-                st.epoch_seq = st.epoch_seq.saturating_add(1);
+                st.epoch_seq = st.epoch_seq.max(recovered_seq).saturating_add(1);
                 st.has_recovery_code = true;
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
@@ -1163,8 +1524,11 @@ mod native_client {
                     journal_id: format!("restore-epoch-{}", st.epoch_seq),
                     op_type: "epoch_rotation".to_string(),
                     epoch_seq: st.epoch_seq,
-                    state_json: serde_json::json!({ "trigger": "recovery_code_restore" })
-                        .to_string(),
+                    state_json: serde_json::json!({
+                        "trigger": "recovery_code_restore",
+                        "recoveredEpochSeq": recovered_seq,
+                    })
+                    .to_string(),
                     status: "completed".to_string(),
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
@@ -1365,6 +1729,7 @@ mod native_client {
         ) -> Result<u32, MLSError> {
             let count = self.db.write_tx(|tx| {
                 let mut imported = 0u32;
+                let mut max_seq: Option<i64> = None;
                 for msg in &messages {
                     if msg.conversation_id != conversation_id {
                         return Err(MLSError::invalid_input(
@@ -1372,7 +1737,17 @@ mod native_client {
                         ));
                     }
                     tx.insert_message(msg)?;
+                    max_seq = Some(max_seq.map_or(msg.seq, |cur| cur.max(msg.seq)));
                     imported = imported.saturating_add(1);
+                }
+                if let Some(imported_max_seq) = max_seq {
+                    if let Some(mut convo) = tx.get_conversation(conversation_id)? {
+                        if imported_max_seq > convo.last_seq {
+                            convo.last_seq = imported_max_seq;
+                            convo.updated_at_ms = unix_now_ms();
+                            tx.upsert_conversation(&convo)?;
+                        }
+                    }
                 }
                 Ok(imported)
             })?;
@@ -1420,6 +1795,7 @@ mod native_client {
                 plaintext_json: fallback_json.clone(),
                 labyrinth_frame_json: canonical_labyrinth_frame_json(&fallback_json),
                 mls_ciphertext_b64: BASE64_STANDARD.encode(&row.payload_bytes),
+                frame_nonce_b64: None,
                 created_at_ms: row.created_at_ms,
             })
         }
@@ -1449,27 +1825,23 @@ mod native_client {
             Ok((maybe.0, root))
         }
 
-        fn put_space_record(
+        fn apply_space_writes(
             &self,
             space_uri: &str,
-            collection: &str,
-            rkey: &str,
-            record_value: serde_json::Value,
-        ) -> Result<u16, MLSError> {
+            writes: &[serde_json::Value],
+        ) -> Result<PlatformHttpResponse, MLSError> {
             let endpoint = format!(
-                "{}/xrpc/com.atproto.space.putRecords",
+                "{}/xrpc/com.atproto.space.applyWrites",
                 self.config.pds_endpoint.trim_end_matches('/')
             );
             let body = serde_json::to_vec(&serde_json::json!({
+                "repo": self.normalized_did,
                 "space": space_uri,
-                "records": [{
-                    "collection": collection,
-                    "rkey": rkey,
-                    "value": record_value,
-                }],
+                "validate": false,
+                "writes": writes,
             }))
-            .map_err(|e| MLSError::Internal(format!("serialize Space putRecords: {e}")))?;
-            let resp = self.transport.execute_http(PlatformHttpRequest {
+            .map_err(|e| MLSError::Internal(format!("serialize Space applyWrites: {e}")))?;
+            self.transport.execute_http(PlatformHttpRequest {
                 method: "POST".to_string(),
                 url: endpoint,
                 headers: vec![PlatformHttpHeader {
@@ -1477,152 +1849,405 @@ mod native_client {
                     value: "application/json".to_string(),
                 }],
                 body: Some(body),
-            })?;
-            Ok(resp.status)
+            })
+        }
+
+        /// Paginate `com.atproto.space.listRecords` for `collection` in `space_uri`.
+        /// Returns `Ok(None)` only when a stub transport returns `{}` without a `"records"` array.
+        fn list_space_records_if_supported(
+            &self,
+            space_uri: &str,
+            collection: &str,
+        ) -> Result<Option<Vec<serde_json::Value>>, MLSError> {
+            let base = self.config.pds_endpoint.trim_end_matches('/');
+            let mut cursor: Option<String> = None;
+            let mut all_values: Vec<serde_json::Value> = Vec::new();
+            let mut saw_records_array = false;
+
+            loop {
+                let mut url = format!(
+                    "{base}/xrpc/com.atproto.space.listRecords?space={}&repo={}&collection={}&limit=100",
+                    percent_encode_query_component(space_uri),
+                    percent_encode_query_component(&self.normalized_did),
+                    percent_encode_query_component(collection),
+                );
+                if let Some(ref c) = cursor {
+                    url.push_str("&cursor=");
+                    url.push_str(&percent_encode_query_component(c));
+                }
+
+                let resp = self.transport.execute_http(PlatformHttpRequest {
+                    method: "GET".to_string(),
+                    url,
+                    headers: Vec::new(),
+                    body: None,
+                })?;
+                if resp.status >= 400 {
+                    return Err(MLSError::Internal(format!(
+                        "com.atproto.space.listRecords({collection}) returned HTTP {}",
+                        resp.status
+                    )));
+                }
+                let parsed: serde_json::Value = serde_json::from_slice(&resp.body)
+                    .map_err(|e| MLSError::Internal(format!("parse Space listRecords: {e}")))?;
+                let Some(arr) = parsed.get("records").and_then(|v| v.as_array()) else {
+                    if !saw_records_array {
+                        return Ok(None);
+                    }
+                    break;
+                };
+                saw_records_array = true;
+                for entry in arr {
+                    if let Some(val) = entry.get("value") {
+                        all_values.push(val.clone());
+                    }
+                }
+                match parsed
+                    .get("cursor")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(next) if !arr.is_empty() => cursor = Some(next.to_string()),
+                    _ => break,
+                }
+            }
+
+            Ok(Some(all_values))
         }
 
         /// Drain durable `labyrinth_queue` items strictly outside `write_tx` (`Spec §5 I6`).
         ///
+        /// Seals canonical `blue.catbird.labyrinth.batch` records via `com.atproto.space.applyWrites`
+        /// with `<16-hex-seq>-<tid>` rkeys and `frame_nonce` preserved inside AEAD plaintext.
         /// If the conversation Space rejects the write with `401`/`403`/`404` (e.g. involuntary
         /// MLS kick or closed Space per `[CB-22]`), seals a canonical `v5` `OwnerBatch`
         /// (`KIND_ATTRIBUTED_FRAME = 0x03`, preserving `sender_did`) into the account's personal
         /// mailbox Space (`at://{did}/space/blue.catbird.labyrinth.mailbox/self`) and deletes
-        /// committed rows idempotently (`200..300` or `409 RecordAlreadyExists`).
+        /// committed rows idempotently (`200..300`, `409`, or `400 RecordAlreadyExists`).
         #[cfg(feature = "labyrinth")]
         pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
-            let rows = self.db.read_tx(|tx| tx.list_labyrinth_queue(None, 100))?;
-            if rows.is_empty() {
-                return Ok(0);
-            }
+            use labyrinth::sign::TransportSigner as _;
+
             let (status, owner_root) = self.load_status_and_owner_root()?;
             if !status.backup_enabled {
                 return Ok(0);
             }
 
-            let mut committed_ids: Vec<String> = Vec::with_capacity(rows.len());
-            let mut first_err: Option<MLSError> = None;
+            let now_ms = unix_now_ms();
+            let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+            let mut mek_cache: std::collections::HashMap<String, labyrinth::mek::Mek> =
+                std::collections::HashMap::new();
+            let mut total_committed: u32 = 0;
 
-            for row in &rows {
-                let payload = match self.decode_queue_row(row) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        first_err = Some(e);
-                        break;
-                    }
-                };
-                let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
-                    format!(
-                        "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
-                        payload.sequencer_did, payload.conversation_id
-                    )
-                });
-                let rkey = format!("outbox-{}", sanitize_rkey(&row.item_id));
-                let primary_val = serde_json::json!({
-                    "$type": "blue.catbird.labyrinth.outboxEntry",
-                    "threadId": payload.conversation_id,
-                    "messageId": payload.message_id,
-                    "seq": payload.seq,
-                    "epoch": payload.epoch,
-                    "senderDid": payload.sender_did,
-                    "mlsCiphertextB64": payload.mls_ciphertext_b64,
-                    "createdAt": rfc3339_from_ms(payload.created_at_ms),
-                });
-
-                let primary_status = match self.put_space_record(
-                    &convo_space,
-                    "blue.catbird.labyrinth.batch",
-                    &rkey,
-                    primary_val,
-                ) {
-                    Ok(code) => code,
-                    Err(e) => {
-                        first_err = Some(e);
-                        break;
-                    }
-                };
-
-                if (200..300).contains(&primary_status) || primary_status == 409 {
-                    committed_ids.push(row.item_id.clone());
-                    continue;
+            loop {
+                let rows = self.db.read_tx(|tx| tx.list_labyrinth_queue(None, 100))?;
+                if rows.is_empty() {
+                    break;
                 }
 
-                if matches!(primary_status, 401 | 403 | 404) {
-                    // Involuntary kick / Space access revoked ([CB-22]): seal into personal mailbox Space
-                    // using v5 KIND_ATTRIBUTED_FRAME so sender attribution survives restore.
-                    let owner_msg = labyrinth::message::seal_owner_attributed(
-                        &owner_root,
-                        status.epoch_seq,
-                        &payload.conversation_id,
-                        &payload.message_id,
-                        payload.created_at_ms.max(0) as u64,
-                        &payload.sender_did,
-                        payload.labyrinth_frame_json.as_bytes(),
-                    )
-                    .map_err(|e| {
-                        MLSError::Cryptography(format!("seal_owner_attributed fallback: {e}"))
-                    })?;
-                    let batch = labyrinth::records::OwnerBatch::from_messages(
-                        &[owner_msg],
-                        rfc3339_from_ms(payload.created_at_ms),
-                    )
-                    .map_err(|e| MLSError::Internal(format!("OwnerBatch::from_messages: {e}")))?;
-                    let batch_val = serde_json::to_value(&batch)
-                        .map_err(|e| MLSError::Internal(format!("serialize OwnerBatch: {e}")))?;
-                    let fb_rkey = format!("fallback-{}", sanitize_rkey(&row.item_id));
-                    match self.put_space_record(
-                        &status.mailbox_space_uri,
-                        "blue.catbird.labyrinth.ownerBatch",
-                        &fb_rkey,
-                        batch_val,
-                    ) {
-                        Ok(fb_code) if (200..300).contains(&fb_code) || fb_code == 409 => {
-                            committed_ids.push(row.item_id.clone());
-                        }
-                        Ok(fb_code) => {
-                            first_err = Some(MLSError::Internal(format!(
-                                "personal mailbox OwnerBatch fallback returned HTTP {fb_code}"
-                            )));
-                            break;
-                        }
+                let mut committed_ids: Vec<String> = Vec::with_capacity(rows.len());
+                let mut first_err: Option<MLSError> = None;
+
+                for (idx, row) in rows.iter().enumerate() {
+                    let payload = match self.decode_queue_row(row) {
+                        Ok(p) => p,
                         Err(e) => {
                             first_err = Some(e);
                             break;
                         }
+                    };
+                    let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
+                        format!(
+                            "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
+                            payload.sequencer_did, payload.conversation_id
+                        )
+                    });
+
+                    let mek = if let Some(m) = mek_cache.get(&payload.conversation_id) {
+                        m.clone()
+                    } else {
+                        let m = ensure_convo_sender_mek(
+                            &self.db,
+                            &payload.conversation_id,
+                            transport_signer.transport_public_key(),
+                            now_ms,
+                        )?;
+                        mek_cache.insert(payload.conversation_id.clone(), m.clone());
+                        m
+                    };
+
+                    let ts_ms = payload.created_at_ms.max(0) as u64;
+                    let sender_data: Zeroizing<Vec<u8>> = if let Some(ref nonce_b64) =
+                        payload.frame_nonce_b64
+                    {
+                        if let Ok(decoded) = BASE64_STANDARD.decode(nonce_b64.as_bytes()) {
+                            if decoded.len() == 32 {
+                                let mut combined =
+                                    Vec::with_capacity(32 + payload.labyrinth_frame_json.len());
+                                combined.extend_from_slice(&decoded);
+                                combined.extend_from_slice(payload.labyrinth_frame_json.as_bytes());
+                                Zeroizing::new(combined)
+                            } else {
+                                Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
+                            }
+                        } else {
+                            Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
+                        }
+                    } else {
+                        Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
+                    };
+
+                    let mut sealed_msg = match labyrinth::message::seal_sender(
+                        &mek,
+                        &payload.conversation_id,
+                        &payload.message_id,
+                        ts_ms,
+                        &sender_data,
+                        &transport_signer,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            first_err = Some(MLSError::Cryptography(format!(
+                                "seal_sender conversation Batch: {e}"
+                            )));
+                            break;
+                        }
+                    };
+                    sealed_msg.seq = Some(payload.seq.max(0) as u64);
+
+                    let sender_batch = match labyrinth::records::Batch::from_messages(
+                        &payload.conversation_id,
+                        &[sealed_msg],
+                        labyrinth::records::datetime_from_ms(ts_ms),
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            first_err =
+                                Some(MLSError::Internal(format!("Batch::from_messages: {e}")));
+                            break;
+                        }
+                    };
+                    let batch_val = match serde_json::to_value(&sender_batch) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            first_err = Some(MLSError::Internal(format!("serialize Batch: {e}")));
+                            break;
+                        }
+                    };
+                    let tid = deterministic_tid(
+                        payload.created_at_ms,
+                        idx as u64,
+                        &format!("batch:{}:{}", payload.conversation_id, row.item_id),
+                    );
+                    let rkey = format!("{:016x}-{tid}", payload.seq.max(0) as u64);
+
+                    let primary_resp = match self.apply_space_writes(
+                        &convo_space,
+                        &[serde_json::json!({
+                            "$type": "com.atproto.space.applyWrites#create",
+                            "collection": labyrinth::records::nsid::BATCH,
+                            "rkey": rkey,
+                            "value": batch_val,
+                        })],
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            first_err = Some(e);
+                            break;
+                        }
+                    };
+
+                    if is_space_write_committed(&primary_resp) {
+                        committed_ids.push(row.item_id.clone());
+                        continue;
                     }
-                } else {
-                    first_err = Some(MLSError::Internal(format!(
-                        "conversation Space putRecords returned HTTP {primary_status}"
-                    )));
+
+                    if matches!(primary_resp.status, 401 | 403 | 404) {
+                        // Involuntary kick / Space access revoked ([CB-22]): seal into personal mailbox Space
+                        // using v5 KIND_ATTRIBUTED_FRAME so sender attribution survives restore.
+                        let owner_msg = match labyrinth::message::seal_owner_attributed(
+                            &owner_root,
+                            status.epoch_seq,
+                            &payload.conversation_id,
+                            &payload.message_id,
+                            ts_ms,
+                            &payload.sender_did,
+                            payload.labyrinth_frame_json.as_bytes(),
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                first_err = Some(MLSError::Cryptography(format!(
+                                    "seal_owner_attributed fallback: {e}"
+                                )));
+                                break;
+                            }
+                        };
+                        let owner_batch = match labyrinth::records::OwnerBatch::from_messages(
+                            &[owner_msg],
+                            labyrinth::records::datetime_from_ms(ts_ms),
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                first_err = Some(MLSError::Internal(format!(
+                                    "OwnerBatch::from_messages: {e}"
+                                )));
+                                break;
+                            }
+                        };
+                        let owner_batch_val = match serde_json::to_value(&owner_batch) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                first_err =
+                                    Some(MLSError::Internal(format!("serialize OwnerBatch: {e}")));
+                                break;
+                            }
+                        };
+                        let fb_rkey = deterministic_tid(
+                            payload.created_at_ms,
+                            idx as u64,
+                            &format!("fb:{}:{}", payload.conversation_id, row.item_id),
+                        );
+                        match self.apply_space_writes(
+                            &status.mailbox_space_uri,
+                            &[serde_json::json!({
+                                "$type": "com.atproto.space.applyWrites#create",
+                                "collection": labyrinth::records::nsid::OWNER_BATCH,
+                                "rkey": fb_rkey,
+                                "value": owner_batch_val,
+                            })],
+                        ) {
+                            Ok(fb_resp) if is_space_write_committed(&fb_resp) => {
+                                committed_ids.push(row.item_id.clone());
+                            }
+                            Ok(fb_resp) => {
+                                first_err = Some(MLSError::Internal(format!(
+                                    "personal mailbox OwnerBatch fallback returned HTTP {}",
+                                    fb_resp.status
+                                )));
+                                break;
+                            }
+                            Err(e) => {
+                                first_err = Some(e);
+                                break;
+                            }
+                        }
+                    } else {
+                        first_err = Some(MLSError::Internal(format!(
+                            "conversation Space applyWrites returned HTTP {}",
+                            primary_resp.status
+                        )));
+                        break;
+                    }
+                }
+
+                if !committed_ids.is_empty() {
+                    self.db.write_tx(|tx| {
+                        for id in &committed_ids {
+                            tx.dequeue_labyrinth_item(id)?;
+                        }
+                        Ok(())
+                    })?;
+                    total_committed = total_committed.saturating_add(committed_ids.len() as u32);
+                }
+
+                if let Some(err) = first_err {
+                    return Err(err);
+                }
+                if committed_ids.is_empty() {
                     break;
                 }
             }
 
-            if !committed_ids.is_empty() {
-                self.db.write_tx(|tx| {
-                    for id in &committed_ids {
-                        tx.dequeue_labyrinth_item(id)?;
-                    }
-                    Ok(())
-                })?;
-            }
-
-            if let Some(err) = first_err {
-                return Err(err);
-            }
-            Ok(committed_ids.len() as u32)
+            Ok(total_committed)
         }
 
-        /// Rescue locally cached SQLCipher conversation messages + pending outbox items into
-        /// the account's personal mailbox Space (`v5` `OwnerBatch` with `KIND_ATTRIBUTED_FRAME`)
-        /// when involuntarily kicked or before local conversation deletion (`[CB-22]`, `[CB-37]`, `I6`).
+        /// Rescue ALL locally cached SQLCipher conversation messages + pending outbox items
+        /// (paginating past the 500-row SQL page cap) into the account's personal mailbox Space
+        /// (`v5` `OwnerBatch` with `KIND_ATTRIBUTED_FRAME`) when involuntarily kicked or before
+        /// local conversation deletion (`[CB-22]`, `[CB-37]`, `I6`).
         #[cfg(feature = "labyrinth")]
         pub fn rescue_conversation_on_kick(&self, conversation_id: &str) -> Result<u32, MLSError> {
             let (mut cached_msgs, queued_rows) = self.db.read_tx(|tx| {
-                let msgs = tx.list_messages(conversation_id, None, 1_000)?;
-                let queued = tx.list_labyrinth_queue(Some(conversation_id), 500)?;
-                Ok((msgs, queued))
+                let mut all_msgs: Vec<MessageRow> = Vec::new();
+                let mut after_rowid: i64 = 0;
+                let mut msg_stmt = tx
+                    .conn()
+                    .prepare(
+                        "SELECT rowid, message_id, conversation_id, group_id, epoch, seq, sender_did, \
+                                sender_device_id, plaintext_json, created_at_ms, is_own \
+                         FROM messages WHERE conversation_id = ?1 AND rowid > ?2 \
+                         ORDER BY rowid ASC LIMIT 500",
+                    )
+                    .map_err(|e| MLSError::Internal(format!("prepare rescue messages query: {e}")))?;
+                loop {
+                    let rows = msg_stmt
+                        .query_map(rusqlite::params![conversation_id, after_rowid], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                MessageRow {
+                                    message_id: row.get(1)?,
+                                    conversation_id: row.get(2)?,
+                                    group_id: row.get(3)?,
+                                    epoch: row.get(4)?,
+                                    seq: row.get(5)?,
+                                    sender_did: row.get(6)?,
+                                    sender_device_id: row.get(7)?,
+                                    plaintext_json: row.get(8)?,
+                                    created_at_ms: row.get(9)?,
+                                    is_own: row.get::<_, i64>(10)? != 0,
+                                },
+                            ))
+                        })
+                        .map_err(|e| {
+                            MLSError::Internal(format!("execute rescue messages query: {e}"))
+                        })?;
+                    let mut page_len = 0usize;
+                    for r in rows {
+                        let (rid, msg) = r.map_err(|e| {
+                            MLSError::Internal(format!("read rescue message row: {e}"))
+                        })?;
+                        after_rowid = rid;
+                        all_msgs.push(msg);
+                        page_len += 1;
+                    }
+                    if page_len < 500 {
+                        break;
+                    }
+                }
+
+                let mut stmt = tx
+                    .conn()
+                    .prepare(
+                        "SELECT item_id, conversation_id, group_id_hex, seq, payload_bytes, created_at_ms \
+                         FROM labyrinth_queue WHERE conversation_id = ?1 ORDER BY seq ASC, item_id ASC",
+                    )
+                    .map_err(|e| MLSError::Internal(format!("prepare rescue queue query: {e}")))?;
+                let queued_iter = stmt
+                    .query_map([conversation_id], |row| {
+                        Ok(LabyrinthQueueRow {
+                            item_id: row.get(0)?,
+                            conversation_id: row.get(1)?,
+                            group_id_hex: row.get(2)?,
+                            seq: row.get(3)?,
+                            payload_bytes: row.get(4)?,
+                            created_at_ms: row.get(5)?,
+                        })
+                    })
+                    .map_err(|e| MLSError::Internal(format!("execute rescue queue query: {e}")))?;
+                let mut all_queued = Vec::new();
+                for r in queued_iter {
+                    all_queued.push(
+                        r.map_err(|e| MLSError::Internal(format!("read rescue queue row: {e}")))?,
+                    );
+                }
+                Ok((all_msgs, all_queued))
             })?;
-            cached_msgs.reverse();
+            cached_msgs.sort_by(|a, b| {
+                a.created_at_ms
+                    .cmp(&b.created_at_ms)
+                    .then_with(|| a.seq.cmp(&b.seq))
+                    .then_with(|| a.message_id.cmp(&b.message_id))
+            });
 
             let (status, owner_root) = self.load_status_and_owner_root()?;
             if !status.backup_enabled {
@@ -1672,34 +2297,38 @@ mod native_client {
             }
 
             let now_ms = unix_now_ms();
+            let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
             for (chunk_idx, chunk) in sealed_items
                 .chunks(labyrinth::records::MAX_BATCH_ITEMS)
                 .enumerate()
             {
-                let first_id = chunk
-                    .first()
-                    .map(|m| sanitize_rkey(&m.message_id))
-                    .unwrap_or_else(|| "0".to_string());
-                let rkey = format!(
-                    "rescue-{}-{chunk_idx}-{first_id}",
-                    sanitize_rkey(conversation_id)
+                let first_ts = chunk.first().map(|m| m.timestamp as i64).unwrap_or(now_ms);
+                let first_id = chunk.first().map(|m| m.message_id.as_str()).unwrap_or("0");
+                let rkey = deterministic_tid(
+                    first_ts,
+                    chunk_idx as u64,
+                    &format!("rescue:{conversation_id}:{chunk_idx}:{first_id}"),
                 );
-                let batch = labyrinth::records::OwnerBatch::from_messages(
-                    chunk,
-                    rfc3339_from_ms(now_ms),
-                )
-                .map_err(|e| MLSError::Internal(format!("OwnerBatch::from_messages: {e}")))?;
+                let batch =
+                    labyrinth::records::OwnerBatch::from_messages(chunk, created_at.clone())
+                        .map_err(|e| {
+                            MLSError::Internal(format!("OwnerBatch::from_messages: {e}"))
+                        })?;
                 let batch_val = serde_json::to_value(&batch)
                     .map_err(|e| MLSError::Internal(format!("serialize OwnerBatch: {e}")))?;
-                let code = self.put_space_record(
+                let resp = self.apply_space_writes(
                     &status.mailbox_space_uri,
-                    "blue.catbird.labyrinth.ownerBatch",
-                    &rkey,
-                    batch_val,
+                    &[serde_json::json!({
+                        "$type": "com.atproto.space.applyWrites#create",
+                        "collection": labyrinth::records::nsid::OWNER_BATCH,
+                        "rkey": rkey,
+                        "value": batch_val,
+                    })],
                 )?;
-                if !((200..300).contains(&code) || code == 409) {
+                if !is_space_write_committed(&resp) {
                     return Err(MLSError::Internal(format!(
-                        "rescue_conversation_on_kick putRecords returned HTTP {code}"
+                        "rescue_conversation_on_kick applyWrites returned HTTP {}",
+                        resp.status
                     )));
                 }
             }
@@ -1778,6 +2407,151 @@ mod native_client {
                 }
             }
             Ok(out)
+        }
+
+        /// Restore a kicked/left conversation's history on any enrolled/restored device directly
+        /// from `blue.catbird.labyrinth.ownerBatch` records in the account's personal mailbox Space,
+        /// preserving authenticated `sender_did` attribution (`[CB-22]`, `[CB-37]`, `Gate 3`).
+        #[cfg(feature = "labyrinth")]
+        pub fn restore_conversation_from_owner_mailbox(
+            &self,
+            conversation_id: &str,
+        ) -> Result<u32, MLSError> {
+            let status = self.labyrinth_status()?;
+            let Some(records) = self.list_space_records_if_supported(
+                &status.mailbox_space_uri,
+                labyrinth::records::nsid::OWNER_BATCH,
+            )?
+            else {
+                return Ok(0);
+            };
+
+            let mut recovered_items: Vec<(u64, String, String, String)> = Vec::new();
+            let mut seen_ids = std::collections::HashSet::new();
+
+            for rec_val in records {
+                let batch: labyrinth::records::OwnerBatch = serde_json::from_value(rec_val)
+                    .map_err(|e| MLSError::Internal(format!("parse OwnerBatch: {e}")))?;
+                let msgs = batch
+                    .to_messages()
+                    .map_err(|e| MLSError::Internal(format!("OwnerBatch::to_messages: {e}")))?;
+                for msg in msgs {
+                    if msg.thread_id != conversation_id {
+                        continue;
+                    }
+                    if !seen_ids.insert(msg.message_id.clone()) {
+                        continue;
+                    }
+                    let root_bytes = self
+                        .db
+                        .read_tx(|tx| tx.get_labyrinth_state(&owner_epoch_root_key(msg.epoch_seq)))?
+                        .ok_or_else(|| {
+                            MLSError::InvalidState(format!(
+                                "missing owner_epoch_root for epoch {}",
+                                msg.epoch_seq
+                            ))
+                        })?;
+                    let root: [u8; 32] = root_bytes.as_slice().try_into().map_err(|_| {
+                        MLSError::Internal("invalid owner_epoch_root length".to_string())
+                    })?;
+                    let opened = labyrinth::message::open_owner_content(&root, &msg)
+                        .map_err(|e| MLSError::Cryptography(format!("open_owner_content: {e}")))?;
+                    let (sender_opt, frame_bytes) = match opened {
+                        labyrinth::message::OwnerContent::AttributedFrame { sender_did, frame } => {
+                            (Some(sender_did), frame)
+                        }
+                        labyrinth::message::OwnerContent::CommittedFrame { frame, .. } => {
+                            let sender = msg.sequencer_receipt.as_ref().and_then(|r| {
+                                r.signed
+                                    .payload
+                                    .sender_device_did_url
+                                    .split('#')
+                                    .next()
+                                    .filter(|s| s.starts_with("did:"))
+                                    .map(str::to_string)
+                            });
+                            (sender, frame)
+                        }
+                        labyrinth::message::OwnerContent::Frame(frame) => (None, frame),
+                        labyrinth::message::OwnerContent::Tombstone { .. } => continue,
+                    };
+                    let Some(sender_did) = sender_opt else {
+                        continue;
+                    };
+                    let plaintext_json = String::from_utf8(frame_bytes).map_err(|e| {
+                        MLSError::Internal(format!("restored frame is not UTF-8: {e}"))
+                    })?;
+                    recovered_items.push((
+                        msg.timestamp,
+                        msg.message_id,
+                        sender_did,
+                        plaintext_json,
+                    ));
+                }
+            }
+
+            if recovered_items.is_empty() {
+                return Ok(0);
+            }
+            recovered_items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+            let now_ms = unix_now_ms();
+            let imported = self.db.write_tx(|tx| {
+                let existing_convo = tx.get_conversation(conversation_id)?;
+                let group_id = existing_convo
+                    .as_ref()
+                    .map(|c| c.group_id.clone())
+                    .unwrap_or_else(|| Sha256::digest(conversation_id.as_bytes()).to_vec());
+                let base_seq = existing_convo.as_ref().map(|c| c.last_seq).unwrap_or(0);
+                let mut next_seq = base_seq;
+                let mut count = 0u32;
+
+                for (ts_ms, msg_id, sender_did, plaintext_json) in &recovered_items {
+                    if tx.get_message(msg_id)?.is_some() {
+                        continue;
+                    }
+                    next_seq = next_seq.saturating_add(1);
+                    let is_own = sender_did == &self.normalized_did;
+                    tx.insert_message(&MessageRow {
+                        message_id: msg_id.clone(),
+                        conversation_id: conversation_id.to_string(),
+                        group_id: group_id.clone(),
+                        epoch: 0,
+                        seq: next_seq,
+                        sender_did: sender_did.clone(),
+                        sender_device_id: "restored-labyrinth".to_string(),
+                        plaintext_json: plaintext_json.clone(),
+                        created_at_ms: *ts_ms as i64,
+                        is_own,
+                    })?;
+                    count = count.saturating_add(1);
+                }
+
+                let mut convo = existing_convo.unwrap_or(ConversationRow {
+                    conversation_id: conversation_id.to_string(),
+                    group_id,
+                    generation: 0,
+                    epoch: 0,
+                    last_seq: next_seq,
+                    sequencer_did: self.config.home_ds_did.clone(),
+                    space_uri: None,
+                    title: None,
+                    unread_count: 0,
+                    updated_at_ms: now_ms,
+                });
+                convo.last_seq = convo.last_seq.max(next_seq);
+                convo.updated_at_ms = now_ms;
+                tx.upsert_conversation(&convo)?;
+
+                Ok(count)
+            })?;
+
+            if imported > 0 {
+                self.notify(PlatformChangeEvent::MessagesUpdated {
+                    conversation_id: conversation_id.to_string(),
+                });
+            }
+            Ok(imported)
         }
     }
 }

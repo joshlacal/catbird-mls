@@ -637,11 +637,156 @@ fn parse_did_doc_sequencer_keys(
     Ok((redaction, receipt))
 }
 
+/// Resolves a federated sequencer DID (`did:web:...` or `did:plc:...`) into a
+/// validated, SSRF-hardened `https://` DID document URL.
+///
+/// Rejects single-label/local hosts (`localhost`, `.local`, `.internal`), IPv4/IPv6
+/// literals, non-443 ports, userinfo (`@`), path traversal (`.` / `..` / `%2e` / `%2f`),
+/// and malformed `did:plc` identifiers.
+pub fn did_document_url(did: &str) -> Result<String, String> {
+    let base = normalize_sequencer_did(did);
+    if let Some(plc_id) = base.strip_prefix("did:plc:") {
+        if plc_id.len() != 24
+            || !plc_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+        {
+            return Err(format!("invalid did:plc identifier: {did}"));
+        }
+        return Ok(format!("https://plc.directory/did:plc:{plc_id}"));
+    }
+
+    let Some(web_rest) = base.strip_prefix("did:web:") else {
+        return Err(format!("unsupported sequencer DID method: {did}"));
+    };
+    if web_rest.is_empty() {
+        return Err("empty did:web authority".into());
+    }
+
+    let mut segments = web_rest.split(':');
+    let raw_host_seg = segments.next().unwrap_or("");
+    let raw_host_decoded = if let Some(h) = raw_host_seg
+        .strip_suffix("%3A443")
+        .or_else(|| raw_host_seg.strip_suffix("%3a443"))
+    {
+        h
+    } else if raw_host_seg.contains('%') {
+        return Err(format!(
+            "disallowed port or percent-encoding in did:web host: {did}"
+        ));
+    } else {
+        raw_host_seg
+    };
+
+    if raw_host_decoded.is_empty()
+        || raw_host_decoded.len() > 253
+        || raw_host_decoded.contains('@')
+        || raw_host_decoded.contains('/')
+        || raw_host_decoded.contains('?')
+        || raw_host_decoded.contains('#')
+        || raw_host_decoded.starts_with('[')
+        || raw_host_decoded.ends_with(']')
+        || raw_host_decoded.parse::<std::net::IpAddr>().is_ok()
+    {
+        return Err(format!("disallowed did:web host: {did}"));
+    }
+
+    let host_lower = raw_host_decoded.to_ascii_lowercase();
+    let labels: Vec<&str> = host_lower.split('.').collect();
+    if labels.len() < 2 {
+        return Err(format!("single-label did:web host rejected (SSRF): {did}"));
+    }
+    if matches!(
+        labels.last().copied(),
+        Some("localhost" | "local" | "internal" | "arpa")
+    ) {
+        return Err(format!("local/reserved did:web TLD rejected (SSRF): {did}"));
+    }
+    if labels
+        .iter()
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(format!("numeric IPv4 did:web host rejected (SSRF): {did}"));
+    }
+    for label in &labels {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(format!("invalid DNS label in did:web host: {did}"));
+        }
+    }
+
+    let mut path_parts: Vec<String> = Vec::new();
+    for seg in segments {
+        if seg.is_empty()
+            || seg == "."
+            || seg == ".."
+            || seg.contains('/')
+            || seg.contains('\\')
+            || seg.contains('?')
+            || seg.contains('#')
+        {
+            return Err(format!("invalid path segment in did:web: {did}"));
+        }
+        let bytes = seg.as_bytes();
+        let mut i = 0;
+        let mut decoded_ascii = String::with_capacity(bytes.len());
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'%' {
+                if i + 2 >= bytes.len() {
+                    return Err(format!("truncated percent-escape in did:web path: {did}"));
+                }
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                let (Some(h), Some(l)) = (hi, lo) else {
+                    return Err(format!("invalid percent-escape in did:web path: {did}"));
+                };
+                let val = ((h << 4) | l) as u8;
+                if matches!(val, 0x00..=0x1F | 0x7F | b'/' | b'\\' | b'?' | b'#') {
+                    return Err(format!(
+                        "encoded control/separator byte in did:web path: {did}"
+                    ));
+                }
+                decoded_ascii.push(val as char);
+                i += 3;
+            } else if matches!(
+                b,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+            ) {
+                decoded_ascii.push(b as char);
+                i += 1;
+            } else {
+                return Err(format!("disallowed character in did:web path: {did}"));
+            }
+        }
+        if decoded_ascii == "." || decoded_ascii == ".." {
+            return Err(format!("encoded dot-segment in did:web path: {did}"));
+        }
+        path_parts.push(seg.to_owned());
+    }
+
+    if path_parts.is_empty() {
+        Ok(format!("https://{host_lower}/.well-known/did.json"))
+    } else {
+        Ok(format!(
+            "https://{host_lower}/{}/did.json",
+            path_parts.join("/")
+        ))
+    }
+}
+
 /// Verifying `mls-ds` directory & epoch-head publisher over the 6 clean-slate endpoints.
 pub struct DsDirectoryStore {
     transport: Arc<GatewayXrpcTransport>,
     sequencer_key: Option<SequencerKey>,
     sequencer_receipt_key: Option<SequencerReceiptKey>,
+    placements: Option<(String, Arc<dyn super::state::StateVault>)>,
     thread_keys: std::sync::Mutex<std::collections::HashMap<String, CachedSequencerKeys>>,
     did_doc_keys: std::sync::Mutex<
         std::collections::HashMap<String, (Option<SequencerKey>, Option<SequencerReceiptKey>)>,
@@ -658,15 +803,51 @@ impl DsDirectoryStore {
             transport,
             sequencer_key,
             sequencer_receipt_key,
+            placements: None,
             thread_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
             did_doc_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn with_placements(
+        mut self,
+        did: impl Into<String>,
+        placements: Arc<dyn super::state::StateVault>,
+    ) -> Self {
+        self.placements = Some((did.into(), placements));
+        self
+    }
+
+    fn saved_thread_authority(&self, thread_id: &str) -> labyrinth::Result<Option<String>> {
+        let Some((ref did, ref vault)) = self.placements else {
+            return Ok(None);
+        };
+        let key = super::space::thread_placement_key(did);
+        let Some(raw) = vault
+            .load(&key)
+            .map_err(|e| labyrinth::Error::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let pins: std::collections::BTreeMap<String, super::space::ThreadPlacement> =
+            serde_json::from_slice(&raw)
+                .map_err(|_| labyrinth::Error::Malformed("saved conversation placements"))?;
+        let Some(pin) = pins.get(thread_id) else {
+            return Ok(None);
+        };
+        pin.validate()?;
+        let Some(ref space_uri) = pin.space else {
+            return Ok(None);
+        };
+        let parsed = labyrinth::store::space::SpaceRef::parse(space_uri)?;
+        Ok(Some(normalize_sequencer_did(&parsed.space_did)))
     }
 
     async fn resolve_did_doc_keys(
         &self,
         sequencer_did: &str,
     ) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+        let _validated_url = did_document_url(sequencer_did).map_err(labyrinth::Error::Backend)?;
         if let Some(cached) = self
             .did_doc_keys
             .lock()
@@ -685,10 +866,12 @@ impl DsDirectoryStore {
             return Ok((None, None));
         };
         let parsed = parse_did_doc_sequencer_keys(sequencer_did, &doc_bytes)?;
-        self.did_doc_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sequencer_did.to_owned(), parsed.clone());
+        if parsed.0.is_some() || parsed.1.is_some() {
+            self.did_doc_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sequencer_did.to_owned(), parsed.clone());
+        }
         Ok(parsed)
     }
 
@@ -718,49 +901,72 @@ impl DsDirectoryStore {
         let mut inline_redaction: Option<SequencerKey> = None;
         let mut inline_receipt: Option<SequencerReceiptKey> = None;
 
-        if let Ok(body) = state_res {
-            let parsed: serde_json::Value = serde_json::from_slice(&body)
-                .map_err(|_| labyrinth::Error::Malformed("getConversationState JSON"))?;
-            if let Some(raw_ds) = parsed["state"]["sequencerDid"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-            {
-                let norm_ds = normalize_sequencer_did(raw_ds);
-                if let Some(raw_ed) = parsed["state"]
-                    .get("sequencerPublicKey")
-                    .and_then(decode_wire_bytes_any)
+        match state_res {
+            Ok(body) => {
+                let parsed: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|_| labyrinth::Error::Malformed("getConversationState JSON"))?;
+                if let Some(raw_ds) = parsed["state"]["sequencerDid"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
                 {
-                    if let Ok(key) = <[u8; 32]>::try_from(raw_ed.as_slice()) {
-                        inline_redaction = Some(SequencerKey {
-                            did: norm_ds.clone(),
-                            key,
-                        });
+                    let norm_ds = normalize_sequencer_did(raw_ds);
+                    if let Some(raw_ed) = parsed["state"]
+                        .get("sequencerPublicKey")
+                        .and_then(decode_wire_bytes_any)
+                    {
+                        if let Ok(key) = <[u8; 32]>::try_from(raw_ed.as_slice()) {
+                            inline_redaction = Some(SequencerKey {
+                                did: norm_ds.clone(),
+                                key,
+                            });
+                        }
                     }
-                }
-                if let Some(raw_p256) = parsed["state"]
-                    .get("sequencerReceiptPublicKey")
-                    .and_then(decode_wire_bytes_any)
+                    if let Some(raw_p256) = parsed["state"]
+                        .get("sequencerReceiptPublicKey")
+                        .and_then(decode_wire_bytes_any)
+                    {
+                        if p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw_p256).is_ok() {
+                            inline_receipt = Some(SequencerReceiptKey {
+                                did: norm_ds.clone(),
+                                public_key_sec1: raw_p256,
+                            });
+                        }
+                    }
+                    sequencer_did = Some(norm_ds);
+                } else if let Some(space_uri) = parsed["state"]["conversationSpace"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
                 {
-                    if p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw_p256).is_ok() {
-                        inline_receipt = Some(SequencerReceiptKey {
-                            did: norm_ds.clone(),
-                            public_key_sec1: raw_p256,
-                        });
-                    }
+                    let space_ref = labyrinth::store::space::SpaceRef::parse(space_uri)?;
+                    sequencer_did = Some(normalize_sequencer_did(&space_ref.space_did));
                 }
-                sequencer_did = Some(norm_ds);
+            }
+            Err(e) => {
+                let mapped = map_xrpc_error(e);
+                match mapped {
+                    labyrinth::Error::Forbidden | labyrinth::Error::NotFound("conversation") => {
+                        sequencer_did = self.saved_thread_authority(thread_id)?;
+                    }
+                    other => return Err(other),
+                }
             }
         }
 
-        let matches_target = |candidate_did: &str, target: Option<&str>| match target {
+        if sequencer_did.is_none() {
+            sequencer_did = self.saved_thread_authority(thread_id)?;
+        }
+
+        // Fail closed: NEVER match home DS keys when `sequencer_did` is unknown (`None`)
+        // or belongs to a foreign federated authority.
+        let matches_expected = |candidate_did: &str, target: Option<&str>| match target {
             Some(expected) => normalize_sequencer_did(candidate_did) == expected,
-            None => true,
+            None => false,
         };
 
         let mut redaction_key = inline_redaction;
         if redaction_key.is_none() {
             if let Some(ref sk) = self.sequencer_key {
-                if matches_target(&sk.did, sequencer_did.as_deref()) {
+                if matches_expected(&sk.did, sequencer_did.as_deref()) {
                     redaction_key = Some(SequencerKey {
                         did: normalize_sequencer_did(&sk.did),
                         key: sk.key,
@@ -775,7 +981,7 @@ impl DsDirectoryStore {
                 .await
             {
                 let norm = normalize_sequencer_did(&did);
-                if matches_target(&norm, sequencer_did.as_deref()) {
+                if sequencer_did.as_deref().is_none_or(|exp| norm == exp) {
                     if sequencer_did.is_none() {
                         sequencer_did = Some(norm.clone());
                     }
@@ -787,7 +993,7 @@ impl DsDirectoryStore {
         let mut receipt_key = inline_receipt;
         if receipt_key.is_none() {
             if let Some(ref rk) = self.sequencer_receipt_key {
-                if matches_target(&rk.did, sequencer_did.as_deref())
+                if matches_expected(&rk.did, sequencer_did.as_deref())
                     && p256::ecdsa::VerifyingKey::from_sec1_bytes(&rk.public_key_sec1).is_ok()
                 {
                     receipt_key = Some(SequencerReceiptKey {
@@ -804,7 +1010,7 @@ impl DsDirectoryStore {
                 .await
             {
                 let norm = normalize_sequencer_did(&did);
-                if matches_target(&norm, sequencer_did.as_deref())
+                if sequencer_did.as_deref().is_none_or(|exp| norm == exp)
                     && p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).is_ok()
                 {
                     if sequencer_did.is_none() {
@@ -828,16 +1034,18 @@ impl DsDirectoryStore {
                     receipt_key = doc_receipt;
                 }
             }
-            self.thread_keys
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    thread_id.to_owned(),
-                    CachedSequencerKeys {
-                        redaction_key: redaction_key.clone(),
-                        receipt_key: receipt_key.clone(),
-                    },
-                );
+            if redaction_key.is_some() || receipt_key.is_some() {
+                self.thread_keys
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        thread_id.to_owned(),
+                        CachedSequencerKeys {
+                            redaction_key: redaction_key.clone(),
+                            receipt_key: receipt_key.clone(),
+                        },
+                    );
+            }
         }
 
         Ok((redaction_key, receipt_key))

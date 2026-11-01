@@ -204,6 +204,7 @@ pub struct MlsAccountDb {
     db_key_32: Zeroizing<[u8; 32]>,
     mode: OpenMode,
     suspended: AtomicBool,
+    conn_open: AtomicBool,
     state: Mutex<AccountDbConnState>,
     eviction_hooks: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     keychain: Mutex<Option<Arc<dyn KeychainAccess>>>,
@@ -223,6 +224,7 @@ impl MlsAccountDb {
             db_key_32: Zeroizing::new(*db_key_32),
             mode,
             suspended: AtomicBool::new(false),
+            conn_open: AtomicBool::new(true),
             state: Mutex::new(AccountDbConnState {
                 conn: Some(conn),
                 last_reconciled_data_version: initial_dv,
@@ -271,11 +273,9 @@ impl MlsAccountDb {
     }
 
     /// Returns `true` when the database handle is open and accepting admissions.
+    /// Lock-free (`AtomicBool`) so `@MainActor` handle checks never contend on `self.state`.
     pub fn is_open(&self) -> bool {
-        if self.suspended.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.state.lock().map(|g| g.conn.is_some()).unwrap_or(false)
+        !self.suspended.load(Ordering::SeqCst) && self.conn_open.load(Ordering::SeqCst)
     }
 
     /// Obtain a SQLite interrupt handle if the connection is currently open.
@@ -431,6 +431,7 @@ impl MlsAccountDb {
         guard.last_reconciled_data_version = 0;
 
         let Some(conn) = guard.conn.take() else {
+            self.conn_open.store(false, Ordering::SeqCst);
             drop(guard);
             self.fire_eviction_hooks();
             return Ok(BackgroundCheckpointReport {
@@ -457,6 +458,7 @@ impl MlsAccountDb {
             Ok(()) => {}
             Err((leaked_conn, _)) => drop(leaked_conn),
         }
+        self.conn_open.store(false, Ordering::SeqCst);
 
         drop(guard);
         self.fire_eviction_hooks();
@@ -481,6 +483,7 @@ impl MlsAccountDb {
             // Force first post-resume write_tx to reconcile against any NSE writes made while closed.
             guard.last_reconciled_data_version = 0;
         }
+        self.conn_open.store(true, Ordering::SeqCst);
         self.suspended.store(false, Ordering::SeqCst);
         drop(guard);
         self.fire_eviction_hooks();

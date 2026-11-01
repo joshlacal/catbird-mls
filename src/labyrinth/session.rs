@@ -118,6 +118,7 @@ impl SessionDeps {
             self.sequencer_key.clone(),
             self.sequencer_receipt_key.clone(),
         )
+        .with_placements(self.did.clone(), self.placements.clone())
     }
 
     fn space_store(&self) -> Option<SpaceMailboxStore> {

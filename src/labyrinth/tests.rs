@@ -911,3 +911,322 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
     assert_eq!(dir.sequencer_key(unknown_conv).await.unwrap(), None);
     assert_eq!(dir.sequencer_receipt_key(unknown_conv).await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_placement_recovery() {
+    use labyrinth::store::{MailboxDirectory as _, SequencerKey, SequencerReceiptKey};
+    use p256::ecdsa::SigningKey as P256SigningKey;
+
+    use super::space::{thread_placement_key, ThreadPlacement};
+    use super::transport::did_document_url;
+
+    // 1. Validate SSRF-hardened `did_document_url`.
+    assert_eq!(
+        did_document_url("did:plc:z72i7hdynmk6r22z27h6tvur").unwrap(),
+        "https://plc.directory/did:plc:z72i7hdynmk6r22z27h6tvur"
+    );
+    assert_eq!(
+        did_document_url("did:web:foreign-ds.catbird.test").unwrap(),
+        "https://foreign-ds.catbird.test/.well-known/did.json"
+    );
+    assert_eq!(
+        did_document_url("did:web:foreign-ds.catbird.test%3A443").unwrap(),
+        "https://foreign-ds.catbird.test/.well-known/did.json"
+    );
+    assert_eq!(
+        did_document_url("did:web:foreign-ds.catbird.test:services:mls").unwrap(),
+        "https://foreign-ds.catbird.test/services/mls/did.json"
+    );
+    for bad in [
+        "did:web:localhost",
+        "did:web:127.0.0.1",
+        "did:web:169.254.169.254",
+        "did:web:metadata.internal",
+        "did:web:printer.local",
+        "did:web:evil.example%3A8080",
+        "did:web:user@evil.example",
+        "did:web:evil.example:..",
+        "did:web:evil.example:%2e%2e",
+        "did:web:evil.example:foo%2fbar",
+        "did:plc:short",
+        "did:key:z6Mkf5rGMoatrSj1f4CyvuHBeXJELe9RPdzo2PKGNCKVtZxP",
+    ] {
+        assert!(
+            did_document_url(bad).is_err(),
+            "expected SSRF/malformed DID rejection for {bad}"
+        );
+    }
+
+    // 2. Custom gateway simulating 503 outage and 403 post-kick on `getConversationState`.
+    struct StatusGateway {
+        status: u16,
+        foreign_did: String,
+        foreign_doc: Vec<u8>,
+    }
+    #[async_trait::async_trait]
+    impl LabyrinthGateway for StatusGateway {
+        async fn submit_labyrinth(
+            &self,
+            _request: LabyrinthRequest,
+        ) -> Result<GatewayResponse, String> {
+            Err("unused".into())
+        }
+        async fn submit_canonical(
+            &self,
+            _request: PreparedRequest,
+        ) -> Result<GatewayResponse, String> {
+            let body = if self.status == 403 {
+                br#"{"error":"Forbidden","message":"removed from conversation"}"#.to_vec()
+            } else {
+                br#"{"error":"ServiceUnavailable","message":"ds down"}"#.to_vec()
+            };
+            Ok(GatewayResponse {
+                status: self.status,
+                content_type: Some("application/json".into()),
+                body,
+            })
+        }
+        async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
+            if did == self.foreign_did {
+                Ok(Some(self.foreign_doc.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let alice = "did:plc:alicefl5hard000000000000";
+    let home_ds = "did:web:home-ds.catbird.test";
+    let foreign_ds = "did:web:foreign-ds.catbird.test";
+    let kicked_conv = "conv-foreign-kicked";
+
+    let home_ed = SigningKey::from_bytes(&[0x31; 32])
+        .verifying_key()
+        .to_bytes();
+    let home_p256 = P256SigningKey::from_bytes((&[0x32u8; 32]).into())
+        .unwrap()
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    let foreign_ed = SigningKey::from_bytes(&[0x41; 32])
+        .verifying_key()
+        .to_bytes();
+    let foreign_p256 = P256SigningKey::from_bytes((&[0x42u8; 32]).into())
+        .unwrap()
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    let mut ed_mc = vec![0xed, 0x01];
+    ed_mc.extend_from_slice(&foreign_ed);
+    let mut p256_mc = vec![0x80, 0x24];
+    p256_mc.extend_from_slice(&foreign_p256);
+    let foreign_doc = serde_json::to_vec(&serde_json::json!({
+        "id": foreign_ds,
+        "verificationMethod": [
+            {
+                "id": format!("{foreign_ds}#labyrinth-redaction-1"),
+                "type": "Multikey",
+                "controller": foreign_ds,
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, &ed_mc),
+            },
+            {
+                "id": format!("{foreign_ds}#mls-receipt-1"),
+                "type": "Multikey",
+                "controller": foreign_ds,
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, &p256_mc),
+            }
+        ]
+    }))
+    .unwrap();
+
+    let home_seq = SequencerKey {
+        did: home_ds.to_owned(),
+        key: home_ed,
+    };
+    let home_rcpt = SequencerReceiptKey {
+        did: home_ds.to_owned(),
+        public_key_sec1: home_p256,
+    };
+
+    // Case A: 503 outage on `getConversationState` MUST propagate `Err`, NEVER returning home DS keys!
+    let signer = Arc::new(TestChatSigner::from_seed(91));
+    let transport_503 = Arc::new(GatewayXrpcTransport::new(
+        Arc::new(StatusGateway {
+            status: 503,
+            foreign_did: foreign_ds.to_owned(),
+            foreign_doc: foreign_doc.clone(),
+        }),
+        signer.clone(),
+        alice.to_owned(),
+        "dev-503".into(),
+    ));
+    let dir_503 = super::transport::DsDirectoryStore::new(
+        transport_503,
+        Some(home_seq.clone()),
+        Some(home_rcpt.clone()),
+    );
+    assert!(dir_503.sequencer_key(kicked_conv).await.is_err());
+    assert!(dir_503.sequencer_receipt_key(kicked_conv).await.is_err());
+
+    // Case B: 403 Forbidden WITHOUT saved ThreadPlacement MUST return `Ok(None)`, NEVER home DS keys!
+    let transport_403 = Arc::new(GatewayXrpcTransport::new(
+        Arc::new(StatusGateway {
+            status: 403,
+            foreign_did: foreign_ds.to_owned(),
+            foreign_doc: foreign_doc.clone(),
+        }),
+        signer,
+        alice.to_owned(),
+        "dev-403".into(),
+    ));
+    let empty_placements: Arc<dyn StateVault> = Arc::new(MemoryVault::default());
+    let dir_403_no_pin = super::transport::DsDirectoryStore::new(
+        transport_403.clone(),
+        Some(home_seq.clone()),
+        Some(home_rcpt.clone()),
+    )
+    .with_placements(alice, empty_placements);
+    assert_eq!(
+        dir_403_no_pin.sequencer_key(kicked_conv).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        dir_403_no_pin
+            .sequencer_receipt_key(kicked_conv)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Case C: 403 Forbidden WITH saved foreign conversation Space ThreadPlacement recovers
+    // `foreign_ds` and resolves the foreign DS's DID document keys after kick!
+    let pinned_placements = Arc::new(MemoryVault::default());
+    let mut pins = std::collections::BTreeMap::new();
+    pins.insert(
+        kicked_conv.to_owned(),
+        ThreadPlacement {
+            space: Some(format!(
+                "at://{foreign_ds}/space/blue.catbird.labyrinth.conversation/{kicked_conv}-0"
+            )),
+            generation: 0,
+        },
+    );
+    pinned_placements
+        .compare_exchange(
+            &thread_placement_key(alice),
+            None,
+            &serde_json::to_vec(&pins).unwrap(),
+        )
+        .unwrap();
+
+    let dir_403_pinned =
+        super::transport::DsDirectoryStore::new(transport_403, Some(home_seq), Some(home_rcpt))
+            .with_placements(alice, pinned_placements);
+    assert_eq!(
+        dir_403_pinned.sequencer_key(kicked_conv).await.unwrap(),
+        Some(SequencerKey {
+            did: foreign_ds.to_owned(),
+            key: foreign_ed,
+        })
+    );
+    assert_eq!(
+        dir_403_pinned
+            .sequencer_receipt_key(kicked_conv)
+            .await
+            .unwrap(),
+        Some(SequencerReceiptKey {
+            did: foreign_ds.to_owned(),
+            public_key_sec1: foreign_p256,
+        })
+    );
+}
+
+#[tokio::test]
+async fn fault_line_2_transient_pds_outage_during_deleted_convo_owner_rescue_retains_rows() {
+    use labyrinth::store::space::{SpaceError, SpaceRpc};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FlakyWriteSpaceRpc {
+        inner: Arc<dyn SpaceRpc>,
+        fail_writes: Arc<AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl SpaceRpc for FlakyWriteSpaceRpc {
+        async fn query(
+            &self,
+            nsid: &str,
+            params: &[(&str, String)],
+        ) -> Result<Vec<u8>, SpaceError> {
+            self.inner.query(nsid, params).await
+        }
+        async fn procedure(&self, nsid: &str, payload: &[u8]) -> Result<Vec<u8>, SpaceError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(SpaceError::named(
+                    503,
+                    "ServiceUnavailable",
+                    "transient PDS Space outage",
+                ));
+            }
+            self.inner.procedure(nsid, payload).await
+        }
+    }
+
+    let alice = "did:plc:alicefl2pds5030000000000";
+    let gone_conv = "99999999-8888-4777-8666-555555555555";
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState::default())); // `gone_conv` returns 404 ConversationNotFound
+
+    let fail_writes = Arc::new(AtomicBool::new(false));
+    let mut alice_deps = build_deps(alice, "dev-a1", 61, ds_state, &space_host, &pds_host, None);
+    alice_deps.space = Some(Arc::new(FlakyWriteSpaceRpc {
+        inner: Arc::new(space_host.client(alice)),
+        fail_writes: fail_writes.clone(),
+    }));
+
+    let mut session = alice_deps.clone().enable().await.expect("enable");
+    let queue = MemoryQueueStore::default();
+    let row = PendingArchive::new(
+        alice,
+        gone_conv,
+        "msg-deleted-convo-503",
+        1_700_000_099_000,
+        b"do not drop me on pds 503",
+    )
+    .with_mls_snapshot("9988", 1, vec![alice.to_owned()]);
+    assert!(enqueue(&queue, &row).unwrap());
+
+    // Simulate transient PDS outage while `gone_conv` is 404 on mls-ds:
+    fail_writes.store(true, Ordering::SeqCst);
+    let report_fail = flush_queue(&mut session, &alice_deps, &queue)
+        .await
+        .expect("flush_queue handles transient pds error without dropping");
+    assert_eq!(
+        report_fail.dropped, 0,
+        "transient PDS outage must NEVER drop queued rows"
+    );
+    assert_eq!(report_fail.quarantined, 0);
+    assert_eq!(report_fail.archived, 0);
+    assert_eq!(report_fail.failed_conversations, 1);
+    assert_eq!(queue.list(alice).unwrap().len(), 1);
+
+    // When PDS recovers, retry rescues the row into Alice's personal mailbox Space!
+    fail_writes.store(false, Ordering::SeqCst);
+    let report_ok = flush_queue(&mut session, &alice_deps, &queue)
+        .await
+        .expect("retry flush_queue succeeds");
+    assert_eq!(report_ok.archived, 1);
+    assert_eq!(report_ok.dropped, 0);
+    assert!(queue.list(alice).unwrap().is_empty());
+
+    let hist = session
+        .load_history(gone_conv, TimeRange::ALL)
+        .await
+        .expect("load rescued history");
+    assert_eq!(hist.messages.len(), 1);
+    assert_eq!(hist.messages[0].frame, b"do not drop me on pds 503");
+}
