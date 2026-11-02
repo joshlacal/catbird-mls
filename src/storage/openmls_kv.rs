@@ -250,15 +250,49 @@ impl<T: KvBackend + ?Sized> KvBackend for std::sync::Arc<T> {
     }
 }
 
-/// Recorded in-memory `openmls_kv` write/delete batch (`Spec §6.1` / `I6`).
+/// Recorded `openmls_kv` write/delete batch (`Spec §6.1` / `I6`).
 ///
-/// Captures `kv_put`/`kv_delete` mutations before an HTTP call so group transitions
-/// merge only after server acceptance. Application sends instead reserve their
-/// sender generation with an immutable send journal before dispatch: a timeout
-/// cannot prove the ciphertext was not published.
+/// Commit transitions journal the serialized batch before HTTP and apply it only
+/// after acceptance, including recovery from an own sequenced Commit after restart.
+/// Application sends instead reserve their sender generation before dispatch:
+/// a timeout cannot prove the ciphertext was not published.
 #[derive(Clone, Debug, Default)]
 pub struct KvWriteBatch {
     entries: std::collections::BTreeMap<(u16, String, Vec<u8>), Option<Vec<u8>>>,
+}
+
+// JSON object keys cannot represent the composite KV key; encode ordered entries as a sequence.
+impl serde::Serialize for KvWriteBatch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(&self.entries)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for KvWriteBatch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BatchVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BatchVisitor {
+            type Value = KvWriteBatch;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an OpenMLS KV write/delete entry sequence")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut batch = KvWriteBatch::new();
+                while let Some((key, value)) = seq.next_element()? {
+                    batch.entries.insert(key, value);
+                }
+                Ok(batch)
+            }
+        }
+
+        deserializer.deserialize_seq(BatchVisitor)
+    }
 }
 
 impl KvWriteBatch {

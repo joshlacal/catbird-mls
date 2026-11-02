@@ -18,6 +18,10 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
+use crate::chat_v2::transcript::{
+    normalize_read_presentation, project_signed_body, SignedMutationKind, SignedWrapper,
+    VerifiedMutation,
+};
 use crate::client::chat_wire;
 use crate::client::traits::PlatformChangeEvent;
 use crate::client::QueuedLabyrinthArchivePayload;
@@ -39,6 +43,7 @@ use crate::storage::{
     ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
 };
 
+use super::live_plane::PendingCommitTransition;
 use super::native_client::CatbirdMlsClient;
 
 fn build_join_config() -> MlsGroupJoinConfig {
@@ -47,6 +52,33 @@ fn build_join_config() -> MlsGroupJoinConfig {
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(5)
         .build()
+}
+
+fn verify_own_commit_body(signed_request: &Value, public_key: &[u8]) -> Result<Value, MLSError> {
+    let kind = signed_request
+        .pointer("/body/$type")
+        .and_then(Value::as_str)
+        .and_then(SignedMutationKind::from_type_id)
+        .ok_or_else(|| MLSError::Cryptography("own Commit has no signed mutation kind".into()))?;
+    let wrapper_name = match kind {
+        SignedMutationKind::CommitTransition => "signedCommitTransition",
+        SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
+        _ => {
+            return Err(MLSError::Cryptography(
+                "own Commit has the wrong signed kind".into(),
+            ))
+        }
+    };
+    let raw = serde_json::to_vec(signed_request)?;
+    let mut normalized = normalize_read_presentation(&raw, wrapper_name, false)
+        .map_err(|e| MLSError::Cryptography(format!("normalize own Commit: {e}")))?;
+    let wrapper = SignedWrapper::decode(&serde_json::to_vec(&normalized)?)
+        .map_err(|e| MLSError::Cryptography(format!("decode own Commit signature: {e}")))?;
+    let projected = project_signed_body(kind, &wrapper.body)
+        .map_err(|e| MLSError::Cryptography(format!("project own Commit: {e}")))?;
+    VerifiedMutation::verify(projected, wrapper.signature, public_key)
+        .map_err(|e| MLSError::Cryptography(format!("verify own Commit signature: {e}")))?;
+    Ok(normalized["body"].take())
 }
 
 impl CatbirdMlsClient {
@@ -843,6 +875,9 @@ impl CatbirdMlsClient {
                     updated_at_ms: now_ms,
                 };
                 tx.upsert_conversation(&row)?;
+                Self::prune_pending_commit_transitions(
+                    tx, cid, row.generation, row.epoch, false,
+                )?;
                 tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords_str, now_ms)
             })?;
 
@@ -997,8 +1032,8 @@ impl CatbirdMlsClient {
             let welcome_id = self.hooks.uuid_v4().to_string();
             let now_ms = self.hooks.now_ms();
 
-            // Stage `add_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx` (`I6`)
-            // so a stale prior / network failure never forks local OpenMLS epoch state!
+            // Stage without changing `openmls_kv`; retain the merged batch in the journal
+            // across an uncertain response so sync can recover the accepted own Commit.
             let built = self.db.read_tx(|tx| {
                 let Some(convo) = tx.get_conversation(cid)? else {
                     return Ok(None);
@@ -1162,6 +1197,7 @@ impl CatbirdMlsClient {
                 "lifecycle": "active",
             });
 
+            let commit_sha256: [u8; 32] = Sha256::digest(&commit_bytes).into();
             let fulfill_body = json!({
                 "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
                 "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0",
@@ -1206,10 +1242,18 @@ impl CatbirdMlsClient {
                     "framing": "mlsMessage",
                     "contentType": "publicMessageCommit",
                     "bytes": { "$bytes": STANDARD.encode(&commit_bytes) },
-                    "sha256": STANDARD.encode(Sha256::digest(&commit_bytes)),
+                    "sha256": STANDARD.encode(commit_sha256),
                 },
                 "metadataSnapshot": carried_snap.clone(),
             });
+            let kv_batch = self.persist_pending_commit_transition(PendingCommitTransition {
+                conversation_id: cid.to_string(),
+                transition_id: transition_id.clone(),
+                commit_sha256,
+                prior: prior_coords.clone(),
+                next: next_coords.clone(),
+                kv_batch,
+            })?;
 
             if crate::planted::is_planted_bug_active(
                 crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
@@ -1226,13 +1270,15 @@ impl CatbirdMlsClient {
             ) {
                 Ok(val) => val,
                 Err(e) if e.is_stale_coordinates() => {
-                    if crate::planted::is_planted_bug_active(
-                        crate::planted::PlantedBug::P1KeepLoserStagedCommit,
-                    ) {
-                        self.db.write_tx(|tx| {
-                            Ok(staged_pending_batch.apply(&RusqliteKvBackend(tx.conn()))?)
-                        })?;
-                    }
+                    self.db.write_tx(|tx| {
+                        tx.delete_pending_op("commit_transition", &transition_id)?;
+                        if crate::planted::is_planted_bug_active(
+                            crate::planted::PlantedBug::P1KeepLoserStagedCommit,
+                        ) {
+                            staged_pending_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+                        }
+                        Ok(())
+                    })?;
                     // Concurrent peer transition superseded `boundCoordinate`; discard overlay cleanly!
                     continue;
                 }
@@ -1265,7 +1311,15 @@ impl CatbirdMlsClient {
                     tx.upsert_conversation(&c)?;
                 }
                 tx.put_account_meta(&format!("metadata_snapshot_json:{cid}"), &snap_str, now_ms)?;
-                tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords_str, now_ms)
+                tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords_str, now_ms)?;
+                Self::prune_pending_commit_transitions(
+                    tx,
+                    cid,
+                    prior_gen,
+                    next_epoch as i64,
+                    false,
+                )?;
+                Ok(())
             })?;
             fulfilled = fulfilled.saturating_add(1);
         }
@@ -1530,14 +1584,31 @@ impl CatbirdMlsClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let is_own_echo = actor_did == self.normalized_did && actor_dev == canonical_dev_id;
+                // Actor labels are only a routing hint. Authenticate the complete body,
+                // including manifest and metadata, before taking the own-echo shortcut.
+                let verified_own_body = is_own_echo
+                    .then(|| verify_own_commit_body(signed_req, signer.public()))
+                    .transpose()?;
+                let body = verified_own_body.as_ref().unwrap_or(body);
+                if is_own_echo
+                    && (body["prior"]["conversationId"].as_str() != Some(cid)
+                        || body["next"]["conversationId"].as_str() != Some(cid))
+                {
+                    return Err(MLSError::Cryptography(
+                        "own Commit is signed for a different conversation".into(),
+                    ));
+                }
                 let commit_bytes_opt = body
                     .get("commit")
                     .or_else(|| entry.get("commit"))
                     .and_then(|c| c.get("bytes"))
                     .and_then(|b| chat_wire::json_bytes(b).ok());
-                let snap_opt = body
-                    .get("metadataSnapshot")
-                    .or_else(|| entry.get("metadataSnapshot"));
+                let snap_opt = if is_own_echo {
+                    body.get("metadataSnapshot")
+                } else {
+                    body.get("metadataSnapshot")
+                        .or_else(|| entry.get("metadataSnapshot"))
+                };
                 let next_opt = body
                     .get("next")
                     .or_else(|| entry.get("coordinates"))
@@ -1548,6 +1619,149 @@ impl CatbirdMlsClient {
                         return Ok(false);
                     };
                     let mut removed_self = false;
+                    if is_own_echo {
+                        let transition_id = body
+                            .get("transitionId")
+                            .or_else(|| entry.get("transitionId"))
+                            .or_else(|| entry.get("entryId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let next = next_opt.as_ref().ok_or_else(|| {
+                            MLSError::Cryptography("own Commit missing next coordinate".into())
+                        })?;
+                        let next_epoch = next["epoch"].as_u64().ok_or_else(|| {
+                            MLSError::Cryptography("own Commit has invalid next epoch".into())
+                        })?;
+                        let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                        let provider = self.hooks.openmls_provider(storage);
+                        let mut group =
+                            MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
+                                .map_err(|e| {
+                                    MLSError::Internal(format!("load own Commit group: {e:?}"))
+                                })?
+                                .ok_or_else(|| MLSError::GroupNotFound {
+                                    message: format!("own Commit group missing for {cid}"),
+                                })?;
+                        let next_generation = next["generation"].as_i64().ok_or_else(|| {
+                            MLSError::Cryptography("own Commit has invalid next generation".into())
+                        })?;
+                        if next_generation < c.generation
+                            || (next_generation == c.generation
+                                && next_epoch < group.epoch().as_u64())
+                        {
+                            // A valid older echo may close a sequence gap after a later Commit
+                            // is already durable. Retire its secrets without regressing state.
+                            c.epoch = group.epoch().as_u64() as i64;
+                            Self::prune_pending_commit_transitions(
+                                tx,
+                                cid,
+                                c.generation,
+                                c.epoch,
+                                false,
+                            )?;
+                            c.last_seq = c.last_seq.max(entry_seq);
+                            c.updated_at_ms = now_ms;
+                            tx.upsert_conversation(&c)?;
+                            return Ok(false);
+                        }
+                        if next_generation != c.generation {
+                            return Err(MLSError::Cryptography(
+                                "own Commit does not match the local generation".into(),
+                            ));
+                        }
+                        if let Some(raw) = tx.get_pending_op("commit_transition", transition_id)? {
+                            let pending: PendingCommitTransition = serde_json::from_str(&raw)
+                                .map_err(|e| {
+                                    MLSError::Internal(format!("parse pending commit: {e}"))
+                                })?;
+                            let commit_bytes = commit_bytes_opt.as_ref().ok_or_else(|| {
+                                MLSError::Cryptography("own Commit missing commit bytes".into())
+                            })?;
+                            let digest: [u8; 32] = Sha256::digest(commit_bytes).into();
+                            if pending.conversation_id != cid
+                                || pending.transition_id != transition_id
+                                || pending.commit_sha256 != digest
+                                || &pending.next != next
+                            {
+                                return Err(MLSError::Cryptography(
+                                    "pending commit does not match sequenced own Commit".into(),
+                                ));
+                            }
+                            if group.epoch().as_u64() < next_epoch {
+                                let (gch, ctag) = chat_wire::compute_group_context_hash_and_tag(
+                                    &group, &provider,
+                                )?;
+                                if pending.prior["epoch"].as_u64() != Some(group.epoch().as_u64())
+                                    || pending.prior["generation"].as_i64() != Some(c.generation)
+                                    || chat_wire::json_bytes(&pending.prior["groupId"])?
+                                        != c.group_id
+                                    || chat_wire::json_bytes(&pending.prior["groupContextHash"])?
+                                        != gch
+                                    || chat_wire::json_bytes(&pending.prior["confirmationTag"])?
+                                        != ctag
+                                {
+                                    return Err(MLSError::Cryptography(
+                                        "pending commit does not match local prior MLS state"
+                                            .into(),
+                                    ));
+                                }
+                                pending.kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+                                group = MlsGroup::load(
+                                    provider.storage(),
+                                    &GroupId::from_slice(&c.group_id),
+                                )
+                                .map_err(|e| {
+                                    MLSError::Internal(format!("reload recovered Commit: {e:?}"))
+                                })?
+                                .ok_or_else(|| {
+                                    MLSError::GroupNotFound {
+                                        message: format!(
+                                            "recovered Commit group missing for {cid}"
+                                        ),
+                                    }
+                                })?;
+                                if group.epoch().as_u64() != next_epoch {
+                                    return Err(MLSError::Cryptography(
+                                        "pending commit batch did not restore its next epoch"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        } else if group.epoch().as_u64() < next_epoch {
+                            return Err(MLSError::InvalidState(format!(
+                                "unapplied own Commit {transition_id} has no recovery journal"
+                            )));
+                        }
+                        if group.epoch().as_u64() == next_epoch {
+                            let (gch, ctag) =
+                                chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                            if next["generation"].as_i64() != Some(c.generation)
+                                || chat_wire::json_bytes(&next["groupId"])? != c.group_id
+                                || chat_wire::json_bytes(&next["groupContextHash"])? != gch
+                                || chat_wire::json_bytes(&next["confirmationTag"])? != ctag
+                            {
+                                return Err(MLSError::Cryptography(
+                                    "own Commit does not match recovered MLS state".into(),
+                                ));
+                            }
+                        }
+                        c.epoch = group.epoch().as_u64() as i64;
+                        for change in body["manifest"]["participantChanges"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                        {
+                            if change["$type"] == "blue.catbird.chat.defs#removeParticipant" {
+                                if let Some(target_did) = change["userDid"].as_str() {
+                                    tx.put_account_meta(
+                                        &format!("last_removed_member:{cid}"),
+                                        target_did,
+                                        now_ms,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
                     if !is_own_echo {
                         if let Some(ref commit_bytes) = commit_bytes_opt {
                             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
@@ -1616,20 +1830,37 @@ impl CatbirdMlsClient {
                             }
                         }
                     }
-                    if let Some(snap) = snap_opt {
-                        if let Ok(snap_s) = serde_json::to_string(snap) {
-                            tx.put_account_meta(
-                                &format!("metadata_snapshot_json:{cid}"),
-                                &snap_s,
-                                now_ms,
-                            )?;
+                    let superseded = next_opt.as_ref().is_some_and(|next| {
+                        next["generation"].as_i64().is_some_and(|generation| {
+                            generation < c.generation
+                                || (generation == c.generation
+                                    && next["epoch"].as_i64().is_some_and(|epoch| epoch < c.epoch))
+                        })
+                    });
+                    if !superseded {
+                        if let Some(snap) = snap_opt {
+                            if let Ok(snap_s) = serde_json::to_string(snap) {
+                                tx.put_account_meta(
+                                    &format!("metadata_snapshot_json:{cid}"),
+                                    &snap_s,
+                                    now_ms,
+                                )?;
+                            }
+                        }
+                        if let Some(nc) = &next_opt {
+                            let s = serde_json::to_string(nc)
+                                .map_err(|e| MLSError::Internal(e.to_string()))?;
+                            tx.put_account_meta(&format!("conversation_coords:{cid}"), &s, now_ms)?;
                         }
                     }
-                    if let Some(ref nc) = next_opt {
-                        let s = serde_json::to_string(nc)
-                            .map_err(|e| MLSError::Internal(e.to_string()))?;
-                        tx.put_account_meta(&format!("conversation_coords:{cid}"), &s, now_ms)?;
-                    }
+                    // Epoch-key erasure is atomic with accepted MLS state and its cursor.
+                    Self::prune_pending_commit_transitions(
+                        tx,
+                        cid,
+                        c.generation,
+                        c.epoch,
+                        removed_self,
+                    )?;
                     c.last_seq = c.last_seq.max(entry_seq);
                     c.updated_at_ms = now_ms;
                     tx.upsert_conversation(&c)?;

@@ -90,6 +90,10 @@ struct MockDsState {
     lose_next_send_response: bool,
     fail_next_entries: bool,
     stale_next_submit_transition: bool,
+    defer_next_commit_transition: bool,
+    deferred_commit_transition: Option<PlatformHttpRequest>,
+    lose_next_commit_response: bool,
+    fail_next_commit_status: Option<u16>,
     // PDS records: (repo, collection, rkey) -> value
     pds_records: BTreeMap<(String, String, String), Value>,
     // Direct request published keys: actor_did -> (device_id, key_package_val, grant_val)
@@ -127,6 +131,10 @@ impl SharedMockDs {
                 lose_next_send_response: false,
                 fail_next_entries: false,
                 stale_next_submit_transition: false,
+                defer_next_commit_transition: false,
+                deferred_commit_transition: None,
+                lose_next_commit_response: false,
+                fail_next_commit_status: None,
                 pds_records: BTreeMap::new(),
                 dr_keys: BTreeMap::new(),
                 convo_kps: BTreeMap::new(),
@@ -536,6 +544,26 @@ impl PlatformTransport for SharedMockDs {
             let sr = body_json["signedRequest"].clone();
             let b = &sr["body"];
             let btype = b["$type"].as_str().unwrap_or("");
+            let is_commit = btype.ends_with("commitTransitionBody")
+                || btype.ends_with("leafRecoveryFulfillmentBody");
+            if is_commit {
+                if let Some(status) = g.fail_next_commit_status.take() {
+                    return Ok(PlatformHttpResponse {
+                        status,
+                        headers: vec![],
+                        body: serde_json::to_vec(&json!({
+                            "error": if status == 403 { "AdminRequired" } else { "Unavailable" }
+                        }))
+                        .unwrap(),
+                    });
+                }
+            }
+            if is_commit && std::mem::take(&mut g.defer_next_commit_transition) {
+                g.deferred_commit_transition = Some(req);
+                return Err(MLSError::Internal(
+                    "transition timed out before deferred publication".into(),
+                ));
+            }
             let cid = b["next"]["conversationId"].as_str().unwrap().to_string();
             let next_coords = b["next"].clone();
             let next_seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as i64) + 1;
@@ -605,6 +633,11 @@ impl PlatformTransport for SharedMockDs {
                     request["reservation"]["status"] =
                         json!(if fulfilled { "consumed" } else { "released" });
                 }
+            }
+            if is_commit && std::mem::take(&mut g.lose_next_commit_response) {
+                return Err(MLSError::Internal(
+                    "transition response lost after acceptance".into(),
+                ));
             }
             return ok_json(json!({
                 "seq": next_seq,
@@ -1558,5 +1591,433 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         let a_text: Value = serde_json::from_str(&a.plaintext_json).unwrap();
         let b_text: Value = serde_json::from_str(&b.plaintext_json).unwrap();
         assert_eq!((a.seq, &a_text["text"]), (b.seq, &b_text["text"]));
+    }
+}
+
+#[test]
+fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart() {
+    use openmls::prelude::{GroupId, MlsGroup};
+    use openmls_traits::OpenMlsProvider;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let open = |name: &str, did: &str, device: &str, keys: Arc<MemKeyStore>| {
+        CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: tmp.path().join(name).to_string_lossy().into_owned(),
+                account_did: did.to_string(),
+                device_id: device.to_string(),
+                home_ds_did: DS_DID.to_string(),
+                home_ds_endpoint: DS_URL.to_string(),
+                pds_endpoint: PDS_URL.to_string(),
+            },
+            keys,
+            ds.clone(),
+            None,
+        )
+        .unwrap()
+    };
+    let alice_device = uuid::Uuid::new_v4().to_string();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let mut alice = open("alice", ALICE_DID, &alice_device, alice_keys.clone());
+    let bob = open(
+        "bob",
+        BOB_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        Arc::new(MemKeyStore::new()),
+    );
+    let eve = open(
+        "eve",
+        EVE_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        Arc::new(MemKeyStore::new()),
+    );
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for client in [&alice, &bob, &eve] {
+        client.enroll_device(&scopes).unwrap();
+    }
+    let cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string(), EVE_DID.to_string()],
+            Some("Commit journal recovery".into()),
+            None,
+        )
+        .unwrap();
+    bob.sync().unwrap();
+
+    let local_row = |client: &CatbirdMlsClient| {
+        client
+            .db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+    };
+    let mls_state = |client: &CatbirdMlsClient| {
+        client
+            .db()
+            .write_tx(|tx| {
+                let row = tx.get_conversation(&cid)?.unwrap();
+                let provider = tx.openmls_provider();
+                let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&row.group_id))
+                    .unwrap()
+                    .unwrap();
+                assert!(group.pending_commit().is_none());
+                assert_eq!(row.epoch as u64, group.epoch().as_u64());
+                Ok((
+                    group.epoch().as_u64(),
+                    group
+                        .members()
+                        .map(|member| member.credential.serialized_content().to_vec())
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .unwrap()
+    };
+    let pending_count = |client: &CatbirdMlsClient| {
+        client
+            .db()
+            .read_tx(|tx| {
+                Ok(tx
+                    .conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_ops WHERE op_kind = 'commit_transition'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap())
+            })
+            .unwrap()
+    };
+    let control_state = |client: &CatbirdMlsClient| {
+        client
+            .db()
+            .read_tx(|tx| {
+                Ok((
+                    tx.get_account_meta(&format!("conversation_coords:{cid}"))?,
+                    tx.get_account_meta(&format!("metadata_snapshot_json:{cid}"))?,
+                    tx.get_account_meta(&format!("last_removed_member:{cid}"))?,
+                ))
+            })
+            .unwrap()
+    };
+    let corrupt_own_entry = |original: &Value, field: u8| {
+        let mut entry = original.clone();
+        match field {
+            0 => {
+                entry["signedRequest"]["body"]["commit"]["bytes"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8]) })
+            }
+            1 => {
+                entry["signedRequest"]["body"]["manifest"]["participantChanges"] = json!([{
+                    "$type": "blue.catbird.chat.defs#removeParticipant",
+                    "userDid": BOB_DID,
+                }])
+            }
+            2 => {
+                entry["signedRequest"]["body"]["metadataSnapshot"]["originTransitionId"] =
+                    json!(uuid::Uuid::new_v4().to_string())
+            }
+            _ => {
+                entry["signedRequest"]["signature"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8; 64]) })
+            }
+        }
+        entry
+    };
+    let reject_appended_own_echo = |client: &CatbirdMlsClient, mut entry: Value| {
+        let cursor = local_row(client).last_seq;
+        let state = mls_state(client);
+        let controls = control_state(client);
+        let journals = pending_count(client);
+        {
+            let mut server = ds.inner.lock().unwrap();
+            let entries = server.entries.get_mut(&cid).unwrap();
+            entry["seq"] = json!((entries.len() + 1) as i64);
+            entries.push(entry);
+        }
+        assert!(
+            client.sync().is_err(),
+            "own labels cannot replace a valid wrapper signature"
+        );
+        assert_eq!(local_row(client).last_seq, cursor);
+        assert_eq!(mls_state(client), state);
+        assert_eq!(control_state(client), controls);
+        assert_eq!(pending_count(client), journals);
+        ds.inner
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&cid)
+            .unwrap()
+            .pop();
+    };
+
+    for remove in [false, true] {
+        let perform = |client: &CatbirdMlsClient| {
+            if remove {
+                client.remove_group_member(MemberRole::Admin, &cid, EVE_DID)
+            } else {
+                client.sync().map(|_| ())
+            }
+        };
+        let before = mls_state(&alice);
+        ds.inner.lock().unwrap().stale_next_submit_transition = true;
+        let stale = perform(&alice);
+        if remove {
+            assert!(
+                matches!(stale, Err(MLSError::InvalidState(code)) if code == "StaleCoordinates")
+            );
+        } else {
+            stale.expect("leaf fulfillment skips a deterministically rejected transition");
+        }
+        assert_eq!(mls_state(&alice), before);
+        assert_eq!(
+            pending_count(&alice),
+            0,
+            "stale commits must discard their journal"
+        );
+        let cursor_before = local_row(&alice).last_seq;
+        ds.inner.lock().unwrap().fail_next_commit_status = Some(403);
+        assert!(perform(&alice).is_err());
+        assert_eq!(mls_state(&alice), before);
+        assert_eq!(
+            pending_count(&alice),
+            0,
+            "non-retryable 4xx must erase staged private keys"
+        );
+        ds.inner.lock().unwrap().fail_next_commit_status = Some(503);
+        assert!(perform(&alice).is_err());
+        assert_eq!(mls_state(&alice), before);
+        assert_eq!(
+            pending_count(&alice),
+            1,
+            "uncertain 5xx must retain recovery material"
+        );
+        if remove {
+            for (client, target) in [(&bob, EVE_DID), (&eve, BOB_DID)] {
+                ds.inner.lock().unwrap().fail_next_commit_status = Some(503);
+                assert!(client
+                    .remove_group_member(MemberRole::Admin, &cid, target)
+                    .is_err());
+                assert_eq!(pending_count(client), 1);
+            }
+        }
+
+        if remove {
+            ds.inner.lock().unwrap().lose_next_commit_response = true;
+        } else {
+            ds.inner.lock().unwrap().defer_next_commit_transition = true;
+        }
+        assert!(perform(&alice).is_err());
+        assert_eq!(
+            mls_state(&alice),
+            before,
+            "uncertain commits must not apply their batch"
+        );
+        assert_eq!(local_row(&alice).last_seq, cursor_before);
+        let pending_before_recovery = pending_count(&alice);
+        assert_eq!(pending_before_recovery, 2);
+        let (transition_id, payload, created_at): (String, String, i64) = alice
+            .db()
+            .read_tx(|tx| {
+                Ok(tx
+                    .conn()
+                    .query_row(
+                        "SELECT op_key, payload_json, created_at_ms FROM pending_ops \
+                         WHERE op_kind = 'commit_transition' ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+        let pending: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pending["transition_id"], transition_id);
+        assert_eq!(pending["commit_sha256"].as_array().unwrap().len(), 32);
+        assert!(!pending["kv_batch"].as_array().unwrap().is_empty());
+
+        drop(alice);
+        alice = open("alice", ALICE_DID, &alice_device, alice_keys.clone());
+        assert_eq!(mls_state(&alice), before);
+        let deferred = ds.inner.lock().unwrap().deferred_commit_transition.take();
+        if let Some(request) = deferred {
+            ds.execute_http(request)
+                .expect("server accepts the reordered commit after restart");
+        }
+        bob.sync().expect("peer applies the accepted commit");
+        assert_eq!(
+            pending_count(&bob),
+            0,
+            "a peer Commit retires losing private epoch keys"
+        );
+        if remove {
+            eve.sync()
+                .expect("removed leaf reconciles the winning Commit");
+            assert_eq!(
+                pending_count(&eve),
+                0,
+                "kick cleanup erases all staged private keys"
+            );
+        }
+        let mut accepted = ds.inner.lock().unwrap().entries[&cid]
+            .last()
+            .unwrap()
+            .clone();
+        // Real read presentations may wrap bytes, including the wrapper signature.
+        let signature =
+            catbird_mls::client::chat_wire::json_bytes(&accepted["signedRequest"]["signature"])
+                .unwrap();
+        accepted["signedRequest"]["signature"] = json!({ "$bytes": STANDARD.encode(signature) });
+
+        if !remove {
+            let controls = control_state(&alice);
+            for field in [0, 1, 2, 3] {
+                *ds.inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .get_mut(&cid)
+                    .unwrap()
+                    .last_mut()
+                    .unwrap() = corrupt_own_entry(&accepted, field);
+                assert!(
+                    alice.sync().is_err(),
+                    "every own Commit field must be authenticated"
+                );
+                assert_eq!(mls_state(&alice), before);
+                assert_eq!(local_row(&alice).last_seq, cursor_before);
+                assert_eq!(pending_count(&alice), pending_before_recovery);
+                assert_eq!(control_state(&alice), controls);
+            }
+            *ds.inner
+                .lock()
+                .unwrap()
+                .entries
+                .get_mut(&cid)
+                .unwrap()
+                .last_mut()
+                .unwrap() = accepted.clone();
+
+            alice
+                .db()
+                .write_tx(|tx| {
+                    tx.delete_pending_op("commit_transition", &transition_id)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                alice.sync().is_err(),
+                "an unapplied own commit requires its exact journal"
+            );
+            assert_eq!(mls_state(&alice), before);
+            assert_eq!(local_row(&alice).last_seq, cursor_before);
+            alice
+                .db()
+                .write_tx(|tx| {
+                    tx.put_pending_op("commit_transition", &transition_id, &payload, created_at)?;
+                    tx.conn()
+                        .execute_batch(
+                            "CREATE TEMP TRIGGER fail_commit_journal_delete \
+                     BEFORE DELETE ON pending_ops WHEN OLD.op_kind = 'commit_transition' \
+                     BEGIN SELECT RAISE(ABORT, 'commit journal delete interrupted'); END;",
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                alice.sync().is_err(),
+                "journal deletion and batch application must be atomic"
+            );
+            assert_eq!(
+                mls_state(&alice),
+                before,
+                "failed journal deletion rolls back the MLS batch"
+            );
+            assert_eq!(local_row(&alice).last_seq, cursor_before);
+            assert_eq!(pending_count(&alice), pending_before_recovery);
+            alice
+                .db()
+                .write_tx(|tx| {
+                    tx.conn()
+                        .execute_batch("DROP TRIGGER fail_commit_journal_delete;")
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        alice
+            .sync()
+            .expect("recover accepted own commit from the durable journal");
+        assert_eq!(mls_state(&alice), mls_state(&bob));
+        assert_eq!(mls_state(&alice).0, before.0 + 1);
+        assert_eq!(pending_count(&alice), 0);
+        let accepted_cursor = local_row(&alice).last_seq;
+        alice.sync().expect("recovery is idempotent");
+        assert_eq!(local_row(&alice).last_seq, accepted_cursor);
+        assert_eq!(mls_state(&alice), mls_state(&bob));
+        for field in [1, 2, 3] {
+            reject_appended_own_echo(&alice, corrupt_own_entry(&accepted, field));
+        }
+        let message_id = uuid::Uuid::new_v4().to_string();
+        alice
+            .send_message(&cid, &message_id, "message after own commit recovery")
+            .unwrap();
+        bob.sync()
+            .expect("recovered MLS secrets decrypt on the surviving peer");
+        assert!(bob
+            .list_messages(&cid, None, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.message_id == message_id));
+
+        if !remove {
+            eve.sync().unwrap();
+            alice
+                .sync()
+                .expect("normal accepted add clears its journal atomically");
+            eve.sync().unwrap();
+            bob.sync().unwrap();
+            assert_eq!(pending_count(&alice), 0);
+            assert_eq!(mls_state(&alice), mls_state(&eve));
+            for field in [1, 2, 3] {
+                reject_appended_own_echo(&alice, corrupt_own_entry(&accepted, field));
+            }
+            let controls = control_state(&alice);
+            let state = mls_state(&alice);
+            let mut old_echo = accepted.clone();
+            {
+                let mut server = ds.inner.lock().unwrap();
+                let entries = server.entries.get_mut(&cid).unwrap();
+                old_echo["seq"] = json!((entries.len() + 1) as i64);
+                entries.push(old_echo);
+            }
+            alice
+                .sync()
+                .expect("authenticated superseded own echo closes only its cursor gap");
+            assert_eq!(mls_state(&alice), state);
+            assert_eq!(
+                control_state(&alice),
+                controls,
+                "older echoes must not regress control state"
+            );
+            bob.sync().unwrap();
+        } else {
+            assert_eq!(
+                alice
+                    .db()
+                    .read_tx(|tx| tx.get_account_meta(&format!("last_removed_member:{cid}")))
+                    .unwrap()
+                    .as_deref(),
+                Some(EVE_DID),
+            );
+        }
     }
 }

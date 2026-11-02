@@ -2,7 +2,8 @@
 //!
 //! Selection is thread-local and only takes effect with `feature = "sim"`. Wrap
 //! the synchronous client call (not merely construction of a future) in
-//! [`with_planted_bug`]; selection does not propagate to other threads.
+//! [`with_planted_bug`]. Selection is thread-local; dispatchers must capture
+//! [`active_planted_bug`] before switching threads and restore it on the worker.
 
 /// Real client-path regressions exercised by the Phase 1 simulation oracles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -29,12 +30,26 @@ pub fn set_planted_bug(bug: Option<PlantedBug>) {
     let _ = bug;
 }
 
+/// Return this thread's scoped regression selection, or `None` without `sim`.
+/// Compile-time `plant_p*` features are independent of this runtime selection.
+#[inline]
+pub fn active_planted_bug() -> Option<PlantedBug> {
+    #[cfg(feature = "sim")]
+    {
+        ACTIVE_BUG.with(|active| active.get())
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        None
+    }
+}
+
 /// Check a calibration hook; compiles to `false` outside simulation builds.
 #[inline(always)]
 pub fn is_planted_bug_active(bug: PlantedBug) -> bool {
     #[cfg(feature = "sim")]
     {
-        if ACTIVE_BUG.with(|active| active.get() == Some(bug)) {
+        if active_planted_bug() == Some(bug) {
             return true;
         }
         match bug {
@@ -95,23 +110,34 @@ mod tests {
         let outer = PlantedBug::P1KeepLoserStagedCommit;
         let inner = PlantedBug::P3NetworkInsideWriteTx;
         set_planted_bug(None);
+        assert_eq!(active_planted_bug(), None);
         with_planted_bug(Some(outer), || {
+            assert_eq!(active_planted_bug(), Some(outer));
             assert!(is_planted_bug_active(outer));
-            with_planted_bug(None, || assert!(!is_planted_bug_active(outer)));
+            with_planted_bug(None, || {
+                assert_eq!(active_planted_bug(), None);
+                assert!(!is_planted_bug_active(outer));
+            });
             assert!(is_planted_bug_active(outer));
             let panic = std::panic::catch_unwind(|| {
                 with_planted_bug(Some(inner), || {
+                    assert_eq!(active_planted_bug(), Some(inner));
                     assert!(is_planted_bug_active(inner));
                     panic!("calibration unwind");
                 });
             });
             assert!(panic.is_err());
+            assert_eq!(active_planted_bug(), Some(outer));
             assert!(is_planted_bug_active(outer));
             assert!(!is_planted_bug_active(inner));
-            std::thread::spawn(move || assert!(!is_planted_bug_active(outer)))
-                .join()
-                .unwrap();
+            std::thread::spawn(move || {
+                assert_eq!(active_planted_bug(), None);
+                assert!(!is_planted_bug_active(outer));
+            })
+            .join()
+            .unwrap();
         });
+        assert_eq!(active_planted_bug(), None);
         assert!(!is_planted_bug_active(outer));
     }
 
@@ -162,6 +188,7 @@ mod tests {
     fn selection_is_inert_without_sim() {
         let bug = PlantedBug::P3NetworkInsideWriteTx;
         set_planted_bug(Some(bug));
+        assert_eq!(active_planted_bug(), None);
         let value = with_planted_bug(Some(bug), || {
             assert!(!is_planted_bug_active(bug));
             42

@@ -37,8 +37,9 @@ use crate::orchestrator::direct_request_keys::{
 use crate::orchestrator::direct_request_shared_crypto::build_request_key_publication;
 use crate::push::AuthorizedPeerDeviceKey;
 const ORDINARY_KP_LIFETIME_SECS: u64 = 29 * 86_400;
+use crate::storage::driver_native::map_rusqlite_err;
 use crate::storage::{
-    ConversationRow, GroupMetadataRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
+    ConversationRow, GroupMetadataRow, KvWriteBatch, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
     OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
 };
 
@@ -50,6 +51,16 @@ const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA
 pub(crate) struct PendingApplicationSend {
     pub(crate) body: Value,
     pub(crate) archive: QueuedLabyrinthArchivePayload,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PendingCommitTransition {
+    pub(crate) conversation_id: String,
+    pub(crate) transition_id: String,
+    pub(crate) commit_sha256: [u8; 32],
+    pub(crate) prior: Value,
+    pub(crate) next: Value,
+    pub(crate) kv_batch: KvWriteBatch,
 }
 
 #[derive(Deserialize)]
@@ -119,10 +130,57 @@ impl CatbirdMlsClient {
         })
     }
 
+    pub(crate) fn persist_pending_commit_transition(
+        &self,
+        pending: PendingCommitTransition,
+    ) -> Result<KvWriteBatch, MLSError> {
+        let payload = serde_json::to_string(&pending)
+            .map_err(|e| MLSError::Internal(format!("serialize pending commit: {e}")))?;
+        self.db.write_tx(|tx| {
+            tx.put_pending_op(
+                "commit_transition",
+                &pending.transition_id,
+                &payload,
+                self.hooks.now_ms(),
+            )
+        })?;
+        Ok(pending.kv_batch)
+    }
+
+    /// Retire private staged epoch keys as soon as their prior MLS state is superseded.
+    pub(crate) fn prune_pending_commit_transitions(
+        tx: &crate::storage::SqlTx<'_>,
+        conversation_id: &str,
+        generation: i64,
+        epoch: i64,
+        kicked: bool,
+    ) -> Result<(), MLSError> {
+        tx.conn()
+            .execute(
+                "DELETE FROM pending_ops WHERE op_kind = 'commit_transition' \
+                 AND json_extract(payload_json, '$.conversation_id') = ?1 \
+                 AND (?4 OR json_extract(payload_json, '$.prior.generation') < ?2 \
+                   OR (json_extract(payload_json, '$.prior.generation') = ?2 \
+                       AND json_extract(payload_json, '$.prior.epoch') < ?3))",
+                rusqlite::params![conversation_id, generation, epoch, kicked],
+            )
+            .map_err(|e| map_rusqlite_err("prune pending commit transitions", &e))?;
+        Ok(())
+    }
+
     pub(crate) fn execute_json_post(
         &self,
         url: String,
         body: Vec<u8>,
+    ) -> Result<PlatformHttpResponse, MLSError> {
+        self.execute_json_post_with_pending_commit(url, body, None)
+    }
+
+    fn execute_json_post_with_pending_commit(
+        &self,
+        url: String,
+        body: Vec<u8>,
+        pending_transition_id: Option<&str>,
     ) -> Result<PlatformHttpResponse, MLSError> {
         let req = PlatformHttpRequest {
             method: "POST".to_string(),
@@ -145,6 +203,16 @@ impl CatbirdMlsClient {
                 .is_ok_and(|failure| failure.error == "StaleCoordinates")
             {
                 return Err(MLSError::InvalidState("StaleCoordinates".into()));
+            }
+            // Timeouts, Too Early, rate limits, and 5xx remain uncertain. Other 4xx
+            // responses deterministically reject this attempt and must not retain epoch keys.
+            if (400..500).contains(&resp.status) && !matches!(resp.status, 408 | 425 | 429) {
+                if let Some(transition_id) = pending_transition_id {
+                    self.db.write_tx(|tx| {
+                        tx.delete_pending_op("commit_transition", transition_id)?;
+                        Ok(())
+                    })?;
+                }
             }
             let snippet = String::from_utf8_lossy(&resp.body);
             return Err(MLSError::Internal(format!(
@@ -172,7 +240,16 @@ impl CatbirdMlsClient {
             signer,
         )?;
         let url = format!("{}{}", self.ds_base(), prepared.path);
-        let resp = self.execute_json_post(url, prepared.body.unwrap_or_default())?;
+        let pending_transition_id = if matches!(operation, CanonicalOperation::SubmitTransition) {
+            body_value.get("transitionId").and_then(Value::as_str)
+        } else {
+            None
+        };
+        let resp = self.execute_json_post_with_pending_commit(
+            url,
+            prepared.body.unwrap_or_default(),
+            pending_transition_id,
+        )?;
         if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
             return Err(MLSError::Internal(format!(
                 "empty HTTP {} response body for {operation:?}",
@@ -2030,8 +2107,8 @@ impl CatbirdMlsClient {
             let transition_uuid = self.hooks.uuid_v4();
             let transition_id = transition_uuid.to_string();
 
-            // Stage `remove_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx`
-            // so `openmls_kv` is NEVER advanced if `submitTransition` fails (stale prior or `5xx`)!
+            // Stage without changing `openmls_kv`; journal the merged batch before HTTP so
+            // an accepted transition can be recovered even after a timeout or restart.
             let maybe_commit = self.db.read_tx(|tx| {
                 let signer_json = tx.get_account_meta("enrolled_signer_json")?;
                 let Some(signer_str) = signer_json else {
@@ -2197,6 +2274,7 @@ impl CatbirdMlsClient {
                     "confirmationTag": { "$bytes": STANDARD.encode(&next_ctag) },
                     "lifecycle": "active",
                 });
+                let commit_sha256: [u8; 32] = Sha256::digest(&commit_bytes).into();
                 let body = json!({
                     "$type": "blue.catbird.chat.defs#commitTransitionBody",
                     "signatureDomain": "CATBIRD-CHAT-COMMIT\0",
@@ -2221,10 +2299,18 @@ impl CatbirdMlsClient {
                         "framing": "mlsMessage",
                         "contentType": "publicMessageCommit",
                         "bytes": { "$bytes": STANDARD.encode(&commit_bytes) },
-                        "sha256": STANDARD.encode(Sha256::digest(&commit_bytes)),
+                        "sha256": STANDARD.encode(commit_sha256),
                     },
                     "metadataSnapshot": carried_snap,
                 });
+                let kv_batch = self.persist_pending_commit_transition(PendingCommitTransition {
+                    conversation_id: conversation_id.to_string(),
+                    transition_id: transition_id.clone(),
+                    commit_sha256,
+                    prior: prior_coords.clone(),
+                    next: next_coords.clone(),
+                    kv_batch,
+                })?;
                 if crate::planted::is_planted_bug_active(
                     crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
                 ) {
@@ -2240,12 +2326,15 @@ impl CatbirdMlsClient {
                 ) {
                     Ok(val) => val,
                     Err(err) => {
-                        if crate::planted::is_planted_bug_active(
-                            crate::planted::PlantedBug::P1KeepLoserStagedCommit,
-                        ) && err.is_stale_coordinates()
-                        {
+                        if err.is_stale_coordinates() {
                             self.db.write_tx(|tx| {
-                                Ok(staged_pending_batch.apply(&RusqliteKvBackend(tx.conn()))?)
+                                tx.delete_pending_op("commit_transition", &transition_id)?;
+                                if crate::planted::is_planted_bug_active(
+                                    crate::planted::PlantedBug::P1KeepLoserStagedCommit,
+                                ) {
+                                    staged_pending_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+                                }
+                                Ok(())
                             })?;
                         }
                         return Err(err);
@@ -2301,6 +2390,13 @@ impl CatbirdMlsClient {
                         &format!("metadata_snapshot_json:{conversation_id}"),
                         &snap_str,
                         now_ms,
+                    )?;
+                    Self::prune_pending_commit_transitions(
+                        tx,
+                        conversation_id,
+                        prior_gen,
+                        next_epoch as i64,
+                        false,
                     )?;
                     Ok(gap)
                 })?;
