@@ -989,17 +989,38 @@ impl<'a> SqlReadTx<'a> {
             })
         };
         if let Some(consent) = consent_filter {
-            if consent == "pending" {
+            let matching_states: Option<&[&str]> = match consent {
+                "pending" => Some(&[
+                    "pending",
+                    "incomingPending",
+                    "outgoingPending",
+                    "incoming_pending",
+                    "outgoing_pending",
+                ]),
+                "incomingPending" | "incoming_pending" => {
+                    Some(&["incomingPending", "incoming_pending"])
+                }
+                "outgoingPending" | "outgoing_pending" => {
+                    Some(&["outgoingPending", "outgoing_pending"])
+                }
+                "declined" | "closed" => Some(&["declined", "closed"]),
+                _ => None,
+            };
+            if let Some(states) = matching_states {
+                let placeholders: Vec<String> =
+                    (1..=states.len()).map(|i| format!("?{i}")).collect();
+                let sql = format!(
+                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
+                            first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                     FROM requests WHERE consent IN ({}) ORDER BY updated_at_ms DESC",
+                    placeholders.join(", ")
+                );
                 let mut stmt = self
                     .conn
-                    .prepare(
-                        "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
-                                first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                         FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending') ORDER BY updated_at_ms DESC",
-                    )
+                    .prepare(&sql)
                     .map_err(|e| map_rusqlite_err("list_requests.prepare", &e))?;
                 let rows = stmt
-                    .query_map([], map_row)
+                    .query_map(rusqlite::params_from_iter(states.iter()), map_row)
                     .map_err(|e| map_rusqlite_err("list_requests.query", &e))?;
                 rows.collect::<Result<Vec<_>, _>>()
                     .map_err(|e| map_rusqlite_err("list_requests.collect", &e))

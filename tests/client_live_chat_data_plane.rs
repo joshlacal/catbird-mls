@@ -85,6 +85,9 @@ impl PlatformKeyStore for MemKeyStore {
 struct MockDsState {
     receipt_sk: P256SigningKey,
     tamper_next_receipt: bool,
+    omit_next_receipt: bool,
+    empty_stub_next_send: bool,
+    conflict_409_next_submit_transition: bool,
     // PDS records: (repo, collection, rkey) -> value
     pds_records: BTreeMap<(String, String, String), Value>,
     // Direct request published keys: actor_did -> (device_id, key_package_val, grant_val)
@@ -117,6 +120,9 @@ impl SharedMockDs {
             inner: Mutex::new(MockDsState {
                 receipt_sk: P256SigningKey::random(&mut rand::rngs::OsRng),
                 tamper_next_receipt: false,
+                omit_next_receipt: false,
+                empty_stub_next_send: false,
+                conflict_409_next_submit_transition: false,
                 pds_records: BTreeMap::new(),
                 dr_keys: BTreeMap::new(),
                 convo_kps: BTreeMap::new(),
@@ -480,6 +486,21 @@ impl PlatformTransport for SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.chat.submitTransition") {
+            if g.conflict_409_next_submit_transition {
+                g.conflict_409_next_submit_transition = false;
+                return Ok(PlatformHttpResponse {
+                    status: 409,
+                    headers: vec![PlatformHttpHeader {
+                        name: "content-type".to_string(),
+                        value: "application/json".to_string(),
+                    }],
+                    body: serde_json::to_vec(&json!({
+                        "error": "TransitionConflict",
+                        "message": "Simulated concurrent transition HTTP 409"
+                    }))
+                    .unwrap(),
+                });
+            }
             let sr = body_json["signedRequest"].clone();
             let b = &sr["body"];
             let btype = b["$type"].as_str().unwrap_or("");
@@ -525,6 +546,10 @@ impl PlatformTransport for SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.chat.sendMessage") {
+            if g.empty_stub_next_send {
+                g.empty_stub_next_send = false;
+                return ok_json(json!({ "ok": true }));
+            }
             let sr = body_json["signedRequest"].clone();
             let b = &sr["body"];
             let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
@@ -540,6 +565,12 @@ impl PlatformTransport for SharedMockDs {
                     .unwrap()
                     .try_into()
                     .unwrap();
+
+            if g.omit_next_receipt {
+                g.omit_next_receipt = false;
+                let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
+                return ok_json(json!({ "seq": seq }));
+            }
 
             let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
             let mut payload = SequencerReceiptPayload {
@@ -932,4 +963,314 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
     alice
         .remove_group_member(MemberRole::Admin, &grp_cid, BOB_DID)
         .expect("admin remove bob");
+}
+
+#[test]
+fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() {
+    use catbird_mls::groups::metadata_v1::SpaceAvatarPointer;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let alice_dev = uuid::Uuid::new_v4().to_string();
+    let bob_dev = uuid::Uuid::new_v4().to_string();
+    let eve_dev = uuid::Uuid::new_v4().to_string();
+
+    let alice = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("alice").to_string_lossy().into_owned(),
+            account_did: ALICE_DID.to_string(),
+            device_id: alice_dev,
+            home_ds_did: DS_DID.to_string(),
+            home_ds_endpoint: DS_URL.to_string(),
+            pds_endpoint: PDS_URL.to_string(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.clone(),
+        None,
+    )
+    .expect("open alice");
+    let bob = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("bob").to_string_lossy().into_owned(),
+            account_did: BOB_DID.to_string(),
+            device_id: bob_dev,
+            home_ds_did: DS_DID.to_string(),
+            home_ds_endpoint: DS_URL.to_string(),
+            pds_endpoint: PDS_URL.to_string(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.clone(),
+        None,
+    )
+    .expect("open bob");
+    let eve = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("eve").to_string_lossy().into_owned(),
+            account_did: EVE_DID.to_string(),
+            device_id: eve_dev,
+            home_ds_did: DS_DID.to_string(),
+            home_ds_endpoint: DS_URL.to_string(),
+            pds_endpoint: PDS_URL.to_string(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.clone(),
+        None,
+    )
+    .expect("open eve");
+
+    alice.enroll_device(&scopes).expect("enroll alice");
+    bob.enroll_device(&scopes).expect("enroll bob");
+    eve.enroll_device(&scopes).expect("enroll eve");
+
+    let grp_cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(
+            &grp_cid,
+            DS_DID,
+            vec![BOB_DID.to_string(), EVE_DID.to_string()],
+            Some("Adversarial Room".to_string()),
+            Some("Testing edge cases".to_string()),
+        )
+        .expect("alice create group");
+
+    // Bob accepts invite; Eve also accepts invite
+    let _ = bob.sync().expect("bob sync invite");
+    let _ = eve.sync().expect("eve sync invite");
+
+    // 1. Simulate HTTP 409 on leaf recovery fulfillment during alice.sync():
+    // KvWriteOverlay must discard staged add_members + merge_pending_commit so Alice's group epoch stays 0!
+    {
+        let mut g = ds.inner.lock().unwrap();
+        let peeked_reqs = g
+            .leaf_recovery_inbox
+            .get(ALICE_DID)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(peeked_reqs.len(), 2);
+        g.conflict_409_next_submit_transition = true;
+    }
+    alice
+        .sync()
+        .expect("alice sync skips 409 leaf recovery cleanly without corrupting epoch");
+    let bob_joined_second = bob.sync().unwrap_or(0);
+    let eve_joined = eve.sync().unwrap_or(0);
+    // One of the two recovery requests hit 409 (skipped cleanly) while the second succeeded on the uncorrupted group!
+    assert!(
+        bob_joined_second >= 1 || eve_joined >= 1,
+        "second leaf recovery must succeed because 409 did not corrupt openmls_kv"
+    );
+
+    // Let's also create a clean 3-member group where both Bob and Eve join cleanly
+    let clean_cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(
+            &clean_cid,
+            DS_DID,
+            vec![BOB_DID.to_string(), EVE_DID.to_string()],
+            Some("Clean Trio".to_string()),
+            None,
+        )
+        .expect("create clean trio");
+    bob.sync().expect("bob accept");
+    eve.sync().expect("eve accept");
+    alice.sync().expect("alice fulfill both");
+    bob.sync().expect("bob join welcome");
+    eve.sync().expect("eve join welcome");
+
+    // 2. Empty stub response (`{"ok":true}`) and omitted `sequencerReceipt` on sendMessage MUST fail closed (`I13`)
+    // AND leave zero phantom `MessageRow`/`LabyrinthQueueRow` rows AND keep Alice's sender ratchet intact!
+    ds.inner.lock().unwrap().empty_stub_next_send = true;
+    let bad_stub_mid = uuid::Uuid::new_v4().to_string();
+    assert!(
+        alice
+            .send_message(&clean_cid, &bad_stub_mid, "should reject stub")
+            .is_err(),
+        "live sendMessage must reject empty/stub JSON"
+    );
+    ds.inner.lock().unwrap().omit_next_receipt = true;
+    let missing_rcpt_mid = uuid::Uuid::new_v4().to_string();
+    assert!(
+        alice
+            .send_message(
+                &clean_cid,
+                &missing_rcpt_mid,
+                "should reject missing I13 receipt"
+            )
+            .is_err(),
+        "live sendMessage must reject missing sequencerReceipt (I13)"
+    );
+    assert!(
+        alice
+            .list_messages(&clean_cid, None, 20)
+            .unwrap()
+            .is_empty(),
+        "failed sends must commit zero phantom MessageRows"
+    );
+    assert!(
+        alice
+            .db()
+            .read_tx(|tx| tx.list_labyrinth_queue(None, 20))
+            .unwrap()
+            .iter()
+            .all(|q| q.conversation_id != clean_cid),
+        "failed sends must commit zero LabyrinthQueueRows"
+    );
+
+    // Verify Alice's sender ratchet was NOT advanced by the two failed sends: next send decrypts cleanly on Bob!
+    let valid_mid = uuid::Uuid::new_v4().to_string();
+    alice
+        .send_message(&clean_cid, &valid_mid, "ratchet intact after failed sends")
+        .expect("alice send after failed attempts");
+    bob.sync().expect("bob sync valid message");
+    eve.sync().expect("eve sync valid message");
+    assert!(bob
+        .list_messages(&clean_cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|m| m
+            .plaintext_json
+            .contains("ratchet intact after failed sends")));
+
+    // 3. Concurrent peer message at seq = N landing before Alice's own send at seq = N + 1 (`I2` gap-sync):
+    // Bob sends while Alice has NOT synced yet; then Alice sends. Alice must gap-sync Bob's message!
+    let bob_concurrent_mid = uuid::Uuid::new_v4().to_string();
+    let bob_sent = bob
+        .send_message(&clean_cid, &bob_concurrent_mid, "Bob concurrent first!")
+        .expect("bob concurrent send");
+    let alice_concurrent_mid = uuid::Uuid::new_v4().to_string();
+    let alice_sent = alice
+        .send_message(
+            &clean_cid,
+            &alice_concurrent_mid,
+            "Alice concurrent second!",
+        )
+        .expect("alice concurrent send triggers gap-sync");
+    assert_eq!(alice_sent.seq, bob_sent.seq + 1);
+    let alice_msgs = alice
+        .list_messages(&clean_cid, None, 20)
+        .expect("alice list_messages");
+    assert!(
+        alice_msgs
+            .iter()
+            .any(|m| m.plaintext_json.contains("Bob concurrent first!")),
+        "Alice must automatically gap-sync concurrent peer message instead of skipping seq {}",
+        bob_sent.seq
+    );
+    assert!(alice_msgs
+        .iter()
+        .any(|m| m.plaintext_json.contains("Alice concurrent second!")));
+
+    // 4. SpaceAvatarPointer survives metadata updates (`avatar: None`) AND epoch rotation (`remove_group_member`),
+    // plus HTTP 409 on `remove_group_member` rolls back `MlsGroup` epoch cleanly!
+    bob.sync().expect("bob catch up");
+    eve.sync().expect("eve catch up");
+
+    let avatar = SpaceAvatarPointer {
+        setter_did: ALICE_DID.to_string(),
+        space_blob_cid: "bafkreiavatarclean0001".to_string(),
+        sym_key: vec![0x42; 32],
+        sha256: vec![0x99; 32],
+        mime_type: Some("image/png".to_string()),
+    };
+    alice
+        .update_group_metadata(
+            &clean_cid,
+            "Avatar Set".to_string(),
+            "With avatar".to_string(),
+            Some(avatar),
+        )
+        .expect("set avatar");
+    // Subsequent rename passing `avatar: None` MUST preserve existing SpaceAvatarPointer!
+    alice
+        .update_group_metadata(
+            &clean_cid,
+            "Renamed Keep Avatar".to_string(),
+            "Still has avatar".to_string(),
+            None,
+        )
+        .expect("rename preserving avatar");
+    bob.sync().expect("bob sync metadata with avatar");
+    let bob_meta_1 = bob
+        .get_group_metadata(&clean_cid)
+        .unwrap()
+        .expect("bob meta 1");
+    assert_eq!(bob_meta_1.title.as_deref(), Some("Renamed Keep Avatar"));
+    assert_eq!(
+        bob_meta_1.avatar_blob_cid.as_deref(),
+        Some("bafkreiavatarclean0001")
+    );
+
+    // Inject HTTP 409 on remove_group_member -> must return Err and leave epoch uncorrupted!
+    let epoch_before = alice
+        .list_conversations(None, 20)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.conversation_id == clean_cid)
+        .unwrap()
+        .epoch;
+    ds.inner.lock().unwrap().conflict_409_next_submit_transition = true;
+    assert!(
+        alice
+            .remove_group_member(MemberRole::Admin, &clean_cid, EVE_DID)
+            .is_err(),
+        "HTTP 409 on remove_group_member must return Err"
+    );
+    let epoch_after_409 = alice
+        .list_conversations(None, 20)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.conversation_id == clean_cid)
+        .unwrap()
+        .epoch;
+    assert_eq!(epoch_after_409, epoch_before);
+
+    // Now real remove_group_member succeeds at the uncorrupted epoch and carries SpaceAvatarPointer into next_epoch!
+    alice
+        .remove_group_member(MemberRole::Admin, &clean_cid, EVE_DID)
+        .expect("remove eve after 409");
+    bob.sync().expect("bob sync eve removal");
+    let bob_meta_2 = bob
+        .get_group_metadata(&clean_cid)
+        .unwrap()
+        .expect("bob meta after epoch rotation");
+    assert_eq!(
+        bob_meta_2.avatar_blob_cid.as_deref(),
+        Some("bafkreiavatarclean0001"),
+        "SpaceAvatarPointer must survive epoch-advancing commit re-encryption"
+    );
+
+    // 5. `payloadPruned: true` entry in `getEntries` (`I14`) is skipped cleanly without aborting subsequent live entries!
+    {
+        let mut g = ds.inner.lock().unwrap();
+        let list = g.entries.entry(clean_cid.clone()).or_default();
+        let pruned_seq = (list.len() as i64) + 1;
+        list.push(json!({
+            "$type": "blue.catbird.chat.defs#applicationMessageEntry",
+            "seq": pruned_seq,
+            "messageId": uuid::Uuid::new_v4().to_string(),
+            "payloadPruned": true
+        }));
+    }
+    let after_pruned_mid = uuid::Uuid::new_v4().to_string();
+    alice
+        .send_message(
+            &clean_cid,
+            &after_pruned_mid,
+            "Live message after payloadPruned entry",
+        )
+        .expect("alice send after pruned");
+    bob.sync()
+        .expect("bob sync advances past payloadPruned entry without crashing");
+    assert!(bob
+        .list_messages(&clean_cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|m| m
+            .plaintext_json
+            .contains("Live message after payloadPruned entry")));
 }

@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json",
-    "sourceRevision": "ec5028ce4f424af3819aa3e993c86fca1a85bbde",
-    "sourceSha256": "5533e6457fe4dc1b45fe7ff014940a6aea91657d23bf3d5b1493ac65aeefe984",
-    "sourceTree": "e29416025c27ac91c74930514b2bc85385f93a0c",
+    "sourceRevision": "b48b84f438dd21031d87ead2021abf9ac5014ba6",
+    "sourceSha256": "ef40f381b08442d8077f5f555a025e60bebfc14dcfe3d14213d48d4cd4204c3e",
+    "sourceTree": "6697d2f87ac078788144e4c7df04c0f48bcc5f2c",
     "vectorCaseCount": 10,
     "vectorSet": "signed-mutation",
     "vectorSetCount": 24
@@ -758,8 +758,8 @@
     "sourceCorpusRevision": "a063ed8f995031fa0cf122bca3f4f82c89f08c90",
     "sourceLexicon": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
     "sourceLexiconMirror": "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceLexiconRevision": "8ec8acaa1137b68b57b78ebfaea9404d5923305b",
-    "sourceLexiconSha256": "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf"
+    "sourceLexiconRevision": "34e5cc3b23cc30b4a3ea837719614c436898d321",
+    "sourceLexiconSha256": "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639"
   },
   "publicKeyHex": "ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3",
   "purpose": "Known-answer vectors for the ten active signing domains carried by no control entry. Produced by the server's own transcript code; see tests/chat_protocol_signing_domain_vectors.rs.",

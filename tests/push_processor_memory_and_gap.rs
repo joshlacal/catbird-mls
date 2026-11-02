@@ -1246,6 +1246,7 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
 
     struct CapturingTransport {
         ack_bodies: Mutex<Vec<serde_json::Value>>,
+        pds_records: Mutex<Vec<serde_json::Value>>,
     }
     impl PlatformTransport for CapturingTransport {
         fn execute_http(
@@ -1257,6 +1258,60 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                     status: 400,
                     headers: Vec::new(),
                     body: br#"{"error":"InvalidRequest"}"#.to_vec(),
+                });
+            }
+            if request.url.contains("/xrpc/com.atproto.repo.putRecord") {
+                if let Some(body) = request.body.as_deref() {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+                        if v.get("collection").and_then(|c| c.as_str())
+                            == Some("blue.catbird.chat.device")
+                        {
+                            let rkey = v.get("rkey").and_then(|r| r.as_str()).unwrap_or("dev");
+                            let repo = v.get("repo").and_then(|r| r.as_str()).unwrap_or("");
+                            self.pds_records.lock().unwrap().push(serde_json::json!({
+                                "uri": format!("at://{repo}/blue.catbird.chat.device/{rkey}"),
+                                "cid": "bafyreimock",
+                                "value": v["record"],
+                            }));
+                        }
+                    }
+                }
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: br#"{"uri":"at://did:plc:signedtranscriptuser0001/blue.catbird.chat.device/self","cid":"bafyreimock"}"#.to_vec(),
+                });
+            }
+            if request.url.contains("/xrpc/com.atproto.repo.listRecords") {
+                let records = self.pds_records.lock().unwrap().clone();
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&serde_json::json!({ "records": records })).unwrap(),
+                });
+            }
+            if request.url.contains("/xrpc/blue.catbird.chat.enrollDevice") {
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: br#"{"device":{"authGeneration":1}}"#.to_vec(),
+                });
+            }
+            if request
+                .url
+                .contains("/xrpc/blue.catbird.chat.createConversation")
+            {
+                let v: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).unwrap();
+                let next_coords = v["signedRequest"]["body"]["next"].clone();
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "seq": 1,
+                        "state": { "coordinates": next_coords }
+                    }))
+                    .unwrap(),
                 });
             }
             if request
@@ -1276,7 +1331,7 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
             Ok(PlatformHttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: b"{}".to_vec(),
+                body: br#"{"ok":true}"#.to_vec(),
             })
         }
         fn connect_realtime_stream(
@@ -1299,6 +1354,7 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
     });
     let transport = Arc::new(CapturingTransport {
         ack_bodies: Mutex::new(Vec::new()),
+        pds_records: Mutex::new(Vec::new()),
     });
 
     let client = CatbirdMlsClient::open(

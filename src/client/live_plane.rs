@@ -38,8 +38,8 @@ use crate::orchestrator::direct_request_shared_crypto::build_request_key_publica
 use crate::push::AuthorizedPeerDeviceKey;
 const ORDINARY_KP_LIFETIME_SECS: u64 = 29 * 86_400;
 use crate::storage::{
-    ConversationRow, GroupMetadataRow, LabyrinthQueueRow, MessageRow, OpenMlsKvProvider,
-    OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
+    ConversationRow, GroupMetadataRow, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
+    OpenMlsKvProvider, OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
 };
 
 use super::native_client::CatbirdMlsClient;
@@ -152,7 +152,7 @@ impl CatbirdMlsClient {
         operation: CanonicalOperation,
         body_value: &Value,
         signer: &SignatureKeyPair,
-    ) -> Result<Option<Value>, MLSError> {
+    ) -> Result<Value, MLSError> {
         let prepared = chat_wire::sign_clean_chat_mutation(
             &self.normalized_did,
             device_id,
@@ -163,12 +163,14 @@ impl CatbirdMlsClient {
         )?;
         let url = format!("{}{}", self.ds_base(), prepared.path);
         let resp = self.execute_json_post(url, prepared.body.unwrap_or_default())?;
-        if chat_wire::is_offline_mock_stub_response(&resp.body) {
-            return Ok(None);
+        if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(MLSError::Internal(format!(
+                "empty HTTP {} response body for {operation:?}",
+                resp.status
+            )));
         }
-        let val: Value = serde_json::from_slice(&resp.body)
-            .map_err(|e| MLSError::Internal(format!("parse {operation:?} JSON response: {e}")))?;
-        Ok(Some(val))
+        serde_json::from_slice(&resp.body)
+            .map_err(|e| MLSError::Internal(format!("parse {operation:?} JSON response: {e}")))
     }
 
     pub(crate) fn query_signed_chat_ds(
@@ -177,7 +179,7 @@ impl CatbirdMlsClient {
         params: &[(&str, &str)],
         device_id: &str,
         signer: &SignatureKeyPair,
-    ) -> Result<Option<Value>, MLSError> {
+    ) -> Result<Value, MLSError> {
         let canonical_query = chat_wire::canonical_query_string(params);
         let headers = chat_wire::build_chat_read_headers(
             nsid,
@@ -205,17 +207,18 @@ impl CatbirdMlsClient {
                 resp.status
             )));
         }
-        if chat_wire::is_offline_mock_stub_response(&resp.body) {
-            return Ok(None);
+        if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err(MLSError::Internal(format!(
+                "GET {url} returned empty HTTP {} body",
+                resp.status
+            )));
         }
-        let val: Value = serde_json::from_slice(&resp.body)
-            .map_err(|e| MLSError::Internal(format!("parse {nsid} JSON: {e}")))?;
-        Ok(Some(val))
+        serde_json::from_slice(&resp.body)
+            .map_err(|e| MLSError::Internal(format!("parse {nsid} JSON: {e}")))
     }
 
     pub(crate) fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError> {
-        // 1. If did:web matches home_ds_did or localhost, try direct .well-known/did.json first if did:web,
-        //    plus com.atproto.identity.resolveDid on PDS.
+        // 1. Try com.atproto.identity.resolveDid on PDS, then .well-known/did.json for did:web / home_ds_did.
         let pds_resolve_url = format!(
             "{}/xrpc/com.atproto.identity.resolveDid?did={}",
             self.pds_base(),
@@ -227,7 +230,7 @@ impl CatbirdMlsClient {
             headers: Vec::new(),
             body: None,
         }) {
-            if resp.status == 200 && !chat_wire::is_offline_mock_stub_response(&resp.body) {
+            if resp.status == 200 {
                 if let Ok(doc_bytes) = chat_wire::extract_did_doc_from_resolve_response(&resp.body)
                 {
                     let now_ms = unix_now_ms();
@@ -258,7 +261,7 @@ impl CatbirdMlsClient {
                 headers: Vec::new(),
                 body: None,
             }) {
-                if resp.status == 200 && !chat_wire::is_offline_mock_stub_response(&resp.body) {
+                if resp.status == 200 {
                     if let Ok(doc_bytes) =
                         chat_wire::extract_did_doc_from_resolve_response(&resp.body)
                     {
@@ -284,7 +287,7 @@ impl CatbirdMlsClient {
                 headers: Vec::new(),
                 body: None,
             }) {
-                if resp.status == 200 && !chat_wire::is_offline_mock_stub_response(&resp.body) {
+                if resp.status == 200 {
                     if let Ok(doc_bytes) =
                         chat_wire::extract_did_doc_from_resolve_response(&resp.body)
                     {
@@ -330,7 +333,7 @@ impl CatbirdMlsClient {
         );
         let resp = self.transport.execute_http(PlatformHttpRequest {
             method: "GET".to_string(),
-            url: list_url.clone(),
+            url: list_url,
             headers: Vec::new(),
             body: None,
         })?;
@@ -339,30 +342,6 @@ impl CatbirdMlsClient {
                 "I4 PDS listRecords({target_did}) failed with HTTP {}",
                 resp.status
             )));
-        }
-
-        if chat_wire::is_offline_mock_stub_response(&resp.body) {
-            let fallback = self.db.read_tx(|tx| {
-                tx.get_account_meta(&format!("authorized_device_keys:{target_did}"))
-            })?;
-            if let Some(json_str) = fallback {
-                return serde_json::from_str(&json_str)
-                    .map_err(|e| MLSError::Internal(format!("parse cached I4 keys: {e}")));
-            }
-            return Ok(Vec::new());
-        }
-
-        let val: Value = serde_json::from_slice(&resp.body)
-            .map_err(|e| MLSError::Internal(format!("parse PDS listRecords JSON: {e}")))?;
-        if val.get("records").is_none() {
-            let fallback = self.db.read_tx(|tx| {
-                tx.get_account_meta(&format!("authorized_device_keys:{target_did}"))
-            })?;
-            if let Some(json_str) = fallback {
-                return serde_json::from_str(&json_str)
-                    .map_err(|e| MLSError::Internal(format!("parse cached I4 keys: {e}")));
-            }
-            return Ok(Vec::new());
         }
 
         let pairs = chat_wire::parse_pds_device_list_records(target_did, &resp.body)?;
@@ -411,7 +390,7 @@ impl CatbirdMlsClient {
                 body: None,
             })
             .ok()?;
-        if resp.status != 200 || chat_wire::is_offline_mock_stub_response(&resp.body) {
+        if resp.status != 200 {
             return None;
         }
         let val: Value = serde_json::from_slice(&resp.body).ok()?;
@@ -539,14 +518,13 @@ impl CatbirdMlsClient {
             &signer,
         )?;
         let auth_generation = enroll_resp
-            .as_ref()
-            .and_then(|v| {
-                v.get("device")
-                    .and_then(|d| d.get("authGeneration"))
-                    .and_then(|g| g.as_i64())
-                    .or_else(|| v.get("authGeneration").and_then(|g| g.as_i64()))
-            })
-            .unwrap_or(1)
+            .get("device")
+            .and_then(|d| d.get("authGeneration"))
+            .and_then(|g| g.as_i64())
+            .or_else(|| enroll_resp.get("authGeneration").and_then(|g| g.as_i64()))
+            .ok_or_else(|| {
+                MLSError::Internal("enrollDevice response missing authGeneration".to_string())
+            })?
             .max(1);
 
         // 3. Persist authoritative `auth_generation` + generate C33 DirectRequestKeyPublication.
@@ -834,14 +812,6 @@ impl CatbirdMlsClient {
             serde_json::to_vec(&json!({ "signedRequest": prepare_wrapper_val }))
                 .map_err(|e| MLSError::Internal(e.to_string()))?,
         )?;
-        if chat_wire::is_offline_mock_stub_response(&prepare_http.body) {
-            return self.create_group_local_offline(
-                canonical_convo_id,
-                sequencer_did,
-                None,
-                description,
-            );
-        }
 
         let prep_outer: Value = serde_json::from_slice(&prepare_http.body)
             .map_err(|e| MLSError::Internal(format!("parse prepareDirectRequest: {e}")))?;
@@ -919,7 +889,11 @@ impl CatbirdMlsClient {
             .unwrap_or("#mls-receipt-1");
         let authority_key = self
             .resolve_sequencer_receipt_key(authority_did, receipt_kid)?
-            .unwrap_or_else(|| vec![0x02; 33]);
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "C33/I13: unable to resolve `{authority_did}` DID document for `{receipt_kid}`"
+                ))
+            })?;
 
         let effective_convo_id = preparation
             .get("conversationId")
@@ -950,37 +924,41 @@ impl CatbirdMlsClient {
         rand::rngs::OsRng.fill_bytes(&mut group_id_bytes);
         let now_secs = unix_now_secs();
 
-        let bootstrap = self.db.write_tx(|tx| {
-            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-            let provider = OpenMlsKvProvider::new(storage)?;
-            let (_group, boot) = direct_request_bootstrap::prepare_with_provider(
-                &provider,
-                &signer,
-                &DirectRequestBootstrapInput {
-                    draft_id: request_id.clone(),
-                    context_json,
-                    group_id: group_id_bytes.clone(),
-                    generation: 0,
-                    state_version: 1,
-                    key_packages: packages,
-                    expected_package_refs: refs,
-                    authority_import_until: min_deadline,
-                    preparation_request_digest: *prepare_verified.request_digest(),
-                    receipt_authority_key: authority_key,
-                    text: intro_text.clone(),
-                    invitation: None,
-                    metadata: GroupMetadataV1 {
-                        version: 1,
-                        title: String::new(),
-                        description: String::new(),
-                        avatar_blob_locator: None,
-                        avatar_content_type: None,
-                        space_avatar: None,
+        let (bootstrap, kv_batch) = self.db.read_tx(|tx| {
+            let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+            let boot = {
+                let storage = OpenMlsKvStorage::new(&overlay);
+                let provider = OpenMlsKvProvider::new(storage)?;
+                let (_group, boot) = direct_request_bootstrap::prepare_with_provider(
+                    &provider,
+                    &signer,
+                    &DirectRequestBootstrapInput {
+                        draft_id: request_id.clone(),
+                        context_json,
+                        group_id: group_id_bytes.clone(),
+                        generation: 0,
+                        state_version: 1,
+                        key_packages: packages,
+                        expected_package_refs: refs,
+                        authority_import_until: min_deadline,
+                        preparation_request_digest: *prepare_verified.request_digest(),
+                        receipt_authority_key: authority_key,
+                        text: intro_text.clone(),
+                        invitation: None,
+                        metadata: GroupMetadataV1 {
+                            version: 1,
+                            title: String::new(),
+                            description: String::new(),
+                            avatar_blob_locator: None,
+                            avatar_content_type: None,
+                            space_avatar: None,
+                        },
                     },
-                },
-                now_secs,
-            )?;
-            Ok(boot)
+                    now_secs,
+                )?;
+                boot
+            };
+            Ok((boot, overlay.into_batch()))
         })?;
 
         let import_until = bootstrap.import_until;
@@ -1087,6 +1065,7 @@ impl CatbirdMlsClient {
             .map_err(|e| MLSError::Internal(e.to_string()))?;
 
         let convo_row = self.db.write_tx(|tx| {
+            kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
             let row = ConversationRow {
                 conversation_id: effective_convo_id.clone(),
                 group_id: group_id_bytes.clone(),
@@ -1182,27 +1161,37 @@ impl CatbirdMlsClient {
         let title_str = title.clone().unwrap_or_default();
         let desc_str = description.clone().unwrap_or_default();
 
-        let (signer, auth_generation, ggi_bytes, gch, ctag, meta_snap_json) =
-            self.db.write_tx(|tx| {
-                let signer_json = tx.get_account_meta("enrolled_signer_json")?;
-                let signer = if let Some(raw) = signer_json {
-                    serde_json::from_str::<SignatureKeyPair>(&raw)
-                        .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?
-                } else {
-                    let s = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
-                        .map_err(|e| MLSError::Cryptography(format!("generate signer: {e:?}")))?;
-                    let serialized =
-                        serde_json::to_string(&s).map_err(|e| MLSError::Internal(e.to_string()))?;
-                    tx.put_account_meta("enrolled_signer_json", &serialized, now_ms)?;
-                    s
-                };
-                let auth_gen = tx
-                    .get_account_meta("auth_generation")?
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(1)
-                    .max(1);
+        let (
+            signer,
+            new_signer_json,
+            auth_generation,
+            ggi_bytes,
+            gch,
+            ctag,
+            meta_snap_json,
+            kv_batch,
+        ) = self.db.read_tx(|tx| {
+            let signer_json = tx.get_account_meta("enrolled_signer_json")?;
+            let (signer, new_signer_str) = if let Some(raw) = signer_json {
+                let s = serde_json::from_str::<SignatureKeyPair>(&raw)
+                    .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?;
+                (s, None)
+            } else {
+                let s = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
+                    .map_err(|e| MLSError::Cryptography(format!("generate signer: {e:?}")))?;
+                let serialized =
+                    serde_json::to_string(&s).map_err(|e| MLSError::Internal(e.to_string()))?;
+                (s, Some(serialized))
+            };
+            let auth_gen = tx
+                .get_account_meta("auth_generation")?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1)
+                .max(1);
 
-                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+            let (ggi, gch, ctag, snap) = {
+                let storage = OpenMlsKvStorage::new(&overlay);
                 let provider = OpenMlsKvProvider::new(storage)?;
                 signer
                     .store(provider.storage())
@@ -1271,36 +1260,22 @@ impl CatbirdMlsClient {
                     signer.public(),
                     &title_str,
                     &desc_str,
+                    None,
                 )?;
+                (ggi, gch, ctag, snap)
+            };
 
-                if title.is_some() || description.is_some() {
-                    let meta_v1 = GroupMetadataV1 {
-                        version: 1,
-                        title: title_str.clone(),
-                        description: desc_str.clone(),
-                        avatar_blob_locator: None,
-                        avatar_content_type: None,
-                        space_avatar: None,
-                    };
-                    tx.upsert_group_metadata(&GroupMetadataRow {
-                        conversation_id: canonical_convo_id.to_string(),
-                        metadata_version: 1,
-                        epoch: 0,
-                        title: title.clone(),
-                        description: description.clone(),
-                        avatar_setter_did: None,
-                        avatar_blob_cid: None,
-                        avatar_sym_key: None,
-                        avatar_sha256: None,
-                        avatar_mime_type: None,
-                        metadata_json: serde_json::to_string(&meta_v1)
-                            .map_err(|e| MLSError::Internal(e.to_string()))?,
-                        updated_at_ms: now_ms,
-                    })?;
-                }
-
-                Ok((signer, auth_gen, ggi, gch, ctag, snap))
-            })?;
+            Ok((
+                signer,
+                new_signer_str,
+                auth_gen,
+                ggi,
+                gch,
+                ctag,
+                snap,
+                overlay.into_batch(),
+            ))
+        })?;
 
         let mut participants = vec![json!({
             "userDid": self.normalized_did,
@@ -1368,7 +1343,7 @@ impl CatbirdMlsClient {
             "signedAt": chat_wire::now_rfc3339_millis(),
         });
 
-        let resp_opt = self.submit_signed_chat_op(
+        let resp_val = self.submit_signed_chat_op(
             canonical_dev_id,
             Some(auth_generation),
             CanonicalOperation::CreateConversation,
@@ -1376,23 +1351,20 @@ impl CatbirdMlsClient {
             &signer,
         )?;
 
-        let server_coords = resp_opt
-            .as_ref()
-            .and_then(|v| {
-                v.get("state")
-                    .and_then(|s| s.get("coordinates"))
-                    .or_else(|| v.get("coordinates"))
-            })
+        let server_coords = resp_val
+            .get("state")
+            .and_then(|s| s.get("coordinates"))
+            .or_else(|| resp_val.get("coordinates"))
             .cloned()
             .unwrap_or(next_coords);
-        let server_seq = resp_opt
-            .as_ref()
-            .and_then(|v| {
-                v.get("seq").and_then(|s| s.as_i64()).or_else(|| {
-                    v.get("entry")
-                        .and_then(|e| e.get("seq"))
-                        .and_then(|s| s.as_i64())
-                })
+        let server_seq = resp_val
+            .get("seq")
+            .and_then(|s| s.as_i64())
+            .or_else(|| {
+                resp_val
+                    .get("entry")
+                    .and_then(|e| e.get("seq"))
+                    .and_then(|s| s.as_i64())
             })
             .unwrap_or(1)
             .max(1);
@@ -1409,6 +1381,28 @@ impl CatbirdMlsClient {
             .map_err(|e| MLSError::Internal(e.to_string()))?;
 
         let convo = self.db.write_tx(|tx| {
+            if let Some(ref raw_signer) = new_signer_json {
+                tx.put_account_meta("enrolled_signer_json", raw_signer, now_ms)?;
+            }
+            kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+            if title.is_some() || description.is_some() {
+                let meta_v1 = GroupMetadataV1 {
+                    version: 1,
+                    title: title_str.clone(),
+                    description: desc_str.clone(),
+                    avatar_blob_locator: None,
+                    avatar_content_type: None,
+                    space_avatar: None,
+                };
+                let meta_row = chat_wire::group_metadata_row_from_v1(
+                    canonical_convo_id,
+                    1,
+                    0,
+                    &meta_v1,
+                    now_ms,
+                )?;
+                tx.upsert_group_metadata(&meta_row)?;
+            }
             let row = ConversationRow {
                 conversation_id: canonical_convo_id.to_string(),
                 group_id: group_id_bytes,
@@ -1520,33 +1514,41 @@ impl CatbirdMlsClient {
             "signedAt": chat_wire::now_rfc3339_millis(),
         });
 
-        let resp_opt = self.submit_signed_chat_op(
+        let resp_val = self.submit_signed_chat_op(
             &canonical_dev_id,
             Some(auth_generation),
             CanonicalOperation::SubmitTransition,
             &policy_body,
             &signer,
         )?;
-        let updated_coords = resp_opt
-            .as_ref()
-            .and_then(|v| {
-                v.get("state")
-                    .and_then(|s| s.get("coordinates"))
-                    .or_else(|| v.get("coordinates"))
-            })
+        let updated_coords = resp_val
+            .get("state")
+            .and_then(|s| s.get("coordinates"))
+            .or_else(|| resp_val.get("coordinates"))
             .cloned()
             .unwrap_or(next_coords);
-        let new_seq = resp_opt
-            .as_ref()
-            .and_then(|v| v.get("seq").and_then(|s| s.as_i64()))
+        let new_seq = resp_val
+            .get("seq")
+            .and_then(|s| s.as_i64())
+            .or_else(|| {
+                resp_val
+                    .get("entry")
+                    .and_then(|e| e.get("seq"))
+                    .and_then(|s| s.as_i64())
+            })
             .unwrap_or(existing.last_seq.saturating_add(1));
         let now_ms = unix_now_ms();
         let coords_str = serde_json::to_string(&updated_coords)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
 
-        let updated = self.db.write_tx(|tx| {
+        let (updated, needs_gap_sync) = self.db.write_tx(|tx| {
             let mut row = tx.get_conversation(conversation_id)?.unwrap_or(existing);
-            row.last_seq = row.last_seq.max(new_seq);
+            let mut gap = false;
+            if new_seq == row.last_seq.saturating_add(1) {
+                row.last_seq = new_seq;
+            } else if new_seq > row.last_seq.saturating_add(1) {
+                gap = true;
+            }
             row.updated_at_ms = now_ms;
             tx.upsert_conversation(&row)?;
             tx.put_account_meta(
@@ -1554,8 +1556,12 @@ impl CatbirdMlsClient {
                 &coords_str,
                 now_ms,
             )?;
-            Ok(row)
+            Ok((row, gap))
         })?;
+
+        if needs_gap_sync {
+            let _ = self.sync_conversation_entries(&canonical_dev_id, &signer, &updated);
+        }
 
         let _ = self.fulfill_leaf_recovery_inbox(&canonical_dev_id, &signer, auth_generation, None);
         let refreshed = self
@@ -1667,49 +1673,60 @@ impl CatbirdMlsClient {
         let gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
         let ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
 
-        // Create OpenMLS PrivateMessage + persist optimistic message & outbox item atomically.
-        let (signer, auth_generation, convo_snapshot, ciphertext_bytes, aad_json, provisional_row) =
-            self.db.write_tx(|tx| {
-                let mut convo = tx.get_conversation(&canonical_convo_id)?.ok_or_else(|| {
-                    MLSError::GroupNotFound {
-                        message: format!("conversation {canonical_convo_id} not found"),
-                    }
+        // Stage OpenMLS `create_message` over `KvWriteOverlay` inside `read_tx` so SQLite
+        // (`openmls_kv`, `messages`, `labyrinth_queue`, `conversations`) is untouched if
+        // live `sendMessage` fails or returns an unverified receipt.
+        let (
+            signer,
+            auth_generation,
+            convo_snapshot,
+            msg_epoch,
+            ciphertext_bytes,
+            aad_json,
+            kv_batch,
+        ) = self.db.read_tx(|tx| {
+            let convo = tx.get_conversation(&canonical_convo_id)?.ok_or_else(|| {
+                MLSError::GroupNotFound {
+                    message: format!("conversation {canonical_convo_id} not found"),
+                }
+            })?;
+            let signer_json = tx
+                .get_account_meta("enrolled_signer_json")?
+                .ok_or_else(|| {
+                    MLSError::InvalidState("device signer not initialized".to_string())
                 })?;
-                let signer_json =
-                    tx.get_account_meta("enrolled_signer_json")?
-                        .ok_or_else(|| {
-                            MLSError::InvalidState("device signer not initialized".to_string())
-                        })?;
-                let signer: SignatureKeyPair = serde_json::from_str(&signer_json)
-                    .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?;
-                let auth_gen = tx
-                    .get_account_meta("auth_generation")?
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(1)
-                    .max(1);
+            let signer: SignatureKeyPair = serde_json::from_str(&signer_json)
+                .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?;
+            let auth_gen = tx
+                .get_account_meta("auth_generation")?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1)
+                .max(1);
 
-                let aad_prior = chat_wire::build_aad_prior_coordinate(
-                    &convo_uuid,
-                    &convo.group_id,
-                    generation,
-                    state_version,
-                    epoch_u64 as i64,
-                    &gch,
-                    &ctag,
-                );
-                let aad_val = json!({
-                    "protocolVersion": "1",
-                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                    "generation": generation,
-                    "messageId": STANDARD.encode(msg_uuid.as_bytes()),
-                    "prior": aad_prior,
-                    "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
-                });
-                let aad_bytes = canonical_application_aad_bytes(&aad_val).map_err(|e| {
-                    MLSError::Cryptography(format!("canonical_application_aad_bytes: {e}"))
-                })?;
+            let aad_prior = chat_wire::build_aad_prior_coordinate(
+                &convo_uuid,
+                &convo.group_id,
+                generation,
+                state_version,
+                epoch_u64 as i64,
+                &gch,
+                &ctag,
+            );
+            let aad_val = json!({
+                "protocolVersion": "1",
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                "generation": generation,
+                "messageId": STANDARD.encode(msg_uuid.as_bytes()),
+                "prior": aad_prior,
+                "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
+            });
+            let aad_bytes = canonical_application_aad_bytes(&aad_val).map_err(|e| {
+                MLSError::Cryptography(format!("canonical_application_aad_bytes: {e}"))
+            })?;
 
-                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+            let ciphertext = {
+                let storage = OpenMlsKvStorage::new(&overlay);
                 let provider = OpenMlsKvProvider::new(storage)?;
                 let mut group =
                     MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
@@ -1724,62 +1741,23 @@ impl CatbirdMlsClient {
                     .map_err(|e| MLSError::Cryptography(format!("create_message: {e:?}")));
                 group.set_aad(Vec::new());
                 let mls_out = mls_out?;
-                let ciphertext = mls_out
+                let ct = mls_out
                     .tls_serialize_detached()
                     .map_err(|e| MLSError::Internal(format!("serialize message: {e:?}")))?;
+                let active_epoch = group.epoch().as_u64() as i64;
+                (ct, active_epoch)
+            };
 
-                let prov_seq = convo.last_seq.saturating_add(1);
-                convo.last_seq = prov_seq;
-                convo.epoch = group.epoch().as_u64() as i64;
-                convo.updated_at_ms = now_ms;
-                tx.upsert_conversation(&convo)?;
-
-                let row = MessageRow {
-                    message_id: canonical_msg_id.clone(),
-                    conversation_id: canonical_convo_id.clone(),
-                    group_id: convo.group_id.clone(),
-                    epoch: convo.epoch,
-                    seq: prov_seq,
-                    sender_did: self.normalized_did.clone(),
-                    sender_device_id: canonical_dev_id.clone(),
-                    plaintext_json: display_json.clone(),
-                    created_at_ms: now_ms,
-                    is_own: true,
-                };
-                tx.insert_message(&row)?;
-
-                let group_id_hex = hex::encode(&convo.group_id);
-                let queued = QueuedLabyrinthArchivePayload {
-                    version: 1,
-                    message_id: canonical_msg_id.clone(),
-                    conversation_id: canonical_convo_id.clone(),
-                    group_id_hex: group_id_hex.clone(),
-                    epoch: convo.epoch,
-                    seq: prov_seq,
-                    sender_did: self.normalized_did.clone(),
-                    sender_device_id: canonical_dev_id.clone(),
-                    sequencer_did: convo.sequencer_did.clone(),
-                    space_uri: convo.space_uri.clone(),
-                    plaintext_json: display_json.clone(),
-                    labyrinth_frame_json: frame_json.clone(),
-                    mls_ciphertext_b64: STANDARD.encode(&ciphertext),
-                    frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
-                    sequencer_receipt_json: None,
-                    created_at_ms: now_ms,
-                };
-                let queued_bytes = serde_json::to_vec(&queued)
-                    .map_err(|e| MLSError::Internal(format!("serialize queue payload: {e}")))?;
-                tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                    item_id: canonical_msg_id.clone(),
-                    conversation_id: canonical_convo_id.clone(),
-                    group_id_hex,
-                    seq: prov_seq,
-                    payload_bytes: queued_bytes,
-                    created_at_ms: now_ms,
-                })?;
-
-                Ok((signer, auth_gen, convo, ciphertext, aad_val, row))
-            })?;
+            Ok((
+                signer,
+                auth_gen,
+                convo,
+                ciphertext.1,
+                ciphertext.0,
+                aad_val,
+                overlay.into_batch(),
+            ))
+        })?;
 
         // Strictly outside `write_tx` (`I6`): dispatch signed `blue.catbird.chat.sendMessage`.
         let send_body = json!({
@@ -1802,34 +1780,16 @@ impl CatbirdMlsClient {
             "blobBindings": [],
         });
 
-        let Some(resp_val) = self.submit_signed_chat_op(
+        let resp_val = self.submit_signed_chat_op(
             &canonical_dev_id,
             Some(auth_generation),
             CanonicalOperation::SendMessage,
             &send_body,
             &signer,
-        )?
-        else {
-            self.notify_change(PlatformChangeEvent::MessagesUpdated {
-                conversation_id: canonical_convo_id,
-            });
-            return Ok(provisional_row);
-        };
+        )?;
 
-        // Verify `I13` ES256 `sequencerReceipt` against `{sequencer_did}#mls-receipt-1`!
-        let mut authoritative_seq = resp_val
-            .get("seq")
-            .and_then(|v| v.as_i64())
-            .or_else(|| {
-                resp_val
-                    .get("entry")
-                    .and_then(|e| e.get("seq"))
-                    .and_then(|v| v.as_i64())
-            })
-            .unwrap_or(provisional_row.seq);
-        let mut verified_receipt_json: Option<String> = None;
-
-        if let Some(receipt_val) = resp_val
+        // Enforce mandatory `I13` ES256 `sequencerReceipt` verification against `{sequencer_did}#mls-receipt-1`!
+        let receipt_val = resp_val
             .get("sequencerReceipt")
             .or_else(|| {
                 resp_val
@@ -1837,50 +1797,64 @@ impl CatbirdMlsClient {
                     .and_then(|e| e.get("sequencerReceipt"))
             })
             .filter(|v| !v.is_null())
-        {
-            let kid = receipt_val
-                .get("kid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("#mls-receipt-1");
-            let sec1_key = self
-                .resolve_sequencer_receipt_key(&convo_snapshot.sequencer_did, kid)?
-                .ok_or_else(|| {
-                    MLSError::Cryptography(format!(
-                        "I13: unable to resolve `{}` DID document for #mls-receipt-1 verification",
-                        convo_snapshot.sequencer_did
-                    ))
-                })?;
-            let expected_entry_id = resp_val
-                .pointer("/entry/entryId")
-                .and_then(|v| v.as_str())
-                .or_else(|| receipt_val.get("entryId").and_then(|v| v.as_str()))
-                .unwrap_or(&canonical_msg_id);
-            let (rcpt_seq, _rcpt_gen, archived_json) =
-                chat_wire::parse_and_verify_i13_sequencer_receipt(
-                    receipt_val,
-                    &sec1_key,
-                    &convo_snapshot.sequencer_did,
-                    &canonical_convo_id,
-                    &convo_snapshot.group_id,
-                    convo_snapshot.epoch.max(0) as u64,
-                    expected_entry_id,
-                    &archive_commitment,
-                )?;
-            authoritative_seq = rcpt_seq as i64;
-            verified_receipt_json = Some(archived_json);
-        }
-
-        let final_row = self.db.write_tx(|tx| {
-            let mut updated_row = provisional_row.clone();
-            updated_row.seq = authoritative_seq;
-            tx.conn()
-                .execute(
-                    "UPDATE messages SET seq = ?1 WHERE message_id = ?2;",
-                    rusqlite::params![authoritative_seq, canonical_msg_id],
+            .ok_or_else(|| {
+                MLSError::Cryptography(
+                    "I13: sendMessage response missing non-null sequencerReceipt".to_string(),
                 )
-                .map_err(|e| MLSError::Internal(format!("update message seq: {e}")))?;
+            })?;
+        let kid = receipt_val
+            .get("kid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("#mls-receipt-1");
+        let sec1_key = self
+            .resolve_sequencer_receipt_key(&convo_snapshot.sequencer_did, kid)?
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "I13: unable to resolve `{}` DID document for #mls-receipt-1 verification",
+                    convo_snapshot.sequencer_did
+                ))
+            })?;
+        let expected_entry_id = resp_val
+            .pointer("/entry/entryId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&canonical_msg_id);
+        let (rcpt_seq, _rcpt_gen, archived_json) =
+            chat_wire::parse_and_verify_i13_sequencer_receipt(
+                receipt_val,
+                &sec1_key,
+                &convo_snapshot.sequencer_did,
+                &canonical_convo_id,
+                &convo_snapshot.group_id,
+                msg_epoch.max(0) as u64,
+                expected_entry_id,
+                &archive_commitment,
+            )?;
+        let authoritative_seq = rcpt_seq as i64;
+
+        let (final_row, needs_gap_sync) = self.db.write_tx(|tx| {
+            kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+            let row = MessageRow {
+                message_id: canonical_msg_id.clone(),
+                conversation_id: canonical_convo_id.clone(),
+                group_id: convo_snapshot.group_id.clone(),
+                epoch: msg_epoch,
+                seq: authoritative_seq,
+                sender_did: self.normalized_did.clone(),
+                sender_device_id: canonical_dev_id.clone(),
+                plaintext_json: display_json.clone(),
+                created_at_ms: now_ms,
+                is_own: true,
+            };
+            tx.insert_message(&row)?;
+
+            let mut gap = false;
             if let Some(mut c) = tx.get_conversation(&canonical_convo_id)? {
-                c.last_seq = c.last_seq.max(authoritative_seq);
+                c.epoch = c.epoch.max(msg_epoch);
+                if authoritative_seq == c.last_seq.saturating_add(1) {
+                    c.last_seq = authoritative_seq;
+                } else if authoritative_seq > c.last_seq.saturating_add(1) {
+                    gap = true;
+                }
                 c.updated_at_ms = now_ms;
                 tx.upsert_conversation(&c)?;
             }
@@ -1891,7 +1865,7 @@ impl CatbirdMlsClient {
                 message_id: canonical_msg_id.clone(),
                 conversation_id: canonical_convo_id.clone(),
                 group_id_hex: group_id_hex.clone(),
-                epoch: convo_snapshot.epoch,
+                epoch: msg_epoch,
                 seq: authoritative_seq,
                 sender_did: self.normalized_did.clone(),
                 sender_device_id: canonical_dev_id.clone(),
@@ -1901,7 +1875,7 @@ impl CatbirdMlsClient {
                 labyrinth_frame_json: frame_json,
                 mls_ciphertext_b64: STANDARD.encode(&ciphertext_bytes),
                 frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
-                sequencer_receipt_json: verified_receipt_json,
+                sequencer_receipt_json: Some(archived_json),
                 created_at_ms: now_ms,
             };
             let queued_bytes = serde_json::to_vec(&queued)
@@ -1915,8 +1889,17 @@ impl CatbirdMlsClient {
                 payload_bytes: queued_bytes,
                 created_at_ms: now_ms,
             })?;
-            Ok(updated_row)
+            Ok((row, gap))
         })?;
+
+        if needs_gap_sync {
+            if let Some(convo_now) = self
+                .db
+                .read_tx(|tx| tx.get_conversation(&canonical_convo_id))?
+            {
+                self.sync_conversation_entries(&canonical_dev_id, &signer, &convo_now)?;
+            }
+        }
 
         self.notify_change(PlatformChangeEvent::MessagesUpdated {
             conversation_id: canonical_convo_id,
@@ -1935,24 +1918,21 @@ impl CatbirdMlsClient {
         }
         enforce_admin_removal_policy(&self.normalized_did, actor_role, &[target_did.to_string()])?;
         let now_ms = unix_now_ms();
-        let convo = self.db.write_tx(|tx| {
-            let c =
-                tx.get_conversation(conversation_id)?
-                    .ok_or_else(|| MLSError::GroupNotFound {
-                        message: format!("conversation {conversation_id} not found"),
-                    })?;
-            tx.put_account_meta(
-                &format!("last_removed_member:{}", c.conversation_id),
-                target_did,
-                now_ms,
-            )?;
-            Ok(c)
-        })?;
+        let convo = self
+            .db
+            .read_tx(|tx| tx.get_conversation(conversation_id))?
+            .ok_or_else(|| MLSError::GroupNotFound {
+                message: format!("conversation {conversation_id} not found"),
+            })?;
 
-        if let (Some(canonical_dev_id), Ok(convo_uuid)) = (
-            self.canonical_uuid_v4_device_id(),
-            uuid::Uuid::parse_str(conversation_id.trim()),
-        ) {
+        let live_ids = self.canonical_uuid_v4_device_id().and_then(|dev_id| {
+            let c_uuid = uuid::Uuid::parse_str(conversation_id.trim())
+                .ok()
+                .filter(|u| u.get_version_num() == 4)?;
+            Some((dev_id, c_uuid))
+        });
+
+        if let Some((canonical_dev_id, convo_uuid)) = live_ids {
             let prior_coords = self.load_or_build_conversation_coords(conversation_id)?;
             let prior_sv = prior_coords
                 .get("stateVersion")
@@ -1971,7 +1951,9 @@ impl CatbirdMlsClient {
             let transition_uuid = uuid::Uuid::new_v4();
             let transition_id = transition_uuid.to_string();
 
-            let maybe_commit = self.db.write_tx(|tx| {
+            // Stage `remove_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx`
+            // so `openmls_kv` is NEVER advanced if `submitTransition` fails (`409` race or `5xx`)!
+            let maybe_commit = self.db.read_tx(|tx| {
                 let signer_json = tx.get_account_meta("enrolled_signer_json")?;
                 let Some(signer_str) = signer_json else {
                     return Ok(None);
@@ -1983,134 +1965,144 @@ impl CatbirdMlsClient {
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(1)
                     .max(1);
-                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = OpenMlsKvProvider::new(storage)?;
-                let mut group =
-                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
-                        .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
-                        .ok_or_else(|| MLSError::GroupNotFound {
-                            message: format!("MlsGroup missing for {conversation_id}"),
-                        })?;
+                let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+                let built = {
+                    let storage = OpenMlsKvStorage::new(&overlay);
+                    let provider = OpenMlsKvProvider::new(storage)?;
+                    let mut group =
+                        MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                            .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                            .ok_or_else(|| MLSError::GroupNotFound {
+                                message: format!("MlsGroup missing for {conversation_id}"),
+                            })?;
 
-                let prefix = format!("{target_did}#");
-                let mut target_leaves = Vec::new();
-                let mut removed_leaf_entries = Vec::new();
-                for member in group.members() {
-                    if let Ok(id_str) = std::str::from_utf8(member.credential.serialized_content())
-                    {
-                        if let Some(dev_part) = id_str.strip_prefix(&prefix) {
-                            target_leaves.push(member.index);
-                            removed_leaf_entries.push(json!({
-                                "$type": "blue.catbird.chat.defs#removeLeaf",
-                                "userDid": target_did,
-                                "deviceId": dev_part,
-                            }));
+                    let prefix = format!("{target_did}#");
+                    let mut target_leaves = Vec::new();
+                    let mut removed_leaf_entries = Vec::new();
+                    for member in group.members() {
+                        if let Ok(id_str) =
+                            std::str::from_utf8(member.credential.serialized_content())
+                        {
+                            if let Some(dev_part) = id_str.strip_prefix(&prefix) {
+                                target_leaves.push(member.index);
+                                removed_leaf_entries.push(json!({
+                                    "$type": "blue.catbird.chat.defs#removeLeaf",
+                                    "userDid": target_did,
+                                    "deviceId": dev_part,
+                                }));
+                            }
                         }
                     }
-                }
-                if target_leaves.is_empty() {
-                    return Ok(None);
-                }
+                    if target_leaves.is_empty() {
+                        return Ok(None);
+                    }
 
-                let aad_prior = chat_wire::build_aad_prior_coordinate(
-                    &convo_uuid,
-                    &convo.group_id,
-                    prior_gen,
-                    prior_sv,
-                    prior_epoch as i64,
-                    &prior_gch,
-                    &prior_ctag,
-                );
-                let commit_aad_val = json!({
-                    "protocolVersion": "1",
-                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                    "generation": prior_gen,
-                    "transitionId": STANDARD.encode(transition_uuid.as_bytes()),
-                    "prior": aad_prior,
-                });
-                let commit_aad_bytes =
-                    canonical_commit_aad_bytes(&commit_aad_val).map_err(|e| {
-                        MLSError::Cryptography(format!("canonical_commit_aad_bytes: {e}"))
-                    })?;
-                group.set_aad(commit_aad_bytes);
-                let (commit_msg, _, _) =
-                    group
+                    let aad_prior = chat_wire::build_aad_prior_coordinate(
+                        &convo_uuid,
+                        &convo.group_id,
+                        prior_gen,
+                        prior_sv,
+                        prior_epoch as i64,
+                        &prior_gch,
+                        &prior_ctag,
+                    );
+                    let commit_aad_val = json!({
+                        "protocolVersion": "1",
+                        "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                        "generation": prior_gen,
+                        "transitionId": STANDARD.encode(transition_uuid.as_bytes()),
+                        "prior": aad_prior,
+                    });
+                    let commit_aad_bytes =
+                        canonical_commit_aad_bytes(&commit_aad_val).map_err(|e| {
+                            MLSError::Cryptography(format!("canonical_commit_aad_bytes: {e}"))
+                        })?;
+                    group.set_aad(commit_aad_bytes);
+                    let (commit_msg, _, _) = group
                         .remove_members(&provider, &signer, &target_leaves)
                         .map_err(|e| MLSError::Cryptography(format!("remove_members: {e:?}")))?;
-                group
-                    .merge_pending_commit(&provider)
-                    .map_err(|e| MLSError::Cryptography(format!("merge_pending_commit: {e:?}")))?;
-                group.set_aad(Vec::new());
+                    group.merge_pending_commit(&provider).map_err(|e| {
+                        MLSError::Cryptography(format!("merge_pending_commit: {e:?}"))
+                    })?;
+                    group.set_aad(Vec::new());
 
-                let commit_bytes = commit_msg
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("serialize commit: {e:?}")))?;
-                let next_epoch = group.epoch().as_u64();
-                let (next_gch, next_ctag) =
-                    chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_row = tx.get_group_metadata(conversation_id)?;
-                let meta_ver = meta_row
-                    .as_ref()
-                    .map(|m| m.metadata_version.max(1) as u64)
-                    .unwrap_or(1);
-                let title_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.title.clone())
-                    .unwrap_or_default();
-                let desc_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.description.clone())
-                    .unwrap_or_default();
-                let meta_key = derive_metadata_key_from_group(
-                    &mut group,
-                    provider.crypto(),
-                    provider.storage(),
-                    &convo.group_id,
-                    next_epoch,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
-                    tx,
-                    conversation_id,
-                    &meta_key,
-                    &convo.group_id,
-                    &convo_uuid,
-                    prior_gen,
-                    next_epoch,
-                    &next_gch,
-                    &next_ctag,
-                    &transition_id,
-                    meta_ver,
-                    &canonical_dev_id,
-                    auth_gen,
-                    signer.public(),
-                    &title_s,
-                    &desc_s,
-                )?;
+                    let commit_bytes = commit_msg
+                        .tls_serialize_detached()
+                        .map_err(|e| MLSError::Internal(format!("serialize commit: {e:?}")))?;
+                    let next_epoch = group.epoch().as_u64();
+                    let (next_gch, next_ctag) =
+                        chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                    let meta_row = tx.get_group_metadata(conversation_id)?;
+                    let meta_ver = meta_row
+                        .as_ref()
+                        .map(|m| m.metadata_version.max(1) as u64)
+                        .unwrap_or(1);
+                    let title_s = meta_row
+                        .as_ref()
+                        .and_then(|m| m.title.clone())
+                        .unwrap_or_default();
+                    let desc_s = meta_row
+                        .as_ref()
+                        .and_then(|m| m.description.clone())
+                        .unwrap_or_default();
+                    let avatar_opt = meta_row
+                        .as_ref()
+                        .and_then(chat_wire::space_avatar_from_metadata_row);
+                    let meta_key = derive_metadata_key_from_group(
+                        &mut group,
+                        provider.crypto(),
+                        provider.storage(),
+                        &convo.group_id,
+                        next_epoch,
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
+                    let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
+                        tx,
+                        conversation_id,
+                        &meta_key,
+                        &convo.group_id,
+                        &convo_uuid,
+                        prior_gen,
+                        next_epoch,
+                        &next_gch,
+                        &next_ctag,
+                        &transition_id,
+                        meta_ver,
+                        &canonical_dev_id,
+                        auth_gen,
+                        signer.public(),
+                        &title_s,
+                        &desc_s,
+                        avatar_opt,
+                    )?;
+                    (
+                        signer,
+                        auth_gen,
+                        commit_aad_val,
+                        commit_bytes,
+                        removed_leaf_entries,
+                        next_epoch,
+                        next_gch,
+                        next_ctag,
+                        carried_snap,
+                    )
+                };
+                Ok(Some((built, overlay.into_batch())))
+            })?;
 
-                Ok(Some((
+            if let Some((
+                (
                     signer,
                     auth_gen,
                     commit_aad_val,
                     commit_bytes,
-                    removed_leaf_entries,
+                    removed_leaves,
                     next_epoch,
                     next_gch,
                     next_ctag,
                     carried_snap,
-                )))
-            })?;
-
-            if let Some((
-                signer,
-                auth_gen,
-                commit_aad_val,
-                commit_bytes,
-                removed_leaves,
-                next_epoch,
-                next_gch,
-                next_ctag,
-                carried_snap,
+                ),
+                kv_batch,
             )) = maybe_commit
             {
                 let next_coords = json!({
@@ -2151,18 +2143,46 @@ impl CatbirdMlsClient {
                     },
                     "metadataSnapshot": carried_snap,
                 });
-                let _ = self.submit_signed_chat_op(
+                let resp_val = self.submit_signed_chat_op(
                     &canonical_dev_id,
                     Some(auth_gen),
                     CanonicalOperation::SubmitTransition,
                     &body,
                     &signer,
                 )?;
-                let coords_str = serde_json::to_string(&next_coords)
+                let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
+                    resp_val
+                        .get("entry")
+                        .and_then(|e| e.get("seq"))
+                        .and_then(|v| v.as_i64())
+                });
+                let updated_coords = resp_val
+                    .get("state")
+                    .and_then(|s| s.get("coordinates"))
+                    .or_else(|| resp_val.get("coordinates"))
+                    .cloned()
+                    .unwrap_or(next_coords);
+                let coords_str = serde_json::to_string(&updated_coords)
                     .map_err(|e| MLSError::Internal(e.to_string()))?;
-                self.db.write_tx(|tx| {
+                let snap_str = serde_json::to_string(&carried_snap)
+                    .map_err(|e| MLSError::Internal(e.to_string()))?;
+                let needs_gap_sync = self.db.write_tx(|tx| {
+                    kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+                    tx.put_account_meta(
+                        &format!("last_removed_member:{}", convo.conversation_id),
+                        target_did,
+                        now_ms,
+                    )?;
+                    let mut gap = false;
                     if let Some(mut c) = tx.get_conversation(conversation_id)? {
                         c.epoch = next_epoch as i64;
+                        if let Some(auth_seq) = auth_seq_opt {
+                            if auth_seq == c.last_seq.saturating_add(1) {
+                                c.last_seq = auth_seq;
+                            } else if auth_seq > c.last_seq.saturating_add(1) {
+                                gap = true;
+                            }
+                        }
                         c.updated_at_ms = now_ms;
                         tx.upsert_conversation(&c)?;
                     }
@@ -2170,11 +2190,34 @@ impl CatbirdMlsClient {
                         &format!("conversation_coords:{conversation_id}"),
                         &coords_str,
                         now_ms,
-                    )
+                    )?;
+                    tx.put_account_meta(
+                        &format!("metadata_snapshot_json:{conversation_id}"),
+                        &snap_str,
+                        now_ms,
+                    )?;
+                    Ok(gap)
                 })?;
+                if needs_gap_sync {
+                    if let Some(convo_now) =
+                        self.db.read_tx(|tx| tx.get_conversation(conversation_id))?
+                    {
+                        let _ =
+                            self.sync_conversation_entries(&canonical_dev_id, &signer, &convo_now);
+                    }
+                }
+                self.notify_change(PlatformChangeEvent::ConversationsUpdated);
+                return Ok(());
             }
         }
 
+        self.db.write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("last_removed_member:{}", convo.conversation_id),
+                target_did,
+                now_ms,
+            )
+        })?;
         self.notify_change(PlatformChangeEvent::ConversationsUpdated);
         Ok(())
     }
@@ -2182,7 +2225,7 @@ impl CatbirdMlsClient {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reencrypt_metadata_snapshot_for_epoch(
         &self,
-        tx: &crate::storage::SqlTx<'_>,
+        tx: &crate::storage::SqlReadTx<'_>,
         conversation_id: &str,
         metadata_key: &[u8; 32],
         group_id: &[u8],
@@ -2198,6 +2241,7 @@ impl CatbirdMlsClient {
         public_key: &[u8],
         title: &str,
         description: &str,
+        space_avatar: Option<SpaceAvatarPointer>,
     ) -> Result<Value, MLSError> {
         if let Some(prev_str) =
             tx.get_account_meta(&format!("metadata_snapshot_json:{conversation_id}"))?
@@ -2219,8 +2263,8 @@ impl CatbirdMlsClient {
                     title: title.to_string(),
                     description: description.to_string(),
                     avatar_blob_locator: None,
-                    avatar_content_type: None,
-                    space_avatar: None,
+                    avatar_content_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
+                    space_avatar: space_avatar.clone(),
                 };
                 let ct = encrypt_metadata_snapshot_with_nonce(
                     metadata_key,
@@ -2268,6 +2312,7 @@ impl CatbirdMlsClient {
             public_key,
             title,
             description,
+            space_avatar,
         )
     }
 
@@ -2278,52 +2323,50 @@ impl CatbirdMlsClient {
         description: String,
         space_avatar: Option<SpaceAvatarPointer>,
     ) -> Result<GroupMetadataRow, MLSError> {
-        let meta_v1 = GroupMetadataV1 {
-            version: 1,
-            title: title.clone(),
-            description: description.clone(),
-            avatar_blob_locator: None,
-            avatar_content_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-            space_avatar: space_avatar.clone(),
-        };
-        let serialized = serde_json::to_vec(&meta_v1)
-            .map_err(|e| MLSError::Internal(format!("serialize GroupMetadataV1: {e}")))?;
-        validate_metadata_snapshot_size(&serialized)?;
-
         let now_ms = unix_now_ms();
-        let (updated, maybe_live) = self.db.write_tx(|tx| {
-            let mut convo =
+        let (staged_row, maybe_live) = self.db.read_tx(|tx| {
+            let convo =
                 tx.get_conversation(conversation_id)?
                     .ok_or_else(|| MLSError::GroupNotFound {
                         message: format!("conversation {conversation_id} not found"),
                     })?;
-            let next_ver = tx
-                .get_group_metadata(conversation_id)?
+            let existing_meta = tx.get_group_metadata(conversation_id)?;
+            let next_ver = existing_meta
+                .as_ref()
                 .map(|m| m.metadata_version.saturating_add(1))
                 .unwrap_or(1);
+            let effective_avatar = space_avatar.clone().or_else(|| {
+                existing_meta
+                    .as_ref()
+                    .and_then(chat_wire::space_avatar_from_metadata_row)
+            });
 
-            let row = GroupMetadataRow {
-                conversation_id: conversation_id.to_string(),
-                metadata_version: next_ver,
-                epoch: convo.epoch,
-                title: (!title.is_empty()).then(|| title.clone()),
-                description: (!description.is_empty()).then(|| description.clone()),
-                avatar_setter_did: space_avatar.as_ref().map(|a| a.setter_did.clone()),
-                avatar_blob_cid: space_avatar.as_ref().map(|a| a.space_blob_cid.clone()),
-                avatar_sym_key: space_avatar.as_ref().map(|a| a.sym_key.clone()),
-                avatar_sha256: space_avatar.as_ref().map(|a| a.sha256.clone()),
-                avatar_mime_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-                metadata_json: String::from_utf8_lossy(&serialized).into_owned(),
-                updated_at_ms: now_ms,
+            let meta_v1 = GroupMetadataV1 {
+                version: 1,
+                title: title.clone(),
+                description: description.clone(),
+                avatar_blob_locator: None,
+                avatar_content_type: effective_avatar.as_ref().and_then(|a| a.mime_type.clone()),
+                space_avatar: effective_avatar,
             };
-            tx.upsert_group_metadata(&row)?;
-            convo.title = row.title.clone();
-            convo.updated_at_ms = now_ms;
-            tx.upsert_conversation(&convo)?;
+            let serialized = serde_json::to_vec(&meta_v1)
+                .map_err(|e| MLSError::Internal(format!("serialize GroupMetadataV1: {e}")))?;
+            validate_metadata_snapshot_size(&serialized)?;
+
+            let row = chat_wire::group_metadata_row_from_v1(
+                conversation_id,
+                next_ver,
+                convo.epoch,
+                &meta_v1,
+                now_ms,
+            )?;
 
             let live_bundle = if let (Some(dev_id), Ok(convo_uuid), Some(signer_str)) = (
                 self.canonical_uuid_v4_device_id(),
-                uuid::Uuid::parse_str(conversation_id.trim()),
+                uuid::Uuid::parse_str(conversation_id.trim())
+                    .ok()
+                    .filter(|u| u.get_version_num() == 4)
+                    .ok_or(()),
                 tx.get_account_meta("enrolled_signer_json")?,
             ) {
                 let signer: SignatureKeyPair = serde_json::from_str(&signer_str)
@@ -2333,72 +2376,78 @@ impl CatbirdMlsClient {
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(1)
                     .max(1);
-                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = OpenMlsKvProvider::new(storage)?;
-                if let Some(mut group) =
-                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
-                        .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
-                {
-                    let epoch_u64 = group.epoch().as_u64();
-                    let (gch, ctag) =
-                        chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                    let meta_key = derive_metadata_key_from_group(
-                        &mut group,
-                        provider.crypto(),
-                        provider.storage(),
-                        &convo.group_id,
-                        epoch_u64,
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                    let tid = uuid::Uuid::new_v4().to_string();
-                    let nonce: [u8; 12] = rand::random();
-                    let ct = encrypt_metadata_snapshot_with_nonce(
-                        &meta_key,
-                        &convo.group_id,
-                        epoch_u64,
-                        next_ver as u64,
-                        &nonce,
-                        &meta_v1,
-                    )?;
-                    validate_metadata_snapshot_size(&ct)?;
-                    let snap = json!({
-                        "authorProof": {
-                            "authGenerationAtOrigin": auth_gen,
-                            "authorDeviceId": dev_id,
-                            "authorDid": self.normalized_did,
-                            "authorKeyId": derive_key_id(signer.public()),
-                            "deviceStatusAtOrigin": "active",
-                            "originSeq": convo.last_seq.saturating_add(1),
+                let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+                let snap_opt = {
+                    let storage = OpenMlsKvStorage::new(&overlay);
+                    let provider = OpenMlsKvProvider::new(storage)?;
+                    if let Some(mut group) =
+                        MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                            .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                    {
+                        let epoch_u64 = group.epoch().as_u64();
+                        let (gch, ctag) =
+                            chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                        let meta_key = derive_metadata_key_from_group(
+                            &mut group,
+                            provider.crypto(),
+                            provider.storage(),
+                            &convo.group_id,
+                            epoch_u64,
+                        )
+                        .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
+                        let tid = uuid::Uuid::new_v4().to_string();
+                        let nonce: [u8; 12] = rand::random();
+                        let ct = encrypt_metadata_snapshot_with_nonce(
+                            &meta_key,
+                            &convo.group_id,
+                            epoch_u64,
+                            next_ver as u64,
+                            &nonce,
+                            &meta_v1,
+                        )?;
+                        validate_metadata_snapshot_size(&ct)?;
+                        let snap = json!({
+                            "authorProof": {
+                                "authGenerationAtOrigin": auth_gen,
+                                "authorDeviceId": dev_id,
+                                "authorDid": self.normalized_did,
+                                "authorKeyId": derive_key_id(signer.public()),
+                                "deviceStatusAtOrigin": "active",
+                                "originSeq": convo.last_seq.saturating_add(1),
+                                "originTransitionId": tid,
+                                "roleAtOrigin": "admin",
+                                "signaturePublicKey": { "$bytes": STANDARD.encode(signer.public()) },
+                            },
+                            "ciphertext": { "$bytes": STANDARD.encode(&ct) },
+                            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ct)),
+                            "ciphertextSize": ct.len(),
+                            "coordinate": {
+                                "confirmationTag": { "$bytes": STANDARD.encode(&ctag) },
+                                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                                "epoch": epoch_u64,
+                                "generation": convo.generation,
+                                "groupContextHash": { "$bytes": STANDARD.encode(gch) },
+                                "groupId": { "$bytes": STANDARD.encode(&convo.group_id) },
+                            },
+                            "metadataVersion": next_ver,
+                            "nonce": { "$bytes": STANDARD.encode(nonce) },
                             "originTransitionId": tid,
-                            "roleAtOrigin": "admin",
-                            "signaturePublicKey": { "$bytes": STANDARD.encode(signer.public()) },
-                        },
-                        "ciphertext": { "$bytes": STANDARD.encode(&ct) },
-                        "ciphertextSha256": STANDARD.encode(Sha256::digest(&ct)),
-                        "ciphertextSize": ct.len(),
-                        "coordinate": {
-                            "confirmationTag": { "$bytes": STANDARD.encode(&ctag) },
-                            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                            "epoch": epoch_u64,
-                            "generation": convo.generation,
-                            "groupContextHash": { "$bytes": STANDARD.encode(gch) },
-                            "groupId": { "$bytes": STANDARD.encode(&convo.group_id) },
-                        },
-                        "metadataVersion": next_ver,
-                        "nonce": { "$bytes": STANDARD.encode(nonce) },
-                        "originTransitionId": tid,
-                    });
-                    Some((dev_id, signer, auth_gen, tid, snap))
-                } else {
-                    None
-                }
+                        });
+                        Some((tid, snap))
+                    } else {
+                        None
+                    }
+                };
+                snap_opt.map(|(tid, snap)| {
+                    (dev_id, signer, auth_gen, tid, snap, overlay.into_batch())
+                })
             } else {
                 None
             };
             Ok((row, live_bundle))
         })?;
 
-        if let Some((dev_id, signer, auth_gen, tid, snap)) = maybe_live {
+        if let Some((dev_id, signer, auth_gen, tid, snap, kv_batch)) = maybe_live {
             let prior_coords = self.load_or_build_conversation_coords(conversation_id)?;
             let prior_sv = prior_coords
                 .get("stateVersion")
@@ -2420,18 +2469,45 @@ impl CatbirdMlsClient {
                 "metadataSnapshot": snap,
                 "signedAt": chat_wire::now_rfc3339_millis(),
             });
-            let _ = self.submit_signed_chat_op(
+            let resp_val = self.submit_signed_chat_op(
                 &dev_id,
                 Some(auth_gen),
                 CanonicalOperation::SubmitTransition,
                 &body,
                 &signer,
             )?;
-            let coords_str = serde_json::to_string(&next_coords)
+            let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
+                resp_val
+                    .get("entry")
+                    .and_then(|e| e.get("seq"))
+                    .and_then(|v| v.as_i64())
+            });
+            let updated_coords = resp_val
+                .get("state")
+                .and_then(|s| s.get("coordinates"))
+                .or_else(|| resp_val.get("coordinates"))
+                .cloned()
+                .unwrap_or(next_coords);
+            let coords_str = serde_json::to_string(&updated_coords)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
             let snap_str =
                 serde_json::to_string(&snap).map_err(|e| MLSError::Internal(e.to_string()))?;
-            self.db.write_tx(|tx| {
+            let needs_gap_sync = self.db.write_tx(|tx| {
+                kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
+                tx.upsert_group_metadata(&staged_row)?;
+                let mut gap = false;
+                if let Some(mut convo) = tx.get_conversation(conversation_id)? {
+                    convo.title = staged_row.title.clone();
+                    if let Some(auth_seq) = auth_seq_opt {
+                        if auth_seq == convo.last_seq.saturating_add(1) {
+                            convo.last_seq = auth_seq;
+                        } else if auth_seq > convo.last_seq.saturating_add(1) {
+                            gap = true;
+                        }
+                    }
+                    convo.updated_at_ms = now_ms;
+                    tx.upsert_conversation(&convo)?;
+                }
                 tx.put_account_meta(
                     &format!("conversation_coords:{conversation_id}"),
                     &coords_str,
@@ -2441,14 +2517,30 @@ impl CatbirdMlsClient {
                     &format!("metadata_snapshot_json:{conversation_id}"),
                     &snap_str,
                     now_ms,
-                )
+                )?;
+                Ok(gap)
+            })?;
+            if needs_gap_sync {
+                if let Some(convo) = self.db.read_tx(|tx| tx.get_conversation(conversation_id))? {
+                    let _ = self.sync_conversation_entries(&dev_id, &signer, &convo);
+                }
+            }
+        } else {
+            self.db.write_tx(|tx| {
+                tx.upsert_group_metadata(&staged_row)?;
+                if let Some(mut convo) = tx.get_conversation(conversation_id)? {
+                    convo.title = staged_row.title.clone();
+                    convo.updated_at_ms = now_ms;
+                    tx.upsert_conversation(&convo)?;
+                }
+                Ok(())
             })?;
         }
 
         self.notify_change(PlatformChangeEvent::GroupMetadataUpdated {
             conversation_id: conversation_id.to_string(),
         });
-        Ok(updated)
+        Ok(staged_row)
     }
 
     pub(crate) fn accept_direct_request_live_or_offline(
@@ -2511,31 +2603,42 @@ impl CatbirdMlsClient {
                     self.ds_base()
                 );
                 let resp = self.execute_json_post(accept_url, wire)?;
-                let next_coords = if !chat_wire::is_offline_mock_stub_response(&resp.body) {
-                    serde_json::from_slice::<Value>(&resp.body)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("coordinates").cloned().or_else(|| {
-                                v.get("acceptanceProof")
-                                    .and_then(|p| p.get("receipt"))
-                                    .and_then(|r| r.get("body"))
-                                    .and_then(|b| b.get("next"))
-                                    .cloned()
-                            })
-                        })
-                        .unwrap_or(next)
-                } else {
-                    next
-                };
+                let resp_val: Value = serde_json::from_slice(&resp.body).map_err(|e| {
+                    MLSError::Internal(format!("parse acceptConversation JSON: {e}"))
+                })?;
+                let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
+                    resp_val
+                        .get("entry")
+                        .and_then(|e| e.get("seq"))
+                        .and_then(|v| v.as_i64())
+                });
+                let next_coords = resp_val
+                    .get("coordinates")
+                    .cloned()
+                    .or_else(|| {
+                        resp_val
+                            .get("acceptanceProof")
+                            .and_then(|p| p.get("receipt"))
+                            .and_then(|r| r.get("body"))
+                            .and_then(|b| b.get("next"))
+                            .cloned()
+                    })
+                    .unwrap_or(next);
                 let next_coords = chat_wire::canonicalize_wire_coordinate(
                     &next_coords,
                     Some(&req.conversation_id),
                 )?;
                 let coords_str = serde_json::to_string(&next_coords)
                     .map_err(|e| MLSError::Internal(e.to_string()))?;
-                self.db.write_tx(|tx| {
+                let needs_gap_sync = self.db.write_tx(|tx| {
+                    let mut gap = false;
                     if let Some(mut c) = tx.get_conversation(&req.conversation_id)? {
-                        c.last_seq = c.last_seq.max(2);
+                        let target_seq = auth_seq_opt.unwrap_or(2);
+                        if target_seq == c.last_seq.saturating_add(1) {
+                            c.last_seq = target_seq;
+                        } else if target_seq > c.last_seq.saturating_add(1) {
+                            gap = true;
+                        }
                         c.updated_at_ms = now_ms;
                         tx.upsert_conversation(&c)?;
                     }
@@ -2543,8 +2646,17 @@ impl CatbirdMlsClient {
                         &format!("conversation_coords:{}", req.conversation_id),
                         &coords_str,
                         now_ms,
-                    )
+                    )?;
+                    Ok(gap)
                 })?;
+                if needs_gap_sync {
+                    if let Some(convo) = self
+                        .db
+                        .read_tx(|tx| tx.get_conversation(&req.conversation_id))?
+                    {
+                        let _ = self.sync_conversation_entries(&canonical_dev_id, &signer, &convo);
+                    }
+                }
                 self.archive_accepted_opening_messages(&req.conversation_id)?;
             }
         }
@@ -2614,10 +2726,15 @@ impl CatbirdMlsClient {
         if let (Some(canonical_dev_id), Some(req)) =
             (self.canonical_uuid_v4_device_id(), req_opt.as_ref())
         {
-            if let Ok((signer, auth_gen)) = self.load_enrolled_signer_and_auth_gen() {
-                if let Ok(prior_coords) =
-                    self.load_or_build_conversation_coords(&req.conversation_id)
-                {
+            if uuid::Uuid::parse_str(&req.conversation_id)
+                .ok()
+                .filter(|u| u.get_version_num() == 4)
+                .is_some()
+            {
+                if let (Ok((signer, auth_gen)), Ok(prior_coords)) = (
+                    self.load_enrolled_signer_and_auth_gen(),
+                    self.load_or_build_conversation_coords(&req.conversation_id),
+                ) {
                     let prior_sv = prior_coords
                         .get("stateVersion")
                         .and_then(|v| v.as_i64())
@@ -2646,7 +2763,7 @@ impl CatbirdMlsClient {
                         CanonicalOperation::CloseConversation,
                         &close_body,
                         &signer,
-                    );
+                    )?;
                 }
             }
         }

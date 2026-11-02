@@ -250,6 +250,149 @@ impl<T: KvBackend + ?Sized> KvBackend for std::sync::Arc<T> {
     }
 }
 
+/// Recorded in-memory `openmls_kv` write/delete batch (`Spec §6.1` / `I6`).
+///
+/// Captures all `kv_put`/`kv_delete` mutations produced by an OpenMLS operation
+/// before an HTTP call so SQLite `openmls_kv` is untouched if the DS rejects or
+/// drops the request. Once the DS returns HTTP `200`, [`KvWriteBatch::apply`]
+/// commits the staged mutations atomically inside the post-HTTP `write_tx`.
+#[derive(Clone, Debug, Default)]
+pub struct KvWriteBatch {
+    entries: std::collections::BTreeMap<(u16, String, Vec<u8>), Option<Vec<u8>>>,
+}
+
+impl KvWriteBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn apply<B: KvBackend>(&self, backend: &B) -> Result<(), OpenMlsKvError> {
+        for ((version, scope, key), value_opt) in &self.entries {
+            match value_opt {
+                Some(val) => backend.kv_put(*version, scope, key, val)?,
+                None => backend.kv_delete(*version, scope, key)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Copy-on-write `KvBackend` overlay reading unmodified keys from `base` and
+/// buffering all `kv_put`/`kv_delete` calls in memory.
+pub struct KvWriteOverlay<B> {
+    base: B,
+    batch: std::cell::RefCell<KvWriteBatch>,
+}
+
+impl<B> KvWriteOverlay<B> {
+    pub fn new(base: B) -> Self {
+        Self {
+            base,
+            batch: std::cell::RefCell::new(KvWriteBatch::new()),
+        }
+    }
+
+    pub fn into_batch(self) -> KvWriteBatch {
+        self.batch.into_inner()
+    }
+
+    pub fn clone_batch(&self) -> KvWriteBatch {
+        self.batch.borrow().clone()
+    }
+}
+
+impl<B: KvBackend> KvBackend for KvWriteOverlay<B> {
+    fn kv_get(
+        &self,
+        version: u16,
+        scope: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, OpenMlsKvError> {
+        let lookup = (version, scope.to_string(), key.to_vec());
+        if let Some(staged) = self.batch.borrow().entries.get(&lookup) {
+            return Ok(staged.clone());
+        }
+        self.base.kv_get(version, scope, key)
+    }
+
+    fn kv_put(
+        &self,
+        version: u16,
+        scope: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), OpenMlsKvError> {
+        self.batch.borrow_mut().entries.insert(
+            (version, scope.to_string(), key.to_vec()),
+            Some(value.to_vec()),
+        );
+        Ok(())
+    }
+
+    fn kv_delete(&self, version: u16, scope: &str, key: &[u8]) -> Result<(), OpenMlsKvError> {
+        self.batch
+            .borrow_mut()
+            .entries
+            .insert((version, scope.to_string(), key.to_vec()), None);
+        Ok(())
+    }
+
+    fn kv_list_keys_in_scope(
+        &self,
+        version: u16,
+        scope: &str,
+    ) -> Result<Vec<Vec<u8>>, OpenMlsKvError> {
+        Ok(self
+            .kv_list_entries_in_scope(version, scope)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+
+    fn kv_list_entries_in_scope(
+        &self,
+        version: u16,
+        scope: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, OpenMlsKvError> {
+        let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = self
+            .base
+            .kv_list_entries_in_scope(version, scope)?
+            .into_iter()
+            .collect();
+        for ((v, s, k), val_opt) in &self.batch.borrow().entries {
+            if *v == version && s == scope {
+                match val_opt {
+                    Some(val) => {
+                        merged.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        merged.remove(k);
+                    }
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    fn kv_count_all(&self) -> Result<usize, OpenMlsKvError> {
+        let base_count = self.base.kv_count_all()? as isize;
+        let mut delta: isize = 0;
+        for ((v, s, k), val_opt) in &self.batch.borrow().entries {
+            let existed = self.base.kv_get(*v, s, k)?.is_some();
+            if !existed && val_opt.is_some() {
+                delta += 1;
+            } else if existed && val_opt.is_none() {
+                delta -= 1;
+            }
+        }
+        Ok((base_count + delta).max(0) as usize)
+    }
+}
+
 /// Unified single-table `StorageProvider<CURRENT_VERSION>` over `openmls_kv`.
 pub struct OpenMlsKvStorage<B> {
     backend: B,

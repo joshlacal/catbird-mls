@@ -42,18 +42,18 @@ FIXTURE_SOURCES = (
         Path("mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json"),
         Path("src/orchestrator/generated/mls_chat_signing_domain_vectors.json"),
         10,
-        "5533e6457fe4dc1b45fe7ff014940a6aea91657d23bf3d5b1493ac65aeefe984",
+        "ef40f381b08442d8077f5f555a025e60bebfc14dcfe3d14213d48d4cd4204c3e",
     ),
 )
 ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json")
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
 GENERATOR_VERSION = 9
 PROVENANCE_KEY = "_catbird_mls_provenance"
-CANONICAL_SOURCE_REVISION = "3fe103463e09d4c47077e433883df982ff9e2beb"
-CANONICAL_SOURCE_TREE = "9feac29cb51cdf46cc92155bb7b56ed4d74e3e08"
-CANONICAL_SOURCE_SHA256 = "e7a23bc2b8e383729d8046a33cd24d86ef6cf8261989692f327e816e10343938"
-SERVER_SOURCE_REVISION = "ec5028ce4f424af3819aa3e993c86fca1a85bbde"
-SERVER_SOURCE_TREE = "e29416025c27ac91c74930514b2bc85385f93a0c"
+CANONICAL_SOURCE_REVISION = "854142ea1c644af437bf1ce23629c5397cf64dde"
+CANONICAL_SOURCE_TREE = "8913a10c361f52732b3940e6bbdbd2f154abbc09"
+CANONICAL_SOURCE_SHA256 = "a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d"
+SERVER_SOURCE_REVISION = "b48b84f438dd21031d87ead2021abf9ac5014ba6"
+SERVER_SOURCE_TREE = "6697d2f87ac078788144e4c7df04c0f48bcc5f2c"
 SERVER_VECTOR_SET = "signed-mutation"
 SERVER_VECTOR_SET_COUNT = 24
 

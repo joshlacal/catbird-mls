@@ -35,7 +35,7 @@ use crate::orchestrator::direct_request_bootstrap::{
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use crate::push::{root_did_from_credential_bytes, AuthorizedPeerDeviceKey};
 use crate::storage::{
-    ConversationRow, GroupMetadataRow, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage, RequestRow,
+    ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage, RequestRow,
     RusqliteKvBackend,
 };
 
@@ -115,7 +115,7 @@ impl CatbirdMlsClient {
         signer: &SignatureKeyPair,
         auth_generation: i64,
     ) -> Result<(u32, Option<String>), MLSError> {
-        let Some(resp) = self.query_signed_chat_ds(
+        let resp = self.query_signed_chat_ds(
             "blue.catbird.chat.getConversations",
             &[
                 ("actorDeviceId", canonical_dev_id),
@@ -125,10 +125,7 @@ impl CatbirdMlsClient {
             ],
             canonical_dev_id,
             signer,
-        )?
-        else {
-            return Ok((0, None));
-        };
+        )?;
         let inventory_session_id = resp
             .get("inventorySessionId")
             .and_then(|v| v.as_str())
@@ -188,14 +185,18 @@ impl CatbirdMlsClient {
                             && p.get("status").and_then(|s| s.as_str()) == Some("pending")
                     }) {
                         if let Some(prov) = me.get("invitationProvenance") {
-                            let _ = self.accept_group_invitation(
+                            if let Err(e) = self.accept_group_invitation(
                                 canonical_dev_id,
                                 signer,
                                 auth_generation,
                                 cid,
                                 coords,
                                 prov,
-                            );
+                            ) {
+                                if !e.to_string().contains("HTTP 409") {
+                                    return Err(e);
+                                }
+                            }
                         }
                     }
                 }
@@ -254,7 +255,7 @@ impl CatbirdMlsClient {
         cid: &str,
         sequencer_did_fallback: &str,
     ) -> Result<bool, MLSError> {
-        let Some(entries_val) = self.query_signed_chat_ds(
+        let entries_val = self.query_signed_chat_ds(
             "blue.catbird.chat.getEntries",
             &[
                 ("actorDeviceId", canonical_dev_id),
@@ -264,10 +265,7 @@ impl CatbirdMlsClient {
             ],
             canonical_dev_id,
             signer,
-        )?
-        else {
-            return Ok(false);
-        };
+        )?;
         let Some(entries) = entries_val.get("entries").and_then(|v| v.as_array()) else {
             return Ok(false);
         };
@@ -431,6 +429,9 @@ impl CatbirdMlsClient {
                 }
             })
             .unwrap_or_else(|| sequencer_did_fallback.to_string());
+        let dr_rcpt_json = raw_dr_entry
+            .get("sequencerReceipt")
+            .and_then(|r| serde_json::to_string(r).ok());
         let now_ms = unix_now_ms();
         let pub_norm_str = String::from_utf8(pub_norm_bytes)
             .map_err(|e| MLSError::Internal(format!("C33 pub UTF-8: {e}")))?;
@@ -558,7 +559,7 @@ impl CatbirdMlsClient {
                 labyrinth_frame_json: intro_json,
                 mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
                 frame_nonce_b64: None,
-                sequencer_receipt_json: None,
+                sequencer_receipt_json: dr_rcpt_json,
                 created_at_ms: now_ms,
             };
             tx.put_account_meta(
@@ -582,7 +583,7 @@ impl CatbirdMlsClient {
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
     ) -> Result<Option<String>, MLSError> {
-        let Some(resp) = self.query_signed_chat_ds(
+        let resp = self.query_signed_chat_ds(
             "blue.catbird.chat.getConversations",
             &[
                 ("actorDeviceId", canonical_dev_id),
@@ -592,10 +593,7 @@ impl CatbirdMlsClient {
             ],
             canonical_dev_id,
             signer,
-        )?
-        else {
-            return Ok(None);
-        };
+        )?;
         Ok(resp
             .get("inventorySessionId")
             .and_then(|v| v.as_str())
@@ -624,15 +622,12 @@ impl CatbirdMlsClient {
             ("supportedProtocolVersions", "1"),
             ("supportedProtocolVersions", "2"),
         ]);
-        let Some(resp) = self.query_signed_chat_ds(
+        let resp = self.query_signed_chat_ds(
             "blue.catbird.chat.getPendingWelcomes",
             &q_pairs,
             canonical_dev_id,
             signer,
-        )?
-        else {
-            return Ok(0);
-        };
+        )?;
         let Some(welcomes) = resp
             .get("items")
             .or_else(|| resp.get("welcomes"))
@@ -671,10 +666,6 @@ impl CatbirdMlsClient {
                 .unwrap_or(&self.config.home_ds_did);
             let coords_canon = chat_wire::canonicalize_wire_coordinate(coords, Some(cid))?;
 
-            // If Phase 1 (`import_incoming_c33_direct_request`) already joined this conversation's
-            // one-time KeyPackageBundle, do NOT attempt to re-consume it — and do NOT acknowledge
-            // a C33 direct-request Welcome while its consent is still pending (`acceptConversation`
-            // transitions `direct_request_transport_inbox` atomically with `acceptance_proof`).
             let already_joined = self.db.read_tx(|tx| tx.get_conversation(cid))?.is_some();
             if already_joined {
                 let is_dr_welcome = w_env.get("$type").and_then(|t| t.as_str())
@@ -720,9 +711,8 @@ impl CatbirdMlsClient {
             candidate_dids.insert(self.normalized_did.clone(), ());
             let mut all_auth_keys: Vec<AuthorizedPeerDeviceKey> = Vec::new();
             for did in candidate_dids.keys() {
-                if let Ok(keys) = self.fetch_and_cache_authorized_pds_device_keys(did) {
-                    all_auth_keys.extend(keys);
-                }
+                let keys = self.fetch_and_cache_authorized_pds_device_keys(did)?;
+                all_auth_keys.extend(keys);
             }
 
             let welcome_bytes_res = w_env
@@ -740,56 +730,41 @@ impl CatbirdMlsClient {
             let coords_str = serde_json::to_string(&coords_canon)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
 
-            // Pre-extract member DIDs from StagedWelcome inside a rolled-back SAVEPOINT so OpenMLS's
-            // one-time KeyPackageBundle deletion during `new_from_welcome` is rolled back before `write_tx`.
-            let extra_dids: Vec<String> = self.db.write_tx(|tx| {
-                tx.conn()
-                    .execute_batch("SAVEPOINT i4_welcome_peek;")
-                    .map_err(|e| MLSError::Internal(format!("savepoint i4_welcome_peek: {e}")))?;
-                let peek_res: Result<Vec<String>, MLSError> = (|| {
-                    let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                    let provider = OpenMlsKvProvider::new(storage)?;
-                    let msg_in =
-                        MlsMessageIn::tls_deserialize_exact(&welcome_bytes).map_err(|e| {
-                            MLSError::Cryptography(format!("deserialize Welcome: {e:?}"))
-                        })?;
-                    let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
-                        return Err(MLSError::Cryptography("not Welcome".to_string()));
-                    };
-                    let staged = StagedWelcome::new_from_welcome(
-                        &provider,
-                        &build_join_config(),
-                        welcome,
-                        None,
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
-                    let mut found = Vec::new();
-                    if let Ok(sender) = staged.welcome_sender() {
-                        if let Ok((d, _)) =
-                            root_did_from_credential_bytes(sender.credential().serialized_content())
-                        {
-                            found.push(d);
-                        }
+            // Pre-extract member DIDs from StagedWelcome over KvWriteOverlay inside `read_tx` so OpenMLS's
+            // one-time KeyPackageBundle deletion during `new_from_welcome` never touches SQLite during peek.
+            let extra_dids: Vec<String> = self.db.read_tx(|tx| {
+                let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+                let storage = OpenMlsKvStorage::new(overlay);
+                let provider = OpenMlsKvProvider::new(storage)?;
+                let msg_in = MlsMessageIn::tls_deserialize_exact(&welcome_bytes)
+                    .map_err(|e| MLSError::Cryptography(format!("deserialize Welcome: {e:?}")))?;
+                let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
+                    return Err(MLSError::Cryptography("not Welcome".to_string()));
+                };
+                let staged =
+                    StagedWelcome::new_from_welcome(&provider, &build_join_config(), welcome, None)
+                        .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
+                let mut found = Vec::new();
+                if let Ok(sender) = staged.welcome_sender() {
+                    if let Ok((d, _)) =
+                        root_did_from_credential_bytes(sender.credential().serialized_content())
+                    {
+                        found.push(d);
                     }
-                    for m in staged.members() {
-                        if let Ok((d, _)) =
-                            root_did_from_credential_bytes(m.credential.serialized_content())
-                        {
-                            found.push(d);
-                        }
+                }
+                for m in staged.members() {
+                    if let Ok((d, _)) =
+                        root_did_from_credential_bytes(m.credential.serialized_content())
+                    {
+                        found.push(d);
                     }
-                    Ok(found)
-                })();
-                let _ = tx.conn().execute_batch(
-                    "ROLLBACK TO SAVEPOINT i4_welcome_peek; RELEASE SAVEPOINT i4_welcome_peek;",
-                );
-                peek_res
+                }
+                Ok(found)
             })?;
             for d in extra_dids {
                 if candidate_dids.insert(d.clone(), ()).is_none() {
-                    if let Ok(keys) = self.fetch_and_cache_authorized_pds_device_keys(&d) {
-                        all_auth_keys.extend(keys);
-                    }
+                    let keys = self.fetch_and_cache_authorized_pds_device_keys(&d)?;
+                    all_auth_keys.extend(keys);
                 }
             }
 
@@ -832,23 +807,10 @@ impl CatbirdMlsClient {
                     if let Some((m_epoch, m_ver, meta)) =
                         chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snap)
                     {
-                        decrypted_title = (!meta.title.is_empty()).then(|| meta.title.clone());
-                        tx.upsert_group_metadata(&GroupMetadataRow {
-                            conversation_id: cid.to_string(),
-                            metadata_version: m_ver,
-                            epoch: m_epoch,
-                            title: decrypted_title.clone(),
-                            description: (!meta.description.is_empty())
-                                .then(|| meta.description.clone()),
-                            avatar_setter_did: None,
-                            avatar_blob_cid: None,
-                            avatar_sym_key: None,
-                            avatar_sha256: None,
-                            avatar_mime_type: None,
-                            metadata_json: serde_json::to_string(&meta)
-                                .map_err(|e| MLSError::Internal(e.to_string()))?,
-                            updated_at_ms: now_ms,
-                        })?;
+                        let meta_row =
+                            chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, now_ms)?;
+                        decrypted_title = meta_row.title.clone();
+                        tx.upsert_group_metadata(&meta_row)?;
                     }
                     if let Ok(snap_s) = serde_json::to_string(snap) {
                         tx.put_account_meta(
@@ -929,15 +891,12 @@ impl CatbirdMlsClient {
             ("supportedProtocolVersions", "1"),
             ("supportedProtocolVersions", "2"),
         ]);
-        let Some(resp) = self.query_signed_chat_ds(
+        let resp = self.query_signed_chat_ds(
             "blue.catbird.chat.getLeafRecoveryInbox",
             &q_pairs,
             canonical_dev_id,
             signer,
-        )?
-        else {
-            return Ok(0);
-        };
+        )?;
         let Some(requests) = resp
             .get("items")
             .or_else(|| resp.get("requests"))
@@ -1047,11 +1006,14 @@ impl CatbirdMlsClient {
             let welcome_id = uuid::Uuid::new_v4().to_string();
             let now_ms = unix_now_ms();
 
-            let built = self.db.write_tx(|tx| {
+            // Stage `add_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx` (`I6`)
+            // so an HTTP 409 / network failure never forks local OpenMLS epoch state!
+            let built = self.db.read_tx(|tx| {
                 let Some(convo) = tx.get_conversation(cid)? else {
                     return Ok(None);
                 };
-                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+                let storage = OpenMlsKvStorage::new(&overlay);
                 let provider = OpenMlsKvProvider::new(storage)?;
                 let validated_kp = kp_in
                     .validate(provider.crypto(), ProtocolVersion::Mls10)
@@ -1115,6 +1077,9 @@ impl CatbirdMlsClient {
                     .as_ref()
                     .and_then(|m| m.description.clone())
                     .unwrap_or_default();
+                let avatar_opt = meta_row
+                    .as_ref()
+                    .and_then(chat_wire::space_avatar_from_metadata_row);
                 let meta_key = derive_metadata_key_from_group(
                     &mut group,
                     provider.crypto(),
@@ -1140,8 +1105,12 @@ impl CatbirdMlsClient {
                     signer.public(),
                     &title_s,
                     &desc_s,
+                    avatar_opt,
                 )?;
+                drop(provider);
+                let kv_batch = overlay.into_batch();
                 Ok(Some((
+                    kv_batch,
                     convo.group_id,
                     commit_aad_val,
                     commit_bytes,
@@ -1154,6 +1123,7 @@ impl CatbirdMlsClient {
             })?;
 
             let Some((
+                kv_batch,
                 group_id,
                 commit_aad_val,
                 commit_bytes,
@@ -1224,25 +1194,45 @@ impl CatbirdMlsClient {
                     "bytes": { "$bytes": STANDARD.encode(&commit_bytes) },
                     "sha256": STANDARD.encode(Sha256::digest(&commit_bytes)),
                 },
-                "metadataSnapshot": carried_snap,
+                "metadataSnapshot": carried_snap.clone(),
             });
 
-            let _ = self.submit_signed_chat_op(
+            let resp_val = match self.submit_signed_chat_op(
                 canonical_dev_id,
                 Some(auth_generation),
                 CanonicalOperation::SubmitTransition,
                 &fulfill_body,
                 signer,
-            )?;
+            ) {
+                Ok(val) => val,
+                Err(e) if e.to_string().contains("HTTP 409") => {
+                    // Concurrent peer transition superseded `boundCoordinate`; discard overlay cleanly!
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
+            let authoritative_seq = resp_val
+                .get("seq")
+                .or_else(|| resp_val.pointer("/entry/seq"))
+                .and_then(|v| v.as_i64());
             let coords_str = serde_json::to_string(&next_coords)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let snap_str = serde_json::to_string(&carried_snap)
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
             self.db.write_tx(|tx| {
+                kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
                 if let Some(mut c) = tx.get_conversation(cid)? {
                     c.epoch = next_epoch as i64;
+                    if let Some(seq) = authoritative_seq {
+                        if seq == c.last_seq + 1 {
+                            c.last_seq = seq;
+                        }
+                    }
                     c.updated_at_ms = now_ms;
                     tx.upsert_conversation(&c)?;
                 }
+                tx.put_account_meta(&format!("metadata_snapshot_json:{cid}"), &snap_str, now_ms)?;
                 tx.put_account_meta(&format!("conversation_coords:{cid}"), &coords_str, now_ms)
             })?;
             fulfilled = fulfilled.saturating_add(1);
@@ -1251,7 +1241,7 @@ impl CatbirdMlsClient {
         Ok(fulfilled)
     }
 
-    fn sync_conversation_entries(
+    pub(crate) fn sync_conversation_entries(
         &self,
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
@@ -1266,30 +1256,45 @@ impl CatbirdMlsClient {
             return Ok(0);
         }
 
-        let after_seq_str = convo.last_seq.max(0).to_string();
-        let Some(resp) = self.query_signed_chat_ds(
-            "blue.catbird.chat.getEntries",
-            &[
-                ("actorDeviceId", canonical_dev_id),
-                ("afterSeq", &after_seq_str),
-                ("conversationId", cid),
-                ("limit", "100"),
-            ],
-            canonical_dev_id,
-            signer,
-        )?
-        else {
-            return Ok(0);
-        };
-        let Some(raw_entries) = resp.get("entries").and_then(|v| v.as_array()) else {
-            return Ok(0);
-        };
-        if raw_entries.is_empty() {
+        let mut sorted_entries: Vec<Value> = Vec::new();
+        let mut cursor_seq = convo.last_seq.max(0);
+        for _ in 0..50 {
+            let after_seq_str = cursor_seq.to_string();
+            let resp = self.query_signed_chat_ds(
+                "blue.catbird.chat.getEntries",
+                &[
+                    ("actorDeviceId", canonical_dev_id),
+                    ("afterSeq", &after_seq_str),
+                    ("conversationId", cid),
+                    ("limit", "100"),
+                ],
+                canonical_dev_id,
+                signer,
+            )?;
+            let Some(page_entries) = resp.get("entries").and_then(|v| v.as_array()) else {
+                break;
+            };
+            if page_entries.is_empty() {
+                break;
+            }
+            let page_len = page_entries.len();
+            let page_max_seq = page_entries
+                .iter()
+                .filter_map(|e| e.get("seq").and_then(|s| s.as_i64()))
+                .max()
+                .unwrap_or(cursor_seq);
+            sorted_entries.extend(page_entries.iter().cloned());
+            if page_len < 100 || page_max_seq <= cursor_seq {
+                break;
+            }
+            cursor_seq = page_max_seq;
+        }
+        if sorted_entries.is_empty() {
             return Ok(0);
         }
 
-        let mut sorted_entries: Vec<Value> = raw_entries.clone();
         sorted_entries.sort_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
+        sorted_entries.dedup_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
 
         // Pre-fetch PDS `blue.catbird.chat.device` keys (`I4`) for all DIDs referenced in batch
         // plus all current local `MlsGroup` members.
@@ -1445,25 +1450,11 @@ impl CatbirdMlsClient {
                                     &mut group, &provider, snap,
                                 )
                             {
-                                let new_title =
-                                    (!meta.title.is_empty()).then(|| meta.title.clone());
-                                tx.upsert_group_metadata(&GroupMetadataRow {
-                                    conversation_id: cid.to_string(),
-                                    metadata_version: m_ver,
-                                    epoch: m_epoch,
-                                    title: new_title.clone(),
-                                    description: (!meta.description.is_empty())
-                                        .then(|| meta.description.clone()),
-                                    avatar_setter_did: None,
-                                    avatar_blob_cid: None,
-                                    avatar_sym_key: None,
-                                    avatar_sha256: None,
-                                    avatar_mime_type: None,
-                                    metadata_json: serde_json::to_string(&meta)
-                                        .map_err(|e| MLSError::Internal(e.to_string()))?,
-                                    updated_at_ms: now_ms,
-                                })?;
-                                c.title = new_title;
+                                let meta_row = chat_wire::group_metadata_row_from_v1(
+                                    cid, m_ver, m_epoch, &meta, now_ms,
+                                )?;
+                                c.title = meta_row.title.clone();
+                                tx.upsert_group_metadata(&meta_row)?;
                             }
                         }
                         if let Ok(snap_s) = serde_json::to_string(snap) {
@@ -1574,25 +1565,11 @@ impl CatbirdMlsClient {
                                             &mut group, &provider, snap,
                                         )
                                     {
-                                        let new_title =
-                                            (!meta.title.is_empty()).then(|| meta.title.clone());
-                                        tx.upsert_group_metadata(&GroupMetadataRow {
-                                            conversation_id: cid.to_string(),
-                                            metadata_version: m_ver,
-                                            epoch: m_epoch,
-                                            title: new_title.clone(),
-                                            description: (!meta.description.is_empty())
-                                                .then(|| meta.description.clone()),
-                                            avatar_setter_did: None,
-                                            avatar_blob_cid: None,
-                                            avatar_sym_key: None,
-                                            avatar_sha256: None,
-                                            avatar_mime_type: None,
-                                            metadata_json: serde_json::to_string(&meta)
-                                                .map_err(|e| MLSError::Internal(e.to_string()))?,
-                                            updated_at_ms: now_ms,
-                                        })?;
-                                        c.title = new_title;
+                                        let meta_row = chat_wire::group_metadata_row_from_v1(
+                                            cid, m_ver, m_epoch, &meta, now_ms,
+                                        )?;
+                                        c.title = meta_row.title.clone();
+                                        tx.upsert_group_metadata(&meta_row)?;
                                     }
                                 }
                             }
@@ -1632,6 +1609,20 @@ impl CatbirdMlsClient {
                 || body.get("applicationMessage").is_some()
                 || entry.get("applicationMessage").is_some()
             {
+                if entry.get("payloadPruned").and_then(|v| v.as_bool()) == Some(true) {
+                    self.db.write_tx(|tx| {
+                        if let Some(mut c) = tx.get_conversation(cid)? {
+                            c.last_seq = c.last_seq.max(entry_seq);
+                            c.updated_at_ms = now_ms;
+                            tx.upsert_conversation(&c)?;
+                        }
+                        Ok(())
+                    })?;
+                    max_seq = max_seq.max(entry_seq);
+                    applied_count = applied_count.saturating_add(1);
+                    continue;
+                }
+
                 let msg_id = body
                     .get("messageId")
                     .or_else(|| entry.get("messageId"))
@@ -1662,6 +1653,32 @@ impl CatbirdMlsClient {
                     max_seq = max_seq.max(entry_seq);
                     continue;
                 }
+
+                // Enforce `I13`: require & resolve sequencer receipt key strictly outside `write_tx` (`I6`)!
+                let rcpt_val = entry
+                    .get("sequencerReceipt")
+                    .filter(|v| v.is_object())
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(format!(
+                            "I13: applicationEntry {msg_id} at seq {entry_seq} missing sequencerReceipt"
+                        ))
+                    })?;
+                let rcpt_kid = rcpt_val
+                    .get("kid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#mls-receipt-1");
+                let rcpt_sec1 = self
+                    .resolve_sequencer_receipt_key(&convo.sequencer_did, rcpt_kid)?
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(format!(
+                            "I13: unable to resolve `{}` DID document for #mls-receipt-1 verification",
+                            convo.sequencer_did
+                        ))
+                    })?;
+                let expected_rcpt_entry_id = entry
+                    .get("entryId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(msg_id);
 
                 let app_obj = body
                     .get("applicationMessage")
@@ -1731,9 +1748,31 @@ impl CatbirdMlsClient {
                             "expected ApplicationMessage".to_string(),
                         ));
                     };
-                    let (display_body, json_str, _verified_commitment) =
+                    let (display_body, json_str, verified_commitment_opt) =
                         extract_plaintext_body_and_verify_aad(&app_msg.into_bytes(), &aad_bytes)?;
                     let _ = display_body;
+                    let verified_commitment = verified_commitment_opt.ok_or_else(|| {
+                        MLSError::Cryptography(
+                            "I13: applicationEntry missing verified AAD archiveCommitment"
+                                .to_string(),
+                        )
+                    })?;
+
+                    let (rcpt_seq, _, _) = chat_wire::parse_and_verify_i13_sequencer_receipt(
+                        rcpt_val,
+                        &rcpt_sec1,
+                        &c.sequencer_did,
+                        cid,
+                        &c.group_id,
+                        msg_epoch.max(0) as u64,
+                        expected_rcpt_entry_id,
+                        &verified_commitment,
+                    )?;
+                    if rcpt_seq as i64 != entry_seq {
+                        return Err(MLSError::Cryptography(format!(
+                            "I13: receipt seq {rcpt_seq} != entry seq {entry_seq}"
+                        )));
+                    }
 
                     tx.insert_message(&MessageRow {
                         message_id: msg_id.to_string(),
@@ -1782,8 +1821,8 @@ impl CatbirdMlsClient {
         if was_kicked {
             let _ = self.rescue_conversation_on_kick(cid);
         }
-        if max_seq >= 1 && applied_count > 0 {
-            let _ = self.acknowledge_entries_up_to(cid, max_seq);
+        if max_seq >= 1 && applied_count > 0 && !was_kicked {
+            self.acknowledge_entries_up_to(cid, max_seq)?;
         }
 
         Ok(applied_count)

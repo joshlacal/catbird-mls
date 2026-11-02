@@ -1,4 +1,12 @@
 {
+  "_catbird_mls_provenance": {
+    "generator": "scripts/generate_chat_schema.py",
+    "generatorVersion": 9,
+    "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
+    "sourceRevision": "854142ea1c644af437bf1ce23629c5397cf64dde",
+    "sourceSha256": "a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d",
+    "sourceTree": "8913a10c361f52732b3940e6bbdbd2f154abbc09"
+  },
   "defs": {
     "accessEndedEvent": {
       "description": "Frozen-audience notice closing one exact device-leaf interval inclusively; another device of the same DID does not extend it.",

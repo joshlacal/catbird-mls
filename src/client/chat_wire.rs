@@ -57,21 +57,6 @@ pub fn unix_secs_rfc3339_millis(seconds: u64) -> Result<String, MLSError> {
         .ok_or_else(|| MLSError::invalid_input("invalid unix timestamp"))
 }
 
-/// Detect offline unit-test mock responses (`""`, `"{}"`, or `{"ok": true}`) that carry no real
-/// `mls-ds` response fields, while never treating real `mls-ds` payloads or HTTP errors as stubs.
-pub fn is_offline_mock_stub_response(body: &[u8]) -> bool {
-    if body.iter().all(|b| b.is_ascii_whitespace()) {
-        return true;
-    }
-    let Ok(val) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
-    let Some(obj) = val.as_object() else {
-        return false;
-    };
-    obj.is_empty() || (obj.len() == 1 && obj.get("ok") == Some(&Value::Bool(true)))
-}
-
 /// Encode a single component with `application/x-www-form-urlencoded` rules matching
 /// `url::form_urlencoded::Serializer` (`mls-ds/server/src/chat_protocol/read_auth.rs`).
 pub fn urlencode_form_component(input: &str) -> String {
@@ -664,6 +649,58 @@ pub fn compute_group_context_hash_and_tag<P: OpenMlsProvider>(
     Ok((gch, tag))
 }
 
+/// Extract a [`SpaceAvatarPointer`](crate::groups::metadata_v1::SpaceAvatarPointer) from a stored [`GroupMetadataRow`](crate::storage::GroupMetadataRow).
+pub fn space_avatar_from_metadata_row(
+    row: &crate::storage::GroupMetadataRow,
+) -> Option<crate::groups::metadata_v1::SpaceAvatarPointer> {
+    if let (Some(setter_did), Some(space_blob_cid), Some(sym_key), Some(sha256)) = (
+        row.avatar_setter_did.as_ref(),
+        row.avatar_blob_cid.as_ref(),
+        row.avatar_sym_key.as_ref(),
+        row.avatar_sha256.as_ref(),
+    ) {
+        return Some(crate::groups::metadata_v1::SpaceAvatarPointer {
+            setter_did: setter_did.clone(),
+            space_blob_cid: space_blob_cid.clone(),
+            sym_key: sym_key.clone(),
+            sha256: sha256.clone(),
+            mime_type: row.avatar_mime_type.clone(),
+        });
+    }
+    serde_json::from_str::<GroupMetadataV1>(&row.metadata_json)
+        .ok()
+        .and_then(|m| m.space_avatar)
+}
+
+/// Convert a decrypted [`GroupMetadataV1`] into a [`GroupMetadataRow`](crate::storage::GroupMetadataRow),
+/// preserving all `SpaceAvatarPointer` columns (`1A`).
+pub fn group_metadata_row_from_v1(
+    conversation_id: &str,
+    metadata_version: i64,
+    epoch: i64,
+    meta: &GroupMetadataV1,
+    updated_at_ms: i64,
+) -> Result<crate::storage::GroupMetadataRow, MLSError> {
+    let avatar = meta.space_avatar.as_ref();
+    Ok(crate::storage::GroupMetadataRow {
+        conversation_id: conversation_id.to_string(),
+        metadata_version,
+        epoch,
+        title: (!meta.title.is_empty()).then(|| meta.title.clone()),
+        description: (!meta.description.is_empty()).then(|| meta.description.clone()),
+        avatar_setter_did: avatar.map(|a| a.setter_did.clone()),
+        avatar_blob_cid: avatar.map(|a| a.space_blob_cid.clone()),
+        avatar_sym_key: avatar.map(|a| a.sym_key.clone()),
+        avatar_sha256: avatar.map(|a| a.sha256.clone()),
+        avatar_mime_type: avatar
+            .and_then(|a| a.mime_type.clone())
+            .or_else(|| meta.avatar_content_type.clone()),
+        metadata_json: serde_json::to_string(meta)
+            .map_err(|e| MLSError::Internal(e.to_string()))?,
+        updated_at_ms,
+    })
+}
+
 /// Build an encrypted `metadataSnapshot` JSON object for `creationBody`, `metadataTransitionBody`,
 /// `commitTransitionBody`, or `leafRecoveryFulfillmentBody`.
 #[allow(clippy::too_many_arguments)]
@@ -684,6 +721,7 @@ pub fn build_encrypted_metadata_snapshot_json(
     public_key: &[u8],
     title: &str,
     description: &str,
+    space_avatar: Option<crate::groups::metadata_v1::SpaceAvatarPointer>,
 ) -> Result<Value, MLSError> {
     let nonce: [u8; 12] = rand::random();
     let payload = GroupMetadataV1 {
@@ -691,8 +729,8 @@ pub fn build_encrypted_metadata_snapshot_json(
         title: title.to_string(),
         description: description.to_string(),
         avatar_blob_locator: None,
-        avatar_content_type: None,
-        space_avatar: None,
+        avatar_content_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
+        space_avatar,
     };
     let ciphertext = encrypt_metadata_snapshot_with_nonce(
         metadata_key,
@@ -981,6 +1019,61 @@ pub fn verify_leaf_pds_map_i4(
         )));
     }
     Ok((root_did, device_id))
+}
+
+/// Universal (native + WASM) `I4` verifier for a `StagedCommit`, checking the Commit sender leaf,
+/// all `AddProposal` leaves, and all `UpdateProposal` leaves against PDS `blue.catbird.chat.device` keys.
+pub fn verify_staged_commit_pds_map_i4(
+    group: &openmls::prelude::MlsGroup,
+    sender: &openmls::prelude::Sender,
+    staged: &openmls::prelude::StagedCommit,
+    authorized_by_did: &BTreeMap<String, Vec<(String, Vec<u8>)>>,
+) -> Result<(), MLSError> {
+    if let openmls::prelude::Sender::Member(leaf_idx) = sender {
+        let sender_member = group
+            .members()
+            .find(|m| m.index == *leaf_idx)
+            .ok_or_else(|| {
+                MLSError::insufficient_permissions("I4/F-02: Commit sender leaf missing from group")
+            })?;
+        verify_leaf_pds_map_i4(
+            sender_member.credential.serialized_content(),
+            &sender_member.signature_key,
+            authorized_by_did,
+        )?;
+    } else {
+        return Err(MLSError::insufficient_permissions(
+            "I4/F-02: external/non-member Commit rejected",
+        ));
+    }
+
+    for queued in staged.add_proposals() {
+        let ln = queued.add_proposal().key_package().leaf_node();
+        verify_leaf_pds_map_i4(
+            ln.credential().serialized_content(),
+            ln.signature_key().as_slice(),
+            authorized_by_did,
+        )?;
+    }
+
+    for queued in staged.update_proposals() {
+        let ln = queued.update_proposal().leaf_node();
+        let new_id = ln.credential().serialized_content();
+        if let openmls::prelude::Sender::Member(leaf_idx) = queued.sender() {
+            let old_member = group
+                .members()
+                .find(|m| m.index == *leaf_idx)
+                .ok_or(MLSError::InvalidCommit)?;
+            if old_member.credential.serialized_content() != new_id {
+                return Err(MLSError::InvalidCommit);
+            }
+        } else {
+            return Err(MLSError::InvalidCommit);
+        }
+        verify_leaf_pds_map_i4(new_id, ln.signature_key().as_slice(), authorized_by_did)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
