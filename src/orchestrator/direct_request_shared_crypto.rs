@@ -334,7 +334,7 @@ pub fn build_request_key_publication<P: OpenMlsProvider>(
             .as_slice()
             .to_vec();
         let hash = STANDARD.encode(Sha256::digest(&encoded));
-        let grant_id = uuid::Uuid::new_v4().to_string();
+        let grant_id = crate::sim_hooks::openmls_rand_uuid_v4(provider.rand())?.to_string();
         let grant = sign(
             DirectRequestKind::Grant,
             json!({"$type":"blue.catbird.chat.defs#directRequestGrantBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-GRANT\u{0}","protocolVersion":"2","actorDid":input.actor_did,"actorDeviceId":input.actor_device_id,"keyId":key_id,"authGeneration":input.auth_generation,"grantId":grant_id,"grantRevision":input.revision,"purpose":"direct-request-bootstrap","profile":"encryptedIntroduction1","keyPackageRef":STANDARD.encode(&reference),"keyPackageSha256":hash,"expiresAt":expiry,"idempotencyKey":grant_id,"signedAt":signed_at}),
@@ -342,9 +342,11 @@ pub fn build_request_key_publication<P: OpenMlsProvider>(
         entries.push(json!({"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":STANDARD.encode(encoded),"sha256":hash,"keyPackageRef":STANDARD.encode(&reference)},"grant":grant}));
         bundles.push((reference, bundle));
     }
+    let publication_idempotency_key =
+        crate::sim_hooks::openmls_rand_uuid_v4(provider.rand())?.to_string();
     let signed = sign(
         DirectRequestKind::Keys,
-        json!({"$type":"blue.catbird.chat.defs#directRequestKeysPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-KEYS\u{0}","protocolVersion":"2","actorDid":input.actor_did,"actorDeviceId":input.actor_device_id,"keyId":key_id,"authGeneration":input.auth_generation,"revision":input.revision,"enabled":input.enabled,"keys":entries,"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":signed_at}),
+        json!({"$type":"blue.catbird.chat.defs#directRequestKeysPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-KEYS\u{0}","protocolVersion":"2","actorDid":input.actor_did,"actorDeviceId":input.actor_device_id,"keyId":key_id,"authGeneration":input.auth_generation,"revision":input.revision,"enabled":input.enabled,"keys":entries,"idempotencyKey":publication_idempotency_key,"signedAt":signed_at}),
     )?;
     let record = DirectRequestKeyPublication {
         actor_did: input.actor_did.clone(),

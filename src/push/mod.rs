@@ -20,8 +20,9 @@ pub fn should_inline_push_ciphertext(ciphertext: &[u8]) -> bool {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use processor::{
-    process_push_notification, AuthorizedPeerDeviceKey, FetchedMetadataSnapshot, FetchedPushEntry,
-    NotificationPreview, PushFetchBundle, PushFetchTransport, PushKeystore, PushWakePayload,
+    process_push_notification, process_push_notification_with_hooks, AuthorizedPeerDeviceKey,
+    FetchedMetadataSnapshot, FetchedPushEntry, NotificationPreview, PushFetchBundle,
+    PushFetchTransport, PushKeystore, PushWakePayload,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use processor::{

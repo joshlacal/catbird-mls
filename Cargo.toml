@@ -60,6 +60,12 @@ web-time = "1.1"
 scopeguard = "1.2"
 tracing = "0.1"
 rand = "0.8"
+rand_chacha = "0.3"
+hpke-rs = { version = "0.7", features = ["hazmat", "serialization"] }
+hpke-rs-crypto = "0.7"
+hpke-rs-libcrux = "0.7"
+libcrux-kem = "0.0.9"
+libcrux-ecdh = "0.0.8"
 hkdf = "0.12"
 hmac = "0.12"
 subtle = "2"
@@ -94,6 +100,8 @@ e2e-aad = []
 test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_memory_storage/test-utils"]
 # Labyrinth 1.1 encrypted history backup over ATProto Spaces (enabled by default per D4).
 labyrinth = ["dep:labyrinth"]
+# Deterministic simulation testing (DST) fault-injection (`buggify!`) hooks.
+sim = []
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }

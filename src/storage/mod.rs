@@ -17,7 +17,8 @@ pub mod schema;
 #[cfg(not(target_arch = "wasm32"))]
 pub use driver_native::{
     derive_db_key_32_from_str, derive_sqlcipher_96hex_key_spec, BackgroundCheckpointReport,
-    MlsAccountDb, OpenMode, RusqliteKvBackend, SharedAccountDbKvBackend, SqlReadTx, SqlTx,
+    MlsAccountDb, OpenMode, RusqliteKvBackend, SharedAccountDbKvBackend, SqlDriver, SqlReadTx,
+    SqlTx,
 };
 pub use driver_wasm::{wasm_sqlite3mc_init_pragmas, WasmAccountDb, WasmSqlBackend};
 pub use openmls_kv::{

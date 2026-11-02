@@ -205,10 +205,15 @@ pub struct MlsAccountDb {
     mode: OpenMode,
     suspended: AtomicBool,
     conn_open: AtomicBool,
+    conn_in_tx: AtomicBool,
+    write_tx_active: AtomicBool,
     state: Mutex<AccountDbConnState>,
     eviction_hooks: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
     keychain: Mutex<Option<Arc<dyn KeychainAccess>>>,
 }
+
+/// Alias used by deterministic simulation (`catbird-sim`) and `I6` autocommit probes.
+pub type SqlDriver = MlsAccountDb;
 
 impl MlsAccountDb {
     /// Open or create `<did_hash>.db` using SQLCipher 4 96-hex raw key+HKDF salt (`I8`).
@@ -225,6 +230,46 @@ impl MlsAccountDb {
             mode,
             suspended: AtomicBool::new(false),
             conn_open: AtomicBool::new(true),
+            conn_in_tx: AtomicBool::new(false),
+            write_tx_active: AtomicBool::new(false),
+            state: Mutex::new(AccountDbConnState {
+                conn: Some(conn),
+                last_reconciled_data_version: initial_dv,
+            }),
+            eviction_hooks: Mutex::new(Vec::new()),
+            keychain: Mutex::new(None),
+        })
+    }
+
+    /// Open an isolated in-memory SQLCipher database with the unified schema initialized.
+    ///
+    /// Intended for fast, deterministic unit and pressure-tank (`I6`) tests without
+    /// filesystem setup.
+    pub fn open_in_memory_for_test() -> Result<Self, MLSError> {
+        let db_key_32 = [0x42u8; 32];
+        let conn = Connection::open_in_memory()
+            .map_err(|e| map_rusqlite_err("Connection::open_in_memory", &e))?;
+        let key_spec = Zeroizing::new(derive_sqlcipher_96hex_key_spec(&db_key_32));
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_memory_security = OFF;\n\
+             PRAGMA key = \"{}\";\n\
+             PRAGMA synchronous = NORMAL;",
+            key_spec.as_str()
+        ))
+        .map_err(|e| map_rusqlite_err("open_in_memory_for_test SQLCipher init", &e))?;
+        conn.execute_batch(UNIFIED_SCHEMA_DDL)
+            .map_err(|e| map_rusqlite_err("open_in_memory_for_test UNIFIED_SCHEMA_DDL", &e))?;
+        let initial_dv: i64 = conn
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .map_err(|e| map_rusqlite_err("open_in_memory_for_test data_version", &e))?;
+        Ok(Self {
+            path: PathBuf::from(":memory:"),
+            db_key_32: Zeroizing::new(db_key_32),
+            mode: OpenMode::App,
+            suspended: AtomicBool::new(false),
+            conn_open: AtomicBool::new(true),
+            conn_in_tx: AtomicBool::new(false),
+            write_tx_active: AtomicBool::new(false),
             state: Mutex::new(AccountDbConnState {
                 conn: Some(conn),
                 last_reconciled_data_version: initial_dv,
@@ -278,6 +323,45 @@ impl MlsAccountDb {
         !self.suspended.load(Ordering::SeqCst) && self.conn_open.load(Ordering::SeqCst)
     }
 
+    /// Returns `true` when the underlying SQLite connection is currently inside an active
+    /// transaction (`!conn.is_autocommit()`), using safe `rusqlite::Connection::is_autocommit()`
+    /// exclusively (zero `unsafe`).
+    ///
+    /// Safe to call both from outside a transaction (e.g. inside `PlatformTransport::execute_http`
+    /// to assert `I6`) and re-entrantly from inside `read_tx` / `write_tx` on the same thread.
+    pub fn is_in_transaction(&self) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        match self.state.try_lock() {
+            Ok(guard) => guard
+                .conn
+                .as_ref()
+                .is_some_and(|conn| !conn.is_autocommit()),
+            Err(std::sync::TryLockError::WouldBlock) => self.conn_in_tx.load(Ordering::SeqCst),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .conn
+                .as_ref()
+                .is_some_and(|conn| !conn.is_autocommit()),
+        }
+    }
+
+    /// Returns `true` when the database is currently inside an active `BEGIN IMMEDIATE`
+    /// write transaction (`write_tx`).
+    pub fn is_in_write_transaction(&self) -> bool {
+        self.is_open() && self.write_tx_active.load(Ordering::SeqCst) && self.is_in_transaction()
+    }
+
+    /// Build a cloneable [`crate::sim_hooks::TxAutocommitProbe`] bound to this database handle
+    /// so `PlatformTransport::execute_http` implementations can assert `I6` (`!probe.is_in_transaction()`).
+    pub fn autocommit_probe(self: &Arc<Self>) -> crate::sim_hooks::TxAutocommitProbe {
+        let weak = Arc::downgrade(self);
+        crate::sim_hooks::TxAutocommitProbe::new(Arc::new(move || {
+            weak.upgrade().is_some_and(|db| db.is_in_transaction())
+        }))
+    }
+
     /// Obtain a SQLite interrupt handle if the connection is currently open.
     pub fn get_interrupt_handle(&self) -> Option<rusqlite::InterruptHandle> {
         self.state
@@ -303,17 +387,31 @@ impl MlsAccountDb {
 
         conn.execute_batch("BEGIN DEFERRED;")
             .map_err(|e| map_rusqlite_err("read_tx BEGIN DEFERRED", &e))?;
-        struct EndRead<'a>(&'a Connection);
+        self.conn_in_tx
+            .store(!conn.is_autocommit(), Ordering::SeqCst);
+        struct EndRead<'a> {
+            conn: &'a Connection,
+            conn_in_tx: &'a AtomicBool,
+        }
         impl Drop for EndRead<'_> {
             fn drop(&mut self) {
-                let _ = self.0.execute_batch("ROLLBACK;");
+                if !self.conn.is_autocommit() {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                }
+                self.conn_in_tx
+                    .store(!self.conn.is_autocommit(), Ordering::SeqCst);
             }
         }
-        let end_guard = EndRead(conn);
+        let end_guard = EndRead {
+            conn,
+            conn_in_tx: &self.conn_in_tx,
+        };
         let rx = SqlReadTx { conn, keychain };
         let out = f(&rx)?;
         conn.execute_batch("COMMIT;")
             .map_err(|e| map_rusqlite_err("read_tx COMMIT", &e))?;
+        self.conn_in_tx
+            .store(!conn.is_autocommit(), Ordering::SeqCst);
         std::mem::forget(end_guard);
         Ok(out)
     }
@@ -340,10 +438,16 @@ impl MlsAccountDb {
             let conn = guard.conn.as_ref().ok_or(MLSError::ContextClosed)?;
             conn.execute_batch("BEGIN IMMEDIATE;")
                 .map_err(|e| map_rusqlite_err("write_tx BEGIN IMMEDIATE", &e))?;
+            self.conn_in_tx
+                .store(!conn.is_autocommit(), Ordering::SeqCst);
+            self.write_tx_active.store(true, Ordering::SeqCst);
             match conn.query_row("PRAGMA data_version;", [], |r| r.get::<_, i64>(0)) {
                 Ok(dv) => dv,
                 Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK;");
+                    self.conn_in_tx
+                        .store(!conn.is_autocommit(), Ordering::SeqCst);
+                    self.write_tx_active.store(false, Ordering::SeqCst);
                     return Err(map_rusqlite_err("write_tx PRAGMA data_version", &e));
                 }
             }
@@ -355,10 +459,36 @@ impl MlsAccountDb {
 
         let result = {
             let conn = guard.conn.as_ref().ok_or(MLSError::ContextClosed)?;
+            struct UnwindWrite<'a> {
+                conn: &'a Connection,
+                conn_in_tx: &'a AtomicBool,
+                write_tx_active: &'a AtomicBool,
+                disarmed: bool,
+            }
+            impl Drop for UnwindWrite<'_> {
+                fn drop(&mut self) {
+                    if !self.disarmed {
+                        if !self.conn.is_autocommit() {
+                            let _ = self.conn.execute_batch("ROLLBACK;");
+                        }
+                        self.conn_in_tx
+                            .store(!self.conn.is_autocommit(), Ordering::SeqCst);
+                        self.write_tx_active.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+            let mut unwind_guard = UnwindWrite {
+                conn,
+                conn_in_tx: &self.conn_in_tx,
+                write_tx_active: &self.write_tx_active,
+                disarmed: false,
+            };
             let tx = SqlTx {
                 read: SqlReadTx { conn, keychain },
             };
-            f(&tx)
+            let res = f(&tx);
+            unwind_guard.disarmed = true;
+            res
         };
 
         match result {
@@ -367,10 +497,16 @@ impl MlsAccountDb {
                     let conn = guard.conn.as_ref().ok_or(MLSError::ContextClosed)?;
                     if let Err(e) = conn.execute_batch("COMMIT;") {
                         let _ = conn.execute_batch("ROLLBACK;");
+                        self.conn_in_tx
+                            .store(!conn.is_autocommit(), Ordering::SeqCst);
+                        self.write_tx_active.store(false, Ordering::SeqCst);
                         guard.last_reconciled_data_version = 0;
                         self.fire_eviction_hooks();
                         return Err(map_rusqlite_err("write_tx COMMIT", &e));
                     }
+                    self.conn_in_tx
+                        .store(!conn.is_autocommit(), Ordering::SeqCst);
+                    self.write_tx_active.store(false, Ordering::SeqCst);
                     conn.query_row("PRAGMA data_version;", [], |r| r.get::<_, i64>(0))
                         .unwrap_or(current_dv)
                 };
@@ -380,7 +516,12 @@ impl MlsAccountDb {
             Err(err) => {
                 if let Some(conn) = guard.conn.as_ref() {
                     let _ = conn.execute_batch("ROLLBACK;");
+                    self.conn_in_tx
+                        .store(!conn.is_autocommit(), Ordering::SeqCst);
+                } else {
+                    self.conn_in_tx.store(false, Ordering::SeqCst);
                 }
+                self.write_tx_active.store(false, Ordering::SeqCst);
                 guard.last_reconciled_data_version = 0;
                 self.fire_eviction_hooks();
                 Err(err)
@@ -431,6 +572,8 @@ impl MlsAccountDb {
         guard.last_reconciled_data_version = 0;
 
         let Some(conn) = guard.conn.take() else {
+            self.conn_in_tx.store(false, Ordering::SeqCst);
+            self.write_tx_active.store(false, Ordering::SeqCst);
             self.conn_open.store(false, Ordering::SeqCst);
             drop(guard);
             self.fire_eviction_hooks();
@@ -443,21 +586,27 @@ impl MlsAccountDb {
         };
 
         let _ = conn.busy_timeout(Duration::ZERO);
-        let (busy, log_frames, checkpointed_frames) = conn
-            .query_row("PRAGMA main.wal_checkpoint(PASSIVE);", [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap_or((1, 0, 0));
+        let (busy, log_frames, checkpointed_frames) =
+            if crate::buggify!("before_wal_passive_checkpoint") {
+                (1, 0, 0)
+            } else {
+                conn.query_row("PRAGMA main.wal_checkpoint(PASSIVE);", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap_or((1, 0, 0))
+            };
 
         conn.flush_prepared_statement_cache();
         match conn.close() {
             Ok(()) => {}
             Err((leaked_conn, _)) => drop(leaked_conn),
         }
+        self.conn_in_tx.store(false, Ordering::SeqCst);
+        self.write_tx_active.store(false, Ordering::SeqCst);
         self.conn_open.store(false, Ordering::SeqCst);
 
         drop(guard);
@@ -492,6 +641,11 @@ impl MlsAccountDb {
 
     /// Non-blocking passive checkpoint for foreground durability checks.
     pub fn passive_checkpoint(&self) -> Result<(), MLSError> {
+        if crate::buggify!("before_wal_passive_checkpoint") {
+            return Err(MLSError::Internal(
+                "sim buggify: before_wal_passive_checkpoint".to_string(),
+            ));
+        }
         self.with_raw_conn(|conn| {
             let _ = conn.query_row("PRAGMA main.wal_checkpoint(PASSIVE);", [], |row| {
                 Ok((

@@ -35,18 +35,10 @@ use crate::orchestrator::direct_request_bootstrap::{
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use crate::push::{root_did_from_credential_bytes, AuthorizedPeerDeviceKey};
 use crate::storage::{
-    ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvProvider, OpenMlsKvStorage, RequestRow,
-    RusqliteKvBackend,
+    ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
 };
 
 use super::native_client::CatbirdMlsClient;
-
-fn unix_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
 
 fn build_join_config() -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
@@ -221,8 +213,8 @@ impl CatbirdMlsClient {
             .unwrap_or(0);
         let mut next = prior.clone();
         next["stateVersion"] = json!(prior_sv + 1);
-        let transition_id = uuid::Uuid::new_v4().to_string();
-        let recovery_request_id = uuid::Uuid::new_v4().to_string();
+        let transition_id = self.hooks.uuid_v4().to_string();
+        let recovery_request_id = self.hooks.uuid_v4().to_string();
         let body = json!({
             "$type": "blue.catbird.chat.defs#participantAcceptanceBody",
             "signatureDomain": "CATBIRD-CHAT-ACCEPT\0",
@@ -233,7 +225,7 @@ impl CatbirdMlsClient {
             "actorDeviceId": canonical_dev_id,
             "keyId": derive_key_id(signer.public()),
             "authGeneration": auth_generation,
-            "signedAt": chat_wire::now_rfc3339_millis(),
+            "signedAt": self.hooks.now_rfc3339_millis(),
             "prior": prior,
             "next": next,
             "invitationProvenance": invitation_provenance,
@@ -432,7 +424,7 @@ impl CatbirdMlsClient {
         let dr_rcpt_json = raw_dr_entry
             .get("sequencerReceipt")
             .and_then(|r| serde_json::to_string(r).ok());
-        let now_ms = unix_now_ms();
+        let now_ms = self.hooks.now_ms();
         let pub_norm_str = String::from_utf8(pub_norm_bytes)
             .map_err(|e| MLSError::Internal(format!("C33 pub UTF-8: {e}")))?;
         let coords_canon = chat_wire::canonicalize_wire_coordinate(&vp["next"], Some(cid))?;
@@ -441,7 +433,7 @@ impl CatbirdMlsClient {
 
         self.db.write_tx(|tx| {
             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-            let provider = OpenMlsKvProvider::new(storage)?;
+            let provider = self.hooks.openmls_provider(storage);
             let mls_welcome = MlsMessageIn::tls_deserialize_exact(&bootstrap.welcome)
                 .map_err(|e| MLSError::Cryptography(format!("deserialize C33 Welcome: {e:?}")))?;
             let MlsMessageBodyIn::Welcome(welcome) = mls_welcome.extract() else {
@@ -692,8 +684,8 @@ impl CatbirdMlsClient {
                         "actorDeviceId": canonical_dev_id,
                         "keyId": derive_key_id(signer.public()),
                         "authGeneration": auth_generation,
-                        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-                        "signedAt": chat_wire::now_rfc3339_millis(),
+                        "idempotencyKey": self.hooks.uuid_v4().to_string(),
+                        "signedAt": self.hooks.now_rfc3339_millis(),
                     });
                     let _ = self.submit_signed_chat_op(
                         canonical_dev_id,
@@ -726,7 +718,7 @@ impl CatbirdMlsClient {
             };
 
             let meta_snap_opt = w_env.get("metadataSnapshot");
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let coords_str = serde_json::to_string(&coords_canon)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
 
@@ -735,7 +727,7 @@ impl CatbirdMlsClient {
             let extra_dids: Vec<String> = self.db.read_tx(|tx| {
                 let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
                 let storage = OpenMlsKvStorage::new(overlay);
-                let provider = OpenMlsKvProvider::new(storage)?;
+                let provider = self.hooks.openmls_provider(storage);
                 let msg_in = MlsMessageIn::tls_deserialize_exact(&welcome_bytes)
                     .map_err(|e| MLSError::Cryptography(format!("deserialize Welcome: {e:?}")))?;
                 let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
@@ -770,7 +762,7 @@ impl CatbirdMlsClient {
 
             self.db.write_tx(|tx| {
                 let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = OpenMlsKvProvider::new(storage)?;
+                let provider = self.hooks.openmls_provider(storage);
                 let msg_in = MlsMessageIn::tls_deserialize_exact(&welcome_bytes)
                     .map_err(|e| MLSError::Cryptography(format!("deserialize Welcome: {e:?}")))?;
                 let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
@@ -854,8 +846,8 @@ impl CatbirdMlsClient {
                     "actorDeviceId": canonical_dev_id,
                     "keyId": derive_key_id(signer.public()),
                     "authGeneration": auth_generation,
-                    "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-                    "signedAt": chat_wire::now_rfc3339_millis(),
+                    "idempotencyKey": self.hooks.uuid_v4().to_string(),
+                    "signedAt": self.hooks.now_rfc3339_millis(),
                 });
                 let _ = self.submit_signed_chat_op(
                     canonical_dev_id,
@@ -1001,10 +993,10 @@ impl CatbirdMlsClient {
             let prior_gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
             let prior_ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
 
-            let transition_uuid = uuid::Uuid::new_v4();
+            let transition_uuid = self.hooks.uuid_v4();
             let transition_id = transition_uuid.to_string();
-            let welcome_id = uuid::Uuid::new_v4().to_string();
-            let now_ms = unix_now_ms();
+            let welcome_id = self.hooks.uuid_v4().to_string();
+            let now_ms = self.hooks.now_ms();
 
             // Stage `add_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx` (`I6`)
             // so an HTTP 409 / network failure never forks local OpenMLS epoch state!
@@ -1014,7 +1006,7 @@ impl CatbirdMlsClient {
                 };
                 let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
                 let storage = OpenMlsKvStorage::new(&overlay);
-                let provider = OpenMlsKvProvider::new(storage)?;
+                let provider = self.hooks.openmls_provider(storage);
                 let validated_kp = kp_in
                     .validate(provider.crypto(), ProtocolVersion::Mls10)
                     .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
@@ -1158,7 +1150,7 @@ impl CatbirdMlsClient {
                 "actorDeviceId": canonical_dev_id,
                 "keyId": derive_key_id(signer.public()),
                 "authGeneration": auth_generation,
-                "signedAt": chat_wire::now_rfc3339_millis(),
+                "signedAt": self.hooks.now_rfc3339_millis(),
                 "prior": prior_coords,
                 "next": next_coords,
                 "aad": commit_aad_val,
@@ -1220,6 +1212,11 @@ impl CatbirdMlsClient {
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
             let snap_str = serde_json::to_string(&carried_snap)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
+            if crate::buggify!("after_http_2xx_before_db_commit") {
+                return Err(MLSError::Internal(
+                    "sim buggify: after_http_2xx_before_db_commit".to_string(),
+                ));
+            }
             self.db.write_tx(|tx| {
                 kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
                 if let Some(mut c) = tx.get_conversation(cid)? {
@@ -1304,7 +1301,7 @@ impl CatbirdMlsClient {
         }
         let existing_member_dids: Vec<String> = self.db.read_tx(|tx| {
             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-            let provider = OpenMlsKvProvider::new(storage)?;
+            let provider = self.hooks.openmls_provider(storage);
             let mut found = Vec::new();
             if let Some(group) =
                 MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
@@ -1348,7 +1345,7 @@ impl CatbirdMlsClient {
             let signed_req = entry.get("signedRequest").unwrap_or(entry);
             let body = signed_req.get("body").unwrap_or(signed_req);
             let body_type = body.get("$type").and_then(|v| v.as_str()).unwrap_or("");
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
 
             if entry_type.ends_with("accountDeletedEntry") || entry_type == "accountDeleted" {
                 if let Some(deleted_did) = entry
@@ -1440,7 +1437,7 @@ impl CatbirdMlsClient {
                     };
                     if let Some(snap) = snap_opt {
                         let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                        let provider = OpenMlsKvProvider::new(storage)?;
+                        let provider = self.hooks.openmls_provider(storage);
                         if let Some(mut group) =
                             MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
                                 .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
@@ -1519,7 +1516,7 @@ impl CatbirdMlsClient {
                     if !is_own_echo {
                         if let Some(ref commit_bytes) = commit_bytes_opt {
                             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                            let provider = OpenMlsKvProvider::new(storage)?;
+                            let provider = self.hooks.openmls_provider(storage);
                             if let Some(mut group) = MlsGroup::load(
                                 provider.storage(),
                                 &GroupId::from_slice(&c.group_id),
@@ -1698,7 +1695,7 @@ impl CatbirdMlsClient {
                         return Ok(());
                     };
                     let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                    let provider = OpenMlsKvProvider::new(storage)?;
+                    let provider = self.hooks.openmls_provider(storage);
                     let Some(mut group) =
                         MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
                             .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?

@@ -37,6 +37,7 @@ pub mod push;
 pub mod recovery;
 pub mod requests;
 pub mod routing;
+pub mod sim_hooks;
 pub mod storage;
 pub mod sync;
 mod types;
@@ -50,6 +51,10 @@ pub mod atproto_bytes;
 pub use catbird_atproto as atproto;
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::CatbirdMlsClient;
+pub use client::{
+    CatbirdMlsClientConfig, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
+    PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::*;
 pub use error::*;
@@ -69,7 +74,9 @@ pub use orchestrator::direct_request_types::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use platform_lifecycle::*;
 #[cfg(not(target_arch = "wasm32"))]
-pub use push::process_push_notification;
+pub use push::{process_push_notification, process_push_notification_with_hooks};
+#[cfg(not(target_arch = "wasm32"))]
+pub use storage::SqlDriver;
 pub use types::*;
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use openmls::prelude::*;
 use openmls::treesync::LeafNodeSource;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_traits::{storage::StorageProvider, OpenMlsProvider};
+use openmls_traits::{random::OpenMlsRand, storage::StorageProvider, OpenMlsProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -332,7 +332,7 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         ctx["firstMessageId"].as_str().unwrap(),
         &introduction_plaintext(input)?,
     )?;
-    let metadata_nonce: [u8; 12] = rand::random();
+    let metadata_nonce: [u8; 12] = provider.rand().random_array().map_err(crypto_error)?;
     let metadata_ciphertext = encrypt_request_metadata(
         &group,
         provider,

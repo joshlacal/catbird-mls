@@ -28,8 +28,8 @@ use crate::error::MLSError;
 use crate::keychain::KeychainAccess;
 use crate::metadata::{decrypt_metadata_snapshot, derive_metadata_key_from_group};
 use crate::storage::{
-    ConversationRow, GroupMetadataRow, MessageRow, MlsAccountDb, OpenMlsKvProvider,
-    OpenMlsKvStorage, OpenMode, RusqliteKvBackend,
+    ConversationRow, GroupMetadataRow, MessageRow, MlsAccountDb, OpenMlsKvStorage, OpenMode,
+    RusqliteKvBackend,
 };
 
 use super::{
@@ -378,6 +378,26 @@ pub fn process_push_notification(
     transport: Option<Arc<dyn PushFetchTransport>>,
     wake: &PushWakePayload,
 ) -> Result<NotificationPreview, MLSError> {
+    process_push_notification_with_hooks(
+        storage_root,
+        account_did_hash,
+        keystore,
+        transport,
+        wake,
+        &crate::sim_hooks::SimClientHooks::system_default(),
+    )
+}
+
+/// Deterministic simulation entry point for [`process_push_notification`], routing wall-clock
+/// timestamps and OpenMLS provider randomness through [`crate::sim_hooks::SimClientHooks`].
+pub fn process_push_notification_with_hooks(
+    storage_root: &Path,
+    account_did_hash: &str,
+    keystore: Arc<dyn PushKeystore>,
+    transport: Option<Arc<dyn PushFetchTransport>>,
+    wake: &PushWakePayload,
+    hooks: &crate::sim_hooks::SimClientHooks,
+) -> Result<NotificationPreview, MLSError> {
     use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
 
     if !wake.recipient_account_hash.is_empty()
@@ -662,7 +682,7 @@ pub fn process_push_notification(
             });
         }
 
-        let now_ms = unix_now_ms();
+        let now_ms = hooks.now_ms();
 
         // Persist any newly fetched authorized device keys in account_meta.
         if fetch_bundle.is_some() {
@@ -677,7 +697,7 @@ pub fn process_push_notification(
             RusqliteKvBackend(tx.conn()),
             Arc::clone(&keychain_adapter),
         );
-        let provider = OpenMlsKvProvider::new(storage)?;
+        let provider = hooks.openmls_provider(storage);
         let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&current_convo.group_id))
             .map_err(|e| MLSError::Internal(format!("MlsGroup::load failed: {e:?}")))?
             .ok_or_else(|| MLSError::GroupNotFound {

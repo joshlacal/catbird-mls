@@ -218,13 +218,11 @@ pub(crate) mod native_client {
 
     use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
     use base64::Engine as _;
-    use chrono::{SecondsFormat, Utc};
     use openmls::prelude::tls_codec::Serialize as TlsSerialize;
     use openmls::prelude::*;
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_traits::signatures::Signer as _;
     use openmls_traits::OpenMlsProvider;
-    use rand::RngCore;
     use serde::Serialize;
     use sha2::{Digest as _, Sha256};
     use zeroize::Zeroizing;
@@ -244,8 +242,8 @@ pub(crate) mod native_client {
     };
     use crate::storage::{
         BackgroundCheckpointReport, ConversationRow, GroupMetadataRow, LabyrinthQueueRow,
-        MessageRow, MlsAccountDb, MutationJournalRow, OpenMlsKvProvider, OpenMlsKvStorage,
-        OpenMode, RequestRow, RusqliteKvBackend, SqlTx,
+        MessageRow, MlsAccountDb, MutationJournalRow, OpenMlsKvStorage, OpenMode, RequestRow,
+        RusqliteKvBackend, SqlTx,
     };
     use crate::sync::reconcile::persist_entries_then_acknowledge;
 
@@ -301,6 +299,7 @@ pub(crate) mod native_client {
         tx: &SqlTx<'_>,
         epoch_seq: u64,
         now_ms: i64,
+        hooks: &crate::sim_hooks::SimClientHooks,
     ) -> Result<Zeroizing<[u8; 32]>, MLSError> {
         let key = owner_epoch_root_key(epoch_seq);
         if let Some(existing) = tx.get_labyrinth_state(&key)? {
@@ -309,7 +308,7 @@ pub(crate) mod native_client {
             }
         }
         let mut fresh = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(&mut *fresh);
+        hooks.fill_bytes(&mut *fresh);
         tx.put_labyrinth_state(&key, fresh.as_slice(), now_ms)?;
         Ok(fresh)
     }
@@ -349,6 +348,7 @@ pub(crate) mod native_client {
     fn ensure_device_secrets_and_salt(
         tx: &SqlTx<'_>,
         now_ms: i64,
+        hooks: &crate::sim_hooks::SimClientHooks,
     ) -> Result<(labyrinth::device::DeviceSecrets, [u8; 32]), MLSError> {
         let salt = match tx
             .get_labyrinth_state("mailbox_root_salt")?
@@ -357,7 +357,7 @@ pub(crate) mod native_client {
             Some(arr) => arr,
             None => {
                 let mut fresh_salt = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut fresh_salt);
+                hooks.fill_bytes(&mut fresh_salt);
                 tx.put_labyrinth_state("mailbox_root_salt", &fresh_salt, now_ms)?;
                 fresh_salt
             }
@@ -369,9 +369,11 @@ pub(crate) mod native_client {
             }
         }
 
-        let fresh = labyrinth::device::DeviceSecrets::generate_physical().map_err(|e| {
-            MLSError::Cryptography(format!("generate Labyrinth physical DeviceSecrets: {e}"))
-        })?;
+        let fresh = hooks
+            .with_labyrinth_rng(labyrinth::device::DeviceSecrets::generate_physical)
+            .map_err(|e| {
+                MLSError::Cryptography(format!("generate Labyrinth physical DeviceSecrets: {e}"))
+            })?;
         let auth_bytes = fresh
             .storage_auth
             .as_ref()
@@ -417,6 +419,7 @@ pub(crate) mod native_client {
     fn load_or_create_transport_signer(
         db: &MlsAccountDb,
         now_ms: i64,
+        hooks: &crate::sim_hooks::SimClientHooks,
     ) -> Result<ClientTransportSigner, MLSError> {
         let enrolled_opt = db.read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?;
         if let Some(signer_json) = enrolled_opt {
@@ -439,7 +442,7 @@ pub(crate) mod native_client {
                 }
             }
             let mut fresh = Zeroizing::new([0u8; 32]);
-            rand::rngs::OsRng.fill_bytes(&mut *fresh);
+            hooks.fill_bytes(&mut *fresh);
             tx.put_labyrinth_state("transport_ed25519_seed", fresh.as_slice(), now_ms)?;
             Ok(fresh)
         })?;
@@ -460,6 +463,7 @@ pub(crate) mod native_client {
         conversation_id: &str,
         transport_pub: [u8; 32],
         now_ms: i64,
+        hooks: &crate::sim_hooks::SimClientHooks,
     ) -> Result<labyrinth::mek::Mek, MLSError> {
         let state_key = format!("convo_sender_mek:{conversation_id}");
         let secret: Zeroizing<[u8; 32]> = db.write_tx(|tx| {
@@ -469,7 +473,7 @@ pub(crate) mod native_client {
                 }
             }
             let mut fresh = Zeroizing::new([0u8; 32]);
-            rand::rngs::OsRng.fill_bytes(&mut *fresh);
+            hooks.fill_bytes(&mut *fresh);
             tx.put_labyrinth_state(&state_key, fresh.as_slice(), now_ms)?;
             Ok(fresh)
         })?;
@@ -566,20 +570,6 @@ pub(crate) mod native_client {
         }
     }
 
-    fn unix_now_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
-    fn unix_now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    }
-
     #[cfg(feature = "labyrinth")]
     struct RemoteMailboxEpochState {
         epochs: std::collections::BTreeMap<u64, labyrinth::epoch::EpochRecord>,
@@ -602,6 +592,7 @@ pub(crate) mod native_client {
         keystore: Arc<dyn PlatformKeyStore>,
         pub(crate) transport: Arc<dyn PlatformTransport>,
         observer: Option<Arc<dyn PlatformChangeObserver>>,
+        pub(crate) hooks: crate::sim_hooks::SimClientHooks,
         cached_group_titles: Arc<Mutex<std::collections::HashMap<String, String>>>,
         outbox_flush_lock: Mutex<()>,
         wipe_report: PreCutoverWipeReport,
@@ -616,6 +607,24 @@ pub(crate) mod native_client {
             keystore: Arc<dyn PlatformKeyStore>,
             transport: Arc<dyn PlatformTransport>,
             observer: Option<Arc<dyn PlatformChangeObserver>>,
+        ) -> Result<Arc<Self>, MLSError> {
+            Self::open_with_hooks(
+                config,
+                keystore,
+                transport,
+                observer,
+                crate::sim_hooks::SimClientHooks::system_default(),
+            )
+        }
+
+        /// Deterministic simulation constructor injecting [`crate::sim_hooks::SimClientHooks`]
+        /// (`SimClock` + `SimEntropy`) while preserving `CatbirdMlsClient::open` unchanged.
+        pub fn open_with_hooks(
+            config: CatbirdMlsClientConfig,
+            keystore: Arc<dyn PlatformKeyStore>,
+            transport: Arc<dyn PlatformTransport>,
+            observer: Option<Arc<dyn PlatformChangeObserver>>,
+            hooks: crate::sim_hooks::SimClientHooks,
         ) -> Result<Arc<Self>, MLSError> {
             let normalized_did = normalize_account_did(&config.account_did)?;
             let account_did_hash = account_did_hash_hex(&normalized_did)?;
@@ -654,7 +663,7 @@ pub(crate) mod native_client {
             // Initialize encrypted account_meta (`owner_did` lives inside the encrypted DB,
             // never in an unencrypted `accounts.json` per I8) and default D4 Labyrinth state.
             let mailbox_uri = personal_mailbox_space_uri(&normalized_did);
-            let now_ms = unix_now_ms();
+            let now_ms = hooks.now_ms();
             db.write_tx(|tx| {
                 tx.put_account_meta("owner_did", &normalized_did, now_ms)?;
                 tx.put_account_meta("device_id", &config.device_id, now_ms)?;
@@ -678,10 +687,10 @@ pub(crate) mod native_client {
                     tx.put_labyrinth_state("status_json", &bytes, now_ms)?;
                     1
                 };
-                let _ = ensure_owner_epoch_root(tx, epoch_seq, now_ms)?;
+                let _ = ensure_owner_epoch_root(tx, epoch_seq, now_ms, &hooks)?;
                 #[cfg(feature = "labyrinth")]
                 {
-                    let _ = ensure_device_secrets_and_salt(tx, now_ms)?;
+                    let _ = ensure_device_secrets_and_salt(tx, now_ms, &hooks)?;
                 }
                 Ok(())
             })?;
@@ -695,6 +704,7 @@ pub(crate) mod native_client {
                 keystore,
                 transport,
                 observer,
+                hooks,
                 cached_group_titles,
                 outbox_flush_lock: Mutex::new(()),
                 wipe_report,
@@ -735,6 +745,26 @@ pub(crate) mod native_client {
             &self.db
         }
 
+        pub fn sim_hooks(&self) -> &crate::sim_hooks::SimClientHooks {
+            &self.hooks
+        }
+
+        /// Returns `true` when this client's SQLite connection is currently inside any transaction
+        /// (`!conn.is_autocommit()`), using safe `rusqlite::Connection::is_autocommit()`.
+        pub fn is_in_transaction(&self) -> bool {
+            self.db.is_in_transaction()
+        }
+
+        /// Returns `true` when this client's SQLite connection is inside a `BEGIN IMMEDIATE` write transaction (`I6`).
+        pub fn is_in_write_transaction(&self) -> bool {
+            self.db.is_in_write_transaction()
+        }
+
+        /// Obtain a cloneable [`crate::sim_hooks::TxAutocommitProbe`] bound to this client's database (`I6`).
+        pub fn autocommit_probe(&self) -> crate::sim_hooks::TxAutocommitProbe {
+            self.db.autocommit_probe()
+        }
+
         pub fn pre_cutover_wipe_report(&self) -> &PreCutoverWipeReport {
             &self.wipe_report
         }
@@ -766,15 +796,16 @@ pub(crate) mod native_client {
                 return Err(MLSError::insufficient_permissions(eligibility.user_message));
             }
 
-            let now_secs = unix_now_secs();
-            let now_ms = unix_now_ms();
+            let now_secs = self.hooks.now_secs();
+            let now_ms = self.hooks.now_ms();
             let direct_not_after = now_secs + DIRECT_REQUEST_KP_MIN_LIFETIME_SECS + 3600;
             validate_direct_request_key_package_lifetime(now_secs, direct_not_after)?;
             let recovery_not_after = now_secs + RECOVERY_KP_MAX_LIFETIME_SECS;
 
             let scoped_identity = format!("{}#{}", self.normalized_did, self.config.device_id);
-            let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
-                .map_err(|e| MLSError::Cryptography(format!("generate Ed25519 signer: {e:?}")))?;
+            let signer = self
+                .hooks
+                .signature_keypair(CIPHERSUITE.signature_algorithm())?;
             let pub_key = signer.public().to_vec();
 
             let signer_bytes = serde_json::to_vec(&signer)
@@ -788,7 +819,7 @@ pub(crate) mod native_client {
 
             let (direct_kp_bytes, recovery_kp_bytes) = self.db.write_tx(|tx| {
                 let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = OpenMlsKvProvider::new(storage)?;
+                let provider = self.hooks.openmls_provider(storage);
                 signer.store(provider.storage()).map_err(|e| {
                     MLSError::Internal(format!("store signer in openmls_kv: {e:?}"))
                 })?;
@@ -800,7 +831,10 @@ pub(crate) mod native_client {
                 };
 
                 let direct_kp = KeyPackage::builder()
-                    .key_package_lifetime(Lifetime::new(DIRECT_REQUEST_KP_MIN_LIFETIME_SECS + 3600))
+                    .key_package_lifetime(Lifetime::init(
+                        now_secs.saturating_sub(60),
+                        direct_not_after,
+                    ))
                     .leaf_node_capabilities(
                         Capabilities::builder()
                             .ciphersuites(vec![CIPHERSUITE])
@@ -810,8 +844,9 @@ pub(crate) mod native_client {
                     .map_err(|e| MLSError::Cryptography(format!("build C33 KeyPackage: {e:?}")))?;
 
                 let recovery_kp = KeyPackage::builder()
-                    .key_package_lifetime(Lifetime::new(
-                        recovery_not_after.saturating_sub(now_secs),
+                    .key_package_lifetime(Lifetime::init(
+                        now_secs.saturating_sub(60),
+                        recovery_not_after,
                     ))
                     .leaf_node_capabilities(
                         Capabilities::builder()
@@ -986,9 +1021,9 @@ pub(crate) mod native_client {
             title: Option<String>,
             description: Option<String>,
         ) -> Result<ConversationRow, MLSError> {
-            let mut group_id_bytes = vec![0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut group_id_bytes);
-            let now_ms = unix_now_ms();
+            let group_id_bytes = self.hooks.random_array::<32>().to_vec();
+            let now_ms = self.hooks.now_ms();
+            let now_secs = self.hooks.now_secs();
             let space_uri = Some(format!(
                 "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
             ));
@@ -999,8 +1034,9 @@ pub(crate) mod native_client {
                     serde_json::from_str::<SignatureKeyPair>(&raw)
                         .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?
                 } else {
-                    let s = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
-                        .map_err(|e| MLSError::Cryptography(format!("generate signer: {e:?}")))?;
+                    let s = self
+                        .hooks
+                        .signature_keypair(CIPHERSUITE.signature_algorithm())?;
                     let serialized = serde_json::to_string(&s)
                         .map_err(|e| MLSError::Internal(format!("serialize signer: {e}")))?;
                     tx.put_account_meta("enrolled_signer_json", &serialized, now_ms)?;
@@ -1008,7 +1044,7 @@ pub(crate) mod native_client {
                 };
 
                 let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = OpenMlsKvProvider::new(storage)?;
+                let provider = self.hooks.openmls_provider(storage);
                 signer
                     .store(provider.storage())
                     .map_err(|e| MLSError::Internal(format!("store group signer: {e:?}")))?;
@@ -1020,6 +1056,10 @@ pub(crate) mod native_client {
                 };
                 let create_cfg = MlsGroupCreateConfig::builder()
                     .ciphersuite(CIPHERSUITE)
+                    .lifetime(Lifetime::init(
+                        now_secs.saturating_sub(60),
+                        now_secs + 29 * 86_400,
+                    ))
                     .use_ratchet_tree_extension(true)
                     .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                     .max_past_epochs(5)
@@ -1051,8 +1091,7 @@ pub(crate) mod native_client {
                         0,
                     )
                     .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
-                    let mut nonce = [0u8; 12];
-                    rand::rngs::OsRng.fill_bytes(&mut nonce);
+                    let nonce = self.hooks.random_array::<12>();
                     let ct = encrypt_metadata_snapshot_with_nonce(
                         &meta_key,
                         &group_id_bytes,
@@ -1140,7 +1179,7 @@ pub(crate) mod native_client {
                     .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?;
 
                 let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = OpenMlsKvProvider::new(storage)?;
+                let provider = self.hooks.openmls_provider(storage);
                 let mut group =
                     MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
                         .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
@@ -1354,7 +1393,7 @@ pub(crate) mod native_client {
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1)
                 .max(1);
-            let signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let signed_at = self.hooks.now_rfc3339_millis();
 
             let transcript_payload = PushGatewayTranscriptPayload {
                 app_id,
@@ -1446,6 +1485,7 @@ pub(crate) mod native_client {
             let ack_meta = Arc::new(Mutex::new((0_i64, 1_i64)));
             let ack_meta_tx = Arc::clone(&ack_meta);
             let transport = Arc::clone(&self.transport);
+            let hooks = self.hooks.clone();
 
             crate::async_runtime::block_on(persist_entries_then_acknowledge(
                 &self.db,
@@ -1485,7 +1525,7 @@ pub(crate) mod native_client {
                         .lock()
                         .map(|g| *g)
                         .unwrap_or((1, 1));
-                    let signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+                    let signed_at = hooks.now_rfc3339_millis();
                     let transcript_payload = AckTranscriptPayload {
                         key_id: &key_id,
                         up_to_seq: effective_seq,
@@ -1702,7 +1742,7 @@ pub(crate) mod native_client {
                 }
                 let root = self
                     .db
-                    .write_tx(|tx| ensure_owner_epoch_root(tx, seq, now_ms))?;
+                    .write_tx(|tx| ensure_owner_epoch_root(tx, seq, now_ms, &self.hooks))?;
                 let cur_secret = labyrinth::epoch::EpochSecret::from_parts(
                     seq,
                     labyrinth::epoch::space_epoch_id(seq),
@@ -1727,9 +1767,9 @@ pub(crate) mod native_client {
                     (pub0, None, None)
                 } else {
                     let prev_seq = seq - 1;
-                    let prev_root = self
-                        .db
-                        .write_tx(|tx| ensure_owner_epoch_root(tx, prev_seq, now_ms))?;
+                    let prev_root = self.db.write_tx(|tx| {
+                        ensure_owner_epoch_root(tx, prev_seq, now_ms, &self.hooks)
+                    })?;
                     let prev_secret = labyrinth::epoch::EpochSecret::from_parts(
                         prev_seq,
                         labyrinth::epoch::space_epoch_id(prev_seq),
@@ -1758,18 +1798,21 @@ pub(crate) mod native_client {
                         MLSError::Cryptography(format!("EpochPublic::sign({seq}): {e}"))
                     })?;
                     let data_key = cur_secret.data_key();
-                    let enc_prev_seq = labyrinth::aead::seal(
-                        &data_key,
-                        b"epoch_data_metadata",
-                        prev_seq.to_string().as_bytes(),
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("seal prev_seq: {e}")))?;
-                    let enc_prev_root = labyrinth::aead::seal(
-                        &data_key,
-                        b"epoch_data_metadata",
-                        prev_secret.root(),
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("seal prev_root: {e}")))?;
+                    let (enc_prev_seq, enc_prev_root) = self.hooks.with_labyrinth_rng(|| {
+                        let enc_seq = labyrinth::aead::seal(
+                            &data_key,
+                            b"epoch_data_metadata",
+                            prev_seq.to_string().as_bytes(),
+                        )
+                        .map_err(|e| MLSError::Cryptography(format!("seal prev_seq: {e}")))?;
+                        let enc_root = labyrinth::aead::seal(
+                            &data_key,
+                            b"epoch_data_metadata",
+                            prev_secret.root(),
+                        )
+                        .map_err(|e| MLSError::Cryptography(format!("seal prev_root: {e}")))?;
+                        Ok::<_, MLSError>((enc_seq, enc_root))
+                    })?;
                     (pub_n, Some(enc_prev_seq), Some(enc_prev_root))
                 };
 
@@ -2030,8 +2073,8 @@ pub(crate) mod native_client {
                 })?;
                 let st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
-                let (me, _) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms, &self.hooks)?;
+                let (me, _) = ensure_device_secrets_and_salt(tx, now_ms, &self.hooks)?;
                 Ok((st, me))
             })?;
 
@@ -2041,7 +2084,7 @@ pub(crate) mod native_client {
                 return Ok(None);
             };
 
-            let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+            let transport_signer = load_or_create_transport_signer(&self.db, now_ms, &self.hooks)?;
             let (prev_seq, prev_root) = match remote.epochs.keys().next_back().copied() {
                 None => {
                     self.ensure_local_epoch_chain_published(
@@ -2053,7 +2096,7 @@ pub(crate) mod native_client {
                         now_ms,
                     )?;
                     let root = self.db.write_tx(|tx| {
-                        ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms)
+                        ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms, &self.hooks)
                     })?;
                     (st_snapshot.epoch_seq, root)
                 }
@@ -2067,7 +2110,7 @@ pub(crate) mod native_client {
                         now_ms,
                     )?;
                     let root = self.db.write_tx(|tx| {
-                        ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms)
+                        ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms, &self.hooks)
                     })?;
                     (st_snapshot.epoch_seq, root)
                 }
@@ -2086,7 +2129,7 @@ pub(crate) mod native_client {
                         caught_up
                     } else {
                         let root = self.db.write_tx(|tx| {
-                            ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms)
+                            ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms, &self.hooks)
                         })?;
                         (st_snapshot.epoch_seq, root)
                     }
@@ -2117,30 +2160,32 @@ pub(crate) mod native_client {
                     && labyrinth::epoch::verify_member(&prev_secret, m, false).is_ok()
             });
 
-            let (pending_next, opened_next) = if me_in_prev {
-                labyrinth::epoch::open_next(
-                    &self.normalized_did,
-                    &prev_secret,
-                    &prev_rec.public,
-                    &prev_members,
-                    &continuing,
-                    &me_secrets,
-                    &transport_signer,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("epoch::open_next: {e}")))?
-            } else {
-                continuing.retain(|d| d.device_key_pub != me_secrets.public().device_key_pub);
-                labyrinth::epoch::open_next_enrolling(
-                    &self.normalized_did,
-                    &prev_secret,
-                    &prev_rec.public,
-                    &prev_members,
-                    &continuing,
-                    &me_secrets,
-                    &transport_signer,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("epoch::open_next_enrolling: {e}")))?
-            };
+            let (pending_next, opened_next) = self.hooks.with_labyrinth_rng(|| {
+                if me_in_prev {
+                    labyrinth::epoch::open_next(
+                        &self.normalized_did,
+                        &prev_secret,
+                        &prev_rec.public,
+                        &prev_members,
+                        &continuing,
+                        &me_secrets,
+                        &transport_signer,
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("epoch::open_next: {e}")))
+                } else {
+                    continuing.retain(|d| d.device_key_pub != me_secrets.public().device_key_pub);
+                    labyrinth::epoch::open_next_enrolling(
+                        &self.normalized_did,
+                        &prev_secret,
+                        &prev_rec.public,
+                        &prev_members,
+                        &continuing,
+                        &me_secrets,
+                        &transport_signer,
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("epoch::open_next_enrolling: {e}")))
+                }
+            })?;
 
             self.publish_opened_epoch(&st_snapshot.mailbox_space_uri, &opened_next, now_ms)?;
             Ok(Some((
@@ -2157,10 +2202,12 @@ pub(crate) mod native_client {
             if self.is_handle_closed() {
                 return Err(MLSError::ContextClosed);
             }
-            let code = labyrinth::recovery_code::RecoveryCode::generate()
+            let code = self
+                .hooks
+                .with_labyrinth_rng(labyrinth::recovery_code::RecoveryCode::generate)
                 .map_err(|e| MLSError::Cryptography(format!("generate RecoveryCode: {e}")))?;
             let grouped = code.format_grouped();
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
 
             let (st_snapshot, mut active_seq, mut owner_root, me_secrets, salt) =
@@ -2171,15 +2218,16 @@ pub(crate) mod native_client {
                     let st: LabyrinthBackupStatus = serde_json::from_slice(&raw)
                         .map_err(|e| MLSError::Internal(e.to_string()))?;
                     let seq = st.epoch_seq;
-                    let root = ensure_owner_epoch_root(tx, seq, now_ms)?;
-                    let (me, salt) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                    let root = ensure_owner_epoch_root(tx, seq, now_ms, &self.hooks)?;
+                    let (me, salt) = ensure_device_secrets_and_salt(tx, now_ms, &self.hooks)?;
                     Ok((st, seq, root, me, salt))
                 })?;
 
             if let Some(mut remote) =
                 self.fetch_remote_mailbox_epoch_state(&st_snapshot.mailbox_space_uri)?
             {
-                let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+                let transport_signer =
+                    load_or_create_transport_signer(&self.db, now_ms, &self.hooks)?;
                 match remote.epochs.keys().next_back().copied() {
                     None => {
                         self.ensure_local_epoch_chain_published(
@@ -2251,15 +2299,19 @@ pub(crate) mod native_client {
                 labyrinth::epoch::space_epoch_id(active_seq),
                 *owner_root,
             );
-            let (vdev_bundle, member_rec) = labyrinth::virtual_device::create(
-                &self.normalized_did,
-                &code,
-                &me_secrets,
-                &current_epoch,
-                &salt,
-                labyrinth::virtual_device::Mechanism::Code,
-            )
-            .map_err(|e| MLSError::Cryptography(format!("virtual_device::create: {e}")))?;
+            let (vdev_bundle, member_rec) = self
+                .hooks
+                .with_labyrinth_rng(|| {
+                    labyrinth::virtual_device::create(
+                        &self.normalized_did,
+                        &code,
+                        &me_secrets,
+                        &current_epoch,
+                        &salt,
+                        labyrinth::virtual_device::Mechanism::Code,
+                    )
+                })
+                .map_err(|e| MLSError::Cryptography(format!("virtual_device::create: {e}")))?;
 
             let vdev_doc = labyrinth::records::VirtualDevice::from_bundle(
                 &vdev_bundle,
@@ -2347,7 +2399,7 @@ pub(crate) mod native_client {
                     MLSError::invalid_input("invalid 40-character Labyrinth recovery code")
                 })?;
 
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let (st_before, local_vdev_doc, me_secrets) = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
@@ -2355,7 +2407,7 @@ pub(crate) mod native_client {
                 let st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 let local_doc = tx.get_labyrinth_state("recovery_vdev_doc_json")?;
-                let (me, _) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                let (me, _) = ensure_device_secrets_and_salt(tx, now_ms, &self.hooks)?;
                 Ok((st, local_doc, me))
             })?;
 
@@ -2416,7 +2468,8 @@ pub(crate) mod native_client {
             recovered_roots.insert(recovered_seq, recovered_root.clone());
 
             let new_epoch_seq = if let Some(mut remote) = remote_opt {
-                let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+                let transport_signer =
+                    load_or_create_transport_signer(&self.db, now_ms, &self.hooks)?;
                 self.publish_physical_device_if_needed(
                     &st_before.mailbox_space_uri,
                     &me_secrets,
@@ -2574,37 +2627,39 @@ pub(crate) mod native_client {
                         m.device_key_pub == me_secrets.public().device_key_pub
                             && labyrinth::epoch::verify_member(&fwd_cur, m, false).is_ok()
                     });
-                    let (pending_next, opened_next) = if me_in_latest {
-                        labyrinth::epoch::open_next(
-                            &self.normalized_did,
-                            &fwd_cur,
-                            &fwd_pub,
-                            &latest_members,
-                            &continuing,
-                            &me_secrets,
-                            &transport_signer,
-                        )
-                        .map_err(|e| {
-                            MLSError::Cryptography(format!("restore epoch::open_next: {e}"))
-                        })?
-                    } else {
-                        continuing
-                            .retain(|d| d.device_key_pub != me_secrets.public().device_key_pub);
-                        labyrinth::epoch::open_next_enrolling(
-                            &self.normalized_did,
-                            &fwd_cur,
-                            &fwd_pub,
-                            &latest_members,
-                            &continuing,
-                            &me_secrets,
-                            &transport_signer,
-                        )
-                        .map_err(|e| {
-                            MLSError::Cryptography(format!(
-                                "restore epoch::open_next_enrolling: {e}"
-                            ))
-                        })?
-                    };
+                    let (pending_next, opened_next) = self.hooks.with_labyrinth_rng(|| {
+                        if me_in_latest {
+                            labyrinth::epoch::open_next(
+                                &self.normalized_did,
+                                &fwd_cur,
+                                &fwd_pub,
+                                &latest_members,
+                                &continuing,
+                                &me_secrets,
+                                &transport_signer,
+                            )
+                            .map_err(|e| {
+                                MLSError::Cryptography(format!("restore epoch::open_next: {e}"))
+                            })
+                        } else {
+                            continuing
+                                .retain(|d| d.device_key_pub != me_secrets.public().device_key_pub);
+                            labyrinth::epoch::open_next_enrolling(
+                                &self.normalized_did,
+                                &fwd_cur,
+                                &fwd_pub,
+                                &latest_members,
+                                &continuing,
+                                &me_secrets,
+                                &transport_signer,
+                            )
+                            .map_err(|e| {
+                                MLSError::Cryptography(format!(
+                                    "restore epoch::open_next_enrolling: {e}"
+                                ))
+                            })
+                        }
+                    })?;
                     self.publish_opened_epoch(&st_before.mailbox_space_uri, &opened_next, now_ms)?;
                     let rotated_seq = pending_next.seq();
                     recovered_roots.insert(rotated_seq, Zeroizing::new(*pending_next.root()));
@@ -2633,7 +2688,7 @@ pub(crate) mod native_client {
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
                 }
-                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms, &self.hooks)?;
 
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("restore-epoch-{}", st.epoch_seq),
@@ -2674,7 +2729,7 @@ pub(crate) mod native_client {
                     "passkey PRF requires non-empty credential_id and 32-byte PRF output",
                 ));
             }
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let status = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
@@ -2698,11 +2753,13 @@ pub(crate) mod native_client {
 
         /// Generate a 6-digit One-Time Code (`OTC`) on an enrolled device (`I16` hybrid `CPace + ML-KEM-768`).
         pub fn initiate_otc_pairing(&self) -> Result<OtcPairingOffer, MLSError> {
-            let code = labyrinth::otc::OneTimeCode::generate()
+            let code = self
+                .hooks
+                .with_labyrinth_rng(labyrinth::otc::OneTimeCode::generate)
                 .map_err(|e| MLSError::Cryptography(format!("generate OneTimeCode: {e}")))?;
             let raw_digits = code.as_str().to_string();
             let formatted_code = code.format_grouped();
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             self.db.write_tx(|tx| {
                 tx.put_labyrinth_state("pending_otc_digits", raw_digits.as_bytes(), now_ms)
             })?;
@@ -2724,9 +2781,12 @@ pub(crate) mod native_client {
             let parsed = labyrinth::otc::OneTimeCode::parse(six_digit_code)
                 .map_err(|_| MLSError::invalid_input("invalid 6-digit OTC code"))?;
 
-            let (initiator, init_msg) =
-                labyrinth::otc::Initiator::start(&parsed, &self.normalized_did)
-                    .map_err(|e| MLSError::Cryptography(format!("OTC Initiator::start: {e}")))?;
+            let (initiator, init_msg) = self
+                .hooks
+                .with_labyrinth_rng(|| {
+                    labyrinth::otc::Initiator::start(&parsed, &self.normalized_did)
+                })
+                .map_err(|e| MLSError::Cryptography(format!("OTC Initiator::start: {e}")))?;
             let ek_len = init_msg.ek_otc.len() as u32;
             let sid = init_msg.sid.to_vec();
 
@@ -2742,8 +2802,9 @@ pub(crate) mod native_client {
 
             let mut responder =
                 labyrinth::otc::Responder::new(responder_code, &self.normalized_did);
-            let (resp_msg, resp_key) = responder
-                .respond(&init_msg)
+            let (resp_msg, resp_key) = self
+                .hooks
+                .with_labyrinth_rng(|| responder.respond(&init_msg))
                 .map_err(|e| MLSError::Cryptography(format!("OTC Responder::respond: {e}")))?;
             let ct_len = resp_msg.kem_ct.len() as u32;
             let init_key = initiator
@@ -2756,7 +2817,7 @@ pub(crate) mod native_client {
                 ));
             }
 
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             #[cfg(feature = "labyrinth")]
             let rotated_remote = self.rotate_mailbox_epoch_if_supported(None, now_ms)?;
             #[cfg(not(feature = "labyrinth"))]
@@ -2777,7 +2838,7 @@ pub(crate) mod native_client {
                     )?;
                 } else {
                     st.epoch_seq = st.epoch_seq.saturating_add(1);
-                    let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                    let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms, &self.hooks)?;
                 }
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
@@ -2823,7 +2884,7 @@ pub(crate) mod native_client {
             if self.is_handle_closed() {
                 return Err(MLSError::ContextClosed);
             }
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             #[cfg(feature = "labyrinth")]
             let rotated_remote = {
                 let maybe_target_pk: Option<[u8; 32]> = hex::decode(target_device_id.trim())
@@ -2850,7 +2911,7 @@ pub(crate) mod native_client {
                     )?;
                 } else {
                     st.epoch_seq = st.epoch_seq.saturating_add(1);
-                    let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                    let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms, &self.hooks)?;
                 }
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("revoke-{target_device_id}-{}", st.epoch_seq),
@@ -2898,7 +2959,7 @@ pub(crate) mod native_client {
                     if let Some(mut convo) = tx.get_conversation(conversation_id)? {
                         if imported_max_seq > convo.last_seq {
                             convo.last_seq = imported_max_seq;
-                            convo.updated_at_ms = unix_now_ms();
+                            convo.updated_at_ms = self.hooks.now_ms();
                             tx.upsert_conversation(&convo)?;
                         }
                     }
@@ -2972,11 +3033,11 @@ pub(crate) mod native_client {
                     return Ok((maybe.0, Zeroizing::new(arr)));
                 }
             }
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let epoch_seq = maybe.0.epoch_seq;
             let root = self
                 .db
-                .write_tx(|tx| ensure_owner_epoch_root(tx, epoch_seq, now_ms))?;
+                .write_tx(|tx| ensure_owner_epoch_root(tx, epoch_seq, now_ms, &self.hooks))?;
             Ok((maybe.0, root))
         }
 
@@ -3109,8 +3170,14 @@ pub(crate) mod native_client {
                 return Ok(0);
             }
 
-            let now_ms = unix_now_ms();
-            let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+            if crate::buggify!("between_labyrinth_enqueue_and_flush") {
+                return Err(MLSError::Internal(
+                    "sim buggify: between_labyrinth_enqueue_and_flush".to_string(),
+                ));
+            }
+
+            let now_ms = self.hooks.now_ms();
+            let transport_signer = load_or_create_transport_signer(&self.db, now_ms, &self.hooks)?;
             let mut mek_cache: std::collections::HashMap<String, labyrinth::mek::Mek> =
                 std::collections::HashMap::new();
             let mut total_committed: u32 = 0;
@@ -3158,6 +3225,7 @@ pub(crate) mod native_client {
                                 &payload.conversation_id,
                                 transport_signer.transport_public_key(),
                                 now_ms,
+                                &self.hooks,
                             )?;
                             mek_cache.insert(payload.conversation_id.clone(), m.clone());
                             m
@@ -3193,16 +3261,18 @@ pub(crate) mod native_client {
                                     break;
                                 }
                             };
-                            match labyrinth::message::seal_sender_committed(
-                                &mek,
-                                &payload.conversation_id,
-                                &payload.message_id,
-                                ts_ms,
-                                &nonce_32,
-                                payload.labyrinth_frame_json.as_bytes(),
-                                &archived,
-                                &transport_signer,
-                            ) {
+                            match self.hooks.with_labyrinth_rng(|| {
+                                labyrinth::message::seal_sender_committed(
+                                    &mek,
+                                    &payload.conversation_id,
+                                    &payload.message_id,
+                                    ts_ms,
+                                    &nonce_32,
+                                    payload.labyrinth_frame_json.as_bytes(),
+                                    &archived,
+                                    &transport_signer,
+                                )
+                            }) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     convo_err = Some(MLSError::Cryptography(format!(
@@ -3224,14 +3294,16 @@ pub(crate) mod native_client {
                                 Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
                             };
 
-                            let mut s = match labyrinth::message::seal_sender(
-                                &mek,
-                                &payload.conversation_id,
-                                &payload.message_id,
-                                ts_ms,
-                                &sender_data,
-                                &transport_signer,
-                            ) {
+                            let mut s = match self.hooks.with_labyrinth_rng(|| {
+                                labyrinth::message::seal_sender(
+                                    &mek,
+                                    &payload.conversation_id,
+                                    &payload.message_id,
+                                    ts_ms,
+                                    &sender_data,
+                                    &transport_signer,
+                                )
+                            }) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     convo_err = Some(MLSError::Cryptography(format!(
@@ -3303,15 +3375,17 @@ pub(crate) mod native_client {
                             }
                             // Involuntary kick / Space access revoked ([CB-22]): seal into personal mailbox Space
                             // using v5 KIND_ATTRIBUTED_FRAME so sender attribution survives restore.
-                            let owner_msg = match labyrinth::message::seal_owner_attributed(
-                                &owner_root,
-                                status.epoch_seq,
-                                &payload.conversation_id,
-                                &payload.message_id,
-                                ts_ms,
-                                &payload.sender_did,
-                                payload.labyrinth_frame_json.as_bytes(),
-                            ) {
+                            let owner_msg = match self.hooks.with_labyrinth_rng(|| {
+                                labyrinth::message::seal_owner_attributed(
+                                    &owner_root,
+                                    status.epoch_seq,
+                                    &payload.conversation_id,
+                                    &payload.message_id,
+                                    ts_ms,
+                                    &payload.sender_did,
+                                    payload.labyrinth_frame_json.as_bytes(),
+                                )
+                            }) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     convo_err = Some(MLSError::Cryptography(format!(
@@ -3527,16 +3601,20 @@ pub(crate) mod native_client {
                     continue;
                 }
                 let frame_json = canonical_labyrinth_frame_json(&msg.plaintext_json);
-                let owner_msg = labyrinth::message::seal_owner_attributed(
-                    &owner_root,
-                    status.epoch_seq,
-                    conversation_id,
-                    &msg.message_id,
-                    msg.created_at_ms.max(0) as u64,
-                    &msg.sender_did,
-                    frame_json.as_bytes(),
-                )
-                .map_err(|e| MLSError::Cryptography(format!("seal_owner_attributed: {e}")))?;
+                let owner_msg = self
+                    .hooks
+                    .with_labyrinth_rng(|| {
+                        labyrinth::message::seal_owner_attributed(
+                            &owner_root,
+                            status.epoch_seq,
+                            conversation_id,
+                            &msg.message_id,
+                            msg.created_at_ms.max(0) as u64,
+                            &msg.sender_did,
+                            frame_json.as_bytes(),
+                        )
+                    })
+                    .map_err(|e| MLSError::Cryptography(format!("seal_owner_attributed: {e}")))?;
                 sealed_items.push(owner_msg);
             }
 
@@ -3545,16 +3623,20 @@ pub(crate) mod native_client {
                 if !seen_ids.insert(payload.message_id.clone()) {
                     continue;
                 }
-                let owner_msg = labyrinth::message::seal_owner_attributed(
-                    &owner_root,
-                    status.epoch_seq,
-                    conversation_id,
-                    &payload.message_id,
-                    payload.created_at_ms.max(0) as u64,
-                    &payload.sender_did,
-                    payload.labyrinth_frame_json.as_bytes(),
-                )
-                .map_err(|e| MLSError::Cryptography(format!("seal_owner_attributed: {e}")))?;
+                let owner_msg = self
+                    .hooks
+                    .with_labyrinth_rng(|| {
+                        labyrinth::message::seal_owner_attributed(
+                            &owner_root,
+                            status.epoch_seq,
+                            conversation_id,
+                            &payload.message_id,
+                            payload.created_at_ms.max(0) as u64,
+                            &payload.sender_did,
+                            payload.labyrinth_frame_json.as_bytes(),
+                        )
+                    })
+                    .map_err(|e| MLSError::Cryptography(format!("seal_owner_attributed: {e}")))?;
                 sealed_items.push(owner_msg);
             }
 
@@ -3562,7 +3644,7 @@ pub(crate) mod native_client {
                 return Ok(0);
             }
 
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
             for (chunk_idx, chunk) in sealed_items
                 .chunks(labyrinth::records::MAX_BATCH_ITEMS)
@@ -3776,7 +3858,7 @@ pub(crate) mod native_client {
             if self.is_handle_closed() {
                 return Err(MLSError::ContextClosed);
             }
-            let now_ms = unix_now_ms();
+            let now_ms = self.hooks.now_ms();
             let imported = self.db.write_tx(|tx| {
                 let existing_convo = tx.get_conversation(conversation_id)?;
                 let group_id = existing_convo

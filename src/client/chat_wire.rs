@@ -179,12 +179,34 @@ pub fn build_acknowledge_entries_request(
     up_to_seq: i64,
     signer: &SignatureKeyPair,
 ) -> Result<Vec<u8>, MLSError> {
-    let key_id = derive_key_id(signer.public());
     let signed_at = now_rfc3339_millis();
+    build_acknowledge_entries_request_at(
+        conversation_id,
+        generation,
+        actor_device_id,
+        auth_generation,
+        up_to_seq,
+        signer,
+        &signed_at,
+    )
+}
+
+/// Build a signed `POST /xrpc/blue.catbird.chat.acknowledgeEntries` JSON body (`I14`)
+/// using a caller-supplied RFC 3339 millisecond timestamp (`signed_at`).
+pub fn build_acknowledge_entries_request_at(
+    conversation_id: &str,
+    generation: i64,
+    actor_device_id: &str,
+    auth_generation: i64,
+    up_to_seq: i64,
+    signer: &SignatureKeyPair,
+    signed_at: &str,
+) -> Result<Vec<u8>, MLSError> {
+    let key_id = derive_key_id(signer.public());
     let payload = AckTranscriptPayload {
         key_id: &key_id,
         up_to_seq,
-        signed_at: &signed_at,
+        signed_at,
         generation,
         actor_device_id,
         auth_generation,
@@ -217,6 +239,18 @@ pub fn build_pds_device_put_record_body(
     device_id: &str,
     mls_signature_public_key: &[u8],
 ) -> Result<Vec<u8>, MLSError> {
+    let created_at = now_rfc3339_millis();
+    build_pds_device_put_record_body_at(repo_did, device_id, mls_signature_public_key, &created_at)
+}
+
+/// Build `com.atproto.repo.putRecord` JSON body for `blue.catbird.chat.device/{device_id}`
+/// using a caller-supplied RFC 3339 millisecond timestamp (`created_at`).
+pub fn build_pds_device_put_record_body_at(
+    repo_did: &str,
+    device_id: &str,
+    mls_signature_public_key: &[u8],
+    created_at: &str,
+) -> Result<Vec<u8>, MLSError> {
     serde_json::to_vec(&json!({
         "repo": repo_did,
         "collection": "blue.catbird.chat.device",
@@ -225,7 +259,7 @@ pub fn build_pds_device_put_record_body(
             "$type": "blue.catbird.chat.device",
             "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(mls_signature_public_key) },
             "algorithm": "ed25519",
-            "createdAt": now_rfc3339_millis(),
+            "createdAt": created_at,
         }
     }))
     .map_err(|e| MLSError::Internal(format!("serialize blue.catbird.chat.device putRecord: {e}")))
@@ -236,6 +270,17 @@ pub fn build_pds_chat_declaration_put_record_body(
     repo_did: &str,
     delivery_service_did: &str,
 ) -> Result<Vec<u8>, MLSError> {
+    let created_at = now_rfc3339_millis();
+    build_pds_chat_declaration_put_record_body_at(repo_did, delivery_service_did, &created_at)
+}
+
+/// Build `com.atproto.repo.putRecord` JSON body for `blue.catbird.chat.declaration/self`
+/// using a caller-supplied RFC 3339 millisecond timestamp (`created_at`).
+pub fn build_pds_chat_declaration_put_record_body_at(
+    repo_did: &str,
+    delivery_service_did: &str,
+    created_at: &str,
+) -> Result<Vec<u8>, MLSError> {
     serde_json::to_vec(&json!({
         "repo": repo_did,
         "collection": "blue.catbird.chat.declaration",
@@ -245,7 +290,7 @@ pub fn build_pds_chat_declaration_put_record_body(
             "allowIncoming": "all",
             "deliveryService": delivery_service_did,
             "protocolVersion": "2",
-            "createdAt": now_rfc3339_millis(),
+            "createdAt": created_at,
         }
     }))
     .map_err(|e| {
@@ -724,6 +769,50 @@ pub fn build_encrypted_metadata_snapshot_json(
     space_avatar: Option<crate::groups::metadata_v1::SpaceAvatarPointer>,
 ) -> Result<Value, MLSError> {
     let nonce: [u8; 12] = rand::random();
+    build_encrypted_metadata_snapshot_json_with_nonce(
+        metadata_key,
+        group_id,
+        convo_uuid,
+        generation,
+        target_epoch,
+        group_context_hash,
+        confirmation_tag,
+        transition_id,
+        metadata_version,
+        origin_seq,
+        actor_did,
+        actor_device_id,
+        auth_generation,
+        public_key,
+        title,
+        description,
+        space_avatar,
+        nonce,
+    )
+}
+
+/// Build an encrypted `metadataSnapshot` JSON object using an explicit 12-byte AEAD `nonce`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_encrypted_metadata_snapshot_json_with_nonce(
+    metadata_key: &[u8; 32],
+    group_id: &[u8],
+    convo_uuid: &uuid::Uuid,
+    generation: i64,
+    target_epoch: u64,
+    group_context_hash: &[u8],
+    confirmation_tag: &[u8],
+    transition_id: &str,
+    metadata_version: u64,
+    origin_seq: u64,
+    actor_did: &str,
+    actor_device_id: &str,
+    auth_generation: i64,
+    public_key: &[u8],
+    title: &str,
+    description: &str,
+    space_avatar: Option<crate::groups::metadata_v1::SpaceAvatarPointer>,
+    nonce: [u8; 12],
+) -> Result<Value, MLSError> {
     let payload = GroupMetadataV1 {
         version: 1,
         title: title.to_string(),
