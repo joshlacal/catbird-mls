@@ -1754,16 +1754,22 @@ pub(crate) mod native_client {
                 .map_err(|e| MLSError::Cryptography(format!("members_hash_for_devices: {e}")))?;
 
                 let (public, encrypted_prev_seq, encrypted_prev_root) = if seq == 0 {
-                    let pub0 = labyrinth::mailbox::EpochPublic::sign(
-                        &self.normalized_did,
-                        0,
-                        &cur_secret.mailbox_keys(),
-                        members_hash,
-                        None,
-                        None,
-                        transport_signer,
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("EpochPublic::sign(0): {e}")))?;
+                    let pub0 = self
+                        .hooks
+                        .with_labyrinth_rng(|| {
+                            labyrinth::mailbox::EpochPublic::sign(
+                                &self.normalized_did,
+                                0,
+                                &cur_secret.mailbox_keys(),
+                                members_hash,
+                                None,
+                                None,
+                                transport_signer,
+                            )
+                        })
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!("EpochPublic::sign(0): {e}"))
+                        })?;
                     (pub0, None, None)
                 } else {
                     let prev_seq = seq - 1;
@@ -1785,34 +1791,35 @@ pub(crate) mod native_client {
                             ))
                         })?;
                     let prev_keys = prev_secret.mailbox_keys();
-                    let pub_n = labyrinth::mailbox::EpochPublic::sign(
-                        &self.normalized_did,
-                        seq,
-                        &cur_secret.mailbox_keys(),
-                        members_hash,
-                        Some(prev_head),
-                        Some(&prev_keys.sig_secret),
-                        transport_signer,
-                    )
-                    .map_err(|e| {
-                        MLSError::Cryptography(format!("EpochPublic::sign({seq}): {e}"))
-                    })?;
                     let data_key = cur_secret.data_key();
-                    let (enc_prev_seq, enc_prev_root) = self.hooks.with_labyrinth_rng(|| {
-                        let enc_seq = labyrinth::aead::seal(
-                            &data_key,
-                            b"epoch_data_metadata",
-                            prev_seq.to_string().as_bytes(),
-                        )
-                        .map_err(|e| MLSError::Cryptography(format!("seal prev_seq: {e}")))?;
-                        let enc_root = labyrinth::aead::seal(
-                            &data_key,
-                            b"epoch_data_metadata",
-                            prev_secret.root(),
-                        )
-                        .map_err(|e| MLSError::Cryptography(format!("seal prev_root: {e}")))?;
-                        Ok::<_, MLSError>((enc_seq, enc_root))
-                    })?;
+                    let (pub_n, enc_prev_seq, enc_prev_root) =
+                        self.hooks.with_labyrinth_rng(|| {
+                            let pub_n = labyrinth::mailbox::EpochPublic::sign(
+                                &self.normalized_did,
+                                seq,
+                                &cur_secret.mailbox_keys(),
+                                members_hash,
+                                Some(prev_head),
+                                Some(&prev_keys.sig_secret),
+                                transport_signer,
+                            )
+                            .map_err(|e| {
+                                MLSError::Cryptography(format!("EpochPublic::sign({seq}): {e}"))
+                            })?;
+                            let enc_seq = labyrinth::aead::seal(
+                                &data_key,
+                                b"epoch_data_metadata",
+                                prev_seq.to_string().as_bytes(),
+                            )
+                            .map_err(|e| MLSError::Cryptography(format!("seal prev_seq: {e}")))?;
+                            let enc_root = labyrinth::aead::seal(
+                                &data_key,
+                                b"epoch_data_metadata",
+                                prev_secret.root(),
+                            )
+                            .map_err(|e| MLSError::Cryptography(format!("seal prev_root: {e}")))?;
+                            Ok::<_, MLSError>((pub_n, enc_seq, enc_root))
+                        })?;
                     (pub_n, Some(enc_prev_seq), Some(enc_prev_root))
                 };
 

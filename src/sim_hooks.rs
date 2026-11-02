@@ -7,6 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime as OpenMlsSystemTime, UNIX_EPOCH as OPENMLS_UNIX_EPOCH};
+#[cfg(target_arch = "wasm32")]
+use web_time::{SystemTime as OpenMlsSystemTime, UNIX_EPOCH as OPENMLS_UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 use hpke_rs_crypto::{
@@ -15,6 +20,12 @@ use hpke_rs_crypto::{
     HpkeCrypto, HpkeTestRng, TryCryptoRng, TryRng,
 };
 use hpke_rs_libcrux::HpkeLibcrux;
+use openmls::prelude::{
+    KeyPackage, KeyPackageIn, KeyPackageVerifyError, MlsGroupJoinConfig, ProtocolVersion,
+    PublicTreeError, RatchetTreeIn, StagedWelcome, Welcome, WelcomeError,
+};
+use openmls::treesync::errors::LeafNodeValidationError;
+use openmls::treesync::LeafNodeSource;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::CryptoProvider as LibcruxCryptoProvider;
 use openmls_memory_storage::MemoryStorage;
@@ -300,6 +311,129 @@ impl SimClientHooks {
     pub fn with_labyrinth_rng<T>(&self, f: impl FnOnce() -> T) -> T {
         f()
     }
+
+    /// Validate `kp_in` cryptographically and check its lifetime against `self.now_secs()`.
+    pub fn validate_key_package(
+        &self,
+        kp_in: KeyPackageIn,
+        crypto: &impl OpenMlsCrypto,
+        version: ProtocolVersion,
+    ) -> Result<KeyPackage, KeyPackageVerifyError> {
+        validate_key_package_at(kp_in, crypto, version, self.now_secs())
+    }
+
+    /// Stage an MLS `Welcome` and validate all `KeyPackage` leaf lifetimes against `self.now_secs()`.
+    pub fn build_staged_welcome<P: openmls::storage::OpenMlsProvider>(
+        &self,
+        provider: &P,
+        join_config: &MlsGroupJoinConfig,
+        welcome: Welcome,
+        ratchet_tree: Option<RatchetTreeIn>,
+    ) -> Result<StagedWelcome, WelcomeError<P::StorageError>> {
+        build_staged_welcome_at(
+            provider,
+            join_config,
+            welcome,
+            ratchet_tree,
+            self.now_secs(),
+        )
+    }
+}
+
+/// Convert Unix timestamp seconds from [`SimClock`] into OpenMLS's platform `SystemTime`.
+pub fn sim_unix_system_time(now_secs: u64) -> OpenMlsSystemTime {
+    OPENMLS_UNIX_EPOCH
+        .checked_add(Duration::from_secs(now_secs))
+        .unwrap_or(OPENMLS_UNIX_EPOCH)
+}
+
+/// Cryptographically validate `kp_in` (signatures, protocol version, capabilities, distinct keys)
+/// while enforcing `[not_before, not_after)` strictly against `now_secs` instead of real wall-clock.
+///
+/// Under `feature = "sim"` (`openmls/unchecked-conversions`), `KeyPackageIn::validate` runs every
+/// cryptographic/structural check before its final `life_time.validate()` call; if only the real
+/// wall-clock check differs from `now_secs`, we convert the cryptographically verified package and
+/// re-validate its `Lifetime` at `sim_unix_system_time(now_secs)`.
+pub fn validate_key_package_at(
+    kp_in: KeyPackageIn,
+    crypto: &impl OpenMlsCrypto,
+    version: ProtocolVersion,
+    now_secs: u64,
+) -> Result<KeyPackage, KeyPackageVerifyError> {
+    let sim_time = sim_unix_system_time(now_secs);
+    #[cfg(feature = "sim")]
+    {
+        let kp_in_backup = kp_in.clone();
+        match kp_in.validate(crypto, version) {
+            Ok(kp) => {
+                kp.life_time().validate_with_time(sim_time)?;
+                Ok(kp)
+            }
+            Err(KeyPackageVerifyError::LifetimeError(_)) => {
+                let kp = kp_in_backup.into_unchecked();
+                kp.life_time().validate_with_time(sim_time)?;
+                Ok(kp)
+            }
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        let kp = kp_in.validate(crypto, version)?;
+        kp.life_time().validate_with_time(sim_time)?;
+        Ok(kp)
+    }
+}
+
+/// Stage an MLS `Welcome` via `JoinBuilder::skip_lifetime_validation()` (preserving full GroupInfo
+/// signature, tree hash, parent hash, and leaf signature verification) and validate every
+/// `LeafNodeSource::KeyPackage(lifetime)` leaf in the ratchet tree against `now_secs`.
+pub fn build_staged_welcome_at<P: openmls::storage::OpenMlsProvider>(
+    provider: &P,
+    join_config: &MlsGroupJoinConfig,
+    welcome: Welcome,
+    ratchet_tree: Option<RatchetTreeIn>,
+    now_secs: u64,
+) -> Result<StagedWelcome, WelcomeError<P::StorageError>> {
+    let sim_time = sim_unix_system_time(now_secs);
+    let mut builder = StagedWelcome::build_from_welcome(provider, join_config, welcome)?;
+    let ciphersuite = builder
+        .processed_welcome()
+        .unverified_group_info()
+        .ciphersuite();
+    let group_id = builder
+        .processed_welcome()
+        .unverified_group_info()
+        .group_id()
+        .clone();
+    let rt_from_ext = builder
+        .processed_welcome()
+        .unverified_group_info()
+        .extensions()
+        .ratchet_tree()
+        .map(|ext| ext.ratchet_tree().clone());
+    let rt_for_lifetimes = match rt_from_ext {
+        Some(rt) => rt,
+        None => match ratchet_tree.clone() {
+            Some(rt) => rt,
+            None => return Err(WelcomeError::MissingRatchetTree),
+        },
+    };
+    if let Some(rt) = ratchet_tree {
+        builder = builder.with_ratchet_tree(rt);
+    }
+    let staged = builder.skip_lifetime_validation().build()?;
+    let verified_tree = rt_for_lifetimes
+        .into_verified(ciphersuite, provider.crypto(), &group_id)
+        .map_err(|_| WelcomeError::PublicTreeError(PublicTreeError::MalformedTree))?;
+    for leaf in verified_tree.leaves() {
+        if let LeafNodeSource::KeyPackage(lifetime) = leaf.leaf_node_source() {
+            lifetime
+                .validate_with_time(sim_time)
+                .map_err(LeafNodeValidationError::Lifetime)?;
+        }
+    }
+    Ok(staged)
 }
 
 /// Shareable probe allowing `SimTransport::execute_http` to assert that no SQLite

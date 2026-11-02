@@ -228,9 +228,13 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         else {
             return Err(invalid("Expected MLS KeyPackage"));
         };
-        let kp = kp
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(crypto_error)?;
+        let kp = crate::sim_hooks::validate_key_package_at(
+            kp,
+            provider.crypto(),
+            ProtocolVersion::Mls10,
+            now,
+        )
+        .map_err(crypto_error)?;
         if kp.last_resort()
             || kp.ciphersuite() != Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519
             || kp
@@ -430,7 +434,7 @@ pub fn import_with_provider<P: OpenMlsProvider>(
         .use_ratchet_tree_extension(true)
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .build();
-    let group = StagedWelcome::new_from_welcome(provider, &config, welcome, None)
+    let group = crate::sim_hooks::build_staged_welcome_at(provider, &config, welcome, None, now)
         .map_err(crypto_error)?
         .into_group(provider)
         .map_err(crypto_error)?;

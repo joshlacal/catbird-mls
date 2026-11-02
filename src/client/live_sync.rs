@@ -441,9 +441,14 @@ impl CatbirdMlsClient {
                     "C33 opaqueWelcome is not an MLS Welcome".to_string(),
                 ));
             };
-            let staged =
-                StagedWelcome::new_from_welcome(&provider, &build_join_config(), welcome, None)
-                    .map_err(|e| MLSError::Cryptography(format!("stage C33 Welcome: {e:?}")))?;
+            let staged = crate::sim_hooks::build_staged_welcome_at(
+                &provider,
+                &build_join_config(),
+                welcome,
+                None,
+                (now_ms.max(0) as u64) / 1_000,
+            )
+            .map_err(|e| MLSError::Cryptography(format!("stage C33 Welcome: {e:?}")))?;
 
             let sender_member = staged.welcome_sender().map_err(|e| {
                 MLSError::Cryptography(format!("C33 welcome_sender lookup failed: {e:?}"))
@@ -733,9 +738,14 @@ impl CatbirdMlsClient {
                 let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
                     return Err(MLSError::Cryptography("not Welcome".to_string()));
                 };
-                let staged =
-                    StagedWelcome::new_from_welcome(&provider, &build_join_config(), welcome, None)
-                        .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
+                let staged = crate::sim_hooks::build_staged_welcome_at(
+                    &provider,
+                    &build_join_config(),
+                    welcome,
+                    None,
+                    (now_ms.max(0) as u64) / 1_000,
+                )
+                .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
                 let mut found = Vec::new();
                 if let Ok(sender) = staged.welcome_sender() {
                     if let Ok((d, _)) =
@@ -768,11 +778,12 @@ impl CatbirdMlsClient {
                 let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
                     return Err(MLSError::Cryptography("not Welcome".to_string()));
                 };
-                let staged = StagedWelcome::new_from_welcome(
+                let staged = crate::sim_hooks::build_staged_welcome_at(
                     &provider,
                     &build_join_config(),
                     welcome,
                     None,
+                    (now_ms.max(0) as u64) / 1_000,
                 )
                 .map_err(|e| MLSError::Cryptography(format!("stage Welcome: {e:?}")))?;
                 let sender = staged
@@ -1007,9 +1018,13 @@ impl CatbirdMlsClient {
                 let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
                 let storage = OpenMlsKvStorage::new(&overlay);
                 let provider = self.hooks.openmls_provider(storage);
-                let validated_kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::Mls10)
-                    .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
+                let validated_kp = crate::sim_hooks::validate_key_package_at(
+                    kp_in,
+                    provider.crypto(),
+                    ProtocolVersion::Mls10,
+                    (now_ms.max(0) as u64) / 1_000,
+                )
+                .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
                 let Some(mut group) =
                     MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
                         .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?

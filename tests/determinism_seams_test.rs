@@ -4,20 +4,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use catbird_mls::client::REQUIRED_LABYRINTH_OAUTH_SCOPES;
 use catbird_mls::sim_hooks::{
-    ChaChaSimEntropy, FixedStepClock, SeededOpenMlsCryptoProvider, SimClientHooks, SimClock,
-    SimEntropy, TxAutocommitProbe,
+    build_staged_welcome_at, validate_key_package_at, ChaChaSimEntropy, FixedStepClock,
+    SeededOpenMlsCryptoProvider, SimClientHooks, SimClock, SimEntropy, TxAutocommitProbe,
 };
 use catbird_mls::{
     buggify, CatbirdMlsClient, CatbirdMlsClientConfig, MLSError, PlatformHttpHeader,
     PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport, SqlDriver,
 };
 use openmls::prelude::*;
+use openmls::treesync::errors::{LeafNodeValidationError, LifetimeError};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::random::OpenMlsRand;
 use openmls_traits::OpenMlsProvider;
 use p256::ecdsa::SigningKey as P256SigningKey;
-use tls_codec::Serialize as _;
+use tls_codec::{Deserialize as _, Serialize as _};
+
+/// Fixed simulation start epoch (`2025-11-01T12:26:40.000Z`) — zero host wall-clock reads.
+const PINNED_START_MS: i64 = 1_762_000_000_000;
+const PINNED_START_SECS: u64 = 1_762_000_000;
+const PINNED_RECEIPT_ISSUED_AT_MS: i64 = 1_762_000_000_500;
+/// Fixed upper-bound constant (`2100-01-01T00:00:00Z`) for OpenMLS `add_members` leaves.
+const PINNED_FAR_NOT_AFTER_SECS: u64 = 4_102_444_800;
 
 struct DeterministicKeyStore {
     items: Mutex<HashMap<String, Vec<u8>>>,
@@ -346,7 +354,7 @@ impl PlatformTransport for DeterministicMockTransport {
                 entry_id: msg_id.to_string(),
                 archive_commitment,
                 seq: 2,
-                issued_at_ms: 1_793_620_000_500,
+                issued_at_ms: PINNED_RECEIPT_ISSUED_AT_MS,
             };
             let signed = labyrinth_protocol::receipt::sign_sequencer_receipt(
                 &self.sequencer_signing_key,
@@ -374,7 +382,7 @@ impl PlatformTransport for DeterministicMockTransport {
                     "senderDeviceId": sender_dev_id,
                     "entryId": msg_id,
                     "archiveCommitment": { "$bytes": archive_commitment_b64 },
-                    "issuedAtMs": 1_793_620_000_500_i64,
+                    "issuedAtMs": PINNED_RECEIPT_ISSUED_AT_MS,
                     "signature": { "$bytes": BASE64.encode(signed.signature) }
                 }
             })));
@@ -413,15 +421,33 @@ fn default_test_scopes() -> Vec<String> {
         .collect()
 }
 
-fn pinned_base_epoch_ms() -> i64 {
-    static BASE_MS: OnceLock<i64> = OnceLock::new();
-    *BASE_MS.get_or_init(|| {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        (secs as i64) * 1_000
-    })
+fn hash_recorded_calls(calls: &[RecordedHttpCall]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(calls.len() as u64).to_le_bytes());
+    for call in calls {
+        hasher.update(&(call.method.len() as u64).to_le_bytes());
+        hasher.update(call.method.as_bytes());
+        hasher.update(&(call.url.len() as u64).to_le_bytes());
+        hasher.update(call.url.as_bytes());
+        hasher.update(&(call.headers.len() as u64).to_le_bytes());
+        for h in &call.headers {
+            hasher.update(&(h.name.len() as u64).to_le_bytes());
+            hasher.update(h.name.as_bytes());
+            hasher.update(&(h.value.len() as u64).to_le_bytes());
+            hasher.update(h.value.as_bytes());
+        }
+        match &call.body {
+            Some(body) => {
+                hasher.update(&[1]);
+                hasher.update(&(body.len() as u64).to_le_bytes());
+                hasher.update(body);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 fn test_client_config(storage_root: String) -> CatbirdMlsClientConfig {
@@ -437,23 +463,22 @@ fn test_client_config(storage_root: String) -> CatbirdMlsClientConfig {
 
 #[test]
 fn fixed_step_clock_is_monotonic_and_deterministic() {
-    let c1 = FixedStepClock::new(1_793_620_000_000, 25);
-    let c2 = FixedStepClock::new(1_793_620_000_000, 25);
-    assert_eq!(c1.now_ms(), 1_793_620_000_000);
-    assert_eq!(c1.now_ms(), 1_793_620_000_025);
-    assert_eq!(c1.now_ms(), 1_793_620_000_050);
+    let c1 = FixedStepClock::new(PINNED_START_MS, 25);
+    let c2 = FixedStepClock::new(PINNED_START_MS, 25);
+    assert_eq!(c1.now_ms(), 1_762_000_000_000);
+    assert_eq!(c1.now_ms(), 1_762_000_000_025);
+    assert_eq!(c1.now_ms(), 1_762_000_000_050);
 
-    assert_eq!(c2.now_ms(), 1_793_620_000_000);
-    assert_eq!(c2.now_ms(), 1_793_620_000_025);
-    assert_eq!(c2.now_ms(), 1_793_620_000_050);
+    assert_eq!(c2.now_ms(), 1_762_000_000_000);
+    assert_eq!(c2.now_ms(), 1_762_000_000_025);
+    assert_eq!(c2.now_ms(), 1_762_000_000_050);
 }
 
 #[test]
 fn two_seeded_clients_produce_byte_identical_enrollment_and_ciphertexts() {
-    let base_ms = pinned_base_epoch_ms();
     let run = |seed: u64| -> (Vec<u8>, Vec<u8>, Vec<u8>, String) {
         let dir = tempfile::tempdir().unwrap();
-        let clock: Arc<dyn SimClock> = Arc::new(FixedStepClock::new(base_ms, 10));
+        let clock: Arc<dyn SimClock> = Arc::new(FixedStepClock::new(1_762_000_000_000, 10));
         let entropy: Arc<dyn SimEntropy> =
             Arc::new(ChaChaSimEntropy::from_seed(seed, b"alice-dev-1"));
         let hooks = SimClientHooks::new(clock, entropy);
@@ -510,17 +535,34 @@ fn two_seeded_clients_produce_byte_identical_enrollment_and_ciphertexts() {
         )
     };
 
-    assert_eq!(run(8_492_014), run(8_492_014));
-    assert_ne!(run(8_492_014), run(8_492_015));
+    let out_a = run(8_492_014);
+    let out_b = run(8_492_014);
+    let out_c = run(8_492_015);
+    assert_eq!(out_a, out_b);
+    assert_ne!(out_a, out_c);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(out_a.0.len() as u64).to_le_bytes());
+    hasher.update(&out_a.0);
+    hasher.update(&(out_a.1.len() as u64).to_le_bytes());
+    hasher.update(&out_a.1);
+    hasher.update(&(out_a.2.len() as u64).to_le_bytes());
+    hasher.update(&out_a.2);
+    hasher.update(&(out_a.3.len() as u64).to_le_bytes());
+    hasher.update(out_a.3.as_bytes());
+    let digest_hex = hasher.finalize().to_hex().to_string();
+    assert_eq!(
+        digest_hex, "87cc87a4b71d87b975516d578fc9264ff2b8d79a1e9592dd4d38a67c2b67189c",
+        "cross-process enrollment + X-Wing ciphertext blake3 digest drifted"
+    );
 }
 
 #[test]
 fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i6() {
-    let base_ms = pinned_base_epoch_ms();
     let run_transcript = |seed: u64| -> Vec<RecordedHttpCall> {
         let dir = tempfile::tempdir().unwrap();
         let hooks = SimClientHooks::new(
-            Arc::new(FixedStepClock::new(base_ms, 25)),
+            Arc::new(FixedStepClock::new(PINNED_START_MS, 25)),
             Arc::new(ChaChaSimEntropy::from_seed(seed, b"wire-transcript")),
         );
         let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
@@ -560,13 +602,79 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     assert!(!t1.is_empty());
     assert_eq!(t1, t2);
     assert_ne!(t1, t3);
+    assert_eq!(
+        hash_recorded_calls(&t1),
+        "f22ff0ad05cfd2aa3c5437d33ad55c5c6ed980b64ae9b38c751a51388ed0c69d",
+        "cross-process HTTP wire transcript blake3 digest drifted"
+    );
+}
+
+#[cfg(feature = "labyrinth")]
+#[test]
+fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_writes() {
+    let run_mailbox_flow = |seed: u64| -> (String, String, Vec<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = SimClientHooks::new(
+            Arc::new(FixedStepClock::new(PINNED_START_MS, 10)),
+            Arc::new(ChaChaSimEntropy::from_seed(seed, b"labyrinth-mailbox")),
+        );
+        let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
+        let keystore = Arc::new(DeterministicKeyStore::new());
+        let transport = Arc::new(DeterministicMockTransport::new());
+        let client =
+            CatbirdMlsClient::open_with_hooks(cfg, keystore, transport.clone(), None, hooks)
+                .unwrap();
+        transport.attach_client(&client);
+
+        client.enroll_device(&default_test_scopes()).unwrap();
+
+        // Advance local Labyrinth epoch via hybrid PQ CPace + ML-KEM-768 OTC pairing
+        // so `complete_otc_pairing` + `setup_recovery_code` publish Device, Epoch(0)
+        // (`EpochPublic::sign(0)`), rotated Epoch(1) (`open_next` / `EpochPublic::sign(1)` +
+        // `aead::seal` prev_seq/prev_root), and `VirtualDevice`!
+        let offer = client.initiate_otc_pairing().unwrap();
+        let completion = client.complete_otc_pairing(&offer.six_digit_code).unwrap();
+        assert!(completion.new_epoch_seq >= 1);
+
+        let recovery_code = client.setup_recovery_code().unwrap();
+
+        let apply_writes_bodies: Vec<Vec<u8>> = transport
+            .recorded_calls()
+            .into_iter()
+            .filter(|c| c.url.contains("/xrpc/com.atproto.space.applyWrites"))
+            .map(|c| c.body.expect("applyWrites body present"))
+            .collect();
+        assert!(apply_writes_bodies.len() >= 4);
+
+        (offer.formatted_code, recovery_code, apply_writes_bodies)
+    };
+
+    let m1 = run_mailbox_flow(8_492_014);
+    let m2 = run_mailbox_flow(8_492_014);
+    let m3 = run_mailbox_flow(8_492_015);
+    assert_eq!(m1, m2);
+    assert_ne!(m1, m3);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(m1.0.as_bytes());
+    hasher.update(m1.1.as_bytes());
+    for body in &m1.2 {
+        hasher.update(&(body.len() as u64).to_le_bytes());
+        hasher.update(body);
+    }
+    assert_eq!(
+        hasher.finalize().to_hex().to_string(),
+        "77506b4696c2731713cb59cc89634facf6a7a0c954914c18d22b77c17de77c7b",
+        "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
+    );
 }
 
 #[test]
 fn seeded_openmls_crypto_provider_draws_strictly_from_sim_entropy() {
-    let base_secs = (pinned_base_epoch_ms() / 1_000) as u64;
-    let lifetime = Lifetime::init(base_secs.saturating_sub(60), base_secs + 30 * 86_400);
-    let run_openmls = |seed: u64| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    // Pure compile-time constants — zero host wall-clock reads.
+    let creator_lifetime = Lifetime::init(PINNED_START_SECS - 60, PINNED_START_SECS + 30 * 86_400);
+    let joiner_lifetime = Lifetime::init(PINNED_START_SECS - 60, PINNED_FAR_NOT_AFTER_SECS);
+    let run_openmls = |seed: u64| -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         let alice_entropy: Arc<dyn SimEntropy> =
             Arc::new(ChaChaSimEntropy::from_seed(seed, b"alice-openmls"));
         let bob_entropy: Arc<dyn SimEntropy> =
@@ -592,7 +700,7 @@ fn seeded_openmls_crypto_provider_draws_strictly_from_sim_entropy() {
         bob_signer.store(bob_provider.storage()).unwrap();
 
         let bob_kp = KeyPackage::builder()
-            .key_package_lifetime(lifetime)
+            .key_package_lifetime(joiner_lifetime)
             .leaf_node_capabilities(Capabilities::builder().ciphersuites(vec![suite]).build())
             .build(
                 suite,
@@ -608,7 +716,7 @@ fn seeded_openmls_crypto_provider_draws_strictly_from_sim_entropy() {
 
         let cfg = MlsGroupCreateConfig::builder()
             .ciphersuite(suite)
-            .lifetime(lifetime)
+            .lifetime(creator_lifetime)
             .use_ratchet_tree_extension(true)
             .build();
         let gid: [u8; 32] = alice_provider.rand().random_array().unwrap();
@@ -624,7 +732,7 @@ fn seeded_openmls_crypto_provider_draws_strictly_from_sim_entropy() {
         )
         .unwrap();
 
-        let (commit, welcome, _) = group
+        let (commit, welcome_out, _) = group
             .add_members(
                 &alice_provider,
                 &alice_signer,
@@ -636,20 +744,333 @@ fn seeded_openmls_crypto_provider_draws_strictly_from_sim_entropy() {
             .create_message(&alice_provider, &alice_signer, b"pq welcome + msg")
             .unwrap();
 
+        let welcome_bytes = welcome_out.tls_serialize_detached().unwrap();
+        let msg_bytes = msg.tls_serialize_detached().unwrap();
+
+        // Bob stages Welcome against `PINNED_START_SECS` and decrypts Alice's X-Wing message.
+        let MlsMessageBodyIn::Welcome(welcome_in) =
+            MlsMessageIn::tls_deserialize_exact(&welcome_bytes)
+                .unwrap()
+                .extract()
+        else {
+            panic!("expected Welcome");
+        };
+        let join_cfg = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let mut bob_group = build_staged_welcome_at(
+            &bob_provider,
+            &join_cfg,
+            welcome_in,
+            None,
+            PINNED_START_SECS,
+        )
+        .unwrap()
+        .into_group(&bob_provider)
+        .unwrap();
+        let proto_msg = MlsMessageIn::tls_deserialize_exact(&msg_bytes)
+            .unwrap()
+            .try_into_protocol_message()
+            .unwrap();
+        let processed = bob_group.process_message(&bob_provider, proto_msg).unwrap();
+        let ProcessedMessageContent::ApplicationMessage(app_msg) = processed.into_content() else {
+            panic!("expected ApplicationMessage");
+        };
+        let decrypted = app_msg.into_bytes();
+        assert_eq!(decrypted, b"pq welcome + msg");
+
         (
             bob_kp_bytes,
-            welcome.tls_serialize_detached().unwrap(),
+            welcome_bytes,
             commit
                 .tls_serialize_detached()
                 .unwrap()
                 .into_iter()
-                .chain(msg.tls_serialize_detached().unwrap())
+                .chain(msg_bytes)
                 .collect(),
+            decrypted,
         )
     };
 
-    assert_eq!(run_openmls(4242), run_openmls(4242));
-    assert_ne!(run_openmls(4242), run_openmls(4243));
+    let o1 = run_openmls(4242);
+    let o2 = run_openmls(4242);
+    let o3 = run_openmls(4243);
+    assert_eq!(o1, o2);
+    assert_ne!(o1, o3);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&o1.0);
+    hasher.update(&o1.1);
+    hasher.update(&o1.2);
+    hasher.update(&o1.3);
+    assert_eq!(
+        hasher.finalize().to_hex().to_string(),
+        "b4db2ae80e97896e6e9e8c3bc9481e7818394db7339476ff4a3c1eb1a2d880d2",
+        "cross-process OpenMLS X-Wing Welcome + ciphertext digest drifted"
+    );
+}
+
+#[test]
+fn sim_clock_virtual_time_travel_validates_and_expires_welcomes() {
+    let suite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+    let join_cfg = MlsGroupJoinConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .build();
+
+    let mint_welcome = |seed: u64| {
+        let alice_provider = SeededOpenMlsCryptoProvider::new(Arc::new(
+            ChaChaSimEntropy::from_seed(seed, b"tt-alice"),
+        ));
+        let bob_provider = SeededOpenMlsCryptoProvider::new(Arc::new(ChaChaSimEntropy::from_seed(
+            seed, b"tt-bob",
+        )));
+        let (alice_sk, alice_pk) = alice_provider
+            .crypto()
+            .signature_key_gen(suite.signature_algorithm())
+            .unwrap();
+        let alice_signer =
+            SignatureKeyPair::from_raw(suite.signature_algorithm(), alice_sk, alice_pk);
+        alice_signer.store(alice_provider.storage()).unwrap();
+
+        let (bob_sk, bob_pk) = bob_provider
+            .crypto()
+            .signature_key_gen(suite.signature_algorithm())
+            .unwrap();
+        let bob_signer = SignatureKeyPair::from_raw(suite.signature_algorithm(), bob_sk, bob_pk);
+        bob_signer.store(bob_provider.storage()).unwrap();
+
+        let bob_kp = KeyPackage::builder()
+            .key_package_lifetime(Lifetime::init(
+                PINNED_START_SECS - 60,
+                PINNED_FAR_NOT_AFTER_SECS,
+            ))
+            .leaf_node_capabilities(Capabilities::builder().ciphersuites(vec![suite]).build())
+            .build(
+                suite,
+                &bob_provider,
+                &bob_signer,
+                CredentialWithKey {
+                    credential: BasicCredential::new(b"did:plc:bob#dev1".to_vec()).into(),
+                    signature_key: bob_signer.public().into(),
+                },
+            )
+            .unwrap();
+
+        let cfg = MlsGroupCreateConfig::builder()
+            .ciphersuite(suite)
+            .lifetime(Lifetime::init(
+                PINNED_START_SECS - 60,
+                PINNED_START_SECS + 29 * 86_400,
+            ))
+            .use_ratchet_tree_extension(true)
+            .build();
+        let gid: [u8; 32] = alice_provider.rand().random_array().unwrap();
+        let mut group = MlsGroup::new_with_group_id(
+            &alice_provider,
+            &alice_signer,
+            &cfg,
+            GroupId::from_slice(&gid),
+            CredentialWithKey {
+                credential: BasicCredential::new(b"did:plc:alice#dev1".to_vec()).into(),
+                signature_key: alice_signer.public().into(),
+            },
+        )
+        .unwrap();
+        let bob_kp_bytes = MlsMessageOut::from(bob_kp.key_package().clone())
+            .tls_serialize_detached()
+            .unwrap();
+        let (_commit, welcome_out, _) = group
+            .add_members(
+                &alice_provider,
+                &alice_signer,
+                &[bob_kp.key_package().clone()],
+            )
+            .unwrap();
+        let welcome_bytes = welcome_out.tls_serialize_detached().unwrap();
+        let MlsMessageBodyIn::Welcome(welcome_in) =
+            MlsMessageIn::tls_deserialize_exact(&welcome_bytes)
+                .unwrap()
+                .extract()
+        else {
+            panic!("expected Welcome");
+        };
+        (bob_provider, bob_kp_bytes, welcome_in)
+    };
+
+    // 1. Rewinding SimClock before `not_before` rejects both KP and Welcome with `NotValidYet`.
+    let (bob_early, kp_bytes_early, welcome_early) = mint_welcome(5150);
+    let MlsMessageBodyIn::KeyPackage(kp_in_early) =
+        MlsMessageIn::tls_deserialize_exact(&kp_bytes_early)
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected KeyPackage");
+    };
+    assert!(matches!(
+        validate_key_package_at(
+            kp_in_early,
+            bob_early.crypto(),
+            ProtocolVersion::Mls10,
+            PINNED_START_SECS - 120
+        ),
+        Err(KeyPackageVerifyError::LifetimeError(LifetimeError::NotValidYet { now, .. }))
+            if now == PINNED_START_SECS - 120
+    ));
+    let err_early = build_staged_welcome_at(
+        &bob_early,
+        &join_cfg,
+        welcome_early,
+        None,
+        PINNED_START_SECS - 120,
+    )
+    .expect_err("Welcome before SimClock not_before must fail");
+    assert!(matches!(
+        err_early,
+        WelcomeError::LeafNodeValidation(LeafNodeValidationError::Lifetime(
+            LifetimeError::NotValidYet { now, .. }
+        )) if now == PINNED_START_SECS - 120
+    ));
+
+    // 2. Advancing SimClock to `+7 days` succeeds cleanly.
+    let (bob_ok, _kp_bytes_ok, welcome_ok) = mint_welcome(5150);
+    let _joined = build_staged_welcome_at(
+        &bob_ok,
+        &join_cfg,
+        welcome_ok,
+        None,
+        PINNED_START_SECS + 7 * 86_400,
+    )
+    .expect("Welcome at +7d SimClock must succeed")
+    .into_group(&bob_ok)
+    .unwrap();
+
+    // 3. Advancing SimClock past `not_after` rejects both KP and Welcome with `Expired`.
+    let (bob_exp, kp_bytes_exp, welcome_exp) = mint_welcome(5150);
+    let MlsMessageBodyIn::KeyPackage(kp_in_exp) =
+        MlsMessageIn::tls_deserialize_exact(&kp_bytes_exp)
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected KeyPackage");
+    };
+    assert!(matches!(
+        validate_key_package_at(
+            kp_in_exp,
+            bob_exp.crypto(),
+            ProtocolVersion::Mls10,
+            PINNED_FAR_NOT_AFTER_SECS + 86_400
+        ),
+        Err(KeyPackageVerifyError::LifetimeError(LifetimeError::Expired { now, .. }))
+            if now == PINNED_FAR_NOT_AFTER_SECS + 86_400
+    ));
+    let err_exp = build_staged_welcome_at(
+        &bob_exp,
+        &join_cfg,
+        welcome_exp,
+        None,
+        PINNED_FAR_NOT_AFTER_SECS + 86_400,
+    )
+    .expect_err("Welcome past SimClock not_after must fail");
+    assert!(matches!(
+        err_exp,
+        WelcomeError::LeafNodeValidation(LeafNodeValidationError::Lifetime(
+            LifetimeError::Expired { now, .. }
+        )) if now == PINNED_FAR_NOT_AFTER_SECS + 86_400
+    ));
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn sim_clock_virtual_time_travel_validates_and_expires_29_day_key_package() {
+    let suite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+    let clock = FixedStepClock::new(PINNED_START_MS, 10);
+    let t0 = clock.now_secs();
+    assert_eq!(t0, PINNED_START_SECS);
+
+    let provider = SeededOpenMlsCryptoProvider::new(Arc::new(ChaChaSimEntropy::from_seed(
+        6060,
+        b"kp-time-travel",
+    )));
+    let (sk, pk) = provider
+        .crypto()
+        .signature_key_gen(suite.signature_algorithm())
+        .unwrap();
+    let signer = SignatureKeyPair::from_raw(suite.signature_algorithm(), sk, pk);
+    signer.store(provider.storage()).unwrap();
+
+    // Narrow 29-day KeyPackage minted in Nov 2025 (`1_762_000_000`), already expired on real wall-clock!
+    let kp_bundle = KeyPackage::builder()
+        .key_package_lifetime(Lifetime::init(t0 - 60, t0 + 29 * 86_400))
+        .leaf_node_capabilities(Capabilities::builder().ciphersuites(vec![suite]).build())
+        .build(
+            suite,
+            &provider,
+            &signer,
+            CredentialWithKey {
+                credential: BasicCredential::new(b"did:plc:bob#dev1".to_vec()).into(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    let kp_bytes = MlsMessageOut::from(kp_bundle.key_package().clone())
+        .tls_serialize_detached()
+        .unwrap();
+    let parse_kp_in = |bytes: &[u8]| -> KeyPackageIn {
+        let MlsMessageBodyIn::KeyPackage(kp_in) = MlsMessageIn::tls_deserialize_exact(bytes)
+            .unwrap()
+            .extract()
+        else {
+            panic!("expected KeyPackage");
+        };
+        kp_in
+    };
+
+    // Valid at `t0` (`2025-11-01`).
+    validate_key_package_at(
+        parse_kp_in(&kp_bytes),
+        provider.crypto(),
+        ProtocolVersion::Mls10,
+        clock.now_secs(),
+    )
+    .expect("29-day KP must validate at SimClock t0");
+
+    // Advance SimClock by `+7 days`: still valid.
+    clock.advance_ms(7 * 86_400 * 1_000);
+    validate_key_package_at(
+        parse_kp_in(&kp_bytes),
+        provider.crypto(),
+        ProtocolVersion::Mls10,
+        clock.now_secs(),
+    )
+    .expect("29-day KP must validate at SimClock t0 + 7d");
+
+    // Advance SimClock by another `+23 days` (`+30 days` total): deterministically expired!
+    clock.advance_ms(23 * 86_400 * 1_000);
+    let err = validate_key_package_at(
+        parse_kp_in(&kp_bytes),
+        provider.crypto(),
+        ProtocolVersion::Mls10,
+        clock.now_secs(),
+    )
+    .expect_err("29-day KP must expire at SimClock t0 + 30d");
+    assert!(matches!(
+        err,
+        KeyPackageVerifyError::LifetimeError(LifetimeError::Expired { not_after, now })
+            if not_after == t0 + 29 * 86_400 && now >= t0 + 30 * 86_400
+    ));
+
+    // Cryptographic signature tampering MUST still fail with `InvalidSignature` even at valid `t0`.
+    let mut tampered = kp_bytes.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xff;
+    let sig_err = validate_key_package_at(
+        parse_kp_in(&tampered),
+        provider.crypto(),
+        ProtocolVersion::Mls10,
+        t0,
+    )
+    .expect_err("tampered KP signature must be rejected");
+    assert!(matches!(sig_err, KeyPackageVerifyError::InvalidSignature));
 }
 
 #[test]
@@ -737,7 +1158,7 @@ fn buggify_controller_fires_all_three_initial_sites_under_sim_feature() {
     // 2. Sites: `after_http_2xx_before_db_commit` and `between_labyrinth_enqueue_and_flush`
     let dir = tempfile::tempdir().unwrap();
     let hooks = SimClientHooks::new(
-        Arc::new(FixedStepClock::new(pinned_base_epoch_ms(), 15)),
+        Arc::new(FixedStepClock::new(PINNED_START_MS, 15)),
         Arc::new(ChaChaSimEntropy::from_seed(77_777, b"buggify-sites")),
     );
     let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
