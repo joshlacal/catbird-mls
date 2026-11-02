@@ -1,4 +1,4 @@
-use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
+use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -62,13 +62,12 @@ pub fn encrypt_payload(
         return Err(FieldEncryptionError::InvalidKeyLength(root_key.len()));
     }
     let key_bytes = derive_content_key(root_key, conversation_id)?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|_| FieldEncryptionError::InvalidKeyLength(key_bytes.len()))?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&Nonce::from(nonce_bytes), plaintext)
         .map_err(|_| FieldEncryptionError::AuthFailed)?;
     let mut out = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
     out.push(PAYLOAD_VERSION_V1);
@@ -100,10 +99,10 @@ pub fn decrypt_payload(
         .expect("slice length checked above");
     let ciphertext = &wire[1 + NONCE_LEN..];
     let key_bytes = derive_content_key(root_key, conversation_id)?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|_| FieldEncryptionError::InvalidKeyLength(key_bytes.len()))?;
     cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
+        .decrypt(&Nonce::from(nonce_bytes), ciphertext)
         .map_err(|_| FieldEncryptionError::AuthFailed)
 }
 

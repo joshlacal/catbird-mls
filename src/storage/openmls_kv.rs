@@ -252,10 +252,10 @@ impl<T: KvBackend + ?Sized> KvBackend for std::sync::Arc<T> {
 
 /// Recorded in-memory `openmls_kv` write/delete batch (`Spec §6.1` / `I6`).
 ///
-/// Captures all `kv_put`/`kv_delete` mutations produced by an OpenMLS operation
-/// before an HTTP call so SQLite `openmls_kv` is untouched if the DS rejects or
-/// drops the request. Once the DS returns HTTP `200`, [`KvWriteBatch::apply`]
-/// commits the staged mutations atomically inside the post-HTTP `write_tx`.
+/// Captures `kv_put`/`kv_delete` mutations before an HTTP call so group transitions
+/// merge only after server acceptance. Application sends instead reserve their
+/// sender generation with an immutable send journal before dispatch: a timeout
+/// cannot prove the ciphertext was not published.
 #[derive(Clone, Debug, Default)]
 pub struct KvWriteBatch {
     entries: std::collections::BTreeMap<(u16, String, Vec<u8>), Option<Vec<u8>>>,

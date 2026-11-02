@@ -87,7 +87,9 @@ struct MockDsState {
     tamper_next_receipt: bool,
     omit_next_receipt: bool,
     empty_stub_next_send: bool,
-    conflict_409_next_submit_transition: bool,
+    lose_next_send_response: bool,
+    fail_next_entries: bool,
+    stale_next_submit_transition: bool,
     // PDS records: (repo, collection, rkey) -> value
     pds_records: BTreeMap<(String, String, String), Value>,
     // Direct request published keys: actor_did -> (device_id, key_package_val, grant_val)
@@ -100,8 +102,8 @@ struct MockDsState {
     entries: BTreeMap<String, Vec<Value>>,
     // Pending welcomes: (did, device_id) -> Vec<Value>
     pending_welcomes: BTreeMap<(String, String), Vec<Value>>,
-    // Leaf recovery inbox: inviter_did -> Vec<Value>
-    leaf_recovery_inbox: BTreeMap<String, Vec<Value>>,
+    // Retained leaf recoveries: conversation_id -> Vec<leafRecoveryView>.
+    leaf_recoveries: BTreeMap<String, Vec<Value>>,
     // Acked welcomes
     acked_welcomes: Vec<String>,
     // Acked entry watermarks: (cid, device_id) -> i64
@@ -122,14 +124,16 @@ impl SharedMockDs {
                 tamper_next_receipt: false,
                 omit_next_receipt: false,
                 empty_stub_next_send: false,
-                conflict_409_next_submit_transition: false,
+                lose_next_send_response: false,
+                fail_next_entries: false,
+                stale_next_submit_transition: false,
                 pds_records: BTreeMap::new(),
                 dr_keys: BTreeMap::new(),
                 convo_kps: BTreeMap::new(),
                 conversations: BTreeMap::new(),
                 entries: BTreeMap::new(),
                 pending_welcomes: BTreeMap::new(),
-                leaf_recovery_inbox: BTreeMap::new(),
+                leaf_recoveries: BTreeMap::new(),
                 acked_welcomes: Vec::new(),
                 acked_watermarks: BTreeMap::new(),
                 space_writes: Vec::new(),
@@ -401,6 +405,9 @@ impl PlatformTransport for SharedMockDs {
                     "sequencerDid": DS_DID,
                     "coordinates": coords.clone(),
                     "participants": parts,
+                    "leaves": [b["manifest"]["actorLeaf"]],
+                    "metadataSnapshot": b["metadataSnapshot"],
+                    "snapshotSeq": 1,
                 }),
             );
             g.entries.entry(cid).or_default().push(json!({
@@ -436,17 +443,13 @@ impl PlatformTransport for SharedMockDs {
                     "coordinates": next_coords
                 }));
             }
-            // Group participantAcceptanceBody -> enqueue leaf recovery request for inviter!
+            // Acceptance creates a post-acceptance-coordinate request, not an inviter inbox row.
             let sr = body_json["signedRequest"].clone();
             let b = &sr["body"];
             let cid = b["next"]["conversationId"].as_str().unwrap().to_string();
             let next_coords = b["next"].clone();
             let invitee_did = b["actorDid"].as_str().unwrap().to_string();
             let invitee_dev = b["actorDeviceId"].as_str().unwrap().to_string();
-            let inviter_did = b["invitationProvenance"]["invitedByDid"]
-                .as_str()
-                .unwrap()
-                .to_string();
             let rec_req_id = b["recoveryRequestId"].as_str().unwrap().to_string();
             let kp = g
                 .convo_kps
@@ -471,32 +474,61 @@ impl PlatformTransport for SharedMockDs {
                 "coordinates": next_coords.clone(),
                 "signedRequest": sr,
             }));
-            g.leaf_recovery_inbox
-                .entry(inviter_did)
-                .or_default()
-                .push(json!({
+            g.conversations.get_mut(&cid).unwrap()["snapshotSeq"] = json!(next_seq);
+            let expires_at =
+                (chrono::DateTime::parse_from_rfc3339(b["signedAt"].as_str().unwrap()).unwrap()
+                    + chrono::Duration::minutes(5))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let requests = g.leaf_recoveries.entry(cid.clone()).or_default();
+            for request in requests
+                .iter_mut()
+                .filter(|request| request["status"] == "open")
+            {
+                request["status"] = json!("superseded");
+                request["reservation"]["status"] = json!("released");
+            }
+            requests.push(json!({
+                "$type": "blue.catbird.chat.defs#leafRecoveryView",
+                "conversationId": cid,
+                "recoveryRequestId": rec_req_id,
+                "requesterDid": invitee_did,
+                "requesterDeviceId": invitee_dev,
+                "recoveryKind": "add",
+                "boundCoordinate": next_coords,
+                "status": "open",
+                "requestedAt": b["signedAt"],
+                "expiresAt": expires_at,
+                "reservation": {
                     "conversationId": cid,
                     "recoveryRequestId": rec_req_id,
-                    "userDid": invitee_did,
-                    "deviceId": invitee_dev,
+                    "boundCoordinate": next_coords,
+                    "requesterDid": invitee_did,
+                    "requesterDeviceId": invitee_dev,
+                    "requesterKeyId": b["keyId"],
+                    "requesterAuthGeneration": b["authGeneration"],
+                    "keyPackageRef": kp["keyPackageRef"],
+                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    "purpose": "leafRecovery",
+                    "status": "active",
+                    "expiresAt": expires_at,
                     "keyPackage": kp,
-                    "coordinates": next_coords,
-                }));
+                },
+            }));
             return ok_json(json!({ "seq": next_seq }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.submitTransition") {
-            if g.conflict_409_next_submit_transition {
-                g.conflict_409_next_submit_transition = false;
+            if g.stale_next_submit_transition {
+                g.stale_next_submit_transition = false;
                 return Ok(PlatformHttpResponse {
-                    status: 409,
+                    status: 400,
                     headers: vec![PlatformHttpHeader {
                         name: "content-type".to_string(),
                         value: "application/json".to_string(),
                     }],
                     body: serde_json::to_vec(&json!({
-                        "error": "TransitionConflict",
-                        "message": "Simulated concurrent transition HTTP 409"
+                        "error": "StaleCoordinates",
+                        "message": "StaleCoordinates"
                     }))
                     .unwrap(),
                 });
@@ -507,6 +539,10 @@ impl PlatformTransport for SharedMockDs {
             let cid = b["next"]["conversationId"].as_str().unwrap().to_string();
             let next_coords = b["next"].clone();
             let next_seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as i64) + 1;
+            assert_eq!(
+                g.conversations[&cid]["coordinates"], b["prior"],
+                "fixture rejects transitions built against a superseded coordinate"
+            );
 
             if btype.ends_with("leafRecoveryFulfillmentBody") {
                 let wb = &b["manifest"]["welcomeBundle"];
@@ -538,6 +574,37 @@ impl PlatformTransport for SharedMockDs {
             }));
             if let Some(st) = g.conversations.get_mut(&cid) {
                 st["coordinates"] = next_coords.clone();
+                st["snapshotSeq"] = json!(next_seq);
+                if let Some(snapshot) = b.get("metadataSnapshot") {
+                    st["metadataSnapshot"] = snapshot.clone();
+                }
+                for change in b["manifest"]["leafChanges"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    let leaves = st["leaves"].as_array_mut().unwrap();
+                    if change["$type"] == "blue.catbird.chat.defs#removeLeaf" {
+                        leaves.retain(|leaf| {
+                            leaf["userDid"] != change["userDid"]
+                                || leaf["deviceId"] != change["deviceId"]
+                        });
+                    } else if change["$type"] == "blue.catbird.chat.defs#addLeafByRecovery" {
+                        leaves.push(json!({
+                            "userDid": change["userDid"],
+                            "deviceId": change["deviceId"],
+                            "leafOrigin": "recovery",
+                        }));
+                    }
+                }
+            }
+            for request in g.leaf_recoveries.get_mut(&cid).into_iter().flatten() {
+                if request["status"] == "open" {
+                    let fulfilled = request["recoveryRequestId"] == b["recoveryRequestId"];
+                    request["status"] = json!(if fulfilled { "fulfilled" } else { "superseded" });
+                    request["reservation"]["status"] =
+                        json!(if fulfilled { "consumed" } else { "released" });
+                }
             }
             return ok_json(json!({
                 "seq": next_seq,
@@ -554,6 +621,26 @@ impl PlatformTransport for SharedMockDs {
             let b = &sr["body"];
             let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
             let msg_id = b["messageId"].as_str().unwrap().to_string();
+            let lose_response = std::mem::take(&mut g.lose_next_send_response);
+            if let Some(entry) = g.entries.get(&cid).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["messageId"].as_str() == Some(msg_id.as_str()))
+            }) {
+                assert_eq!(
+                    entry["signedRequest"], sr,
+                    "uncertain send retries must replay the exact signed ciphertext"
+                );
+                if lose_response {
+                    return Err(MLSError::Internal(
+                        "send response lost after publication".into(),
+                    ));
+                }
+                return ok_json(json!({
+                    "seq": entry["seq"],
+                    "sequencerReceipt": entry["sequencerReceipt"],
+                }));
+            }
             let actor_did = b["actorDid"].as_str().unwrap().to_string();
             let actor_dev = b["actorDeviceId"].as_str().unwrap().to_string();
             let gen = b["prior"]["generation"].as_u64().unwrap_or(0);
@@ -612,6 +699,11 @@ impl PlatformTransport for SharedMockDs {
                 "signedRequest": sr,
                 "sequencerReceipt": rcpt_json.clone(),
             }));
+            if lose_response {
+                return Err(MLSError::Internal(
+                    "send response lost after publication".into(),
+                ));
+            }
             return ok_json(json!({
                 "seq": seq,
                 "sequencerReceipt": rcpt_json,
@@ -643,19 +735,62 @@ impl PlatformTransport for SharedMockDs {
             return ok_json(json!({ "acknowledged": true }));
         }
 
+        if url.contains("/xrpc/blue.catbird.chat.getConversationState") {
+            let cid = q.get("conversationId").expect("conversation ID");
+            let dev = q.get("actorDeviceId").expect("actor device ID");
+            let state = g
+                .conversations
+                .get(cid)
+                .expect("conversation state")
+                .clone();
+            let current_leaf = state["leaves"].as_array().is_some_and(|leaves| {
+                leaves
+                    .iter()
+                    .any(|leaf| leaf["deviceId"].as_str() == Some(dev.as_str()))
+            });
+            let requests: Vec<Value> = g
+                .leaf_recoveries
+                .get(cid)
+                .into_iter()
+                .flatten()
+                .filter(|request| {
+                    current_leaf
+                        && request["requesterDeviceId"].as_str() != Some(dev.as_str())
+                        && request["status"] == "open"
+                        && request["boundCoordinate"] == state["coordinates"]
+                })
+                .cloned()
+                .collect();
+            return ok_json(json!({
+                "state": state,
+                "pendingLeafRecoveryRequests": requests,
+                "pendingResetRequests": [],
+                "pendingLeaveRequests": [],
+            }));
+        }
+
         if url.contains("/xrpc/blue.catbird.chat.getLeafRecoveryInbox") {
             let dev = q.get("actorDeviceId").cloned().unwrap_or_default();
-            let owner = g
-                .convo_kps
-                .keys()
-                .find(|(_, d)| d == &dev)
-                .map(|(did, _)| did.clone())
-                .unwrap_or_default();
-            let reqs = g.leaf_recovery_inbox.remove(&owner).unwrap_or_default();
-            return ok_json(json!({ "requests": reqs }));
+            let requests: Vec<Value> = g
+                .leaf_recoveries
+                .values()
+                .flatten()
+                .filter(|request| request["requesterDeviceId"].as_str() == Some(dev.as_str()))
+                .cloned()
+                .collect();
+            return ok_json(json!({
+                "items": requests,
+                "inventorySessionId": q.get("inventorySessionId"),
+                "snapshotEventCursor": "fixture-events",
+                "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
+                "hasMore": false,
+            }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.getEntries") {
+            if std::mem::take(&mut g.fail_next_entries) {
+                return Err(MLSError::Internal("entries response unavailable".into()));
+            }
             let cid = q.get("conversationId").cloned().unwrap_or_default();
             let after: i64 = q.get("afterSeq").and_then(|s| s.parse().ok()).unwrap_or(0);
             let list: Vec<Value> = g
@@ -980,16 +1115,17 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
     let bob_dev = uuid::Uuid::new_v4().to_string();
     let eve_dev = uuid::Uuid::new_v4().to_string();
 
+    let alice_keys = Arc::new(MemKeyStore::new());
     let alice = CatbirdMlsClient::open(
         CatbirdMlsClientConfig {
             storage_root: tmp.path().join("alice").to_string_lossy().into_owned(),
             account_did: ALICE_DID.to_string(),
-            device_id: alice_dev,
+            device_id: alice_dev.clone(),
             home_ds_did: DS_DID.to_string(),
             home_ds_endpoint: DS_URL.to_string(),
             pds_endpoint: PDS_URL.to_string(),
         },
-        Arc::new(MemKeyStore::new()),
+        alice_keys.clone(),
         ds.clone(),
         None,
     )
@@ -1038,31 +1174,49 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         )
         .expect("alice create group");
 
-    // Bob accepts invite; Eve also accepts invite
+    // Eve's acceptance supersedes Bob's earlier request: only the current coordinate is fulfillable.
     let _ = bob.sync().expect("bob sync invite");
     let _ = eve.sync().expect("eve sync invite");
 
-    // 1. Simulate HTTP 409 on leaf recovery fulfillment during alice.sync():
+    // 1. Simulate HTTP 400 StaleCoordinates on leaf recovery fulfillment during alice.sync():
     // KvWriteOverlay must discard staged add_members + merge_pending_commit so Alice's group epoch stays 0!
     {
         let mut g = ds.inner.lock().unwrap();
-        let peeked_reqs = g
-            .leaf_recovery_inbox
-            .get(ALICE_DID)
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(peeked_reqs.len(), 2);
-        g.conflict_409_next_submit_transition = true;
+        let requests = &g.leaf_recoveries[&grp_cid];
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["status"], "superseded");
+        assert_eq!(requests[1]["status"], "open");
+        assert_eq!(
+            requests[1]["boundCoordinate"],
+            g.conversations[&grp_cid]["coordinates"]
+        );
+        g.stale_next_submit_transition = true;
     }
     alice
         .sync()
-        .expect("alice sync skips 409 leaf recovery cleanly without corrupting epoch");
-    let bob_joined_second = bob.sync().unwrap_or(0);
-    let eve_joined = eve.sync().unwrap_or(0);
-    // One of the two recovery requests hit 409 (skipped cleanly) while the second succeeded on the uncorrupted group!
+        .expect("alice sync skips stale leaf recovery cleanly without corrupting epoch");
+    assert_eq!(
+        alice
+            .db()
+            .read_tx(|tx| tx.get_conversation(&grp_cid))
+            .unwrap()
+            .unwrap()
+            .epoch,
+        0,
+        "StaleCoordinates must leave the local MLS epoch unchanged"
+    );
+    assert_eq!(
+        ds.inner.lock().unwrap().leaf_recoveries[&grp_cid][1]["status"],
+        "open",
+        "discovering a request and losing a transition must not consume the request"
+    );
+    alice
+        .sync()
+        .expect("retry current recovery after stale prior");
+    let eve_joined = eve.sync().expect("eve joins the retried recovery Welcome");
     assert!(
-        bob_joined_second >= 1 || eve_joined >= 1,
-        "second leaf recovery must succeed because 409 did not corrupt openmls_kv"
+        eve_joined >= 1,
+        "retrying the current recovery must succeed because stale rejection did not corrupt openmls_kv"
     );
 
     // Let's also create a clean 3-member group where both Bob and Eve join cleanly
@@ -1077,13 +1231,15 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         )
         .expect("create clean trio");
     bob.sync().expect("bob accept");
-    eve.sync().expect("eve accept");
-    alice.sync().expect("alice fulfill both");
+    alice.sync().expect("alice fulfill bob");
     bob.sync().expect("bob join welcome");
+    eve.sync().expect("eve accept at the new coordinate");
+    alice.sync().expect("alice fulfill eve");
     eve.sync().expect("eve join welcome");
+    bob.sync().expect("bob sync eve addition");
 
     // 2. Empty stub response (`{"ok":true}`) and omitted `sequencerReceipt` on sendMessage MUST fail closed (`I13`)
-    // AND leave zero phantom `MessageRow`/`LabyrinthQueueRow` rows AND keep Alice's sender ratchet intact!
+    // AND leave zero phantom `MessageRow`/`LabyrinthQueueRow` rows while reserving sender generations.
     ds.inner.lock().unwrap().empty_stub_next_send = true;
     let bad_stub_mid = uuid::Uuid::new_v4().to_string();
     assert!(
@@ -1121,7 +1277,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         "failed sends must commit zero LabyrinthQueueRows"
     );
 
-    // Verify Alice's sender ratchet was NOT advanced by the two failed sends: next send decrypts cleanly on Bob!
+    // Reserved-but-unpublished generations may be skipped; they must never be reused.
     let valid_mid = uuid::Uuid::new_v4().to_string();
     alice
         .send_message(&clean_cid, &valid_mid, "ratchet intact after failed sends")
@@ -1166,7 +1322,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         .any(|m| m.plaintext_json.contains("Alice concurrent second!")));
 
     // 4. SpaceAvatarPointer survives metadata updates (`avatar: None`) AND epoch rotation (`remove_group_member`),
-    // plus HTTP 409 on `remove_group_member` rolls back `MlsGroup` epoch cleanly!
+    // plus StaleCoordinates on `remove_group_member` rolls back `MlsGroup` epoch cleanly!
     bob.sync().expect("bob catch up");
     eve.sync().expect("eve catch up");
 
@@ -1205,7 +1361,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         Some("bafkreiavatarclean0001")
     );
 
-    // Inject HTTP 409 on remove_group_member -> must return Err and leave epoch uncorrupted!
+    // Inject StaleCoordinates on remove_group_member: return the classified error and leave epoch uncorrupted.
     let epoch_before = alice
         .list_conversations(None, 20)
         .unwrap()
@@ -1213,26 +1369,24 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         .find(|c| c.conversation_id == clean_cid)
         .unwrap()
         .epoch;
-    ds.inner.lock().unwrap().conflict_409_next_submit_transition = true;
-    assert!(
-        alice
-            .remove_group_member(MemberRole::Admin, &clean_cid, EVE_DID)
-            .is_err(),
-        "HTTP 409 on remove_group_member must return Err"
-    );
-    let epoch_after_409 = alice
+    ds.inner.lock().unwrap().stale_next_submit_transition = true;
+    assert!(matches!(
+        alice.remove_group_member(MemberRole::Admin, &clean_cid, EVE_DID),
+        Err(MLSError::InvalidState(code)) if code == "StaleCoordinates"
+    ));
+    let epoch_after_stale = alice
         .list_conversations(None, 20)
         .unwrap()
         .into_iter()
         .find(|c| c.conversation_id == clean_cid)
         .unwrap()
         .epoch;
-    assert_eq!(epoch_after_409, epoch_before);
+    assert_eq!(epoch_after_stale, epoch_before);
 
     // Now real remove_group_member succeeds at the uncorrupted epoch and carries SpaceAvatarPointer into next_epoch!
     alice
         .remove_group_member(MemberRole::Admin, &clean_cid, EVE_DID)
-        .expect("remove eve after 409");
+        .expect("remove eve after stale prior");
     bob.sync().expect("bob sync eve removal");
     let bob_meta_2 = bob
         .get_group_metadata(&clean_cid)
@@ -1273,4 +1427,136 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         .any(|m| m
             .plaintext_json
             .contains("Live message after payloadPruned entry")));
+
+    // 6. Publication can succeed after the sender loses the response. Preserve both the
+    // exact retry ciphertext and its plaintext across restart without reusing sender keys.
+    let uncertain_mid = uuid::Uuid::new_v4().to_string();
+    for _ in 0..2 {
+        ds.inner.lock().unwrap().lose_next_send_response = true;
+        assert!(alice
+            .send_message(&clean_cid, &uncertain_mid, "accepted without a response")
+            .is_err());
+    }
+    assert!(!alice
+        .list_messages(&clean_cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|m| m.message_id == uncertain_mid));
+    bob.sync().expect("bob decrypts the uncertain publication");
+    let cursor_before = alice
+        .db()
+        .read_tx(|tx| tx.get_conversation(&clean_cid))
+        .unwrap()
+        .unwrap()
+        .last_seq;
+    ds.inner.lock().unwrap().fail_next_entries = true;
+    let later_mid = uuid::Uuid::new_v4().to_string();
+    assert!(
+        alice
+            .send_message(&clean_cid, &later_mid, "later sender generation")
+            .is_err(),
+        "the follow-up gap fetch fails after the later send is durable"
+    );
+    let mut historical = alice
+        .list_messages(&clean_cid, None, 100)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.message_id == later_mid)
+        .expect("later send was durably accepted");
+    historical.epoch = 0;
+    alice
+        .import_conversation_history(&clean_cid, vec![historical])
+        .expect("import ahead-of-cursor history");
+    assert_eq!(
+        alice
+            .db()
+            .read_tx(|tx| tx.get_conversation(&clean_cid))
+            .unwrap()
+            .unwrap()
+            .last_seq,
+        cursor_before,
+        "historical imports must not jump over unresolved live entries"
+    );
+    drop(alice);
+    let alice = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("alice").to_string_lossy().into_owned(),
+            account_did: ALICE_DID.to_string(),
+            device_id: alice_dev,
+            home_ds_did: DS_DID.to_string(),
+            home_ds_endpoint: DS_URL.to_string(),
+            pds_endpoint: PDS_URL.to_string(),
+        },
+        alice_keys,
+        ds.clone(),
+        None,
+    )
+    .expect("reopen alice");
+    let published_entry = ds.inner.lock().unwrap().entries[&clean_cid]
+        .iter()
+        .find(|entry| entry["messageId"].as_str() == Some(uncertain_mid.as_str()))
+        .unwrap()
+        .clone();
+    for tamper_ciphertext in [true, false] {
+        {
+            let mut state = ds.inner.lock().unwrap();
+            let entry = state
+                .entries
+                .get_mut(&clean_cid)
+                .unwrap()
+                .iter_mut()
+                .find(|entry| entry["messageId"].as_str() == Some(uncertain_mid.as_str()))
+                .unwrap();
+            if tamper_ciphertext {
+                entry["signedRequest"]["body"]["applicationMessage"]["bytes"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8]) });
+            } else {
+                entry["sequencerReceipt"]["signature"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+            }
+        }
+        assert!(
+            alice.sync().is_err(),
+            "unproven own echoes must fail closed"
+        );
+        let mut state = ds.inner.lock().unwrap();
+        *state
+            .entries
+            .get_mut(&clean_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["messageId"].as_str() == Some(uncertain_mid.as_str()))
+            .unwrap() = published_entry.clone();
+    }
+    alice
+        .sync()
+        .expect("recover own publication from durable journal");
+    let recovered = alice.list_messages(&clean_cid, None, 100).unwrap();
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|m| m.message_id == uncertain_mid)
+            .count(),
+        1
+    );
+    assert!(alice
+        .list_pending_labyrinth_queue(Some(&clean_cid), 100)
+        .unwrap()
+        .iter()
+        .any(|item| item.message_id == uncertain_mid && item.sequencer_receipt_json.is_some()));
+    let next_mid = uuid::Uuid::new_v4().to_string();
+    alice
+        .send_message(&clean_cid, &next_mid, "next generation after restart")
+        .expect("send after uncertain publication recovery");
+    bob.sync()
+        .expect("no SecretReuseError after uncertain send");
+    let alice_messages = alice.list_messages(&clean_cid, None, 100).unwrap();
+    let bob_messages = bob.list_messages(&clean_cid, None, 100).unwrap();
+    for id in [&uncertain_mid, &later_mid, &next_mid] {
+        let a = alice_messages.iter().find(|m| &m.message_id == id).unwrap();
+        let b = bob_messages.iter().find(|m| &m.message_id == id).unwrap();
+        let a_text: Value = serde_json::from_str(&a.plaintext_json).unwrap();
+        let b_text: Value = serde_json::from_str(&b.plaintext_json).unwrap();
+        assert_eq!((a.seq, &a_text["text"]), (b.seq, &b_text["text"]));
+    }
 }

@@ -956,8 +956,7 @@ where
                     return Ok(false);
                 }
                 let commit = terminal_bytes(&body["commit"]["bytes"])?;
-                if terminal_bytes(&body["commit"]["sha256"])? != Sha256::digest(&commit).as_slice()
-                {
+                if terminal_bytes(&body["commit"]["sha256"])? != Sha256::digest(&commit)[..] {
                     return Err(terminal_invalid("Terminal Commit digest does not match."));
                 }
                 let protocol = MlsMessageIn::tls_deserialize_exact(&commit)

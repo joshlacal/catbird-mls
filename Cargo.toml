@@ -103,6 +103,11 @@ test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_m
 labyrinth = ["dep:labyrinth"]
 # Deterministic simulation testing (DST) fault-injection (`buggify!`) and `SimClock` KP lifetime hooks.
 sim = ["openmls/unchecked-conversions"]
+plant_p1 = ["sim"]
+plant_p2 = ["sim"]
+plant_p3 = ["sim"]
+plant_p6 = ["sim"]
+plant_p13 = ["sim"]
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }

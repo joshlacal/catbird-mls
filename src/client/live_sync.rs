@@ -3,7 +3,7 @@
 //! Executes strictly outside `MlsAccountDb::write_tx` (`I6`) across four phases:
 //! 1. `getConversations` -> `C33` incoming direct-request Welcome/introduction import + pending group invite acceptance.
 //! 2. `getPendingWelcomes` -> `I4`-verified `StagedWelcome` join + `acknowledgeWelcome`.
-//! 3. `getLeafRecoveryInbox` -> `I4`-verified `add_members` commit + `#leafRecoveryFulfillmentBody`.
+//! 3. `getConversationState.pendingLeafRecoveryRequests` -> `I4`-verified `add_members` commit + `#leafRecoveryFulfillmentBody`.
 //! 4. `getEntries` -> `I2`-ordered Commit / Metadata / Application / Acceptance / AccountDeleted reconciliation + `I14` `acknowledge_entries_up_to`.
 
 use std::collections::BTreeMap;
@@ -34,6 +34,7 @@ use crate::orchestrator::direct_request_bootstrap::{
 };
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use crate::push::{root_did_from_credential_bytes, AuthorizedPeerDeviceKey};
+use crate::storage::driver_native::map_rusqlite_err;
 use crate::storage::{
     ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
 };
@@ -77,12 +78,11 @@ impl CatbirdMlsClient {
             inventory_session_id.as_deref(),
         )?);
 
-        // Phase 3: `getLeafRecoveryInbox` -> fulfill leaf recovery requests.
-        total_applied = total_applied.saturating_add(self.fulfill_leaf_recovery_inbox(
+        // Phase 3: current leaves discover fulfillment work through `getConversationState`.
+        total_applied = total_applied.saturating_add(self.fulfill_pending_leaf_recoveries(
             &canonical_dev_id,
             &signer,
             auth_generation,
-            inventory_session_id.as_deref(),
         )?);
 
         // Phase 4: `getEntries` for every known conversation -> decrypt + acknowledgeEntries.
@@ -169,7 +169,7 @@ impl CatbirdMlsClient {
             }
 
             // If we have a pending group invitation in `participants`, accept it so the inviter
-            // receives our leaf recovery request in `getLeafRecoveryInbox`.
+            // can discover our leaf recovery request through `getConversationState`.
             if kind == "group" {
                 if let Some(participants) = state.get("participants").and_then(|v| v.as_array()) {
                     if let Some(me) = participants.iter().find(|p| {
@@ -185,7 +185,7 @@ impl CatbirdMlsClient {
                                 coords,
                                 prov,
                             ) {
-                                if !e.to_string().contains("HTTP 409") {
+                                if !e.is_stale_coordinates() {
                                     return Err(e);
                                 }
                             }
@@ -873,97 +873,92 @@ impl CatbirdMlsClient {
         Ok(joined)
     }
 
-    pub(crate) fn fulfill_leaf_recovery_inbox(
+    pub(crate) fn fulfill_pending_leaf_recoveries(
         &self,
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
         auth_generation: i64,
-        inventory_session_id: Option<&str>,
     ) -> Result<u32, MLSError> {
-        let owned_sid = if inventory_session_id.is_none() {
-            self.acquire_inventory_session_id(canonical_dev_id, signer)?
-        } else {
-            None
-        };
-        let mut q_pairs: Vec<(&str, &str)> = vec![("actorDeviceId", canonical_dev_id)];
-        if let Some(sid) = inventory_session_id.or(owned_sid.as_deref()) {
-            q_pairs.push(("inventorySessionId", sid));
-        }
-        q_pairs.extend_from_slice(&[
-            ("limit", "100"),
-            ("supportedProtocolVersions", "1"),
-            ("supportedProtocolVersions", "2"),
-        ]);
-        let resp = self.query_signed_chat_ds(
-            "blue.catbird.chat.getLeafRecoveryInbox",
-            &q_pairs,
-            canonical_dev_id,
-            signer,
-        )?;
-        let Some(requests) = resp
-            .get("items")
-            .or_else(|| resp.get("requests"))
-            .or_else(|| resp.get("inbox"))
-            .and_then(|v| v.as_array())
-        else {
-            return Ok(0);
-        };
+        // The recovery inbox belongs to the requester, not the fulfiller. Scan
+        // joined groups without the UI list limit, then ask for current-leaf work.
+        let conversation_ids = self.db.read_tx(|tx| {
+            let mut stmt = tx
+                .conn()
+                .prepare(
+                    "SELECT conversation_id, group_id FROM conversations ORDER BY conversation_id",
+                )
+                .map_err(|e| map_rusqlite_err("leaf recovery discovery.prepare", &e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| map_rusqlite_err("leaf recovery discovery.query", &e))?;
+            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let provider = self.hooks.openmls_provider(storage);
+            let mut joined = Vec::new();
+            for row in rows {
+                let (cid, group_id) =
+                    row.map_err(|e| map_rusqlite_err("leaf recovery discovery.row", &e))?;
+                if MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
+                    .map_err(|e| MLSError::Internal(format!("load recovery group: {e:?}")))?
+                    .is_some_and(|group| group.is_active())
+                {
+                    joined.push(cid);
+                }
+            }
+            Ok(joined)
+        })?;
 
         let mut fulfilled = 0u32;
-        for raw_req in requests {
-            let req = raw_req
-                .get("request")
-                .filter(|v| v.is_object() && v.get("recoveryRequestId").is_some())
-                .unwrap_or(raw_req);
-            let Some(cid) = req
-                .get("conversationId")
-                .or_else(|| {
-                    req.get("boundCoordinate")
-                        .and_then(|c| c.get("conversationId"))
-                })
-                .or_else(|| req.get("coordinates").and_then(|c| c.get("conversationId")))
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
+        for conversation_id in conversation_ids {
+            let cid = conversation_id.as_str();
             let Ok(convo_uuid) = uuid::Uuid::parse_str(cid) else {
                 continue;
             };
-            let Some(recovery_request_id) = req
-                .get("recoveryRequestId")
-                .or_else(|| req.get("requestId"))
-                .and_then(|v| v.as_str())
+            let resp = self.query_signed_chat_ds(
+                "blue.catbird.chat.getConversationState",
+                &[("actorDeviceId", canonical_dev_id), ("conversationId", cid)],
+                canonical_dev_id,
+                signer,
+            )?;
+            let Some(prior) = resp.pointer("/state/coordinates") else {
+                continue;
+            };
+            let Some(req) = resp
+                .get("pendingLeafRecoveryRequests")
+                .and_then(|v| v.as_array())
+                .and_then(|requests| {
+                    requests.iter().find(|request| {
+                        request["conversationId"].as_str() == Some(cid)
+                            && request["recoveryKind"].as_str() == Some("add")
+                            && request["status"].as_str() == Some("open")
+                            && request.get("boundCoordinate") == Some(prior)
+                            && !(request["requesterDid"].as_str()
+                                == Some(self.normalized_did.as_str())
+                                && request["requesterDeviceId"].as_str() == Some(canonical_dev_id))
+                    })
+                })
             else {
                 continue;
             };
-            let Some(target_did) = req
-                .get("requesterDid")
-                .or_else(|| req.get("userDid"))
-                .or_else(|| req.get("targetDid"))
-                .and_then(|v| v.as_str())
-            else {
+            // One accepted Commit invalidates the other reservations at this
+            // coordinate. Discover fresh work on the next sync.
+            let Some(recovery_request_id) = req["recoveryRequestId"].as_str() else {
                 continue;
             };
-            let Some(target_device_id) = req
-                .get("requesterDeviceId")
-                .or_else(|| req.get("deviceId"))
-                .or_else(|| req.get("targetDeviceId"))
-                .and_then(|v| v.as_str())
-            else {
+            let Some(target_did) = req["requesterDid"].as_str() else {
                 continue;
             };
-            let kp_obj = req
-                .get("reservation")
-                .and_then(|r| r.get("keyPackage"))
-                .or_else(|| req.get("keyPackage"))
-                .unwrap_or(req);
-            let Ok(kp_bytes) = chat_wire::json_bytes(&kp_obj["bytes"]) else {
+            let Some(target_device_id) = req["requesterDeviceId"].as_str() else {
                 continue;
             };
-            let Ok(kp_ref) = chat_wire::json_bytes(&kp_obj["keyPackageRef"]) else {
+            let reservation = &req["reservation"];
+            let Ok(kp_bytes) = chat_wire::json_bytes(&reservation["keyPackage"]["bytes"]) else {
                 continue;
             };
-
+            let Ok(kp_ref) = chat_wire::json_bytes(&reservation["keyPackageRef"]) else {
+                continue;
+            };
             // Enforce `I4` (`ADR-009`): verify target leaf's KeyPackage against PDS `blue.catbird.chat.device`!
             let target_pds_keys = self.fetch_and_cache_authorized_pds_device_keys(target_did)?;
             let MlsMessageBodyIn::KeyPackage(kp_in) =
@@ -980,15 +975,7 @@ impl CatbirdMlsClient {
                 &target_pds_keys,
             )?;
 
-            let prior_coords = if let Some(c) = req
-                .get("boundCoordinate")
-                .or_else(|| req.get("coordinates"))
-                .or_else(|| req.get("prior"))
-            {
-                chat_wire::canonicalize_wire_coordinate(c, Some(cid))?
-            } else {
-                self.load_or_build_conversation_coords(cid)?
-            };
+            let prior_coords = chat_wire::canonicalize_wire_coordinate(prior, Some(cid))?;
             let prior_sv = prior_coords
                 .get("stateVersion")
                 .and_then(|v| v.as_i64())
@@ -1001,6 +988,7 @@ impl CatbirdMlsClient {
                 .get("generation")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            let prior_group_id = chat_wire::json_bytes(&prior_coords["groupId"])?;
             let prior_gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
             let prior_ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
 
@@ -1010,7 +998,7 @@ impl CatbirdMlsClient {
             let now_ms = self.hooks.now_ms();
 
             // Stage `add_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx` (`I6`)
-            // so an HTTP 409 / network failure never forks local OpenMLS epoch state!
+            // so a stale prior / network failure never forks local OpenMLS epoch state!
             let built = self.db.read_tx(|tx| {
                 let Some(convo) = tx.get_conversation(cid)? else {
                     return Ok(None);
@@ -1031,6 +1019,22 @@ impl CatbirdMlsClient {
                 else {
                     return Ok(None);
                 };
+                // A newer peer Commit must be reconciled by getEntries before
+                // we can fulfill a request bound to its MLS coordinate.
+                if !group.is_active()
+                    || convo.generation != prior_gen
+                    || convo.group_id != prior_group_id
+                    || group.epoch().as_u64() != prior_epoch
+                {
+                    return Ok(None);
+                }
+                let (local_gch, local_ctag) =
+                    chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                if local_gch.as_slice() != prior_gch.as_slice()
+                    || local_ctag.as_slice() != prior_ctag.as_slice()
+                {
+                    return Ok(None);
+                }
 
                 let aad_prior = chat_wire::build_aad_prior_coordinate(
                     &convo_uuid,
@@ -1057,6 +1061,7 @@ impl CatbirdMlsClient {
                 let (commit_out, welcome_out, _) = group
                     .add_members(&provider, signer, &[validated_kp])
                     .map_err(|e| MLSError::Cryptography(format!("recovery add_members: {e:?}")))?;
+                let staged_pending_batch = overlay.clone_batch();
                 group
                     .merge_pending_commit(&provider)
                     .map_err(|e| MLSError::Cryptography(format!("merge recovery commit: {e:?}")))?;
@@ -1118,6 +1123,7 @@ impl CatbirdMlsClient {
                 let kv_batch = overlay.into_batch();
                 Ok(Some((
                     kv_batch,
+                    staged_pending_batch,
                     convo.group_id,
                     commit_aad_val,
                     commit_bytes,
@@ -1131,6 +1137,7 @@ impl CatbirdMlsClient {
 
             let Some((
                 kv_batch,
+                staged_pending_batch,
                 group_id,
                 commit_aad_val,
                 commit_bytes,
@@ -1204,6 +1211,12 @@ impl CatbirdMlsClient {
                 "metadataSnapshot": carried_snap.clone(),
             });
 
+            if crate::planted::is_planted_bug_active(
+                crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
+            ) {
+                self.db
+                    .write_tx(|tx| Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?))?;
+            }
             let resp_val = match self.submit_signed_chat_op(
                 canonical_dev_id,
                 Some(auth_generation),
@@ -1212,7 +1225,14 @@ impl CatbirdMlsClient {
                 signer,
             ) {
                 Ok(val) => val,
-                Err(e) if e.to_string().contains("HTTP 409") => {
+                Err(e) if e.is_stale_coordinates() => {
+                    if crate::planted::is_planted_bug_active(
+                        crate::planted::PlantedBug::P1KeepLoserStagedCommit,
+                    ) {
+                        self.db.write_tx(|tx| {
+                            Ok(staged_pending_batch.apply(&RusqliteKvBackend(tx.conn()))?)
+                        })?;
+                    }
                     // Concurrent peer transition superseded `boundCoordinate`; discard overlay cleanly!
                     continue;
                 }
@@ -1546,29 +1566,38 @@ impl CatbirdMlsClient {
                                     MLSError::Cryptography(format!("commit protocol msg: {e:?}"))
                                 })?;
                                 if proto.epoch().as_u64() == group.epoch().as_u64() {
-                                    let processed =
-                                        group.process_message(&provider, proto).map_err(|e| {
-                                            MLSError::Cryptography(format!("process Commit: {e:?}"))
-                                        })?;
-                                    let commit_sender = processed.sender().clone();
-                                    if let ProcessedMessageContent::StagedCommitMessage(staged) =
-                                        processed.into_content()
-                                    {
-                                        chat_wire::verify_staged_commit_slice_i4(
-                                            &group,
-                                            &commit_sender,
-                                            &staged,
-                                            &flat_auth_keys,
-                                        )?;
-                                        removed_self = staged.self_removed();
-                                        group.merge_staged_commit(&provider, *staged).map_err(
-                                            |e| {
+                                    let retain_loser = crate::planted::is_planted_bug_active(
+                                        crate::planted::PlantedBug::P1KeepLoserStagedCommit,
+                                    ) && group.pending_commit().is_some();
+                                    if !retain_loser {
+                                        let processed = group
+                                            .process_message(&provider, proto)
+                                            .map_err(|e| {
                                                 MLSError::Cryptography(format!(
-                                                    "merge_staged_commit: {e:?}"
+                                                    "process Commit: {e:?}"
                                                 ))
-                                            },
-                                        )?;
-                                        c.epoch = group.epoch().as_u64() as i64;
+                                            })?;
+                                        let commit_sender = processed.sender().clone();
+                                        if let ProcessedMessageContent::StagedCommitMessage(
+                                            staged,
+                                        ) = processed.into_content()
+                                        {
+                                            chat_wire::verify_staged_commit_slice_i4(
+                                                &group,
+                                                &commit_sender,
+                                                &staged,
+                                                &flat_auth_keys,
+                                            )?;
+                                            removed_self = staged.self_removed();
+                                            group.merge_staged_commit(&provider, *staged).map_err(
+                                                |e| {
+                                                    MLSError::Cryptography(format!(
+                                                        "merge_staged_commit: {e:?}"
+                                                    ))
+                                                },
+                                            )?;
+                                            c.epoch = group.epoch().as_u64() as i64;
+                                        }
                                     }
                                 }
                                 if let Some(snap) = snap_opt {
@@ -1675,18 +1704,6 @@ impl CatbirdMlsClient {
                             "I13: applicationEntry {msg_id} at seq {entry_seq} missing sequencerReceipt"
                         ))
                     })?;
-                let rcpt_kid = rcpt_val
-                    .get("kid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("#mls-receipt-1");
-                let rcpt_sec1 = self
-                    .resolve_sequencer_receipt_key(&convo.sequencer_did, rcpt_kid)?
-                    .ok_or_else(|| {
-                        MLSError::Cryptography(format!(
-                            "I13: unable to resolve `{}` DID document for #mls-receipt-1 verification",
-                            convo.sequencer_did
-                        ))
-                    })?;
                 let expected_rcpt_entry_id = entry
                     .get("entryId")
                     .and_then(|v| v.as_str())
@@ -1705,6 +1722,68 @@ impl CatbirdMlsClient {
                         })?,
                 )?;
 
+                if crate::planted::is_planted_bug_active(
+                    crate::planted::PlantedBug::P13AdvanceSeqCursorBeforeDurableStore,
+                ) {
+                    self.db.write_tx(|tx| {
+                        if let Some(mut c) = tx.get_conversation(cid)? {
+                            c.last_seq = c.last_seq.max(entry_seq);
+                            c.updated_at_ms = now_ms;
+                            tx.upsert_conversation(&c)?;
+                        }
+                        Ok(())
+                    })?;
+                    return Err(MLSError::Internal(
+                        "sim planted P13: interrupted after durable cursor advance before message storage"
+                            .to_string(),
+                    ));
+                }
+                if let Some(raw) = self
+                    .db
+                    .read_tx(|tx| tx.get_pending_op("application_send", msg_id))?
+                {
+                    let pending: super::live_plane::PendingApplicationSend =
+                        serde_json::from_str(&raw)
+                            .map_err(|e| MLSError::Internal(format!("parse pending send: {e}")))?;
+                    let reserved_ciphertext = STANDARD
+                        .decode(&pending.archive.mls_ciphertext_b64)
+                        .map_err(|e| MLSError::Internal(format!("pending send ciphertext: {e}")))?;
+                    if pending.archive.conversation_id != cid
+                        || pending.archive.sender_did != self.normalized_did
+                        || pending.archive.sender_device_id != canonical_dev_id
+                        || ct_bytes != reserved_ciphertext
+                    {
+                        return Err(MLSError::Cryptography(
+                            "pending send does not match sequenced application ciphertext".into(),
+                        ));
+                    }
+                    // Own MLS ciphertext is not decryptable. Recover only from the exact durable
+                    // send journal, with the same I13 receipt verification as a successful send.
+                    self.finish_application_send(
+                        pending,
+                        rcpt_val,
+                        expected_rcpt_entry_id,
+                        Some(entry_seq),
+                    )?;
+                    self.notify_change(PlatformChangeEvent::MessagesUpdated {
+                        conversation_id: cid.to_string(),
+                    });
+                    max_seq = max_seq.max(entry_seq);
+                    applied_count = applied_count.saturating_add(1);
+                    continue;
+                }
+                let rcpt_kid = rcpt_val
+                    .get("kid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#mls-receipt-1");
+                let rcpt_sec1 = self
+                    .resolve_sequencer_receipt_key(&convo.sequencer_did, rcpt_kid)?
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(format!(
+                            "I13: unable to resolve `{}` DID document for #mls-receipt-1 verification",
+                            convo.sequencer_did
+                        ))
+                    })?;
                 self.db.write_tx(|tx| {
                     let Some(mut c) = tx.get_conversation(cid)? else {
                         return Ok(());

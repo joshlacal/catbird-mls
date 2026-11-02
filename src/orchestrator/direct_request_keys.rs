@@ -99,8 +99,8 @@ impl DirectRequestKeyPublication {
             }
             if grant.body()["grantRevision"] != body["revision"]
                 || grant.body()["keyPackageRef"] != entry["keyPackage"]["keyPackageRef"]
-                || bytes(&grant.body()["keyPackageSha256"])? != Sha256::digest(&package).as_slice()
-                || bytes(&entry["keyPackage"]["sha256"])? != Sha256::digest(&package).as_slice()
+                || bytes(&grant.body()["keyPackageSha256"])? != Sha256::digest(&package)[..]
+                || bytes(&entry["keyPackage"]["sha256"])? != Sha256::digest(&package)[..]
                 || !refs.insert(bytes(&grant.body()["keyPackageRef"])?)
             {
                 return Err(invalid());

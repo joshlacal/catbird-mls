@@ -300,12 +300,14 @@ fn aead_decrypt(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Result<Vec<u8>, Meta
         return Err(MetadataError::CiphertextTooShort);
     }
     let (nonce_bytes, ciphertext) = blob.split_at(NONCE_SIZE);
-    let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+    let nonce_arr: [u8; NONCE_SIZE] = nonce_bytes
+        .try_into()
+        .map_err(|_| MetadataError::CiphertextTooShort)?;
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
     cipher
         .decrypt(
-            nonce,
+            &chacha20poly1305::Nonce::from(nonce_arr),
             chacha20poly1305::aead::Payload {
                 msg: ciphertext,
                 aad,
@@ -358,10 +360,10 @@ pub fn encrypt_metadata_snapshot_with_nonce(
     let aad = build_metadata_aad(group_id, epoch, metadata_version);
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| MetadataError::Encryption(format!("{e}")))?;
-    let nonce_arr = chacha20poly1305::Nonce::from_slice(nonce);
+    let nonce_arr = chacha20poly1305::Nonce::from(*nonce);
     cipher
         .encrypt(
-            nonce_arr,
+            &nonce_arr,
             chacha20poly1305::aead::Payload {
                 msg: &plaintext,
                 aad: &aad,
@@ -383,10 +385,10 @@ pub fn decrypt_metadata_snapshot(
     let aad = build_metadata_aad(group_id, epoch, metadata_version);
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
-    let nonce_arr = chacha20poly1305::Nonce::from_slice(nonce);
+    let nonce_arr = chacha20poly1305::Nonce::from(*nonce);
     let plaintext = cipher
         .decrypt(
-            nonce_arr,
+            &nonce_arr,
             chacha20poly1305::aead::Payload {
                 msg: ciphertext,
                 aad: &aad,

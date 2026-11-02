@@ -68,7 +68,7 @@ impl WelcomeDelivery {
         }
         let opaque = bytes(&e["opaqueWelcome"])?;
         if !(8..=1_048_576).contains(&opaque.len())
-            || bytes(&e["sha256"])? != Sha256::digest(&opaque).as_slice()
+            || bytes(&e["sha256"])? != Sha256::digest(&opaque)[..]
         {
             return Err(invalid("Welcome hash mismatch"));
         }
@@ -350,7 +350,7 @@ where
         for receipt in self.mls_context().list_welcome_acceptances()? {
             if receipt.delivery.conversation_id() == cid
                 && receipt.delivery.recipient_identity() == identity
-                && bytes(&receipt.delivery.envelope["sha256"])? == digest.as_slice()
+                && bytes(&receipt.delivery.envelope["sha256"])? == digest[..]
             {
                 return Ok(receipt.delivery);
             }

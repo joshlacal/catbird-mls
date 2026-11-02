@@ -169,6 +169,11 @@ impl From<crate::metadata::MetadataError> for MLSError {
 }
 
 impl MLSError {
+    /// Exact XRPC stale-coordinate classification; HTTP status alone is not a protocol code.
+    pub(crate) fn is_stale_coordinates(&self) -> bool {
+        matches!(self, Self::InvalidState(code) if code == "StaleCoordinates")
+    }
+
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput {
             message: msg.into(),
@@ -393,5 +398,15 @@ mod decrypt_class_tests {
             reason: "unrelated backend capability".to_string(),
         }
         .is_external_join_proposal_authorization_rejection());
+    }
+
+    #[test]
+    fn stale_coordinate_classifier_requires_the_exact_protocol_error() {
+        assert!(MLSError::InvalidState("StaleCoordinates".into()).is_stale_coordinates());
+        assert!(
+            !MLSError::InvalidState("unrelated StaleCoordinates detail".into())
+                .is_stale_coordinates()
+        );
+        assert!(!MLSError::Internal("HTTP 409: StaleCoordinates".into()).is_stale_coordinates());
     }
 }

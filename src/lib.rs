@@ -31,6 +31,7 @@ mod mls_context;
 #[cfg(not(target_arch = "wasm32"))]
 mod mls_engine_context;
 pub mod orchestrator;
+pub mod planted;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform_lifecycle;
 pub mod push;
@@ -71,6 +72,9 @@ pub use orchestrator::direct_request_types::{
     RequestCapabilities, RequestConsent, RequestCrypto, RequestIntroductionMetadata,
     RequestPreview,
 };
+#[cfg(all(feature = "sim", not(target_arch = "wasm32")))]
+pub use planted::SimGroupState;
+pub use planted::{is_planted_bug_active, set_planted_bug, with_planted_bug, PlantedBug};
 #[cfg(not(target_arch = "wasm32"))]
 pub use platform_lifecycle::*;
 #[cfg(not(target_arch = "wasm32"))]

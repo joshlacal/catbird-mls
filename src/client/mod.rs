@@ -1197,7 +1197,15 @@ pub(crate) mod native_client {
                     .tls_serialize_detached()
                     .map_err(|e| MLSError::Internal(format!("serialize message: {e:?}")))?;
 
-                let next_seq = convo.last_seq.saturating_add(1);
+                let latest_message_seq: i64 = tx
+                    .conn()
+                    .query_row(
+                        "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation_id = ?1",
+                        [conversation_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| MLSError::Internal(format!("read offline message seq: {e}")))?;
+                let next_seq = convo.last_seq.max(latest_message_seq).saturating_add(1);
                 convo.last_seq = next_seq;
                 convo.epoch = group.epoch().as_u64() as i64;
                 convo.updated_at_ms = now_ms;
@@ -2944,6 +2952,8 @@ pub(crate) mod native_client {
         }
 
         /// Import verified Space history messages into local `<did_hash>.db` (`I13`).
+        /// History does not advance the live entry cursor: missing messages and MLS commits
+        /// before the imported sequence must still be reconciled by `sync`.
         pub fn import_conversation_history(
             &self,
             conversation_id: &str,
@@ -2951,7 +2961,6 @@ pub(crate) mod native_client {
         ) -> Result<u32, MLSError> {
             let count = self.db.write_tx(|tx| {
                 let mut imported = 0u32;
-                let mut max_seq: Option<i64> = None;
                 for msg in &messages {
                     if msg.conversation_id != conversation_id {
                         return Err(MLSError::invalid_input(
@@ -2959,17 +2968,7 @@ pub(crate) mod native_client {
                         ));
                     }
                     tx.insert_message(msg)?;
-                    max_seq = Some(max_seq.map_or(msg.seq, |cur| cur.max(msg.seq)));
                     imported = imported.saturating_add(1);
-                }
-                if let Some(imported_max_seq) = max_seq {
-                    if let Some(mut convo) = tx.get_conversation(conversation_id)? {
-                        if imported_max_seq > convo.last_seq {
-                            convo.last_seq = imported_max_seq;
-                            convo.updated_at_ms = self.hooks.now_ms();
-                            tx.upsert_conversation(&convo)?;
-                        }
-                    }
                 }
                 Ok(imported)
             })?;

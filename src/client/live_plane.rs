@@ -10,6 +10,7 @@ use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as Tl
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
@@ -44,6 +45,18 @@ use crate::storage::{
 use super::native_client::CatbirdMlsClient;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PendingApplicationSend {
+    pub(crate) body: Value,
+    pub(crate) archive: QueuedLabyrinthArchivePayload,
+}
+
+#[derive(Deserialize)]
+struct ChatProtocolFailure<'a> {
+    #[serde(borrow)]
+    error: std::borrow::Cow<'a, str>,
+}
 
 fn canonical_labyrinth_frame_for_text(input: &str) -> (String, String) {
     if serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(input).is_ok() {
@@ -111,7 +124,7 @@ impl CatbirdMlsClient {
         url: String,
         body: Vec<u8>,
     ) -> Result<PlatformHttpResponse, MLSError> {
-        let resp = self.transport.execute_http(PlatformHttpRequest {
+        let req = PlatformHttpRequest {
             method: "POST".to_string(),
             url: url.clone(),
             headers: vec![PlatformHttpHeader {
@@ -119,8 +132,20 @@ impl CatbirdMlsClient {
                 value: "application/json".to_string(),
             }],
             body: Some(body),
-        })?;
+        };
+        let resp = if crate::planted::is_planted_bug_active(
+            crate::planted::PlantedBug::P3NetworkInsideWriteTx,
+        ) {
+            self.db.write_tx(|_tx| self.transport.execute_http(req))?
+        } else {
+            self.transport.execute_http(req)?
+        };
         if resp.status >= 400 {
+            if serde_json::from_slice::<ChatProtocolFailure<'_>>(&resp.body)
+                .is_ok_and(|failure| failure.error == "StaleCoordinates")
+            {
+                return Err(MLSError::InvalidState("StaleCoordinates".into()));
+            }
             let snippet = String::from_utf8_lossy(&resp.body);
             return Err(MLSError::Internal(format!(
                 "POST {url} failed with HTTP {}: {snippet}",
@@ -1030,6 +1055,12 @@ impl CatbirdMlsClient {
             "{}/xrpc/blue.catbird.chat.publishDirectRequest",
             self.ds_base()
         );
+        if crate::planted::is_planted_bug_active(
+            crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
+        ) {
+            self.db
+                .write_tx(|tx| Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?))?;
+        }
         let _ = self.execute_json_post(
             publish_url,
             serde_json::to_vec(&json!({ "signedRequest": publish_wrapper_val }))
@@ -1336,6 +1367,12 @@ impl CatbirdMlsClient {
             "signedAt": self.hooks.now_rfc3339_millis(),
         });
 
+        if crate::planted::is_planted_bug_active(
+            crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
+        ) {
+            self.db
+                .write_tx(|tx| Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?))?;
+        }
         let resp_val = self.submit_signed_chat_op(
             canonical_dev_id,
             Some(auth_generation),
@@ -1568,7 +1605,7 @@ impl CatbirdMlsClient {
             let _ = self.sync_conversation_entries(&canonical_dev_id, &signer, &updated);
         }
 
-        let _ = self.fulfill_leaf_recovery_inbox(&canonical_dev_id, &signer, auth_generation, None);
+        let _ = self.fulfill_pending_leaf_recoveries(&canonical_dev_id, &signer, auth_generation);
         let refreshed = self
             .db
             .read_tx(|tx| tx.get_conversation(conversation_id))?
@@ -1677,18 +1714,9 @@ impl CatbirdMlsClient {
         let gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
         let ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
 
-        // Stage OpenMLS `create_message` over `KvWriteOverlay` inside `read_tx` so SQLite
-        // (`openmls_kv`, `messages`, `labyrinth_queue`, `conversations`) is untouched if
-        // live `sendMessage` fails or returns an unverified receipt.
-        let (
-            signer,
-            auth_generation,
-            convo_snapshot,
-            msg_epoch,
-            ciphertext_bytes,
-            aad_json,
-            kv_batch,
-        ) = self.db.read_tx(|tx| {
+        // Reserve the sender generation and immutable recovery material atomically before HTTP.
+        // A timeout can still publish the ciphertext; rolling the ratchet back would reuse its key.
+        let (signer, auth_generation, pending) = self.db.write_tx(|tx| {
             let convo = tx.get_conversation(&canonical_convo_id)?.ok_or_else(|| {
                 MLSError::GroupNotFound {
                     message: format!("conversation {canonical_convo_id} not found"),
@@ -1706,6 +1734,22 @@ impl CatbirdMlsClient {
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1)
                 .max(1);
+            if let Some(raw) = tx.get_pending_op("application_send", &canonical_msg_id)? {
+                let pending: PendingApplicationSend = serde_json::from_str(&raw)
+                    .map_err(|e| MLSError::Internal(format!("parse pending send: {e}")))?;
+                if pending.archive.conversation_id != canonical_convo_id
+                    || pending.archive.plaintext_json != display_json
+                    || pending.archive.sender_device_id != canonical_dev_id
+                {
+                    return Err(MLSError::invalid_input(
+                        "message_id already reserved for a different send",
+                    ));
+                }
+                let auth_gen = pending.body["authGeneration"].as_i64().ok_or_else(|| {
+                    MLSError::Internal("pending send missing authGeneration".into())
+                })?;
+                return Ok((signer, auth_gen, pending));
+            }
 
             let aad_prior = chat_wire::build_aad_prior_coordinate(
                 &convo_uuid,
@@ -1728,9 +1772,8 @@ impl CatbirdMlsClient {
                 MLSError::Cryptography(format!("canonical_application_aad_bytes: {e}"))
             })?;
 
-            let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
             let ciphertext = {
-                let storage = OpenMlsKvStorage::new(&overlay);
+                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
                 let provider = self.hooks.openmls_provider(storage);
                 let mut group =
                     MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
@@ -1752,43 +1795,58 @@ impl CatbirdMlsClient {
                 (ct, active_epoch)
             };
 
-            Ok((
-                signer,
-                auth_gen,
-                convo,
-                ciphertext.1,
-                ciphertext.0,
-                aad_val,
-                overlay.into_batch(),
-            ))
+            let body = json!({
+                "$type": "blue.catbird.chat.defs#applicationSendBody",
+                "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
+                "messageId": canonical_msg_id,
+                "actorDid": self.normalized_did,
+                "actorDeviceId": canonical_dev_id,
+                "keyId": derive_key_id(signer.public()),
+                "authGeneration": auth_gen,
+                "signedAt": self.hooks.now_rfc3339_millis(),
+                "prior": prior_coords,
+                "aad": aad_val,
+                "applicationMessage": {
+                    "framing": "mlsMessage",
+                    "contentType": "privateMessageApplication",
+                    "bytes": { "$bytes": STANDARD.encode(&ciphertext.0) },
+                    "sha256": { "$bytes": STANDARD.encode(Sha256::digest(&ciphertext.0)) },
+                },
+                "blobBindings": [],
+            });
+            let pending = PendingApplicationSend {
+                body,
+                archive: QueuedLabyrinthArchivePayload {
+                    version: 1,
+                    message_id: canonical_msg_id.clone(),
+                    conversation_id: canonical_convo_id.clone(),
+                    group_id_hex: hex::encode(&convo.group_id),
+                    epoch: ciphertext.1,
+                    seq: 0,
+                    sender_did: self.normalized_did.clone(),
+                    sender_device_id: canonical_dev_id.clone(),
+                    sequencer_did: convo.sequencer_did,
+                    space_uri: convo.space_uri,
+                    plaintext_json: display_json.clone(),
+                    labyrinth_frame_json: frame_json,
+                    mls_ciphertext_b64: STANDARD.encode(&ciphertext.0),
+                    frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
+                    sequencer_receipt_json: None,
+                    created_at_ms: now_ms,
+                },
+            };
+            let payload = serde_json::to_string(&pending)
+                .map_err(|e| MLSError::Internal(format!("serialize pending send: {e}")))?;
+            tx.put_pending_op("application_send", &canonical_msg_id, &payload, now_ms)?;
+            Ok((signer, auth_gen, pending))
         })?;
 
-        // Strictly outside `write_tx` (`I6`): dispatch signed `blue.catbird.chat.sendMessage`.
-        let send_body = json!({
-            "$type": "blue.catbird.chat.defs#applicationSendBody",
-            "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
-            "messageId": canonical_msg_id,
-            "actorDid": self.normalized_did,
-            "actorDeviceId": canonical_dev_id,
-            "keyId": derive_key_id(signer.public()),
-            "authGeneration": auth_generation,
-            "signedAt": self.hooks.now_rfc3339_millis(),
-            "prior": prior_coords,
-            "aad": aad_json,
-            "applicationMessage": {
-                "framing": "mlsMessage",
-                "contentType": "privateMessageApplication",
-                "bytes": { "$bytes": STANDARD.encode(&ciphertext_bytes) },
-                "sha256": { "$bytes": STANDARD.encode(Sha256::digest(&ciphertext_bytes)) },
-            },
-            "blobBindings": [],
-        });
-
+        // Strictly outside `write_tx` (`I6`); retries reuse the journal's exact signed body.
         let resp_val = self.submit_signed_chat_op(
             &canonical_dev_id,
             Some(auth_generation),
             CanonicalOperation::SendMessage,
-            &send_body,
+            &pending.body,
             &signer,
         )?;
 
@@ -1806,101 +1864,12 @@ impl CatbirdMlsClient {
                     "I13: sendMessage response missing non-null sequencerReceipt".to_string(),
                 )
             })?;
-        let kid = receipt_val
-            .get("kid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("#mls-receipt-1");
-        let sec1_key = self
-            .resolve_sequencer_receipt_key(&convo_snapshot.sequencer_did, kid)?
-            .ok_or_else(|| {
-                MLSError::Cryptography(format!(
-                    "I13: unable to resolve `{}` DID document for #mls-receipt-1 verification",
-                    convo_snapshot.sequencer_did
-                ))
-            })?;
         let expected_entry_id = resp_val
             .pointer("/entry/entryId")
             .and_then(|v| v.as_str())
             .unwrap_or(&canonical_msg_id);
-        let (rcpt_seq, _rcpt_gen, archived_json) =
-            chat_wire::parse_and_verify_i13_sequencer_receipt(
-                receipt_val,
-                &sec1_key,
-                &convo_snapshot.sequencer_did,
-                &canonical_convo_id,
-                &convo_snapshot.group_id,
-                msg_epoch.max(0) as u64,
-                expected_entry_id,
-                &archive_commitment,
-            )?;
-        let authoritative_seq = rcpt_seq as i64;
-
-        if crate::buggify!("after_http_2xx_before_db_commit") {
-            return Err(MLSError::Internal(
-                "sim buggify: after_http_2xx_before_db_commit".to_string(),
-            ));
-        }
-
-        let (final_row, needs_gap_sync) = self.db.write_tx(|tx| {
-            kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
-            let row = MessageRow {
-                message_id: canonical_msg_id.clone(),
-                conversation_id: canonical_convo_id.clone(),
-                group_id: convo_snapshot.group_id.clone(),
-                epoch: msg_epoch,
-                seq: authoritative_seq,
-                sender_did: self.normalized_did.clone(),
-                sender_device_id: canonical_dev_id.clone(),
-                plaintext_json: display_json.clone(),
-                created_at_ms: now_ms,
-                is_own: true,
-            };
-            tx.insert_message(&row)?;
-
-            let mut gap = false;
-            if let Some(mut c) = tx.get_conversation(&canonical_convo_id)? {
-                c.epoch = c.epoch.max(msg_epoch);
-                if authoritative_seq == c.last_seq.saturating_add(1) {
-                    c.last_seq = authoritative_seq;
-                } else if authoritative_seq > c.last_seq.saturating_add(1) {
-                    gap = true;
-                }
-                c.updated_at_ms = now_ms;
-                tx.upsert_conversation(&c)?;
-            }
-
-            let group_id_hex = hex::encode(&convo_snapshot.group_id);
-            let queued = QueuedLabyrinthArchivePayload {
-                version: 1,
-                message_id: canonical_msg_id.clone(),
-                conversation_id: canonical_convo_id.clone(),
-                group_id_hex: group_id_hex.clone(),
-                epoch: msg_epoch,
-                seq: authoritative_seq,
-                sender_did: self.normalized_did.clone(),
-                sender_device_id: canonical_dev_id.clone(),
-                sequencer_did: convo_snapshot.sequencer_did.clone(),
-                space_uri: convo_snapshot.space_uri.clone(),
-                plaintext_json: display_json,
-                labyrinth_frame_json: frame_json,
-                mls_ciphertext_b64: STANDARD.encode(&ciphertext_bytes),
-                frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
-                sequencer_receipt_json: Some(archived_json),
-                created_at_ms: now_ms,
-            };
-            let queued_bytes = serde_json::to_vec(&queued)
-                .map_err(|e| MLSError::Internal(format!("serialize queue payload: {e}")))?;
-            tx.dequeue_labyrinth_item(&canonical_msg_id)?;
-            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                item_id: canonical_msg_id,
-                conversation_id: canonical_convo_id.clone(),
-                group_id_hex,
-                seq: authoritative_seq,
-                payload_bytes: queued_bytes,
-                created_at_ms: now_ms,
-            })?;
-            Ok((row, gap))
-        })?;
+        let (final_row, needs_gap_sync) =
+            self.finish_application_send(pending, receipt_val, expected_entry_id, None)?;
 
         if needs_gap_sync {
             if let Some(convo_now) = self
@@ -1915,6 +1884,106 @@ impl CatbirdMlsClient {
             conversation_id: canonical_convo_id,
         });
         Ok(final_row)
+    }
+
+    pub(crate) fn finish_application_send(
+        &self,
+        pending: PendingApplicationSend,
+        receipt: &Value,
+        entry_id: &str,
+        ordered_seq: Option<i64>,
+    ) -> Result<(MessageRow, bool), MLSError> {
+        let mut queued = pending.archive;
+        let group_id = hex::decode(&queued.group_id_hex)
+            .map_err(|e| MLSError::Internal(format!("pending send group_id: {e}")))?;
+        let nonce = STANDARD
+            .decode(queued.frame_nonce_b64.as_deref().unwrap_or(""))
+            .map_err(|e| MLSError::Internal(format!("pending send frame nonce: {e}")))?;
+        let nonce: [u8; 32] = nonce
+            .try_into()
+            .map_err(|_| MLSError::Internal("pending send frame nonce must be 32 bytes".into()))?;
+        let commitment = labyrinth_protocol::receipt::compute_archive_commitment(
+            &nonce,
+            queued.labyrinth_frame_json.as_bytes(),
+        );
+        let kid = receipt
+            .get("kid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("#mls-receipt-1");
+        let sec1_key = self
+            .resolve_sequencer_receipt_key(&queued.sequencer_did, kid)?
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "I13: unable to resolve `{}` receipt key",
+                    queued.sequencer_did
+                ))
+            })?;
+        let (seq, generation, archived_json) = chat_wire::parse_and_verify_i13_sequencer_receipt(
+            receipt,
+            &sec1_key,
+            &queued.sequencer_did,
+            &queued.conversation_id,
+            &group_id,
+            queued.epoch.max(0) as u64,
+            entry_id,
+            &commitment,
+        )?;
+        let seq = i64::try_from(seq)
+            .map_err(|_| MLSError::Cryptography("I13: receipt seq exceeds i64".into()))?;
+        if ordered_seq.is_some_and(|expected| expected != seq)
+            || receipt["senderDid"].as_str() != Some(queued.sender_did.as_str())
+            || receipt["senderDeviceId"].as_str() != Some(queued.sender_device_id.as_str())
+            || pending.body["prior"]["generation"].as_u64() != Some(generation)
+        {
+            return Err(MLSError::Cryptography(
+                "I13: receipt seq, generation, or sender mismatch".into(),
+            ));
+        }
+        if ordered_seq.is_none() && crate::buggify!("after_http_2xx_before_db_commit") {
+            return Err(MLSError::Internal(
+                "sim buggify: after_http_2xx_before_db_commit".to_string(),
+            ));
+        }
+        queued.seq = seq;
+        queued.sequencer_receipt_json = Some(archived_json);
+        self.db.write_tx(|tx| {
+            let row = MessageRow {
+                message_id: queued.message_id.clone(),
+                conversation_id: queued.conversation_id.clone(),
+                group_id,
+                epoch: queued.epoch,
+                seq,
+                sender_did: queued.sender_did.clone(),
+                sender_device_id: queued.sender_device_id.clone(),
+                plaintext_json: queued.plaintext_json.clone(),
+                created_at_ms: queued.created_at_ms,
+                is_own: true,
+            };
+            tx.insert_message(&row)?;
+            let mut gap = false;
+            if let Some(mut c) = tx.get_conversation(&queued.conversation_id)? {
+                if ordered_seq.is_some() || seq == c.last_seq.saturating_add(1) {
+                    c.last_seq = c.last_seq.max(seq);
+                } else if seq > c.last_seq.saturating_add(1) {
+                    gap = true;
+                }
+                c.updated_at_ms = self.hooks.now_ms();
+                tx.upsert_conversation(&c)?;
+            }
+            let payload_bytes = serde_json::to_vec(&queued)
+                .map_err(|e| MLSError::Internal(format!("serialize queue payload: {e}")))?;
+            tx.dequeue_labyrinth_item(&queued.message_id)?;
+            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
+                item_id: queued.message_id.clone(),
+                conversation_id: queued.conversation_id.clone(),
+                group_id_hex: queued.group_id_hex.clone(),
+                seq,
+                payload_bytes,
+                created_at_ms: queued.created_at_ms,
+            })?;
+            tx.delete_pending_op("application_send", &queued.message_id)?;
+            Ok((row, gap))
+        })
     }
 
     pub(crate) fn remove_group_member_live_or_offline(
@@ -1962,7 +2031,7 @@ impl CatbirdMlsClient {
             let transition_id = transition_uuid.to_string();
 
             // Stage `remove_members` + `merge_pending_commit` over `KvWriteOverlay` inside `read_tx`
-            // so `openmls_kv` is NEVER advanced if `submitTransition` fails (`409` race or `5xx`)!
+            // so `openmls_kv` is NEVER advanced if `submitTransition` fails (stale prior or `5xx`)!
             let maybe_commit = self.db.read_tx(|tx| {
                 let signer_json = tx.get_account_meta("enrolled_signer_json")?;
                 let Some(signer_str) = signer_json else {
@@ -2031,6 +2100,7 @@ impl CatbirdMlsClient {
                     let (commit_msg, _, _) = group
                         .remove_members(&provider, &signer, &target_leaves)
                         .map_err(|e| MLSError::Cryptography(format!("remove_members: {e:?}")))?;
+                    let staged_pending_batch = overlay.clone_batch();
                     group.merge_pending_commit(&provider).map_err(|e| {
                         MLSError::Cryptography(format!("merge_pending_commit: {e:?}"))
                     })?;
@@ -2095,6 +2165,7 @@ impl CatbirdMlsClient {
                         next_gch,
                         next_ctag,
                         carried_snap,
+                        staged_pending_batch,
                     )
                 };
                 Ok(Some((built, overlay.into_batch())))
@@ -2111,6 +2182,7 @@ impl CatbirdMlsClient {
                     next_gch,
                     next_ctag,
                     carried_snap,
+                    staged_pending_batch,
                 ),
                 kv_batch,
             )) = maybe_commit
@@ -2153,13 +2225,32 @@ impl CatbirdMlsClient {
                     },
                     "metadataSnapshot": carried_snap,
                 });
-                let resp_val = self.submit_signed_chat_op(
+                if crate::planted::is_planted_bug_active(
+                    crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
+                ) {
+                    self.db
+                        .write_tx(|tx| Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?))?;
+                }
+                let resp_val = match self.submit_signed_chat_op(
                     &canonical_dev_id,
                     Some(auth_gen),
                     CanonicalOperation::SubmitTransition,
                     &body,
                     &signer,
-                )?;
+                ) {
+                    Ok(val) => val,
+                    Err(err) => {
+                        if crate::planted::is_planted_bug_active(
+                            crate::planted::PlantedBug::P1KeepLoserStagedCommit,
+                        ) && err.is_stale_coordinates()
+                        {
+                            self.db.write_tx(|tx| {
+                                Ok(staged_pending_batch.apply(&RusqliteKvBackend(tx.conn()))?)
+                            })?;
+                        }
+                        return Err(err);
+                    }
+                };
                 let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
                     resp_val
                         .get("entry")
@@ -2485,6 +2576,12 @@ impl CatbirdMlsClient {
                 "metadataSnapshot": snap,
                 "signedAt": self.hooks.now_rfc3339_millis(),
             });
+            if crate::planted::is_planted_bug_active(
+                crate::planted::PlantedBug::P2PrematureMergeBeforeServerAccept,
+            ) {
+                self.db
+                    .write_tx(|tx| Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?))?;
+            }
             let resp_val = self.submit_signed_chat_op(
                 &dev_id,
                 Some(auth_gen),
@@ -2841,6 +2938,46 @@ impl CatbirdMlsClient {
                 dids.insert(self.normalized_did.clone());
             }
             Ok(dids.into_iter().collect())
+        })
+    }
+
+    /// Inspect durable OpenMLS group state directly from `openmls_kv` for simulation oracles.
+    #[cfg(feature = "sim")]
+    pub fn inspect_sim_group(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<crate::planted::SimGroupState>, MLSError> {
+        self.db.read_tx(|tx| {
+            let Some(convo) = tx.get_conversation(conversation_id)? else {
+                return Ok(None);
+            };
+            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let provider = self.hooks.openmls_provider(storage);
+            let Some(group) =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                    .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+            else {
+                return Ok(None);
+            };
+            let mut members: Vec<String> = group
+                .members()
+                .filter_map(|m| {
+                    std::str::from_utf8(m.credential.serialized_content())
+                        .ok()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .collect();
+            members.sort();
+            members.dedup();
+            Ok(Some(crate::planted::SimGroupState {
+                group_id: group.group_id().as_slice().to_vec(),
+                epoch: group.epoch().as_u64(),
+                tree_hash: group.public_group().group_context().tree_hash().to_vec(),
+                members,
+                has_pending_commit: group.pending_commit().is_some(),
+            }))
         })
     }
 }

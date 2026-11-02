@@ -1180,7 +1180,7 @@ fn buggify_controller_fires_all_three_initial_sites_under_sim_feature() {
         )
         .unwrap();
 
-    // Fault right after HTTP 2xx on `sendMessage` before local SQLite `write_tx`.
+    // Fault after HTTP 2xx, before promoting the durable send journal into message/archive rows.
     BuggifyController::with_enabled_sites(&["after_http_2xx_before_db_commit"], || {
         let err = client
             .send_message(
@@ -1196,7 +1196,24 @@ fn buggify_controller_fires_all_three_initial_sites_under_sim_feature() {
             .list_pending_labyrinth_queue(Some(convo_id), 10)
             .unwrap()
             .is_empty(),
-        "local write_tx must not have committed when after_http_2xx_before_db_commit fired"
+        "the archive queue must not commit before receipt-verified send finalization"
+    );
+    let pending_sends = client
+        .db()
+        .read_tx(|tx| {
+            Ok(tx
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_ops WHERE op_kind = 'application_send'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap())
+        })
+        .unwrap();
+    assert_eq!(
+        pending_sends, 1,
+        "crash recovery material must already be durable"
     );
 
     // Now send cleanly so item lands in `labyrinth_queue`, then fault `between_labyrinth_enqueue_and_flush`.

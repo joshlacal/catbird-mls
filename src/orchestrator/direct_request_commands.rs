@@ -529,7 +529,7 @@ where
                 }
             }
             if grant.body()["keyPackageRef"] != device["keyPackage"]["keyPackageRef"]
-                || bytes(&grant.body()["keyPackageSha256"])? != Sha256::digest(&package).as_slice()
+                || bytes(&grant.body()["keyPackageSha256"])? != Sha256::digest(&package)[..]
             {
                 return Err(invalid());
             }

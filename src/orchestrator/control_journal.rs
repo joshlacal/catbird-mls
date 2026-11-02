@@ -158,7 +158,7 @@ impl PreparedControlRecord {
         }
         let commit = bytes(&body["commit"]["bytes"])?;
         let commit_sha256 = bytes(&body["commit"]["sha256"])?;
-        if Sha256::digest(&commit).as_slice() != commit_sha256
+        if Sha256::digest(&commit)[..] != commit_sha256
             || bytes(&request["signedRequest"]["signature"])?.len() != 64
         {
             return Err(invalid("commit or signature binding is invalid"));

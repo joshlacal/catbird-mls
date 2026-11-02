@@ -61,10 +61,12 @@ pub fn decrypt_blob(
     raw_key.copy_from_slice(key);
     let cipher =
         Aes256Gcm::new_from_slice(&*raw_key).map_err(|_| BlobCryptoError::DecryptionFailed)?;
-    let nonce = Nonce::from_slice(iv);
+    let nonce_arr: [u8; NONCE_LEN] = iv
+        .try_into()
+        .map_err(|_| BlobCryptoError::DecryptionFailed)?;
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&Nonce::from(nonce_arr), ciphertext)
         .map_err(|_| BlobCryptoError::DecryptionFailed)
 }
 

@@ -1042,15 +1042,23 @@ impl<'a> SqlReadTx<'a> {
                 is_own: row.get::<_, i64>(9)? != 0,
             })
         };
+        let order_clause = if crate::planted::is_planted_bug_active(
+            crate::planted::PlantedBug::P6OrderTimelineByEpochSeq,
+        ) {
+            "epoch DESC, seq DESC"
+        } else {
+            "seq DESC"
+        };
         if let Some(before) = before_seq {
+            let sql = format!(
+                "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, \
+                        sender_device_id, plaintext_json, created_at_ms, is_own \
+                 FROM messages WHERE conversation_id = ?1 AND seq < ?2 \
+                 ORDER BY {order_clause} LIMIT ?3"
+            );
             let mut stmt = self
                 .conn
-                .prepare(
-                    "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, \
-                            sender_device_id, plaintext_json, created_at_ms, is_own \
-                     FROM messages WHERE conversation_id = ?1 AND seq < ?2 \
-                     ORDER BY seq DESC LIMIT ?3",
-                )
+                .prepare(&sql)
                 .map_err(|e| map_rusqlite_err("list_messages.prepare", &e))?;
             let rows = stmt
                 .query_map(rusqlite::params![conversation_id, before, cap], map_row)
@@ -1058,14 +1066,15 @@ impl<'a> SqlReadTx<'a> {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| map_rusqlite_err("list_messages.collect", &e))
         } else {
+            let sql = format!(
+                "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, \
+                        sender_device_id, plaintext_json, created_at_ms, is_own \
+                 FROM messages WHERE conversation_id = ?1 \
+                 ORDER BY {order_clause} LIMIT ?2"
+            );
             let mut stmt = self
                 .conn
-                .prepare(
-                    "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, \
-                            sender_device_id, plaintext_json, created_at_ms, is_own \
-                     FROM messages WHERE conversation_id = ?1 \
-                     ORDER BY seq DESC LIMIT ?2",
-                )
+                .prepare(&sql)
                 .map_err(|e| map_rusqlite_err("list_messages.prepare", &e))?;
             let rows = stmt
                 .query_map(rusqlite::params![conversation_id, cap], map_row)
@@ -1255,6 +1264,21 @@ impl<'a> SqlReadTx<'a> {
             )
             .optional()
             .map_err(|e| map_rusqlite_err("get_epoch_secret", &e))
+    }
+
+    pub(crate) fn get_pending_op(
+        &self,
+        op_kind: &str,
+        op_key: &str,
+    ) -> Result<Option<String>, MLSError> {
+        self.conn
+            .query_row(
+                "SELECT payload_json FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",
+                rusqlite::params![op_kind, op_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| map_rusqlite_err("get_pending_op", &e))
     }
 
     pub fn list_mutation_journal_pending(&self) -> Result<Vec<MutationJournalRow>, MLSError> {

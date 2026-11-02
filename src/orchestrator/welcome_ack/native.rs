@@ -373,8 +373,7 @@ pub(crate) fn adopt(
             };
             if bytes(&delivery.envelope["coordinates"]["groupContextHash"])
                 .map_err(storage_error)?
-                != Sha256::digest(context.tls_serialize_detached().map_err(storage_error)?)
-                    .as_slice()
+                != Sha256::digest(context.tls_serialize_detached().map_err(storage_error)?)[..]
                 || bytes(&delivery.envelope["coordinates"]["confirmationTag"])
                     .map_err(storage_error)?
                     != tag

@@ -115,6 +115,7 @@ All source is in `src/`. Single crate, no workspace.
 | `logging.rs` | `debug_log!` macro + `MLSLogger` callback for platform log routing |
 | `atproto_bytes.rs` | AT Protocol base64url serde helpers |
 | `ffi.rs` | Legacy C FFI layer (predates UniFFI, kept for interop) |
+| `planted.rs` | `PlantedBug` (`P1`/`P2`/`P3`/`P6`/`P13`) thread-local `sim` calibration hooks + `SimGroupState` |
 
 ## Architecture
 
@@ -130,6 +131,18 @@ MLSOrchestrator<S, A, C, M>
 
 On iOS/Android: each trait is a UniFFI callback interface (Swift/Kotlin provides the impl).
 On WASM/CLI: Rust implementations used directly.
+
+`CatbirdMlsClient` reserves each live application's sender generation and immutable
+send body in `pending_ops` before HTTP dispatch. A timeout may still publish that
+ciphertext. `sync()` recovers its plaintext and archive queue from the journal only
+after matching the exact ciphertext and verifying the sequencer receipt; it never
+decrypts or blindly skips an own-message echo. Imported history does not advance
+the live entry cursor.
+
+Joined clients discover fulfillable leaf-recovery requests through
+`getConversationState.pendingLeafRecoveryRequests`; `getLeafRecoveryInbox` belongs
+to the requesting device. Classify stale transitions by the exact XRPC
+`StaleCoordinates` error, not HTTP 409: the delivery service returns HTTP 400.
 
 ### Async Runtime Bridging
 
