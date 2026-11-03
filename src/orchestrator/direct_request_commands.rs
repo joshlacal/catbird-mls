@@ -576,6 +576,13 @@ where
                     authority_import_until: deadline,
                     preparation_request_digest: *prepared.request_digest(),
                     receipt_authority_key: key,
+                    sequencer_did: auth_did.clone(),
+                    sequencer_receipt_authority_key:
+                        crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                            &intent.trusted_authority_document,
+                            &auth_did,
+                            "#mls-receipt-1",
+                        )?,
                     text: intent.input.text.clone(),
                     invitation: intent.input.invitation.clone(),
                     metadata: crate::metadata::GroupMetadataV1 {
@@ -611,6 +618,7 @@ where
         body["preparationDigest"] = preparation["preparationDigest"].clone();
         body["preparationRequestDigest"] = json!(STANDARD.encode(prepared.request_digest()));
         body["contextHash"] = json!(STANDARD.encode(b.context_hash));
+        body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
         body["next"] = b.coordinates.clone();
         body["importUntil"] = json!(import_until);
         let artifact = |data: &[u8], content_type: &str| json!({"framing":"mlsMessage","contentType":content_type,"bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))});

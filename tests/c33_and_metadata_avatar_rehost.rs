@@ -32,6 +32,49 @@ use catbird_mls::storage::{MessageRow, MlsAccountDb, OpenMode, RequestRow};
 use catbird_mls::sync::reconcile::persist_entries_then_acknowledge;
 use sha2::{Digest, Sha256};
 
+#[test]
+fn c33_generic_receive_preserves_the_authenticated_opening_frame_and_rejects_legacy() {
+    use catbird_mls::chat_v2::transcript::direct_request::{
+        direct_request_application_aad, encode_direct_request_introduction,
+    };
+    use catbird_mls::messaging::receive::extract_plaintext_body_and_verify_aad;
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../src/chat_v2/transcript/vectors/direct_request_vectors.json"
+    ))
+    .unwrap();
+    let body = &vectors["signed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "Publish")
+        .unwrap()["body"];
+    let (plaintext, opening) =
+        encode_direct_request_introduction(br#"{"text":"C33 exact archive frame"}"#, &[33; 32])
+            .unwrap();
+    let coordinates = serde_json::to_vec(&body["next"]).unwrap();
+    let message_id = body["firstMessageId"].as_str().unwrap();
+    let aad = direct_request_application_aad(
+        &[9; 32],
+        &coordinates,
+        message_id,
+        &opening.archive_commitment,
+    )
+    .unwrap();
+    let (text, frame, commitment) =
+        extract_plaintext_body_and_verify_aad(&plaintext, &aad).unwrap();
+    assert_eq!(text, "C33 exact archive frame");
+    assert_eq!(frame.as_bytes(), opening.canonical_payload_bytes);
+    assert_eq!(commitment, Some(opening.archive_commitment));
+    let wrong_aad =
+        direct_request_application_aad(&[9; 32], &coordinates, message_id, &[0; 32]).unwrap();
+    assert!(extract_plaintext_body_and_verify_aad(&plaintext, &wrong_aad).is_err());
+    let mut missing_commitment = b"CATBIRD-DIRECT-REQUEST-APPLICATION-AAD\0".to_vec();
+    missing_commitment.extend(serde_ipld_dagcbor::to_vec(&serde_json::json!({})).unwrap());
+    assert!(extract_plaintext_body_and_verify_aad(&plaintext, &missing_commitment).is_err());
+    let legacy = serde_ipld_dagcbor::to_vec(&serde_json::json!({"text":"legacy"})).unwrap();
+    assert!(extract_plaintext_body_and_verify_aad(&legacy, &aad).is_err());
+}
+
 #[tokio::test]
 async fn c33_direct_request_35d_keypackage_and_opening_message_space_archival() {
     let now_sec = 1_760_000_000u64;

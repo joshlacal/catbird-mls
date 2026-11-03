@@ -77,27 +77,30 @@ be **the same bytes the server embeds** — the server reaches it through
 
 | | |
 |---|---|
-| Source path | `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
-| Source revision | `aa0d0d489443d8a5622a86732e771d3116748b0e` (PetrelCatbird) / `ec5028ce4f424af3819aa3e993c86fca1a85bbde` (mls-ds) |
-| SHA-256 | `dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf` |
-| Size / defs | 123,233 bytes / 198 definitions |
-| Prior SHA-256 | `7a0411afdfde050c255c9b415f700c7e0d93041679d2cde23497797428bdab03` @ `b1814a6c`, 131,653 bytes / 200 definitions |
+| Source path | `PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json` (canonical); mls-ds mirror `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
+| Source revision | `df7653aa530cadaf5d24263ef74a54c688571169` (PetrelCatbird, tree `8d9ac196a76ad4e8f96538ddd304066647210c3a`) |
+| SHA-256 | `fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39` |
+| Size / defs | 231,566 bytes / 257 definitions |
+| Prior SHA-256 | `a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d` @ PetrelCatbird `f102084e` (unchanged through `854142ea`), 230,449 bytes / 257 definitions |
 
-**The changes between those two digests** reflect the standard service-auth
-clean cutover: removal of `deviceAuthenticationRebind` / `deviceAuthenticationRebindBody`
-and associated public clean-chat DPoP fields, which reduced the definition count
-from 200 to 198.
+**The changes between those two digests** are the C33 opening-evidence
+extension (see the cutover section below): a required `archiveCommitment` on
+`directRequestPublicationBody` and `directRequestApplicationAad`, a required
+`sequencerReceipt` on `directRequestPublishedReceipt`, and a required
+`sequencerReceipt` plus closed `publicationReceipt` union on
+`directRequestEntry`. The definition count is unchanged at 257.
 
 **Verified identical across every live copy at sync time** — this vendored copy,
 `PetrelCatbird/lexicons/` (the canonical codegen source), and the mls-ds mirror
-the server embeds all hash to `dea9b6e7…`.
+the server embeds all hash to `fca4178c…`.
 
 To re-check:
 
 ```sh
-cd Catbird+Petrel/mls-ds
-/usr/bin/git show <rev>:lexicon/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
-shasum -a 256 ../PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json
+cd Catbird+Petrel/catbird-mls
+/usr/bin/git -C ../PetrelCatbird show df7653aa530cadaf5d24263ef74a54c688571169:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
+shasum -a 256 src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json ../mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json
+python3 scripts/generate_chat_schema.py --check-mirror
 ```
 
 **The contract does not encode the UUID-bytes rule.** `operationId` and
@@ -229,6 +232,31 @@ cd Catbird+Petrel/mls-ds
 Note that these fixtures are **tracked in git but absent from the mls-ds working
 tree** at its current detached revision — see the detached-HEAD trap in
 `HANDOFF.md`. Read them through `git show`, not the filesystem.
+
+## C33 opening evidence clean cutover (2026-11-03)
+
+`direct_request_vectors.json` and the embedded lexicon are mirrored from
+`mls-ds/server/tests/fixtures/direct_request_vectors.json` and
+`mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` for the mandatory
+opening-evidence extension. Protocol version `2`, signing domains, and
+`encryptedIntroduction1` remain unchanged; incomplete earlier requests are rejected.
+The publication and application AAD require the same 32-byte blinded
+`archiveCommitment`. Published outcomes require an I13 `sequencerReceipt`;
+opening entries retain that receipt and the full signed `publicationReceipt`.
+The entry ID is the signed `firstMessageId`.
+The embedded lexicon for this cutover is PetrelCatbird
+`df7653aa530cadaf5d24263ef74a54c688571169`, SHA-256
+`fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39`
+(see [The embedded lexicon contract](#the-embedded-lexicon-contract)).
+
+The independent opening oracle contains canonical `MLSMessagePayload` JSON,
+a fixed secret frame nonce, its HMAC-SHA256 commitment, and a deterministic
+RFC6979 P-256 I13 receipt. Only the publication and published-outcome golden
+transcripts/digests change; the client compares all golden bytes unchanged.
+The encrypted introduction uses a canonical version-two CBOR envelope carrying
+the nonce and structured payload; the canonical JSON archive frame is captured
+before encryption and reproduced byte-for-byte after decryption. This keeps
+the existing maximum UTF-8 text and ciphertext resource gates intact.
 
 ## The standing rule
 

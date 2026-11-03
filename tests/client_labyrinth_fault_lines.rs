@@ -1,5 +1,5 @@
-//! Integration tests for `CatbirdMlsClient` durable outbox persistence (`[CB-30]`, `I6`)
-//! and involuntary kick owner-mode (`v5` `KIND_ATTRIBUTED_FRAME`) fallback & history rescue (`[CB-22]`, `[CB-37]`).
+//! Explicit test-only offline archive regressions for durable outbox persistence (`[CB-30]`, `I6`)
+//! and involuntary kick owner-mode fallback & history rescue (`[CB-22]`, `[CB-37]`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -9,7 +9,7 @@ use catbird_mls::client::{
     personal_mailbox_space_uri, CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpRequest,
     PlatformHttpResponse, PlatformKeyStore, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
-use catbird_mls::storage::MessageRow;
+use catbird_mls::storage::{ConversationRow, MessageRow};
 use catbird_mls::MLSError;
 use tempfile::TempDir;
 
@@ -140,6 +140,110 @@ impl PlatformTransport for RecordingSpaceTransport {
 }
 
 #[test]
+fn production_constructors_reject_non_uuid_v4_devices() {
+    let tmp = TempDir::new().unwrap();
+    let keystore = Arc::new(TestKeystore::default());
+    let transport = Arc::new(RecordingSpaceTransport::new());
+    for device_id in [
+        "dev-space-only",
+        "11111111-1111-1111-8111-111111111111",
+        "00000000-0000-0000-0000-000000000000",
+    ] {
+        let config = CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: "did:plc:alicearchiveauth00000".to_string(),
+            device_id: device_id.to_string(),
+            home_ds_did: "did:web:chat.catbird.blue".to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        };
+        for (constructor, result) in [
+            (
+                "open",
+                CatbirdMlsClient::open(config.clone(), keystore.clone(), transport.clone(), None),
+            ),
+            (
+                "open_with_hooks",
+                CatbirdMlsClient::open_with_hooks(
+                    config,
+                    keystore.clone(),
+                    transport.clone(),
+                    None,
+                    catbird_mls::sim_hooks::SimClientHooks::system_default(),
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(MLSError::InvalidInput { .. })),
+                "{constructor} accepted non-UUIDv4 device {device_id}",
+            );
+        }
+    }
+}
+
+#[test]
+fn native_empty_flush_and_uuid_only_revocation_stay_local_without_enrollment() {
+    struct NoNetworkTransport;
+    impl PlatformTransport for NoNetworkTransport {
+        fn execute_http(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformHttpResponse, MLSError> {
+            panic!(
+                "unenrolled native archive unexpectedly called {}",
+                request.url
+            );
+        }
+
+        fn connect_realtime_stream(
+            &self,
+            _home_ds_endpoint: String,
+            _cursor_seq: Option<i64>,
+        ) -> Result<(), MLSError> {
+            panic!("unenrolled native archive unexpectedly connected a stream");
+        }
+
+        fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+            panic!("unenrolled native archive unexpectedly disconnected a stream");
+        }
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let client = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: "did:plc:alicearchiveauth00000".to_string(),
+            device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            home_ds_did: "did:web:chat.catbird.blue".to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        Arc::new(NoNetworkTransport),
+        None,
+    )
+    .unwrap();
+    let before = client.labyrinth_status().unwrap();
+    assert!(before.backup_enabled);
+    assert!(client
+        .db()
+        .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))
+        .unwrap()
+        .is_none());
+    assert_eq!(client.flush_labyrinth_queue().unwrap(), 0);
+    assert!(matches!(
+        client.revoke_labyrinth_device("22222222-2222-4222-8222-222222222222"),
+        Err(MLSError::InvalidInput { .. })
+    ));
+    assert_eq!(client.labyrinth_status().unwrap(), before);
+    assert!(client
+        .db()
+        .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn catbird_mls_client_outbox_crash_durability_kick_fallback_and_attributed_history_rescue() {
     let tmp = TempDir::new().expect("tempdir");
     let alice = "did:plc:alicesdk0000000000000";
@@ -165,8 +269,13 @@ fn catbird_mls_client_outbox_crash_durability_kick_fallback_and_attributed_histo
 
     // 1. Open, enroll, create group, send a message, and simulate immediate process crash BEFORE flush!
     let group_id = {
-        let client = CatbirdMlsClient::open(cfg.clone(), keystore.clone(), transport.clone(), None)
-            .expect("open client");
+        let client = CatbirdMlsClient::open_offline_archive_for_test(
+            cfg.clone(),
+            keystore.clone(),
+            transport.clone(),
+            None,
+        )
+        .expect("open offline archive client");
         client.enroll_device(&all_scopes).expect("enroll");
         let convo = client
             .create_group(
@@ -201,8 +310,9 @@ fn catbird_mls_client_outbox_crash_durability_kick_fallback_and_attributed_histo
     };
 
     // 2. Reopen after simulated crash; first verify healthy conversation Batch write, then transient 503 + kick 403!
-    let client = CatbirdMlsClient::open(cfg, keystore, transport.clone(), None)
-        .expect("reopen client after crash");
+    let client =
+        CatbirdMlsClient::open_offline_archive_for_test(cfg, keystore, transport.clone(), None)
+            .expect("reopen offline archive client after crash");
     assert_eq!(
         client
             .list_pending_labyrinth_queue(Some(conv_id), 10)
@@ -483,6 +593,215 @@ impl PlatformTransport for MemorySpacePlatformTransport {
 }
 
 #[test]
+fn offline_committed_owner_frames_authenticate_before_open_or_restore() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use labyrinth::message::{ArchivedReceipt, OwnerMessage};
+    use labyrinth_protocol::receipt::{
+        compute_archive_commitment, sign_sequencer_receipt, SequencerReceiptPayload,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:alicearchiveauth00000";
+    let bob = "did:plc:bobarchiveauth000000";
+    let ds_did = "did:web:chat.catbird.blue";
+    let transport = Arc::new(MemorySpacePlatformTransport::new(&host, alice));
+    let client = CatbirdMlsClient::open_offline_archive_for_test(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "offline-archive-auth".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        transport.clone(),
+        None,
+    )
+    .unwrap();
+    let root = [0x71; 32];
+    let nonce = [0x72; 32];
+    let frame = br#"{"text":"receipt-authenticated archive"}"#;
+    let timestamp_ms = 1_700_300_000_000;
+    let signing_key = p256::ecdsa::SigningKey::from_bytes((&[0x73; 32]).into()).unwrap();
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let did_doc = serde_json::json!({
+        "id": ds_did,
+        "verificationMethod": [{
+            "id": format!("{ds_did}#mls-receipt-1"),
+            "type": "JsonWebKey2020",
+            "controller": ds_did,
+            "publicKeyJwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            },
+        }],
+    });
+    client
+        .db()
+        .write_tx(|tx| {
+            tx.put_labyrinth_state("owner_epoch_root:1", &root, timestamp_ms)?;
+            tx.put_account_meta(
+                &format!("did_doc:{ds_did}"),
+                &did_doc.to_string(),
+                timestamp_ms,
+            )
+        })
+        .unwrap();
+
+    for case in [
+        "valid",
+        "bad-signature",
+        "wrong-commitment",
+        "wrong-nonce",
+        "wrong-authority",
+        "wrong-coordinates",
+        "missing-receipt",
+        "missing-pin",
+        "uncommitted-with-receipt",
+    ] {
+        let conversation_id = format!("convo-archive-auth-{case}");
+        let message_id = format!("msg-archive-auth-{case}");
+        let group_id = vec![0x74; 32];
+        if case != "missing-pin" {
+            client
+                .db()
+                .write_tx(|tx| {
+                    tx.upsert_conversation(&ConversationRow {
+                        conversation_id: conversation_id.clone(),
+                        group_id: group_id.clone(),
+                        generation: 0,
+                        epoch: 0,
+                        last_seq: 0,
+                        sequencer_did: ds_did.to_string(),
+                        space_uri: None,
+                        title: None,
+                        unread_count: 0,
+                        updated_at_ms: timestamp_ms,
+                    })
+                })
+                .unwrap();
+        }
+        let mut payload = SequencerReceiptPayload {
+            sequencer_did: if case == "wrong-authority" {
+                "did:web:untrusted.catbird.test".to_string()
+            } else {
+                ds_did.to_string()
+            },
+            conversation_id: conversation_id.clone(),
+            group_id,
+            epoch: 0,
+            sender_device_did_url: format!("{bob}#11111111-1111-4111-8111-111111111111"),
+            entry_id: message_id.clone(),
+            archive_commitment: compute_archive_commitment(&nonce, frame),
+            seq: 1,
+            issued_at_ms: timestamp_ms,
+        };
+        if case == "wrong-commitment" {
+            payload.archive_commitment[0] ^= 1;
+        }
+        if case == "wrong-coordinates" {
+            payload.entry_id = "a-different-message".to_string();
+        }
+        let key_id = format!("{}#mls-receipt-1", payload.sequencer_did);
+        let mut receipt =
+            ArchivedReceipt::new(sign_sequencer_receipt(&signing_key, &key_id, &payload).unwrap());
+        if case == "bad-signature" {
+            receipt.signed.signature[0] ^= 1;
+        }
+        let sealed_nonce = if case == "wrong-nonce" {
+            [0x75; 32]
+        } else {
+            nonce
+        };
+        let mut msg: OwnerMessage = labyrinth::message::seal_owner_committed(
+            &root,
+            1,
+            &conversation_id,
+            &message_id,
+            timestamp_ms as u64,
+            &sealed_nonce,
+            frame,
+            &receipt,
+        )
+        .unwrap();
+        if case == "missing-receipt" {
+            msg.sequencer_receipt = None;
+        }
+        if case == "uncommitted-with-receipt" {
+            msg = labyrinth::message::seal_owner_attributed(
+                &root,
+                1,
+                &conversation_id,
+                &message_id,
+                timestamp_ms as u64,
+                bob,
+                frame,
+            )
+            .unwrap();
+            msg.sequencer_receipt = Some(receipt);
+        }
+        let batch = labyrinth::records::OwnerBatch::from_messages(
+            &[msg],
+            labyrinth::records::datetime_from_ms(timestamp_ms as u64),
+        )
+        .unwrap();
+        let batch_json = serde_json::to_vec(&batch).unwrap();
+        let opened = client.open_rescued_owner_batch(&batch_json);
+        let response = transport
+            .execute_http(PlatformHttpRequest {
+                method: "POST".to_string(),
+                url: "https://swan.place/xrpc/com.atproto.space.applyWrites".to_string(),
+                headers: Vec::new(),
+                body: Some(
+                    serde_json::to_vec(&serde_json::json!({
+                        "repo": alice,
+                        "space": personal_mailbox_space_uri(alice),
+                        "validate": false,
+                        "writes": [{
+                            "$type": "com.atproto.space.applyWrites#create",
+                            "collection": labyrinth::records::nsid::OWNER_BATCH,
+                            "rkey": case,
+                            "value": batch,
+                        }],
+                    }))
+                    .unwrap(),
+                ),
+            })
+            .unwrap();
+        assert_eq!(response.status, 200, "{case}");
+        let restored = client.restore_conversation_from_owner_mailbox(&conversation_id);
+        let messages = client.list_messages(&conversation_id, None, 10).unwrap();
+        if case == "valid" {
+            assert_eq!(
+                opened.unwrap(),
+                vec![(message_id.clone(), Some(bob.to_string()), frame.to_vec())],
+            );
+            assert_eq!(restored.unwrap(), 1);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].sender_did, bob);
+            assert_eq!(messages[0].plaintext_json.as_bytes(), frame);
+        } else {
+            assert!(
+                opened.is_err(),
+                "{case}: batch opener accepted unauthenticated frame"
+            );
+            assert!(
+                restored.is_err(),
+                "{case}: mailbox restore accepted unauthenticated frame"
+            );
+            assert!(
+                messages.is_empty(),
+                "{case}: unauthenticated plaintext persisted"
+            );
+        }
+    }
+}
+
+#[test]
 fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagination() {
     let space_host = labyrinth::store::space::host::MemorySpaceHost::new();
     let alice = "did:plc:alicesdk0000000000000";
@@ -509,7 +828,7 @@ fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagina
         let tmp1 = TempDir::new().expect("tempdir1");
         let keystore1 = Arc::new(TestKeystore::default());
         let transport1 = Arc::new(MemorySpacePlatformTransport::new(&space_host, alice));
-        let client1 = CatbirdMlsClient::open(
+        let client1 = CatbirdMlsClient::open_offline_archive_for_test(
             CatbirdMlsClientConfig {
                 storage_root: tmp1.path().display().to_string(),
                 account_did: alice.to_string(),
@@ -624,7 +943,7 @@ fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagina
     let tmp2 = TempDir::new().expect("tempdir2");
     let keystore2 = Arc::new(TestKeystore::default());
     let transport2 = Arc::new(MemorySpacePlatformTransport::new(&space_host, alice));
-    let client2 = CatbirdMlsClient::open(
+    let client2 = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp2.path().display().to_string(),
             account_did: alice.to_string(),
@@ -738,7 +1057,7 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     let tmp1 = TempDir::new().expect("tempdir1");
     let keystore1 = Arc::new(TestKeystore::default());
     let transport1 = Arc::new(RecordingSpaceTransport::new());
-    let client1 = CatbirdMlsClient::ffi_open(
+    let client1 = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp1.path().display().to_string(),
             account_did: alice.to_string(),
@@ -751,7 +1070,7 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
         transport1.clone(),
         None,
     )
-    .expect("ffi_open");
+    .expect("open offline archive client for UniFFI exports");
     client1
         .ffi_enroll_device(all_scopes.clone())
         .expect("ffi_enroll_device");
@@ -823,7 +1142,7 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     let tmp_space1 = TempDir::new().expect("tmp_space1");
     let ks_space1 = Arc::new(TestKeystore::default());
     let tr_space1 = Arc::new(MemorySpacePlatformTransport::new(&space_host, alice));
-    let space_client1 = CatbirdMlsClient::ffi_open(
+    let space_client1 = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp_space1.path().display().to_string(),
             account_did: alice.to_string(),
@@ -883,7 +1202,7 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     let tmp_space2 = TempDir::new().expect("tmp_space2");
     let obs2 = Arc::new(RecordingObserver::default());
     let obs_dyn: Arc<dyn PlatformChangeObserver> = obs2.clone();
-    let space_client2 = CatbirdMlsClient::ffi_open(
+    let space_client2 = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp_space2.path().display().to_string(),
             account_did: alice.to_string(),
@@ -1011,7 +1330,7 @@ fn flush_labyrinth_queue_partial_batch_retry_preserves_deterministic_rkeys_witho
         batch_call_count: std::sync::atomic::AtomicUsize::new(0),
         owner_batch_call_count: std::sync::atomic::AtomicUsize::new(0),
     });
-    let client = CatbirdMlsClient::open(
+    let client = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp.path().display().to_string(),
             account_did: alice.to_string(),
@@ -1198,7 +1517,7 @@ fn flush_labyrinth_queue_isolates_per_conversation_503_across_120_rows() {
         stalled_space_substring: convo_stalled.to_string(),
         stall_enabled: std::sync::atomic::AtomicBool::new(true),
     });
-    let client = CatbirdMlsClient::open(
+    let client = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp.path().display().to_string(),
             account_did: alice.to_string(),
@@ -1345,7 +1664,7 @@ fn flush_labyrinth_queue_aborts_in_flight_loop_immediately_when_handle_closes() 
         first_write_entered_tx: Mutex::new(Some(entered_tx)),
         resume_first_write_rx: Mutex::new(Some(resume_rx)),
     });
-    let client = CatbirdMlsClient::open(
+    let client = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp.path().display().to_string(),
             account_did: alice.to_string(),
@@ -1417,11 +1736,11 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
     // - Epoch 1: rescue `convo-ep1` (BEFORE setup_recovery_code and BEFORE OTC!)
     // - OTC pairing -> rotates Space 1 -> 2: rescue `convo-ep2`
     // - setup_recovery_code() at Epoch 2 -> generates 40-char `recovery_code`
-    // - revoke_labyrinth_device -> rotates Space 2 -> 3: rescue `convo-ep3`
+    // - A second OTC pairing rotates Space 2 -> 3: rescue `convo-ep3`
     // -------------------------------------------------------------------------
     let recovery_code = {
         let tmp1 = TempDir::new().expect("tmp1");
-        let client1 = CatbirdMlsClient::open(
+        let client1 = CatbirdMlsClient::open_offline_archive_for_test(
             CatbirdMlsClientConfig {
                 storage_root: tmp1.path().display().to_string(),
                 account_did: alice.to_string(),
@@ -1476,17 +1795,27 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
         // Setup 40-char recovery code at Epoch 2!
         let code = client1.setup_recovery_code().unwrap();
 
-        // Rotate 2 -> 3 via device revocation AFTER setup_recovery_code!
-        let rev_status = client1
-            .revoke_labyrinth_device("stale-peer-device")
-            .unwrap();
-        assert_eq!(rev_status.epoch_seq, 3);
+        // Invalid revocation targets must not rotate or mutate the current epoch.
+        assert!(matches!(
+            client1.revoke_labyrinth_device("stale-peer-device"),
+            Err(MLSError::InvalidInput { .. })
+        ));
+        assert_eq!(client1.labyrinth_status().unwrap().epoch_seq, 2);
+
+        // Intentionally rotate 2 -> 3 via a second OTC pairing after setup_recovery_code.
+        let offer = client1.initiate_otc_pairing().unwrap();
+        let otc_done = client1.complete_otc_pairing(&offer.six_digit_code).unwrap();
+        assert_eq!(otc_done.new_epoch_seq, 3);
 
         client1
             .create_group("convo-ep3", ds_did, Vec::new(), None, None)
             .unwrap();
         client1
-            .send_message("convo-ep3", "ep3-alice-msg", "alice at epoch 3 post-revoke")
+            .send_message(
+                "convo-ep3",
+                "ep3-alice-msg",
+                "alice at epoch 3 post-pairing",
+            )
             .unwrap();
         assert_eq!(client1.rescue_conversation_on_kick("convo-ep3").unwrap(), 1);
 
@@ -1502,7 +1831,7 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
     // -------------------------------------------------------------------------
     {
         let tmp2 = TempDir::new().expect("tmp2");
-        let client2 = CatbirdMlsClient::open(
+        let client2 = CatbirdMlsClient::open_offline_archive_for_test(
             CatbirdMlsClientConfig {
                 storage_root: tmp2.path().display().to_string(),
                 account_did: alice.to_string(),
@@ -1562,7 +1891,7 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
     // - Recovers ALL FOUR conversations (`convo-ep1`..`convo-ep4`)!
     // -------------------------------------------------------------------------
     let tmp3 = TempDir::new().expect("tmp3");
-    let client3 = CatbirdMlsClient::open(
+    let client3 = CatbirdMlsClient::open_offline_archive_for_test(
         CatbirdMlsClientConfig {
             storage_root: tmp3.path().display().to_string(),
             account_did: alice.to_string(),

@@ -371,9 +371,8 @@ where
                     report.skipped_conflicts += 1;
                     continue;
                 }
-                let (MessageSource::Sender | MessageSource::Owner, Some(sender)) =
-                    (m.source, m.sender.clone())
-                else {
+                // Sender, witness and owner copies all import under their attributed sender.
+                let Some(sender) = m.sender.clone() else {
                     report.skipped_unattributed += 1;
                     continue;
                 };

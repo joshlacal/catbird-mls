@@ -290,13 +290,14 @@ pub fn direct_request_application_aad(
     context_hash: &[u8; 32],
     coordinates_json: &[u8],
     message_id: &str,
+    archive_commitment: &[u8; 32],
 ) -> Result<Vec<u8>> {
     project(coordinates_json, "conversationCoordinates", false)?;
     let coordinate: Value = serde_json::from_slice(coordinates_json).map_err(error)?;
     aad(
         b"CATBIRD-DIRECT-REQUEST-APPLICATION-AAD\0",
         "directRequestApplicationAad",
-        json!({"protocolVersion":"2","contextHash":STANDARD.encode(context_hash),"coordinates":coordinate,"messageId":message_id}),
+        json!({"protocolVersion":"2","contextHash":STANDARD.encode(context_hash),"coordinates":coordinate,"messageId":message_id,"archiveCommitment":STANDARD.encode(archive_commitment)}),
     )
 }
 fn aad(domain: &[u8], name: &str, value: Value) -> Result<Vec<u8>> {
@@ -376,6 +377,66 @@ mod tests {
             hex::encode(hash),
             v["context"]["digestHex"].as_str().unwrap()
         );
+    }
+    #[test]
+    fn independent_opening_frame_commitment_and_i13_signature_match() {
+        let vectors = vectors();
+        let oracle = &vectors["openingArchiveFixture"];
+        let nonce: [u8; 32] = STANDARD
+            .decode(oracle["frameNonceBase64"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let expected_frame = oracle["canonicalPayloadUtf8"].as_str().unwrap().as_bytes();
+        let payload: Value = serde_json::from_slice(expected_frame).unwrap();
+        let (plaintext, opening) = encode_direct_request_introduction(
+            &serde_json::to_vec(&json!({"text":payload["text"]})).unwrap(),
+            &nonce,
+        )
+        .unwrap();
+        assert_eq!(opening.canonical_payload_bytes, expected_frame);
+        assert_eq!(
+            STANDARD.encode(opening.archive_commitment),
+            oracle["archiveCommitmentBase64"]
+        );
+        assert_eq!(decode_direct_request_opening(&plaintext).unwrap(), opening);
+        let rows = vectors["signed"].as_array().unwrap();
+        let publication = &rows.iter().find(|row| row["kind"] == "Publish").unwrap()["body"];
+        let published = &rows
+            .iter()
+            .find(|row| {
+                row["kind"] == "Outcome"
+                    && row["body"]["receipt"]["$type"]
+                        == "blue.catbird.chat.defs#directRequestPublishedReceipt"
+            })
+            .unwrap()["body"];
+        let key = STANDARD
+            .decode(oracle["sequencerPublicKeyBase64"].as_str().unwrap())
+            .unwrap();
+        // The I13 receipt binding over this opening is verified by the orchestrator's
+        // `direct_request_bootstrap` tests against these same vectors.
+        assert!(published["receipt"]["sequencerReceipt"].is_object());
+        assert!(!key.is_empty() && publication["next"].is_object());
+        let mut legacy_publication = publication.clone();
+        legacy_publication
+            .as_object_mut()
+            .unwrap()
+            .remove("archiveCommitment");
+        assert!(direct_request_signing_bytes(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&legacy_publication).unwrap(),
+        )
+        .is_err());
+        let mut legacy_receipt = published.clone();
+        legacy_receipt["receipt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sequencerReceipt");
+        assert!(direct_request_signing_bytes(
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&legacy_receipt).unwrap(),
+        )
+        .is_err());
     }
     #[test]
     fn every_signed_binding_rejects_tamper_duplicate_and_unknown_fields() {
@@ -934,23 +995,165 @@ pub fn direct_request_entry_hash(raw_entry: &[u8]) -> Result<[u8; 32]> {
     Ok(Sha256::digest(bytes).into())
 }
 
-/// Host JSON is validated before encryption. Plaintext is canonical DAG-CBOR;
-/// unlike signing projections, UUIDs/DIDs in this application object stay text.
-pub fn encode_direct_request_introduction(raw_host_json: &[u8]) -> Result<Vec<u8>> {
-    let value = validate_direct_request_introduction(raw_host_json)?;
-    serde_ipld_dagcbor::to_vec(&value).map_err(error)
+/// Exact archive frame and secret nonce authenticated by the opening MLS message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectRequestOpening {
+    pub frame_nonce: [u8; 32],
+    pub canonical_payload_bytes: Vec<u8>,
+    pub archive_commitment: [u8; 32],
 }
-/// Exact canonical bytes are required before any preview or invitation projection.
-pub fn decode_direct_request_introduction(raw_cbor: &[u8]) -> Result<Value> {
+impl DirectRequestOpening {
+    pub fn verify(&self, expected: &[u8; 32]) -> Result<()> {
+        use subtle::ConstantTimeEq;
+        let actual = labyrinth_protocol::receipt::compute_archive_commitment(
+            &self.frame_nonce,
+            &self.canonical_payload_bytes,
+        );
+        if !bool::from(actual.ct_eq(expected))
+            || !bool::from(self.archive_commitment.ct_eq(expected))
+        {
+            return Err(error("introduction archive commitment mismatch"));
+        }
+        let payload: Value =
+            serde_json::from_slice(&self.canonical_payload_bytes).map_err(error)?;
+        introduction_from_payload(&payload)?;
+        if serde_json::to_vec(&payload).map_err(error)? != self.canonical_payload_bytes {
+            return Err(error("noncanonical introduction archive frame"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IntroductionEnvelope {
+    version: u8,
+    frame_nonce: [u8; 32],
+    payload: Value,
+}
+
+/// The canonical v1 `MLSMessagePayload` text frame an introduction carries, mirrored
+/// field-for-field so chat_v2 never imports the superseded orchestrator types.
+/// `direct_request_bootstrap` tests pin these bytes to `MLSMessagePayload` itself.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IntroductionFrame {
+    version: u32,
+    message_type: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embed: Option<IntroductionEmbed>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IntroductionEmbed {
+    #[serde(rename = "type")]
+    kind: String,
+    data: Value,
+}
+
+fn introduction_from_payload(payload: &Value) -> Result<Value> {
+    // Any field outside the text frame (reaction, deliveryAck, ...) fails the round trip.
+    let typed: IntroductionFrame = serde_json::from_value(payload.clone()).map_err(error)?;
+    if typed.version != 1
+        || typed.message_type != "text"
+        || serde_json::to_value(&typed).map_err(error)? != *payload
+    {
+        return Err(error(
+            "introduction requires a canonical text MLSMessagePayload",
+        ));
+    }
+    let mut introduction = json!({ "text": typed.text });
+    if let Some(embed) = typed.embed {
+        if embed.kind != "groupInvitation" {
+            return Err(error("introduction forbids non-invitation embeds"));
+        }
+        introduction["invitation"] = embed.data;
+    }
+    validate_direct_request_introduction(&serde_json::to_vec(&introduction).map_err(error)?)
+}
+
+/// Capture canonical MLSMessagePayload JSON before encryption. The version-two
+/// CBOR envelope losslessly encodes its structured value, avoiding JSON escape
+/// expansion inside MLS; decoding MUST reproduce exactly the captured JSON bytes.
+/// The nonce never appears in publication, receipt, or application AAD.
+pub fn encode_direct_request_introduction(
+    raw_host_json: &[u8],
+    frame_nonce: &[u8; 32],
+) -> Result<(Vec<u8>, DirectRequestOpening)> {
+    let introduction = validate_direct_request_introduction(raw_host_json)?;
+    let payload = serde_json::to_value(IntroductionFrame {
+        version: 1,
+        message_type: "text".into(),
+        text: introduction["text"]
+            .as_str()
+            .expect("validated text")
+            .to_owned(),
+        embed: introduction
+            .get("invitation")
+            .map(|invitation| IntroductionEmbed {
+                kind: "groupInvitation".into(),
+                data: invitation.clone(),
+            }),
+    })
+    .map_err(error)?;
+    let canonical_payload_bytes = serde_json::to_vec(&payload).map_err(error)?;
+    let archive_commitment = labyrinth_protocol::receipt::compute_archive_commitment(
+        frame_nonce,
+        &canonical_payload_bytes,
+    );
+    let plaintext = serde_ipld_dagcbor::to_vec(&IntroductionEnvelope {
+        version: 2,
+        frame_nonce: *frame_nonce,
+        payload,
+    })
+    .map_err(error)?;
+    Ok((
+        plaintext,
+        DirectRequestOpening {
+            frame_nonce: *frame_nonce,
+            canonical_payload_bytes,
+            archive_commitment,
+        },
+    ))
+}
+
+/// Reject incomplete legacy plaintext and preserve exact archive frame bytes.
+pub(crate) fn decode_direct_request_introduction_parts(
+    raw_cbor: &[u8],
+) -> Result<(Value, DirectRequestOpening)> {
     if raw_cbor.len() > MAX_INITIAL_APPLICATION_CIPHERTEXT_BYTES {
         return Err(error("introduction plaintext byte cap"));
     }
-    let value: Value = serde_ipld_dagcbor::from_slice(raw_cbor).map_err(error)?;
-    let canonical = serde_ipld_dagcbor::to_vec(&value).map_err(error)?;
-    if canonical != raw_cbor {
-        return Err(error("noncanonical introduction CBOR"));
+    let envelope: IntroductionEnvelope = serde_ipld_dagcbor::from_slice(raw_cbor).map_err(error)?;
+    if envelope.version != 2 || serde_ipld_dagcbor::to_vec(&envelope).map_err(error)? != raw_cbor {
+        return Err(error("noncanonical or unsupported introduction envelope"));
     }
-    validate_direct_request_introduction(&serde_json::to_vec(&value).map_err(error)?)
+    let introduction = introduction_from_payload(&envelope.payload)?;
+    let canonical_payload_bytes = serde_json::to_vec(&envelope.payload).map_err(error)?;
+    let archive_commitment = labyrinth_protocol::receipt::compute_archive_commitment(
+        &envelope.frame_nonce,
+        &canonical_payload_bytes,
+    );
+    Ok((
+        introduction,
+        DirectRequestOpening {
+            frame_nonce: envelope.frame_nonce,
+            canonical_payload_bytes,
+            archive_commitment,
+        },
+    ))
+}
+
+pub fn decode_direct_request_opening(raw_cbor: &[u8]) -> Result<DirectRequestOpening> {
+    decode_direct_request_introduction_parts(raw_cbor).map(|(_, opening)| opening)
+}
+
+/// Display-only projection; archive callers retain [`decode_direct_request_opening`]
+/// and verify its commitment against both MLS AAD and the signed publication.
+pub fn decode_direct_request_introduction(raw_cbor: &[u8]) -> Result<Value> {
+    decode_direct_request_introduction_parts(raw_cbor).map(|(introduction, _)| introduction)
 }
 #[cfg(test)]
 mod introduction_cbor_tests {
@@ -961,12 +1164,22 @@ mod introduction_cbor_tests {
         let value = json!({"text":text,"invitation":{"authorityDid":"did:web:chat.catbird.blue","conversationId":"12345678-1234-4234-8234-123456789abc","invitationTransitionId":"22345678-1234-4234-8234-123456789abc","invitedByDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","invitedByDeviceId":"32345678-1234-4234-8234-123456789abc","recipientDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}});
         let host = serde_json::to_vec(&value).unwrap();
         assert!(host.len() > MAX_INITIAL_APPLICATION_CIPHERTEXT_BYTES);
-        let encrypted_plaintext = encode_direct_request_introduction(&host).unwrap();
+        let (encrypted_plaintext, opening) =
+            encode_direct_request_introduction(&host, &[7; 32]).unwrap();
         assert!(encrypted_plaintext.len() < MAX_REQUEST_TEXT_UTF8_BYTES + 1024);
         assert_eq!(
             decode_direct_request_introduction(&encrypted_plaintext).unwrap(),
             value
         );
+        assert_eq!(
+            decode_direct_request_opening(&encrypted_plaintext).unwrap(),
+            opening
+        );
+        opening.verify(&opening.archive_commitment).unwrap();
+        let frame: IntroductionFrame =
+            serde_json::from_slice(&opening.canonical_payload_bytes).unwrap();
+        assert_eq!(Some(frame.text.as_str()), value["text"].as_str());
+        assert_eq!(frame.embed.unwrap().data, value["invitation"]);
     }
     #[test]
     fn duplicates_unknowns_and_noncanonical_encodings_fail_closed() {
@@ -977,12 +1190,38 @@ mod introduction_cbor_tests {
             serde_ipld_dagcbor::to_vec(&json!({"text":"hello","attachment":"forbidden"})).unwrap();
         assert!(decode_direct_request_introduction(&unknown).is_err());
         let mut invalid = json!({"text":"hello","invitation":{"authorityDid":"did:web:chat.catbird.blue","conversationId":"NOT-A-UUID","invitationTransitionId":"22345678-1234-4234-8234-123456789abc","invitedByDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","invitedByDeviceId":"32345678-1234-4234-8234-123456789abc","recipientDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}});
-        assert!(
-            encode_direct_request_introduction(&serde_json::to_vec(&invalid).unwrap()).is_err()
-        );
+        assert!(encode_direct_request_introduction(
+            &serde_json::to_vec(&invalid).unwrap(),
+            &[7; 32]
+        )
+        .is_err());
         invalid["invitation"] = Value::Null;
+        assert!(encode_direct_request_introduction(
+            &serde_json::to_vec(&invalid).unwrap(),
+            &[7; 32]
+        )
+        .is_err());
+    }
+    #[test]
+    fn opening_nonce_and_exact_frame_are_blindly_committed_and_legacy_is_refused() {
+        let (plaintext, opening) =
+            encode_direct_request_introduction(br#"{"text":"hello"}"#, &[7; 32]).unwrap();
+        assert_eq!(decode_direct_request_opening(&plaintext).unwrap(), opening);
+        assert!(decode_direct_request_introduction(
+            &serde_ipld_dagcbor::to_vec(&json!({"text":"hello"})).unwrap()
+        )
+        .is_err());
+        let mut changed = opening.clone();
+        changed.frame_nonce[0] ^= 1;
+        assert!(changed.verify(&opening.archive_commitment).is_err());
+        changed = opening.clone();
+        changed.canonical_payload_bytes.push(b' ');
+        assert!(changed.verify(&opening.archive_commitment).is_err());
+        let mut envelope: IntroductionEnvelope =
+            serde_ipld_dagcbor::from_slice(&plaintext).unwrap();
+        envelope.payload["reaction"] = json!({"messageId":"forbidden","emoji":"x","action":"add"});
         assert!(
-            encode_direct_request_introduction(&serde_json::to_vec(&invalid).unwrap()).is_err()
+            decode_direct_request_opening(&serde_ipld_dagcbor::to_vec(&envelope).unwrap()).is_err()
         );
     }
 }

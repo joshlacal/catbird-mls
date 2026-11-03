@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "854142ea1c644af437bf1ce23629c5397cf64dde",
-    "sourceSha256": "a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d",
-    "sourceTree": "8913a10c361f52732b3940e6bbdbd2f154abbc09"
+    "sourceRevision": "df7653aa530cadaf5d24263ef74a54c688571169",
+    "sourceSha256": "fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39",
+    "sourceTree": "8d9ac196a76ad4e8f96538ddd304066647210c3a"
   },
   "defs": {
     "accessEndedEvent": {
@@ -2051,6 +2051,11 @@
     },
     "directRequestApplicationAad": {
       "properties": {
+        "archiveCommitment": {
+          "description": "I13 archive commitment bound to the encrypted initial application frame; the blinding frame nonce remains encrypted.",
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
         "contextHash": {
           "ref": "#artifactHash",
           "type": "ref"
@@ -2072,7 +2077,8 @@
         "protocolVersion",
         "contextHash",
         "coordinates",
-        "messageId"
+        "messageId",
+        "archiveCommitment"
       ],
       "type": "object"
     },
@@ -2376,6 +2382,14 @@
           "ref": "#operationId",
           "type": "ref"
         },
+        "publicationReceipt": {
+          "closed": true,
+          "description": "Authoritative signed published outcome, including its mandatory I13 proof, available before recipient Welcome import.",
+          "refs": [
+            "#signedDirectRequestReceipt"
+          ],
+          "type": "union"
+        },
         "receivedAt": {
           "ref": "#canonicalDatetime",
           "type": "ref"
@@ -2384,6 +2398,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedDirectRequestPublication",
@@ -2395,7 +2413,9 @@
         "conversationId",
         "seq",
         "signedRequest",
-        "receivedAt"
+        "receivedAt",
+        "sequencerReceipt",
+        "publicationReceipt"
       ],
       "type": "object"
     },
@@ -3100,6 +3120,11 @@
           "ref": "#bareDid",
           "type": "ref"
         },
+        "archiveCommitment": {
+          "description": "Required I13 commitment, repeated in the initial private MLS application AAD.",
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
         "artifacts": {
           "ref": "#directRequestBootstrapArtifacts",
           "type": "ref"
@@ -3195,7 +3220,8 @@
         "artifacts",
         "idempotencyKey",
         "signedAt",
-        "preparationRequestDigest"
+        "preparationRequestDigest",
+        "archiveCommitment"
       ],
       "type": "object"
     },
@@ -3249,6 +3275,10 @@
         "requestKind": {
           "const": "publish",
           "type": "string"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         }
       },
       "required": [
@@ -3263,7 +3293,8 @@
         "actorDeviceId",
         "actorKeyId",
         "authGeneration",
-        "requestKind"
+        "requestKind",
+        "sequencerReceipt"
       ],
       "type": "object"
     },

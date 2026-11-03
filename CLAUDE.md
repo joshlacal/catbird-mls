@@ -163,17 +163,47 @@ the first acceptance even when relaying it to a remote coordinator fails, so a f
 signed retry is an `IdempotencyConflict`. Accepting an already accepted request is a
 no-op, and a synced acceptance entry also clears the journal.
 
-Labyrinth adapters map the exact HTTP 400 `NotEntitled` and
-`AccessOutsideMembershipInterval` errors to `labyrinth::Error::Forbidden`, like 401/403:
-a kicked or never-joined device then rescues its queue into owner batches and reads its
-owner archive. A device with no saved conversation placement cannot learn the sequencer,
-so it checks owner-archived receipts by `archiveCommitment` only.
+C33 openings use an encrypted version-2 envelope containing `frameNonce` and the
+canonical `MLSMessagePayload`. The signed publication and MLS AAD bind the same blinded
+`archiveCommitment`; the publication outcome and delivered entry must carry the I13
+sequencer receipt. The versioned publication-receipt key and `#mls-receipt-1` are
+independent trust checks. Incomplete legacy openings fail closed instead of becoming
+unsigned archive frames.
 
-A joined group's `sequencer_did` (the `I13` receipt signer) and Space authority come from
-`getConversationState.state.sequencerDid`, never the home DS: the frozen `welcomeView`
-names no sequencer, and a remote member reads a mirror of entries another DS sequenced.
-`sync()` re-points rows and journaled sends whose stored authority differs from the
-inventory state view.
+Labyrinth adapters map exact `NotEntitled` and `AccessOutsideMembershipInterval`
+protocol errors to `Forbidden`. Only a real `Forbidden` or a locally authenticated
+kick/leave permits owner-mailbox fallback; a missing active conversation/Space fails
+closed. Committed owner frames require both a trusted sequencer signature and the
+blinded `archiveCommitment`, never commitment-only attribution.
+The full receipt is bound into owner AEAD. A fresh removed device may bootstrap its
+receipt-key lookup from that authenticated issuer, never from an untrusted public
+receipt; an existing sequencer pin cannot be overridden.
+
+A joined group's `sequencer_did` and Space authority are pinned at initial bootstrap.
+Unsigned inventory may fill an empty pin but cannot replace one or rewrite a reserved
+application send; changing authority requires a verified transfer. NSE commits reconcile
+conversation coordinates from authenticated MLS AAD and the merged group before an app
+can reserve a sender ratchet step.
+
+Native archive flushes visit queued conversations only, using each message's send-time
+MLS roster. Active-member recovery reads Conversation Space batches and MEKs, verifies
+I13 receipts and commitments, and imports canonical `MLSMessagePayload` frames. Owner
+batches use those same frame bytes only for kick/leave/Forbidden rescue. Closing a
+conversation requires an authorized, cid-bound signed wrapper and erases the live MLS
+group, caches, epoch secrets, and all conversation pending-operation journals.
+
+Production `open` and `open_with_hooks` require UUIDv4 device IDs. The Space-only archive
+harness is compiled only under `test`, `test-utils`, or `sim` and must use
+`open_offline_archive_for_test` or `open_offline_archive_with_hooks_for_test`; a device
+ID's shape never selects weaker archive behavior. Run its integration targets with
+`--features sim`.
+
+OAuth requests must use `REQUIRED_LABYRINTH_OAUTH_SCOPES` with explicitly stated
+`read/create/update/delete` actions and the declared record collections. The old
+default-action Space grants require reauthorization: hardened PDS delegation rejects
+them even if a normalized scope string later looks equivalent. Scope eligibility is a
+static coverage check, not proof of original grant provenance; the native credential
+exchange remains authoritative and fails closed without dequeuing archive work.
 
 ### Async Runtime Bridging
 

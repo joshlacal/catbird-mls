@@ -1,5 +1,8 @@
 //! Real pinned XWING/Libcrux feasibility corpus. Every device has an independent
 //! encrypted SQLite provider, reopened across preparation/import boundaries.
+#[allow(dead_code)]
+#[path = "fixtures/direct_request_i13.rs"]
+mod direct_request_i13;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -248,17 +251,19 @@ fn corpus_variant(count: usize, legacy: bool) {
         1,
     )
     .unwrap();
+    let (plaintext, opening) =
+        catbird_mls::chat_v2::transcript::direct_request::encode_direct_request_introduction(
+            &serde_json::to_vec(&serde_json::json!({"text":"x".repeat(16384)})).unwrap(),
+            &[31; 32],
+        )
+        .unwrap();
     let aad = catbird_mls::chat_v2::transcript::direct_request::direct_request_application_aad(
         &context_hash,
         &serde_json::to_vec(&coordinates).unwrap(),
         ctx["firstMessageId"].as_str().unwrap(),
+        &opening.archive_commitment,
     )
     .unwrap();
-    let plaintext =
-        catbird_mls::chat_v2::transcript::direct_request::encode_direct_request_introduction(
-            &serde_json::to_vec(&serde_json::json!({"text":"x".repeat(16384)})).unwrap(),
-        )
-        .unwrap();
     let message = encrypt_bound_introduction(
         &mut group,
         &provider,
@@ -267,6 +272,7 @@ fn corpus_variant(count: usize, legacy: bool) {
         &coordinates,
         ctx["firstMessageId"].as_str().unwrap(),
         &plaintext,
+        &opening.archive_commitment,
     )
     .unwrap();
     let final_info = group
@@ -431,6 +437,11 @@ fn corpus_variant(count: usize, legacy: bool) {
     std::fs::write(artifact_dir.join("context.json"), &context_json).unwrap();
     std::fs::write(artifact_dir.join("metadata-nonce.bin"), metadata_nonce).unwrap();
     std::fs::write(
+        artifact_dir.join("archive-commitment.bin"),
+        opening.archive_commitment,
+    )
+    .unwrap();
+    std::fs::write(
         artifact_dir.join("actor-signature-public-key.bin"),
         signers[0].public(),
     )
@@ -512,6 +523,7 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
         .unwrap()
         .as_secs();
     let context_json=serde_json::to_vec(&serde_json::json!({"protocolVersion":"2","requestId":uuid::Uuid::new_v4().to_string(),"firstMessageId":uuid::Uuid::new_v4().to_string(),"conversationId":uuid::Uuid::new_v4().to_string(),"origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},"actorDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","actorDeviceId":"00000000-0000-4000-8000-000000000000","actorKeyId":URL_SAFE_NO_PAD.encode(Sha256::digest(kp.leaf_node().signature_key().as_slice())),"recipientDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb","preparationDigest":STANDARD.encode([42;32])})).unwrap();
+    let sequencer_authority = p256::ecdsa::SigningKey::from_slice(&[18; 32]).unwrap();
     let input = DirectRequestBootstrapInput {
         draft_id: uuid::Uuid::new_v4().to_string(),
         context_json,
@@ -523,6 +535,12 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
         authority_import_until: now + 20 * 86400,
         preparation_request_digest: [21; 32],
         receipt_authority_key: vec![2; 33],
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: sequencer_authority
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec(),
         text: "protected draft remains readable".into(),
         invitation: None,
         metadata: catbird_mls::metadata::GroupMetadataV1 {
@@ -662,7 +680,7 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
         .to_rfc3339_opts(SecondsFormat::Millis, true);
     let artifact = |bytes: &Vec<u8>, content_type: &str| serde_json::json!({"framing":"mlsMessage","contentType":content_type,"bytes":STANDARD.encode(bytes),"sha256":STANDARD.encode(Sha256::digest(bytes))});
     let metadata = serde_json::json!({"coordinate":metadata_coordinate(&b.coordinates).unwrap(),"originTransitionId":ctx["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(&b.metadata_nonce),"ciphertext":STANDARD.encode(&b.metadata_ciphertext),"ciphertextSha256":STANDARD.encode(Sha256::digest(&b.metadata_ciphertext)),"ciphertextSize":b.metadata_ciphertext.len(),"authorProof":{"authorDid":ctx["actorDid"],"authorDeviceId":ctx["actorDeviceId"],"authorKeyId":ctx["actorKeyId"],"signaturePublicKey":STANDARD.encode(kp.leaf_node().signature_key().as_slice()),"authGenerationAtOrigin":1,"originTransitionId":ctx["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
-    let body = serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\0","protocolVersion":"2","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":ctx["recipientDid"],"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"next":b.coordinates,"importUntil":import_until,"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":[{"recipientDid":ctx["recipientDid"],"recipientDeviceId":"00000000-0000-4000-8000-000000000001","provenance":{"requestId":ctx["requestId"],"preparationDigest":ctx["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(&input.expected_package_refs[0]),"importUntil":import_until}}]},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":signed_at});
+    let body = serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\0","protocolVersion":"2","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":ctx["recipientDid"],"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"archiveCommitment":STANDARD.encode(b.archive_commitment),"next":b.coordinates,"importUntil":import_until,"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":[{"recipientDid":ctx["recipientDid"],"recipientDeviceId":"00000000-0000-4000-8000-000000000001","provenance":{"requestId":ctx["requestId"],"preparationDigest":ctx["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(&input.expected_package_refs[0]),"importUntil":import_until}}]},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":signed_at});
     let transcript = direct_request_signing_bytes(
         DirectRequestKind::Publish,
         &serde_json::to_vec(&body).unwrap(),
@@ -696,8 +714,39 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
+    let sequencer_receipt =
+        direct_request_i13::receipt(&sequencer_authority, &body, 1, &input.sequencer_did);
+    verify_opening_receipt(
+        b,
+        &sequencer_receipt,
+        &input.sequencer_did,
+        &input.sequencer_receipt_authority_key,
+    )
+    .unwrap();
+    for field in [
+        "conversationId",
+        "entryId",
+        "archiveCommitment",
+        "senderDid",
+        "senderDeviceId",
+        "generation",
+        "seq",
+    ] {
+        let mut altered = sequencer_receipt.clone();
+        altered[field] = serde_json::Value::Null;
+        assert!(
+            verify_opening_receipt(
+                b,
+                &altered,
+                &input.sequencer_did,
+                &input.sequencer_receipt_authority_key
+            )
+            .is_err(),
+            "{field}"
+        );
+    }
     let make_receipt = |coordinates: serde_json::Value| {
-        let body = serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":direct_request_receipt_key_id(&authority_key).unwrap(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":ctx["requestId"],"requestKind":"publish","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"actorKeyId":ctx["actorKeyId"],"authGeneration":1,"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"requestDigest":STANDARD.encode(Sha256::digest(&transcript)),"recordedAt":signed_at,"conversationId":ctx["conversationId"],"firstMessageId":ctx["firstMessageId"],"coordinates":coordinates}});
+        let body = serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":direct_request_receipt_key_id(&authority_key).unwrap(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":ctx["requestId"],"requestKind":"publish","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"actorKeyId":ctx["actorKeyId"],"authGeneration":1,"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"requestDigest":STANDARD.encode(Sha256::digest(&transcript)),"recordedAt":signed_at,"conversationId":ctx["conversationId"],"firstMessageId":ctx["firstMessageId"],"coordinates":coordinates,"sequencerReceipt":sequencer_receipt}});
         let input = direct_request_signing_bytes(
             DirectRequestKind::Outcome,
             &serde_json::to_vec(&body).unwrap(),
@@ -751,6 +800,7 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
         published_receipt: receipt,
         receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key,
+        sequencer_receipt_authority_key: input.sequencer_receipt_authority_key.clone(),
         preparation_request_digest: input.preparation_request_digest,
     };
     let mut wrong = welcome_input.clone();
@@ -777,7 +827,10 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
     assert_eq!(
         decrypted,
         DirectRequestIntroductionResult::Ready {
-            plaintext: introduction_plaintext(&input).unwrap()
+            plaintext: introduction_plaintext(&input, &b.opening.as_ref().unwrap().frame_nonce)
+                .unwrap()
+                .0,
+            opening: b.opening.clone().unwrap(),
         }
     );
     drop(bob);
@@ -807,13 +860,19 @@ fn maximum_utf8_text_does_not_expand_past_ciphertext_budget() {
         decode_direct_request_introduction, encode_direct_request_introduction,
     };
     let text = "\0".repeat(16384);
-    let encoded = encode_direct_request_introduction(
+    let (encoded, opening) = encode_direct_request_introduction(
         &serde_json::to_vec(&serde_json::json!({"text":text})).unwrap(),
+        &[31; 32],
     )
     .unwrap();
     assert!(encoded.len() < 17000);
     assert_eq!(
         decode_direct_request_introduction(&encoded).unwrap()["text"],
         text
+    );
+    assert_eq!(
+        catbird_mls::chat_v2::transcript::direct_request::decode_direct_request_opening(&encoded)
+            .unwrap(),
+        opening
     );
 }

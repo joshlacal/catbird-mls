@@ -128,13 +128,99 @@ impl crate::labyrinth::LabyrinthSpaceGateway for NativeArchiveGateway {
         Ok(crate::orchestrator::canonical_transport::GatewayResponse { status: response.status, content_type: response.content_type, body: response.body })
     }
     async fn submit_space_with_headers(&self, request: crate::labyrinth::LabyrinthSpaceRequest) -> Result<crate::labyrinth::LabyrinthSpaceResponse, String> {
-        let mut headers = request.headers;
-        if let Some(content_type) = request.content_type { headers.push(("content-type".into(), content_type)); }
-        let response = self.execute(&self.config.pds_endpoint, request.method, request.path, headers, request.body)?;
-        Ok(crate::labyrinth::LabyrinthSpaceResponse {
-            status: response.status, content_type: response.header("content-type").map(str::to_owned),
-            headers: response.headers.into_iter().map(|h| (h.name, h.value)).collect(), body: response.body,
-        })
+        self.execute_authenticated_space(request).await
+    }
+}
+
+#[cfg(feature = "labyrinth")]
+impl NativeArchiveGateway {
+    fn pds_json(&self, base: &str, method: &str, path: String, body: Option<Vec<u8>>) -> labyrinth::Result<serde_json::Value> {
+        let bytes = crate::labyrinth::transport::decode_response_bounded(
+            self.execute(base, method.into(), path, vec![], body).map(Self::response),
+            crate::labyrinth::transport::MAX_LABYRINTH_XRPC_RESPONSE_BYTES,
+        ).map_err(|error| {
+            if error.error.as_deref() == Some("InvalidSwap") {
+                labyrinth::Error::Conflict
+            } else if matches!(error.status, 400 | 404) && error.error.as_deref() == Some("RecordNotFound") {
+                labyrinth::Error::NotFound("record")
+            } else {
+                crate::labyrinth::transport::map_xrpc_error(error)
+            }
+        })?;
+        serde_json::from_slice(&bytes).map_err(|_| labyrinth::Error::Malformed("PDS repository response"))
+    }
+
+    async fn account_pds(&self, did: &str) -> labyrinth::Result<String> {
+        if did == self.config.account_did { return Ok(self.config.pds_endpoint.clone()); }
+        let doc = crate::labyrinth::LabyrinthGateway::resolve_did_document(self, did).await
+            .map_err(labyrinth::Error::Backend)?.ok_or(labyrinth::Error::Unattested)?;
+        super::chat_wire::extract_pds_endpoint_from_did_doc(&doc).ok_or(labyrinth::Error::Unattested)
+    }
+}
+
+#[cfg(feature = "labyrinth")]
+#[async_trait::async_trait]
+impl labyrinth::store::pds::PublicRepoBackend for NativeArchiveGateway {
+    async fn put_mailbox_keys(&self, did: &str, rkey: &str, record: &[u8], swap_cid: Option<&str>) -> labyrinth::Result<String> {
+        if did != self.config.account_did { return Err(labyrinth::Error::Forbidden); }
+        crate::labyrinth::transport::enforce_pds_record_cap(record).map_err(labyrinth::Error::Backend)?;
+        let record: serde_json::Value = serde_json::from_slice(record).map_err(|_| labyrinth::Error::Malformed("mailboxKeys JSON"))?;
+        let mut body = serde_json::json!({
+            "repo": did, "collection": labyrinth::records::nsid::MAILBOX_KEYS, "rkey": rkey, "record": record,
+        });
+        if let Some(cid) = swap_cid { body["swapRecord"] = cid.into(); }
+        let response = self.pds_json(&self.config.pds_endpoint, "POST", "/xrpc/com.atproto.repo.putRecord".into(),
+            Some(serde_json::to_vec(&body).map_err(|e| labyrinth::Error::Backend(e.to_string()))?))?;
+        response["cid"].as_str().filter(|cid| !cid.is_empty()).map(str::to_owned)
+            .ok_or(labyrinth::Error::Malformed("putRecord missing CID"))
+    }
+
+    async fn get_mailbox_keys(&self, did: &str, rkey: &str) -> labyrinth::Result<Option<(Vec<u8>, String)>> {
+        let base = self.account_pds(did).await?;
+        let path = format!("/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+            super::chat_wire::urlencode_form_component(did), labyrinth::records::nsid::MAILBOX_KEYS,
+            super::chat_wire::urlencode_form_component(rkey));
+        let response = match self.pds_json(&base, "GET", path, None) {
+            Ok(value) => value,
+            Err(labyrinth::Error::NotFound("record")) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let cid = response["cid"].as_str().filter(|cid| !cid.is_empty())
+            .ok_or(labyrinth::Error::Malformed("getRecord missing CID"))?.to_owned();
+        let value = response.get("value").ok_or(labyrinth::Error::Malformed("getRecord missing value"))?;
+        let bytes = serde_json::to_vec(value).map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+        crate::labyrinth::transport::enforce_pds_record_cap(&bytes).map_err(labyrinth::Error::Backend)?;
+        Ok(Some((bytes, cid)))
+    }
+
+    async fn delete_all_mailbox_keys(&self, did: &str) -> labyrinth::Result<()> {
+        if did != self.config.account_did { return Err(labyrinth::Error::Forbidden); }
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let prefix = format!("at://{did}/{}/", labyrinth::records::nsid::MAILBOX_KEYS);
+        loop {
+            let mut path = format!("/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
+                super::chat_wire::urlencode_form_component(did), labyrinth::records::nsid::MAILBOX_KEYS);
+            if let Some(cursor) = &cursor { path.push_str(&format!("&cursor={}", super::chat_wire::urlencode_form_component(cursor))); }
+            let page = self.pds_json(&self.config.pds_endpoint, "GET", path, None)?;
+            let records = page["records"].as_array().ok_or(labyrinth::Error::Malformed("listRecords missing records"))?;
+            for record in records {
+                let uri = record["uri"].as_str().ok_or(labyrinth::Error::Malformed("mailboxKeys URI"))?;
+                let rkey = uri.strip_prefix(&prefix).filter(|key| !key.is_empty() && !key.contains('/'))
+                    .ok_or(labyrinth::Error::Malformed("mailboxKeys URI binding"))?;
+                let cid = record["cid"].as_str().ok_or(labyrinth::Error::Malformed("mailboxKeys CID"))?;
+                self.pds_json(&self.config.pds_endpoint, "POST", "/xrpc/com.atproto.repo.deleteRecord".into(),
+                    Some(serde_json::to_vec(&serde_json::json!({
+                        "repo": did, "collection": labyrinth::records::nsid::MAILBOX_KEYS, "rkey": rkey, "swapRecord": cid,
+                    })).map_err(|e| labyrinth::Error::Backend(e.to_string()))?))?;
+            }
+            cursor = page["cursor"].as_str().map(str::to_owned);
+            match &cursor {
+                None => return Ok(()),
+                Some(next) if !seen.insert(next.clone()) => return Err(labyrinth::Error::Malformed("repeated mailboxKeys cursor")),
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -173,6 +259,95 @@ fn block_on_sync<F: Future>(future: F) -> F::Output {
 }
 
 #[cfg(feature = "labyrinth")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NativeArchiveEvidence {
+    pub(crate) message_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) labyrinth_frame_json: String,
+    pub(crate) frame_nonce_b64: Option<String>,
+    pub(crate) sequencer_receipt_json: Option<String>,
+    pub(crate) created_at_ms: i64,
+}
+
+#[cfg(feature = "labyrinth")]
+impl NativeArchiveEvidence {
+    fn from_queue(item: &QueuedLabyrinthArchivePayload) -> Self {
+        Self {
+            message_id: item.message_id.clone(), conversation_id: item.conversation_id.clone(),
+            labyrinth_frame_json: item.labyrinth_frame_json.clone(), frame_nonce_b64: item.frame_nonce_b64.clone(),
+            sequencer_receipt_json: item.sequencer_receipt_json.clone(), created_at_ms: item.created_at_ms,
+        }
+    }
+}
+
+#[cfg(feature = "labyrinth")]
+type RestoreCopy = (MessageRow, NativeArchiveEvidence, super::chat_wire::StoredArchivedReceipt);
+
+/// Verified archive copies as restorable rows, grouped by message id with equal rows merged.
+/// Labyrinth never returns a witness copy that contradicts an accepted one (ruling 3); what can
+/// still differ under one id are two members' own copies.
+#[cfg(feature = "labyrinth")]
+fn native_restore_copies(conversation_id: &str, self_did: &str, messages: Vec<labyrinth::client::LoadedMessage>)
+    -> Result<std::collections::BTreeMap<String, Vec<RestoreCopy>>, MLSError> {
+    let mut by_id: std::collections::BTreeMap<String, Vec<RestoreCopy>> = std::collections::BTreeMap::new();
+    for message in messages {
+        let archived = message.archived_receipt.as_ref().ok_or_else(|| MLSError::Cryptography("archive frame missing sequencer receipt".into()))?;
+        let nonce = message.frame_nonce.ok_or_else(|| MLSError::Cryptography("archive frame missing blinded commitment nonce".into()))?;
+        let receipt = &archived.signed.payload;
+        let (sender_did, sender_device_id) = receipt.split_sender_device().map_err(|_| MLSError::Cryptography("archive sender device malformed".into()))?;
+        if message.thread_id != conversation_id || receipt.conversation_id != conversation_id
+            || message.sender.as_deref() != Some(sender_did) {
+            return Err(MLSError::Cryptography("archive coordinates/attribution conflict".into()));
+        }
+        crate::orchestrator::MLSMessagePayload::decode(&message.frame).map_err(|e| MLSError::Cryptography(format!("invalid canonical archive frame: {e}")))?;
+        let plaintext_json = String::from_utf8(message.frame).map_err(|e| MLSError::Cryptography(e.to_string()))?;
+        let row = MessageRow {
+            message_id: message.message_id.clone(), conversation_id: conversation_id.into(), group_id: receipt.group_id.clone(),
+            epoch: i64::try_from(receipt.epoch).map_err(|_| MLSError::Cryptography("archive epoch overflow".into()))?,
+            seq: i64::try_from(receipt.seq).map_err(|_| MLSError::Cryptography("archive seq overflow".into()))?,
+            sender_did: sender_did.into(), sender_device_id: sender_device_id.into(), plaintext_json,
+            created_at_ms: i64::try_from(message.timestamp).map_err(|_| MLSError::Cryptography("archive timestamp overflow".into()))?,
+            is_own: sender_did == self_did,
+        };
+        let stored = super::chat_wire::StoredArchivedReceipt {
+            sequencer_did: receipt.sequencer_did.clone(), conversation_id: receipt.conversation_id.clone(), group_id: receipt.group_id.clone(),
+            epoch: receipt.epoch, sender_device_did_url: receipt.sender_device_did_url.clone(), entry_id: receipt.entry_id.clone(),
+            archive_commitment: receipt.archive_commitment.to_vec(), seq: receipt.seq, issued_at_ms: receipt.issued_at_ms,
+            key_id: archived.signed.key_id.clone(), signature: archived.signed.signature.to_vec(), generation: archived.generation,
+        };
+        let evidence = NativeArchiveEvidence {
+            message_id: row.message_id.clone(), conversation_id: conversation_id.into(), labyrinth_frame_json: row.plaintext_json.clone(),
+            frame_nonce_b64: Some(BASE64_STANDARD.encode(nonce)),
+            sequencer_receipt_json: Some(serde_json::to_string(&stored).map_err(|e| MLSError::Internal(e.to_string()))?),
+            created_at_ms: row.created_at_ms,
+        };
+        let copies = by_id.entry(row.message_id.clone()).or_default();
+        if copies.iter().all(|(kept, _, _)| *kept != row) {
+            copies.push((row, evidence, stored));
+        }
+    }
+    Ok(by_id)
+}
+
+/// The copy restore may import for one message id: the one equal to the local message, else the
+/// only copy. Members' disagreeing copies, or a copy disagreeing with local history, cannot be
+/// resolved from the archive, so restore skips that id instead of failing.
+#[cfg(feature = "labyrinth")]
+fn select_restore_copy<'a>(copies: &'a [RestoreCopy], local: Option<&MessageRow>) -> Option<&'a RestoreCopy> {
+    match local {
+        Some(local) => copies.iter().find(|(row, _, _)| {
+            local.conversation_id == row.conversation_id && local.seq == row.seq && local.epoch == row.epoch
+                && local.sender_did == row.sender_did && local.sender_device_id == row.sender_device_id
+                && canonical_labyrinth_frame_json(&local.plaintext_json) == row.plaintext_json
+        }),
+        None => match copies {
+            [only] => Some(only),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(feature = "labyrinth")]
 impl CatbirdMlsClient {
     fn native_archive_run<F: Future + Send>(&self, future: F) -> F::Output where F::Output: Send {
         let hooks = self.hooks.clone();
@@ -186,7 +361,7 @@ impl CatbirdMlsClient {
         let signer = Arc::new(NativeArchiveSigner(signer));
         let mut config = self.config.clone();
         config.account_did = self.normalized_did.clone();
-        config.device_id = self.canonical_uuid_v4_device_id().unwrap_or_else(|| self.config.device_id.clone());
+        config.device_id = self.canonical_uuid_v4_device_id().ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
         let gateway = Arc::new(NativeArchiveGateway { config: config.clone(), db: self.db.clone(), transport: self.transport.clone(), signer: signer.clone(), hooks: self.hooks.clone() });
         let transport = Arc::new(crate::labyrinth::GatewayXrpcTransport::new(gateway.clone(), signer.clone(), self.normalized_did.clone(), config.device_id)
             .with_clock(Arc::new(NativeArchiveClock(self.hooks.clone()))));
@@ -194,7 +369,7 @@ impl CatbirdMlsClient {
             did: self.normalized_did.clone(), transport, signer,
             vault: Arc::new(NativeArchiveVault { db: self.db.clone(), namespace: "native.session", hooks: self.hooks.clone() }),
             placements: Arc::new(NativeArchiveVault { db: self.db.clone(), namespace: "native.placements", hooks: self.hooks.clone() }),
-            pds: None, space: Some(Arc::new(crate::labyrinth::SpaceXrpcTransport::new(gateway))),
+            pds: Some(gateway.clone()), space: Some(Arc::new(crate::labyrinth::SpaceXrpcTransport::new(gateway))),
             local_authority: None, sequencer_key: None, sequencer_receipt_key: None,
             default_conversation_authority_did: None,
         })
@@ -214,7 +389,8 @@ impl CatbirdMlsClient {
     }
 
     pub fn setup_recovery_code(&self) -> Result<String, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() { return self.offline_setup_recovery_code(); }
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test { return self.offline_setup_recovery_code(); }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.enable().await.map_err(native_archive_error)?;
@@ -225,7 +401,8 @@ impl CatbirdMlsClient {
     }
 
     pub fn restore_with_recovery_code(&self, code: &str) -> Result<LabyrinthBackupStatus, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() { return self.offline_restore_with_recovery_code(code); }
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test { return self.offline_restore_with_recovery_code(code); }
         labyrinth::recovery_code::RecoveryCode::candidates(code).map_err(|_| MLSError::invalid_input("invalid 40-character Labyrinth recovery code"))?;
         // A recovery code enrolls storage keys, not an unverified chat device.
         // Register this new device normally before the library attests its binding.
@@ -239,51 +416,76 @@ impl CatbirdMlsClient {
         })
     }
 
-    fn native_cached_archive_rows(&self, conversation_id: &str) -> Result<Vec<MessageRow>, MLSError> {
-        self.db.read_tx(|tx| {
-            let mut statement = tx.conn().prepare(
-                "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, sender_device_id, plaintext_json, created_at_ms, is_own FROM messages WHERE conversation_id = ?1 ORDER BY seq, message_id"
-            ).map_err(|e| MLSError::Internal(format!("read archive messages: {e}")))?;
-            let rows = statement.query_map([conversation_id], |row| Ok(MessageRow {
-                message_id: row.get(0)?, conversation_id: row.get(1)?, group_id: row.get(2)?, epoch: row.get(3)?, seq: row.get(4)?, sender_did: row.get(5)?, sender_device_id: row.get(6)?, plaintext_json: row.get(7)?, created_at_ms: row.get(8)?, is_own: row.get::<_, i64>(9)? != 0,
-            })).map_err(|e| MLSError::Internal(format!("read archive messages: {e}")))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| MLSError::Internal(format!("read archive messages: {e}")))
+    fn pin_native_conversation(&self, conversation_id: &str) -> Result<(), MLSError> {
+        self.db.write_tx(|tx| {
+            let Some(conversation) = tx.get_conversation(conversation_id)? else { return Ok(()); };
+            if conversation.sequencer_did.is_empty() { return Ok(()); }
+            let generation = u64::try_from(conversation.generation)
+                .map_err(|_| MLSError::Cryptography("negative conversation generation".into()))?;
+            let space = conversation.space_uri.unwrap_or_else(|| format!(
+                "at://{}/space/blue.catbird.labyrinth.conversation/{}-{}",
+                conversation.sequencer_did, conversation_id, conversation.generation,
+            ));
+            let parsed = labyrinth::store::space::SpaceRef::parse(&space)
+                .map_err(|e| MLSError::Cryptography(e.to_string()))?;
+            if parsed.space_did != conversation.sequencer_did {
+                return Err(MLSError::Cryptography("conversation Space authority differs from pinned sequencer".into()));
+            }
+            let key = format!("native.placements:{}", crate::labyrinth::space::thread_placement_key(&self.normalized_did));
+            let mut placements: std::collections::BTreeMap<String, crate::labyrinth::space::ThreadPlacement> =
+                tx.get_labyrinth_state(&key)?.map(|raw| serde_json::from_slice(&raw))
+                    .transpose().map_err(|e| MLSError::Cryptography(format!("invalid archive Space pins: {e}")))?
+                    .unwrap_or_default();
+            if placements.get(conversation_id).is_some_and(|pin| pin.space.as_deref() == Some(space.as_str()) && pin.generation == generation) {
+                return Ok(());
+            }
+            placements.insert(conversation_id.to_owned(), crate::labyrinth::space::ThreadPlacement {
+                space: Some(space), generation,
+            });
+            tx.put_labyrinth_state(&key, &serde_json::to_vec(&placements).map_err(|e| MLSError::Internal(e.to_string()))?, self.hooks.now_ms())
         })
     }
 
-    async fn native_backup_owner_rows(&self, session: &mut crate::labyrinth::LabyrinthSession, conversation_id: &str, rows: &[MessageRow]) -> Result<u32, MLSError> {
-        let mut items = Vec::new();
-        let mut saved = Vec::new();
-        for row in rows {
-            let frame = serde_json::to_vec(row).map_err(|e| MLSError::Internal(e.to_string()))?;
-            let digest = Sha256::digest(&frame).to_vec();
-            let key = format!("native.owner:{conversation_id}:{}", row.message_id);
-            if self.db.read_tx(|tx| tx.get_labyrinth_state(&key))?.as_deref() == Some(digest.as_slice()) { continue; }
-            items.push((row.message_id.clone(), row.created_at_ms.max(0) as u64, row.sender_did.clone(), frame));
-            saved.push((key, digest));
-        }
-        if items.is_empty() { return Ok(0); }
-        session.archive_owner_fallback(conversation_id, &items).await.map_err(native_archive_error)?
-            .map_err(|e| MLSError::Internal(format!("owner archive: {e}")))?;
+    async fn native_backup_owner_items(&self, session: &mut crate::labyrinth::LabyrinthSession, conversation_id: &str, items: &[NativeArchiveEvidence]) -> Result<u32, MLSError> {
+        // P11 drops the kicked member's OwnerBatch fallback on every path (flush denial and kick rescue).
+        if crate::planted::is_planted_bug_active(crate::planted::PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes) { return Ok(0); }
+        let pending = self.db.read_tx(|tx| {
+            let mut pending = Vec::new();
+            for item in items {
+                if item.conversation_id != conversation_id {
+                    return Err(MLSError::Cryptography("owner archive conversation mismatch".into()));
+                }
+                crate::orchestrator::MLSMessagePayload::decode(item.labyrinth_frame_json.as_bytes())
+                    .map_err(|e| MLSError::Cryptography(format!("invalid canonical owner frame: {e}")))?;
+                let bytes = serde_json::to_vec(item).map_err(|e| MLSError::Internal(e.to_string()))?;
+                let digest = Sha256::digest(&bytes).to_vec();
+                let key = format!("native.owner:{conversation_id}:{}", item.message_id);
+                if tx.get_labyrinth_state(&key)?.as_deref() != Some(digest.as_slice()) {
+                    pending.push((key, digest, item));
+                }
+            }
+            Ok(pending)
+        })?;
+        if pending.is_empty() { return Ok(0); }
+        let items: Vec<_> = pending.iter().map(|(_, _, item)| *item).collect();
+        session.archive_native_owner(conversation_id, &items).await.map_err(native_archive_error)?
+            .map_err(|e| MLSError::Cryptography(format!("owner archive: {e}")))?;
         self.db.write_tx(|tx| {
-            for (key, digest) in &saved { tx.put_labyrinth_state(key, digest, self.hooks.now_ms())?; }
+            for (key, digest, _) in &pending { tx.put_labyrinth_state(key, digest, self.hooks.now_ms())?; }
             Ok(())
         })?;
-        Ok(items.len() as u32)
+        Ok(pending.len() as u32)
     }
 
     pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() { return self.offline_flush_labyrinth_queue(); }
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test { return self.offline_flush_labyrinth_queue(); }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         if self.is_handle_closed() { return Err(MLSError::ContextClosed); }
         if !self.labyrinth_status()?.backup_enabled { return Ok(0); }
-        if crate::buggify!("between_labyrinth_enqueue_and_flush") { return Err(MLSError::Internal("sim buggify: between_labyrinth_enqueue_and_flush".into())); }
-        let conversations = self.db.read_tx(|tx| {
-            let mut stmt = tx.conn().prepare("SELECT conversation_id FROM messages UNION SELECT conversation_id FROM labyrinth_queue ORDER BY conversation_id").map_err(|e| MLSError::Internal(e.to_string()))?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| MLSError::Internal(e.to_string()))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(|e| MLSError::Internal(e.to_string()))
-        })?;
+        let conversations = self.db.read_tx(|tx| tx.list_labyrinth_queue_conversations())?;
         if conversations.is_empty() { return Ok(0); }
+        if crate::buggify!("between_labyrinth_enqueue_and_flush") { return Err(MLSError::Internal("sim buggify: between_labyrinth_enqueue_and_flush".into())); }
         self.native_archive_run(async {
             let deps = self.native_archive_deps()?;
             let mut session = deps.clone().enable().await.map_err(native_archive_error)?;
@@ -291,51 +493,51 @@ impl CatbirdMlsClient {
             let mut first_error = None;
             for cid in conversations {
                 let result: Result<u32, MLSError> = async {
+                    self.pin_native_conversation(&cid)?;
+                    let local_members = self.list_members(&cid)?;
+                    let local_has_self = local_members.iter().any(|did| did == &self.normalized_did);
+                    let owner_only = match deps.transport.query("blue.catbird.chat.getConversationState", &[("conversationId", cid.clone())]).await {
+                        Ok(_) => !local_has_self,
+                        Err(error) => match crate::labyrinth::transport::map_xrpc_error(error) {
+                            labyrinth::Error::Forbidden => true,
+                            labyrinth::Error::NotFound("conversation") if !local_has_self => true,
+                            error => return Err(MLSError::Cryptography(format!("archive conversation state: {error}"))),
+                        }
+                    };
                     let mut committed = 0;
                     loop {
                         let queued = self.db.read_tx(|tx| tx.list_labyrinth_queue(Some(&cid), 100))?;
                         if queued.is_empty() { break; }
-                        let payloads = queued.iter().map(|row| serde_json::from_slice::<QueuedLabyrinthArchivePayload>(&row.payload_bytes).map_err(|e| MLSError::Internal(format!("invalid archive queue: {e}")))).collect::<Result<Vec<_>, _>>()?;
-                        let members = self.list_members(&cid)?;
-                        let state = deps.transport.query("blue.catbird.chat.getConversationState", &[("conversationId", cid.clone())]).await;
-                        let archive = match state {
-                            Ok(body) => {
-                                let state: serde_json::Value = serde_json::from_slice(&body).map_err(|e| MLSError::Internal(e.to_string()))?;
-                                let mut remote = crate::labyrinth::hooks::roster_members(&state).map_err(|e| MLSError::Internal(e.to_string()))?;
-                                remote.sort(); remote.dedup();
-                                let mut local = members.clone(); local.sort(); local.dedup();
-                                if remote != local { return Err(MLSError::Cryptography("archive DS roster differs from local MLS leaves".into())); }
-                                session.archive_native_sender(&cid, &members, &payloads).await.map_err(native_archive_error)?
+                        let payloads = queued.iter().map(|row| self.decode_queue_row(row)).collect::<Result<Vec<_>, _>>()?;
+                        let mut start = 0;
+                        while start < payloads.len() {
+                            let first = &payloads[start];
+                            if first.conversation_id != cid || first.expected_member_dids.is_empty()
+                                || !first.expected_member_dids.contains(&first.sender_did) {
+                                return Err(MLSError::Cryptography("archive missing authenticated send-time roster".into()));
                             }
-                            Err(error) => Err(crate::labyrinth::transport::map_xrpc_error(error)),
-                        };
-                        let denied = match &archive {
-                            Err(labyrinth::Error::Forbidden | labyrinth::Error::NotFound("space" | "conversation")) => true,
-                            Err(labyrinth::Error::Backend(msg)) if msg.contains("native_archive_context_closed") => return Err(MLSError::ContextClosed),
-                            Err(error) => return Err(MLSError::Internal(format!("sender archive: {error}"))),
-                            Ok(()) => false,
-                        };
-                        let lose_on_kick = denied && crate::planted::is_planted_bug_active(crate::planted::PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes);
-                        if !lose_on_kick {
-                            let ids: std::collections::BTreeSet<_> = queued.iter().map(|row| row.item_id.as_str()).collect();
-                            let mut cached = self.native_cached_archive_rows(&cid)?.into_iter().filter(|row| ids.contains(row.message_id.as_str())).collect::<Vec<_>>();
-                            let seen: std::collections::BTreeSet<_> = cached.iter().map(|row| row.message_id.clone()).collect();
-                            for payload in payloads.iter().filter(|p| !seen.contains(&p.message_id)) {
-                                let group_id = hex::decode(&payload.group_id_hex).unwrap_or_else(|_| Sha256::digest(cid.as_bytes()).to_vec());
-                                cached.push(MessageRow {
-                                    message_id: payload.message_id.clone(), conversation_id: cid.clone(), group_id,
-                                    epoch: payload.epoch, seq: payload.seq, sender_did: payload.sender_did.clone(),
-                                    sender_device_id: payload.sender_device_id.clone(), plaintext_json: payload.plaintext_json.clone(),
-                                    created_at_ms: payload.created_at_ms, is_own: payload.sender_did == self.normalized_did,
-                                });
+                            let mut end = start + 1;
+                            while end < payloads.len() && payloads[end].group_id_hex == first.group_id_hex
+                                && payloads[end].epoch == first.epoch && payloads[end].expected_member_dids == first.expected_member_dids {
+                                end += 1;
                             }
-                            self.native_backup_owner_rows(&mut session, &cid, &cached).await?;
+                            let chunk = &payloads[start..end];
+                            let denied = if owner_only { true } else {
+                                match session.archive_native_sender(&cid, &first.expected_member_dids, chunk).await.map_err(native_archive_error)? {
+                                    Ok(()) => false,
+                                    Err(labyrinth::Error::Forbidden) => true,
+                                    Err(error) => return Err(MLSError::Cryptography(format!("sender archive: {error}"))),
+                                }
+                            };
+                            if denied {
+                                let items: Vec<_> = chunk.iter().map(NativeArchiveEvidence::from_queue).collect();
+                                self.native_backup_owner_items(&mut session, &cid, &items).await?;
+                            }
+                            start = end;
                         }
                         self.db.write_tx(|tx| { for row in &queued { tx.dequeue_labyrinth_item(&row.item_id)?; } Ok(()) })?;
                         committed += queued.len() as u32;
                     }
-                    let incoming = self.native_cached_archive_rows(&cid)?.into_iter().filter(|row| row.sender_did != self.normalized_did).collect::<Vec<_>>();
-                    self.native_backup_owner_rows(&mut session, &cid, &incoming).await?;
                     Ok(committed)
                 }.await;
                 match result {
@@ -350,113 +552,159 @@ impl CatbirdMlsClient {
     }
 
     pub fn rescue_conversation_on_kick(&self, conversation_id: &str) -> Result<u32, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() { return self.offline_rescue_conversation_on_kick(conversation_id); }
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test { return self.offline_rescue_conversation_on_kick(conversation_id); }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         if !self.labyrinth_status()?.backup_enabled { return Ok(0); }
+        self.pin_native_conversation(conversation_id)?;
+        let (items, queued_ids) = self.db.read_tx(|tx| {
+            let mut statement = tx.conn().prepare("SELECT message_id FROM messages WHERE conversation_id = ?1 ORDER BY seq, message_id")
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let ids = statement.query_map([conversation_id], |row| row.get::<_, String>(0))
+                .map_err(|e| MLSError::Internal(e.to_string()))?.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let mut items = std::collections::BTreeMap::new();
+            for id in ids {
+                let raw = tx.get_labyrinth_state(&format!("native.message:{conversation_id}:{id}"))?
+                    .ok_or_else(|| MLSError::Cryptography(format!("missing authenticated archive evidence for {id}")))?;
+                let item: NativeArchiveEvidence = serde_json::from_slice(&raw).map_err(|e| MLSError::Cryptography(format!("invalid archive evidence: {e}")))?;
+                if item.message_id != id || item.conversation_id != conversation_id {
+                    return Err(MLSError::Cryptography("cached archive evidence coordinates mismatch".into()));
+                }
+                items.insert(id, item);
+            }
+            let mut statement = tx.conn().prepare("SELECT item_id, payload_bytes FROM labyrinth_queue WHERE conversation_id = ?1 ORDER BY seq, item_id")
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let queued = statement.query_map([conversation_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let mut queued_ids = Vec::new();
+            for row in queued {
+                let (id, bytes) = row.map_err(|e| MLSError::Internal(e.to_string()))?;
+                let item: NativeArchiveEvidence = serde_json::from_slice(&bytes).map_err(|e| MLSError::Cryptography(format!("invalid archive queue: {e}")))?;
+                if item.message_id != id || item.conversation_id != conversation_id {
+                    return Err(MLSError::Cryptography("queued archive evidence coordinates mismatch".into()));
+                }
+                queued_ids.push(id.clone());
+                items.insert(id, item);
+            }
+            Ok((items.into_values().collect::<Vec<_>>(), queued_ids))
+        })?;
         self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.enable().await.map_err(native_archive_error)?;
-            let mut rows = self.native_cached_archive_rows(conversation_id)?;
-            let queued_rows = self.db.read_tx(|tx| {
-                let mut statement = tx.conn().prepare(
-                    "SELECT item_id, conversation_id, group_id_hex, seq, payload_bytes, created_at_ms FROM labyrinth_queue WHERE conversation_id = ?1 ORDER BY seq, item_id"
-                ).map_err(|e| MLSError::Internal(e.to_string()))?;
-                let iter = statement.query_map([conversation_id], |row| Ok(LabyrinthQueueRow {
-                    item_id: row.get(0)?, conversation_id: row.get(1)?, group_id_hex: row.get(2)?, seq: row.get(3)?, payload_bytes: row.get(4)?, created_at_ms: row.get(5)?,
-                })).map_err(|e| MLSError::Internal(e.to_string()))?;
-                iter.collect::<Result<Vec<_>, _>>().map_err(|e| MLSError::Internal(e.to_string()))
-            })?;
-            let queued_ids: Vec<String> = queued_rows.iter().map(|row| row.item_id.clone()).collect();
-            if crate::planted::is_planted_bug_active(crate::planted::PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes) {
-                rows.retain(|row| !queued_ids.contains(&row.message_id));
-            } else {
-                let seen: std::collections::BTreeSet<_> = rows.iter().map(|row| row.message_id.clone()).collect();
-                for queued in &queued_rows {
-                    let payload = self.decode_queue_row(queued)?;
-                    if !seen.contains(&payload.message_id) {
-                        let group_id = hex::decode(&payload.group_id_hex).unwrap_or_else(|_| Sha256::digest(conversation_id.as_bytes()).to_vec());
-                        rows.push(MessageRow {
-                            message_id: payload.message_id, conversation_id: conversation_id.into(), group_id,
-                            epoch: payload.epoch, seq: payload.seq, sender_did: payload.sender_did.clone(),
-                            sender_device_id: payload.sender_device_id, plaintext_json: payload.plaintext_json,
-                            created_at_ms: payload.created_at_ms, is_own: payload.sender_did == self.normalized_did,
-                        });
-                    }
-                }
-            }
-            self.native_backup_owner_rows(&mut session, conversation_id, &rows).await?;
+            let count = self.native_backup_owner_items(&mut session, conversation_id, &items).await?;
             self.db.write_tx(|tx| { for id in &queued_ids { tx.dequeue_labyrinth_item(id)?; } Ok(()) })?;
             self.save_native_archive_status(&session, false)?;
-            Ok(rows.len() as u32)
+            Ok(count)
         })
+    }
+
+    /// Hides every copy (sender, witness or owner) attributed to an account whose deletion
+    /// `conversation_id` sequenced. Live sync records each authenticated `accountDeletedEntry`; no
+    /// server redaction covers the witness and owner copies other members already published. A
+    /// copy stays only if its sequencer receipt orders it after the deletion. Returns how many it hid.
+    fn hide_deleted_accounts(db: &MlsAccountDb, conversation_id: &str, messages: &mut Vec<labyrinth::client::LoadedMessage>) -> Result<usize, MLSError> {
+        let senders: std::collections::BTreeSet<String> = messages.iter().filter_map(|m| m.sender.clone()).collect();
+        let deleted: std::collections::BTreeMap<String, u64> = db.read_tx(|tx| {
+            let mut deleted = std::collections::BTreeMap::new();
+            for did in &senders {
+                if let Some(raw) = tx.get_labyrinth_state(&super::live_sync::account_deletion_key(conversation_id, did))? {
+                    // An unreadable marker still hides: it can only widen what the deletion covers.
+                    let seq = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+                    deleted.insert(did.clone(), seq);
+                }
+            }
+            Ok(deleted)
+        })?;
+        let before = messages.len();
+        messages.retain(|m| match m.sender.as_deref().and_then(|s| deleted.get(s)) {
+            Some(&at) => m.archived_receipt.as_ref().is_some_and(|r| r.signed.payload.seq > at),
+            None => true,
+        });
+        Ok(before - messages.len())
     }
 
     pub fn open_rescued_owner_batch(&self, batch_json: &[u8]) -> Result<Vec<(String, Option<String>, Vec<u8>)>, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() { return self.offline_open_rescued_owner_batch(batch_json); }
-        let batch: labyrinth::records::OwnerBatch = serde_json::from_slice(batch_json).map_err(|e| MLSError::Internal(e.to_string()))?;
-        self.native_archive_run(async {
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test { return self.offline_open_rescued_owner_batch(batch_json); }
+        let batch: labyrinth::records::OwnerBatch = serde_json::from_slice(batch_json).map_err(|e| MLSError::Cryptography(e.to_string()))?;
+        self.pin_native_conversation(&batch.thread_id)?;
+        let conversation_id = batch.thread_id.clone();
+        let mut messages = self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
-            session.open_owner_record(batch).await.map_err(native_archive_error)?.into_iter().map(|message| {
-                let row: MessageRow = serde_json::from_slice(&message.frame).map_err(|e| MLSError::Internal(format!("native owner frame: {e}")))?;
-                Ok((message.message_id, message.sender, canonical_labyrinth_frame_json(&row.plaintext_json).into_bytes()))
-            }).collect()
-        })
+            session.open_owner_record(batch).await.map_err(native_archive_error)
+        })?;
+        Self::hide_deleted_accounts(&self.db, &conversation_id, &mut messages)?;
+        messages.into_iter().map(|message| {
+            if message.archived_receipt.is_none() || message.frame_nonce.is_none() {
+                return Err(MLSError::Cryptography("owner frame missing I13 evidence".into()));
+            }
+            crate::orchestrator::MLSMessagePayload::decode(&message.frame)
+                .map_err(|e| MLSError::Cryptography(format!("invalid canonical owner frame: {e}")))?;
+            Ok((message.message_id, message.sender, message.frame))
+        }).collect()
     }
 
     pub fn restore_conversation_from_owner_mailbox(&self, conversation_id: &str) -> Result<u32, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() { return self.offline_restore_conversation_from_owner_mailbox(conversation_id); }
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test { return self.offline_restore_conversation_from_owner_mailbox(conversation_id); }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
-        let history = self.native_archive_run(async {
+        self.pin_native_conversation(conversation_id)?;
+        let known_removed = match self.list_members(conversation_id) {
+            Ok(members) => members.iter().all(|did| did != &self.normalized_did),
+            Err(MLSError::GroupNotFound { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        let (mut history, rejected) = self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
-            session.load_owner_history(conversation_id).await.map_err(native_archive_error)
+            if known_removed { return session.load_owner_history(conversation_id).await.map(|m| (m, 0)).map_err(native_archive_error); }
+            let history = session.load_history(conversation_id, labyrinth::store::TimeRange::ALL).await.map_err(native_archive_error)?;
+            if history.undecryptable != 0 { return Err(MLSError::Cryptography("conversation archive contains undecryptable or unverified frames".into())); }
+            let space_readable = history.space_readable;
+            // Active members trust Conversation Space (sender and witness copies); owner records
+            // are only a Forbidden fallback.
+            Ok((history.messages.into_iter().filter(|message| !space_readable || message.source != labyrinth::client::MessageSource::Owner).collect(), history.rejected))
         })?;
-        // Every device of this account archives the rows it saw. Copies of one message
-        // may differ only in device-local receipt time; authoritative fields must agree.
-        let mut by_id: std::collections::BTreeMap<String, MessageRow> = std::collections::BTreeMap::new();
-        for message in history {
-            let row: MessageRow = serde_json::from_slice(&message.frame).map_err(|e| MLSError::Internal(format!("native owner frame: {e}")))?;
-            if row.conversation_id != conversation_id || row.message_id != message.message_id || message.sender.as_deref() != Some(row.sender_did.as_str()) || row.seq < 0 || row.epoch < 0 {
-                return Err(MLSError::Cryptography("owner frame coordinates/attribution mismatch".into()));
-            }
-            match by_id.entry(row.message_id.clone()) {
-                std::collections::btree_map::Entry::Vacant(slot) => { slot.insert(row); }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    let kept = slot.get_mut();
-                    if kept.sender_did != row.sender_did || kept.group_id != row.group_id || kept.epoch != row.epoch || kept.seq != row.seq || kept.plaintext_json != row.plaintext_json {
-                        return Err(MLSError::Cryptography("conflicting owner archive copies".into()));
-                    }
-                    if row.created_at_ms < kept.created_at_ms { *kept = row; }
-                }
-            }
+        if rejected > 0 {
+            tracing::warn!(conversation_id, rejected, "labyrinth restore: ignored witness copies that contradict accepted archive copies");
         }
-        let mut rows: Vec<MessageRow> = by_id.into_values().collect();
-        rows.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.created_at_ms.cmp(&b.created_at_ms)).then_with(|| a.message_id.cmp(&b.message_id)));
-        let count = self.db.write_tx(|tx| {
-            let mut count = 0;
-            for row in &rows {
-                if let Some(existing) = tx.get_message(&row.message_id)? {
-                    if existing.conversation_id != row.conversation_id || existing.seq != row.seq || existing.epoch != row.epoch || existing.sender_did != row.sender_did || existing.plaintext_json != row.plaintext_json {
-                        return Err(MLSError::Cryptography("owner history conflicts with local message".into()));
-                    }
-                    continue;
+        let deleted = Self::hide_deleted_accounts(&self.db, conversation_id, &mut history)?;
+        if deleted > 0 {
+            tracing::info!(conversation_id, deleted, "labyrinth restore: hid archive copies of deleted accounts' messages");
+        }
+        let copies = native_restore_copies(conversation_id, &self.normalized_did, history)?;
+        let (count, skipped) = self.db.write_tx(|tx| {
+            let mut chosen = Vec::new();
+            let mut skipped = 0usize;
+            for group in copies.values() {
+                let local = tx.get_message(&group[0].0.message_id)?;
+                match select_restore_copy(group, local.as_ref()) {
+                    Some(copy) => chosen.push((copy, local.is_none())),
+                    None => skipped += 1,
                 }
-                let mut row = row.clone(); row.is_own = row.sender_did == self.normalized_did;
-                tx.insert_message(&row)?; count += 1;
-                // Already archived for this account: a later flush must not seal it again.
-                let frame = serde_json::to_vec(&row).map_err(|e| MLSError::Internal(e.to_string()))?;
-                let digest: [u8; 32] = Sha256::digest(&frame).into();
-                tx.put_labyrinth_state(&format!("native.owner:{conversation_id}:{}", row.message_id), &digest, self.hooks.now_ms())?;
             }
-            // History never advances the live cursor. A restored archive is not MLS state.
+            chosen.sort_by(|((a, _, _), _), ((b, _, _), _)| a.seq.cmp(&b.seq).then_with(|| a.message_id.cmp(&b.message_id)));
+            let mut count: u32 = 0;
+            for ((row, evidence, _), new) in &chosen {
+                if *new { tx.insert_message(row)?; count += 1; }
+                tx.put_labyrinth_state(&format!("native.message:{conversation_id}:{}", row.message_id),
+                    &serde_json::to_vec(evidence).map_err(|e| MLSError::Internal(e.to_string()))?, self.hooks.now_ms())?;
+            }
+            // Archive recovery does not create MLS state or advance a live delivery cursor.
             if tx.get_conversation(conversation_id)?.is_none() {
-                if let Some(row) = rows.last() {
+                if let Some(((row, _, receipt), _)) = chosen.last() {
                     tx.upsert_conversation(&ConversationRow {
-                        conversation_id: conversation_id.into(), group_id: row.group_id.clone(), generation: 0, epoch: row.epoch, last_seq: 0,
-                        sequencer_did: self.config.home_ds_did.clone(), space_uri: None, title: None, unread_count: 0, updated_at_ms: self.hooks.now_ms(),
+                        conversation_id: conversation_id.into(), group_id: row.group_id.clone(),
+                        generation: i64::try_from(receipt.generation).map_err(|_| MLSError::Cryptography("archive generation overflow".into()))?,
+                        epoch: row.epoch, last_seq: 0, sequencer_did: receipt.sequencer_did.clone(),
+                        space_uri: None, title: None, unread_count: 0, updated_at_ms: self.hooks.now_ms(),
                     })?;
                 }
             }
-            Ok(count)
+            Ok((count, skipped))
         })?;
+        if skipped > 0 {
+            tracing::warn!(conversation_id, skipped, "labyrinth restore: skipped message ids whose archive copies disagree");
+        }
         if count > 0 {
             self.notify(PlatformChangeEvent::ConversationsUpdated);
             self.notify(PlatformChangeEvent::MessagesUpdated { conversation_id: conversation_id.into() });
@@ -465,19 +713,23 @@ impl CatbirdMlsClient {
     }
 
     fn rotate_native_archive(&self, target_device_id: Option<&str>) -> Result<u64, MLSError> {
-        if self.canonical_uuid_v4_device_id().is_none() {
+        let key = target_device_id.map(|id| {
+            hex::decode(id.trim()).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+                .ok_or_else(|| MLSError::invalid_input("target_device_id must resolve to a 32-byte Labyrinth device key; UUID-only revocation is not supported"))
+        }).transpose()?;
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        if self.offline_archive_for_test {
             let now_ms = self.hooks.now_ms();
-            let key: Option<[u8; 32]> = target_device_id.and_then(|id| hex::decode(id.trim()).ok()?.as_slice().try_into().ok());
             if let Some((remote_seq, remote_root)) = self.rotate_mailbox_epoch_if_supported(key.as_ref(), now_ms)? {
                 self.db.write_tx(|tx| tx.put_labyrinth_state(&owner_epoch_root_key(remote_seq), remote_root.as_slice(), now_ms))?;
                 return Ok(remote_seq);
             }
+            if target_device_id.is_some() { return Err(MLSError::invalid_input("revocation requires an authenticated mailbox device key")); }
             let next_seq = self.labyrinth_status()?.epoch_seq.saturating_add(1);
             self.db.write_tx(|tx| { let _ = ensure_owner_epoch_root(tx, next_seq, now_ms, &self.hooks)?; Ok(()) })?;
             return Ok(next_seq);
         }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
-        let key: Option<[u8; 32]> = target_device_id.and_then(|id| hex::decode(id.trim()).ok()?.as_slice().try_into().ok());
         self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.enable().await.map_err(native_archive_error)?;
             match key {
@@ -677,7 +929,7 @@ impl CatbirdMlsClient {
                     namespace: "native.sim.rogue.placements",
                     hooks: self.hooks.clone(),
                 }),
-                pds: None,
+                pds: Some(rogue_gateway.clone()),
                 space: Some(Arc::new(crate::labyrinth::SpaceXrpcTransport::new(
                     rogue_gateway,
                 ))),
@@ -728,5 +980,197 @@ impl CatbirdMlsClient {
         )?;
 
         Ok((head_vec, storage_device_key))
+    }
+}
+
+/// Restore over real Labyrinth verification: a member's relabelled witness copies, or its own
+/// copy colliding with another member's message id, never fail or alter restore.
+#[cfg(all(test, feature = "labyrinth"))]
+mod native_restore_tests {
+    use super::{block_on_sync, native_restore_copies, select_restore_copy, MessageRow};
+    use labyrinth::client::{Backends, Clock, Labyrinth};
+    use labyrinth::message::ArchivedReceipt;
+    use labyrinth::protocol::receipt::{
+        compute_archive_commitment, expected_receipt_key_id, sign_sequencer_receipt, SequencerReceiptPayload,
+    };
+    use labyrinth::sign::TransportSigner;
+    use labyrinth::store::memory::MemoryBackend;
+    use labyrinth::store::{SequencerReceiptKey, TimeRange};
+
+    const CONVERSATION: &str = "5f0f6c1e-7a4b-4c1d-9e2f-3a4b5c6d7e8f";
+    const SEQUENCER: &str = "did:web:ds.example";
+    const DEVICE: &str = "6f1d2c3b-4a59-4687-8796-a5b4c3d2e1f0";
+    const ALICE: &str = "did:plc:alice";
+    const BOB: &str = "did:plc:bob";
+    const CAROL: &str = "did:plc:carol";
+
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now_ms(&self) -> u64 { 1_791_000_000_000 }
+    }
+
+    struct ChatKey(ed25519_dalek::SigningKey);
+    impl TransportSigner for ChatKey {
+        fn transport_public_key(&self) -> [u8; 32] { self.0.verifying_key().to_bytes() }
+        fn sign_transport(&self, msg: &[u8]) -> [u8; 64] {
+            use ed25519_dalek::Signer as _;
+            self.0.sign(msg).to_bytes()
+        }
+    }
+
+    struct Sent { frame: Vec<u8>, nonce: [u8; 32], receipt: ArchivedReceipt }
+
+    struct World { net: MemoryBackend, sequencer: p256::ecdsa::SigningKey }
+
+    impl World {
+        fn new() -> Self {
+            let net = MemoryBackend::new();
+            net.enable_server_order();
+            let sequencer = p256::ecdsa::SigningKey::from_bytes((&[0x42u8; 32]).into()).unwrap();
+            net.set_sequencer_receipt_key(CONVERSATION, SequencerReceiptKey {
+                did: SEQUENCER.into(),
+                public_key_sec1: sequencer.verifying_key().to_encoded_point(true).as_bytes().to_vec(),
+            });
+            Self { net, sequencer }
+        }
+
+        fn join(&self, did: &str, seed: u8) -> Labyrinth {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let public = key.verifying_key().to_bytes();
+            self.net.register_chat_device(did, public);
+            let backends = Backends {
+                mailbox: Box::new(self.net.mailbox(did)), threads: Box::new(self.net.threads(did)),
+                directory: Box::new(self.net.directory()), publishers: vec![], clock: Box::new(FixedClock),
+            };
+            let lab = block_on_sync(Labyrinth::initialize(did, Box::new(ChatKey(key)), backends)).unwrap();
+            self.net.add_leaf(CONVERSATION, did, public);
+            lab
+        }
+
+        /// The sequencer orders `sender`'s canonical text frame and receipts it.
+        fn sequence(&self, sender: &str, id: &str, text: &str) -> Sent {
+            let frame = serde_json::to_vec(&crate::orchestrator::MLSMessagePayload::text(text)).unwrap();
+            let mut nonce = [0u8; 32];
+            for (n, b) in nonce.iter_mut().zip(id.bytes().cycle()) { *n = b; }
+            let seq = self.net.append_chat_entry(CONVERSATION);
+            let payload = SequencerReceiptPayload {
+                sequencer_did: SEQUENCER.into(), conversation_id: CONVERSATION.into(), group_id: vec![0x99; 32], epoch: 1,
+                sender_device_did_url: format!("{sender}#{DEVICE}"), entry_id: format!("entry-{id}"),
+                archive_commitment: compute_archive_commitment(&nonce, &frame), seq, issued_at_ms: 1_791_000_000_000 + seq as i64,
+            };
+            let signed = sign_sequencer_receipt(&self.sequencer, &expected_receipt_key_id(SEQUENCER), &payload).unwrap();
+            Sent { frame, nonce, receipt: ArchivedReceipt::new(signed) }
+        }
+    }
+
+    /// `lab` archives `m`'s exact frame, nonce and receipt under `id`.
+    fn archive(lab: &mut Labyrinth, id: &str, m: &Sent, ts: u64) {
+        let roster = block_on_sync(lab.resolve_roster(&[ALICE, BOB, CAROL])).unwrap();
+        block_on_sync(lab.archive_outgoing_committed(CONVERSATION, &roster, id, ts, &m.nonce, &m.frame, &m.receipt)).unwrap();
+        block_on_sync(lab.flush()).unwrap();
+    }
+
+    /// `(messageId, sender, frame)` restore would import for `lab` next to `local` rows.
+    fn restored(lab: &mut Labyrinth, local: &[MessageRow]) -> Vec<(String, String, Vec<u8>)> {
+        let history = block_on_sync(lab.load_thread(CONVERSATION, TimeRange::ALL)).unwrap();
+        assert!(history.undecryptable.is_empty(), "{:?}", history.undecryptable);
+        let copies = native_restore_copies(CONVERSATION, BOB, history.messages).unwrap();
+        copies.values()
+            .filter_map(|group| select_restore_copy(group, local.iter().find(|row| row.message_id == group[0].0.message_id)))
+            .map(|(row, _, _)| (row.message_id.clone(), row.sender_did.clone(), row.plaintext_json.clone().into_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn restore_yields_exactly_the_genuine_messages_despite_relabelled_witness_copies() {
+        let w = World::new();
+        let mut alice = w.join(ALICE, 1);
+        let mut bob = w.join(BOB, 2);
+        let mut carol = w.join(CAROL, 3);
+        let m1 = w.sequence(ALICE, "m1", "hello");
+        let m2 = w.sequence(ALICE, "m2", "world");
+        archive(&mut alice, "m1", &m1, 100);
+        archive(&mut alice, "m2", &m2, 110);
+        // Carol files genuine frames under the wrong ids: m2's as m1, m1's as m3.
+        archive(&mut carol, "m1", &m2, 120);
+        archive(&mut carol, "m3", &m1, 130);
+        assert_eq!(restored(&mut bob, &[]), [
+            ("m1".to_owned(), ALICE.to_owned(), m1.frame.clone()),
+            ("m2".to_owned(), ALICE.to_owned(), m2.frame.clone()),
+        ]);
+    }
+
+    #[test]
+    fn a_members_colliding_own_copy_cannot_fail_restore() {
+        let w = World::new();
+        let mut alice = w.join(ALICE, 1);
+        let mut bob = w.join(BOB, 2);
+        let mut carol = w.join(CAROL, 3);
+        let m1 = w.sequence(ALICE, "m1", "hello");
+        let m2 = w.sequence(ALICE, "m2", "world");
+        let c1 = w.sequence(CAROL, "c1", "mine");
+        archive(&mut alice, "m1", &m1, 100);
+        archive(&mut alice, "m2", &m2, 110);
+        // Carol archives her own message under Alice's id.
+        archive(&mut carol, "m1", &c1, 120);
+        // Undecidable from the archive alone: m1 is skipped, the rest restores.
+        assert_eq!(restored(&mut bob, &[]), [("m2".to_owned(), ALICE.to_owned(), m2.frame.clone())]);
+        // The local message decides which copy is genuine.
+        let local = MessageRow {
+            message_id: "m1".into(), conversation_id: CONVERSATION.into(), group_id: vec![0x99; 32], epoch: 1,
+            seq: m1.receipt.signed.payload.seq as i64, sender_did: ALICE.into(), sender_device_id: DEVICE.into(),
+            plaintext_json: String::from_utf8(m1.frame.clone()).unwrap(), created_at_ms: 100, is_own: false,
+        };
+        assert_eq!(restored(&mut bob, &[local]), [
+            ("m1".to_owned(), ALICE.to_owned(), m1.frame.clone()),
+            ("m2".to_owned(), ALICE.to_owned(), m2.frame.clone()),
+        ]);
+    }
+
+    /// Production readers get no sequencer redactions; the authenticated `accountDeletedEntry`
+    /// live sync recorded decides. Every copy attributed to the deleted account that its receipt
+    /// orders before the entry is hidden, in Space and owner history alike: its own copy, another
+    /// member's published witness copy of a message it never archived, and re-archived owner
+    /// copies. Other members' messages, and its messages sequenced after the entry, stay.
+    #[test]
+    fn a_sequenced_account_deletion_hides_every_published_copy_of_its_messages() {
+        use super::CatbirdMlsClient;
+        use crate::storage::{MlsAccountDb, OpenMode};
+        fn visible(db: &MlsAccountDb, lab: &mut Labyrinth, owner: bool) -> Vec<String> {
+            let history = if owner {
+                block_on_sync(lab.load_owner_thread(CONVERSATION))
+            } else {
+                block_on_sync(lab.load_thread(CONVERSATION, TimeRange::ALL))
+            }
+            .unwrap();
+            assert!(history.undecryptable.is_empty(), "{:?}", history.undecryptable);
+            let mut messages = history.messages;
+            CatbirdMlsClient::hide_deleted_accounts(db, CONVERSATION, &mut messages).unwrap();
+            messages.into_iter().map(|m| m.message_id).collect()
+        }
+        let w = World::new();
+        let mut alice = w.join(ALICE, 1);
+        let mut bob = w.join(BOB, 2);
+        let mut carol = w.join(CAROL, 3);
+        let a1 = w.sequence(ALICE, "a1", "own copy");
+        let a2 = w.sequence(ALICE, "a2", "never archived by alice");
+        let b1 = w.sequence(BOB, "b1", "bob stays");
+        archive(&mut alice, "a1", &a1, 100);
+        archive(&mut carol, "a1", &a1, 110);
+        archive(&mut carol, "a2", &a2, 120);
+        archive(&mut bob, "b1", &b1, 130);
+        assert_eq!(block_on_sync(bob.rearchive_thread_before_leave(CONVERSATION)).unwrap(), 3);
+        let dir = tempfile::tempdir().unwrap();
+        let db = MlsAccountDb::open_native(dir.path().join("deleted.db"), &[7; 32], OpenMode::App).unwrap();
+        // Published copies stay visible until this device holds the deletion entry.
+        assert_eq!(visible(&db, &mut bob, false), ["a1", "a2", "b1"]);
+        assert_eq!(visible(&db, &mut bob, true), ["a1", "a2", "b1"]);
+
+        let deleted_at = i64::try_from(w.net.append_chat_entry(CONVERSATION)).unwrap();
+        db.write_tx(|tx| super::super::live_sync::record_account_deletion(tx, CONVERSATION, ALICE, deleted_at, 1)).unwrap();
+        let a3 = w.sequence(ALICE, "a3", "after the deletion");
+        archive(&mut alice, "a3", &a3, 200);
+        assert_eq!(visible(&db, &mut bob, false), ["b1", "a3"]);
+        assert_eq!(visible(&db, &mut bob, true), ["b1"]);
     }
 }

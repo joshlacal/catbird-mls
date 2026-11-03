@@ -22,7 +22,14 @@ pub enum PlantedBug {
     P9AutomatedForcedRejoinOnDecryptFailure,
     /// Skip cross-handle data-version cache eviction inside the next write transaction.
     P10SkipDataVersionCheckAfterNseAdvance,
-    /// Revoke conversation Space membership before the removal commit is accepted.
+    /// Drop the kicked member's OwnerBatch preservation. The shared native fallback
+    /// `native_backup_owner_items` (`src/client/native_archive.rs`, the only caller of
+    /// `LabyrinthSession::archive_native_owner`) returns `Ok(0)` without sealing, on both of its
+    /// callers: `flush_labyrinth_queue` after a Forbidden (or owner-only) conversation-Space
+    /// write, and `rescue_conversation_on_kick`. Both still dequeue the items, so they are lost;
+    /// unplanted, both seal them into the member's OwnerBatch first. The test-only offline
+    /// archive (`open_offline_archive_for_test`) is unaffected. The name is kept for CLI and
+    /// calibration references.
     P11RevokeSpaceAccessBeforeKickedMemberFlushes,
     /// Re-decrypt a persisted message replay after reopening the account database.
     P12SkipMessageIdDedupeAfterCrashRestart,

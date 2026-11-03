@@ -1,5 +1,7 @@
 //! Native sender preflight checks. These are not delivery-service publication tests.
 #![allow(dead_code)]
+#[path = "fixtures/direct_request_i13.rs"]
+mod direct_request_i13;
 mod e2e_harness;
 use catbird_mls::orchestrator::{MLSStorageBackend, MlsCryptoContext, OrchestratorError};
 use catbird_mls::{DirectRequestInput, MLSError};
@@ -93,9 +95,7 @@ fn receipt_authority() -> (p256::ecdsa::SigningKey, Vec<u8>, String) {
     let key = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
     let point = key.verifying_key().to_encoded_point(true);
     let id = protocol::direct_request_receipt_key_id(point.as_bytes()).unwrap();
-    let mut multikey = vec![0x80, 0x24];
-    multikey.extend(point.as_bytes());
-    let doc=serde_json::to_vec(&json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{"id":id,"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)}]})).unwrap();
+    let doc = direct_request_i13::authority_document(&key, &id, "did:web:chat.catbird.blue");
     (key, doc, id)
 }
 fn es256(key: &p256::ecdsa::SigningKey, bytes: &[u8]) -> String {
@@ -678,7 +678,7 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
         &pubkey,
     )
     .unwrap();
-    let body = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":method,"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":p["requestId"],"requestKind":"publish","requestDigest":STANDARD.encode(verified_publish.request_digest()),"preparationRequestDigest":STANDARD.encode(verified.request_digest()),"actorDid":p["actorDid"],"actorDeviceId":p["actorDeviceId"],"actorKeyId":p["keyId"],"authGeneration":p["authGeneration"],"conversationId":p["conversationId"],"firstMessageId":p["firstMessageId"],"coordinates":p["next"],"recordedAt":utc(0)}});
+    let body = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":method,"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":p["requestId"],"requestKind":"publish","requestDigest":STANDARD.encode(verified_publish.request_digest()),"preparationRequestDigest":STANDARD.encode(verified.request_digest()),"actorDid":p["actorDid"],"actorDeviceId":p["actorDeviceId"],"actorKeyId":p["keyId"],"authGeneration":p["authGeneration"],"conversationId":p["conversationId"],"firstMessageId":p["firstMessageId"],"coordinates":p["next"],"recordedAt":utc(0),"sequencerReceipt":direct_request_i13::receipt(&authority,p,1,"did:web:chat.catbird.blue")}});
     let receipt = json!({"$type":"blue.catbird.chat.defs#signedDirectRequestReceipt","signature":es256(&authority,&protocol::direct_request_signing_bytes(protocol::DirectRequestKind::Outcome,&serde_json::to_vec(&body).unwrap()).unwrap()),"body":body});
     world.delivery_service().queue_request_operation_response(
         Op::PublishDirectRequest,
@@ -723,7 +723,7 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
         .mls_context()
         .compare_exchange_direct_request_projection(cid, Some(&corrupted), &saved)
         .unwrap());
-    let publication_entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":receipt["body"]["receipt"]["recordedAt"]});
+    let publication_entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":p["firstMessageId"],"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":receipt["body"]["receipt"]["recordedAt"],"sequencerReceipt":receipt["body"]["receipt"]["sequencerReceipt"],"publicationReceipt":receipt});
     let publication_entry = read_bytes(dag_json, "directRequestEntry", true, &publication_entry);
     if authorization_checks {
         for unauthorized in [None, Some(vec![]), Some(vec![vec![91; 32]])] {
@@ -773,11 +773,6 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
         Op::GetEntries,
         200,
         json!({"entries":[publication_entry],"nextAfterSeq":1,"hasMore":false}),
-    );
-    world.delivery_service().queue_request_operation_response(
-        Op::GetDirectRequestOutcome,
-        200,
-        json!({"outcome":read_bytes(dag_json, "signedDirectRequestReceipt", true, &receipt)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,

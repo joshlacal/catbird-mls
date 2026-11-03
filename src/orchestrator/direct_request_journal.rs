@@ -26,6 +26,8 @@ pub struct DirectRequestJournal {
     pub input_sha256: [u8; 32],
     pub preparation_request_digest: [u8; 32],
     pub receipt_authority_key: Vec<u8>,
+    pub sequencer_did: String,
+    pub sequencer_receipt_authority_key: Vec<u8>,
     pub bootstrap: DirectRequestBootstrap,
     pub phase: DirectRequestJournalPhase,
     /// Exact signed wire bytes, immutable once recorded and before transport.
@@ -51,6 +53,8 @@ impl DirectRequestJournal {
             input_sha256: Self::input_digest(input)?,
             preparation_request_digest: input.preparation_request_digest,
             receipt_authority_key: input.receipt_authority_key.clone(),
+            sequencer_did: input.sequencer_did.clone(),
+            sequencer_receipt_authority_key: input.sequencer_receipt_authority_key.clone(),
             bootstrap,
             phase: DirectRequestJournalPhase::PreparedCrypto,
             publish_request: None,
@@ -78,6 +82,12 @@ impl DirectRequestJournal {
         {
             return Err(MLSError::StorageFailed);
         }
+        self.bootstrap
+            .opening
+            .as_ref()
+            .ok_or(MLSError::StorageFailed)?
+            .verify(&self.bootstrap.archive_commitment)
+            .map_err(|_| MLSError::StorageFailed)?;
         if self
             .publish_request
             .as_ref()
@@ -124,6 +134,7 @@ impl DirectRequestJournal {
                     | DirectRequestJournalPhase::RetiredPublished
             );
             if proof["requestId"] != self.request_id
+                || verified.body()["authorityDid"] != self.sequencer_did
                 || proof["preparationRequestDigest"].as_str()
                     != Some(STANDARD.encode(self.preparation_request_digest).as_str())
                 || published
@@ -137,6 +148,15 @@ impl DirectRequestJournal {
                                 .as_deref()))
             {
                 return Err(MLSError::StorageFailed);
+            }
+            if published {
+                super::direct_request_bootstrap::verify_opening_receipt(
+                    &self.bootstrap,
+                    &proof["sequencerReceipt"],
+                    &self.sequencer_did,
+                    &self.sequencer_receipt_authority_key,
+                )
+                .map_err(|_| MLSError::StorageFailed)?;
             }
         }
         Ok(())
@@ -777,6 +797,7 @@ impl DirectRequestJournal {
             || body["conversationId"] != record.conversation_id
             || body["next"] != b.coordinates
             || !eq_bytes(&body["contextHash"], &b.context_hash)
+            || !eq_bytes(&body["archiveCommitment"], &b.archive_commitment)
         {
             return Err(MLSError::invalid_input(
                 "Publication differs from prepared request",

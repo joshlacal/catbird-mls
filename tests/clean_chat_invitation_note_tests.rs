@@ -9,6 +9,8 @@
 //!   qualification (with real PostgreSQL row locks and fault transport) is in
 //!   `mls-ds/e2e-tests/tests/encrypted_request_c28.rs`.
 #![allow(dead_code)]
+#[path = "fixtures/direct_request_i13.rs"]
+mod direct_request_i13;
 mod e2e_harness;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -33,18 +35,7 @@ fn receipt_authority() -> (p256::ecdsa::SigningKey, Vec<u8>, String) {
     let key = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
     let point = key.verifying_key().to_encoded_point(true);
     let id = protocol::direct_request_receipt_key_id(point.as_bytes()).unwrap();
-    let mut multikey = vec![0x80, 0x24];
-    multikey.extend(point.as_bytes());
-    let doc = serde_json::to_vec(&json!({
-        "id": "did:web:chat.catbird.blue",
-        "verificationMethod": [{
-            "id": id,
-            "controller": "did:web:chat.catbird.blue",
-            "type": "Multikey",
-            "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
-        }]
-    }))
-    .unwrap();
+    let doc = direct_request_i13::authority_document(&key, &id, "did:web:chat.catbird.blue");
     (key, doc, id)
 }
 
@@ -234,6 +225,7 @@ fn published_receipt(
             "firstMessageId": p["firstMessageId"],
             "coordinates": p["next"],
             "recordedAt": utc(0),
+            "sequencerReceipt": direct_request_i13::receipt(authority, p, 1, "did:web:chat.catbird.blue"),
         }
     });
     json!({
@@ -671,22 +663,19 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
     // 3. Bob receives and previews the direct request note
     let publication_entry = json!({
         "$type": "blue.catbird.chat.defs#directRequestEntry",
-        "entryId": uuid::Uuid::new_v4().to_string(),
+        "entryId": p["firstMessageId"],
         "conversationId": direct_cid,
         "seq": 1,
         "signedRequest": publication["signedRequest"],
         "receivedAt": receipt["body"]["receipt"]["recordedAt"].clone(),
+        "sequencerReceipt": receipt["body"]["receipt"]["sequencerReceipt"],
+        "publicationReceipt": receipt,
     });
 
     world.delivery_service().queue_request_operation_response(
         Op::GetEntries,
         200,
         json!({"entries": [publication_entry], "hasMore": false, "nextAfterSeq": 1}),
-    );
-    world.delivery_service().queue_request_operation_response(
-        Op::GetDirectRequestOutcome,
-        200,
-        json!({"outcome": receipt}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
@@ -997,21 +986,18 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
     let direct_cid = p["conversationId"].as_str().unwrap().to_string();
     let publication_entry = json!({
         "$type": "blue.catbird.chat.defs#directRequestEntry",
-        "entryId": uuid::Uuid::new_v4().to_string(),
+        "entryId": p["firstMessageId"],
         "conversationId": direct_cid,
         "seq": 1,
         "signedRequest": lost_publish[0]["signedRequest"],
         "receivedAt": receipt["body"]["receipt"]["recordedAt"].clone(),
+        "sequencerReceipt": receipt["body"]["receipt"]["sequencerReceipt"],
+        "publicationReceipt": receipt,
     });
     world.delivery_service().queue_request_operation_response(
         Op::GetEntries,
         200,
         json!({"entries": [publication_entry], "hasMore": false, "nextAfterSeq": 1}),
-    );
-    world.delivery_service().queue_request_operation_response(
-        Op::GetDirectRequestOutcome,
-        200,
-        json!({"outcome": receipt}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,

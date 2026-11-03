@@ -1,3 +1,7 @@
+#[cfg(feature = "labyrinth")]
+#[path = "support/native_archive_auth.rs"]
+mod native_archive_auth;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -115,15 +119,17 @@ struct DeterministicMockTransport {
     pds_records: Mutex<Vec<PdsRepoRecord>>,
     sequencer_signing_key: P256SigningKey,
     sequencer_pub_multibase: String,
-    space_records:
-        Mutex<std::collections::BTreeMap<(String, String, String, String), serde_json::Value>>,
+    #[cfg(feature = "labyrinth")]
+    archive_auth: native_archive_auth::NativeArchiveAuthFixture,
     labyrinth_epochs: Mutex<std::collections::BTreeMap<String, Vec<serde_json::Value>>>,
     chat_device_pubkeys: Mutex<std::collections::BTreeMap<String, Vec<serde_json::Value>>>,
     conversations: Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 impl DeterministicMockTransport {
-    fn new() -> Self {
+    fn new(clock: Arc<dyn SimClock>) -> Self {
+        #[cfg(not(feature = "labyrinth"))]
+        let _ = &clock;
         let sk = P256SigningKey::from_bytes((&[0x33u8; 32]).into()).unwrap();
         let sec1_compressed = sk.verifying_key().to_encoded_point(true);
         // multicodec p256-pub = 0x1200 -> varint [0x80, 0x24]
@@ -137,7 +143,11 @@ impl DeterministicMockTransport {
             pds_records: Mutex::new(Vec::new()),
             sequencer_signing_key: sk,
             sequencer_pub_multibase: pub_multibase,
-            space_records: Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(feature = "labyrinth")]
+            archive_auth: native_archive_auth::NativeArchiveAuthFixture::new(
+                "did:plc:aliceaaaaaaaaaaaaaaaaaaa",
+                Arc::new(move || clock.now_ms()),
+            ),
             labyrinth_epochs: Mutex::new(std::collections::BTreeMap::new()),
             chat_device_pubkeys: Mutex::new(std::collections::BTreeMap::new()),
             conversations: Mutex::new(std::collections::BTreeMap::new()),
@@ -154,36 +164,12 @@ impl DeterministicMockTransport {
     }
 }
 
-impl PlatformTransport for DeterministicMockTransport {
-    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
-        let method = &request.method;
+impl DeterministicMockTransport {
+    fn execute_http_raw(
+        &self,
+        request: &PlatformHttpRequest,
+    ) -> Result<PlatformHttpResponse, MLSError> {
         let url = &request.url;
-
-        if let Some(probe) = self.probe.get() {
-            assert!(
-                !probe.is_in_transaction(),
-                "I6 violation: probe.is_in_transaction() true during execute_http({method} {url})!"
-            );
-        }
-        if let Some(client) = self.client_ref.get() {
-            assert!(
-                !client.is_in_transaction(),
-                "I6 violation: client.is_in_transaction() true during execute_http({method} {url})!"
-            );
-            assert!(
-                !client.is_in_write_transaction(),
-                "I6 violation: client.is_in_write_transaction() true during execute_http({method} {url})!"
-            );
-        }
-
-        let mut sorted_headers = request.headers.clone();
-        sorted_headers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
-        self.calls.lock().unwrap().push(RecordedHttpCall {
-            method: request.method.clone(),
-            url: request.url.clone(),
-            headers: sorted_headers,
-            body: request.body.clone(),
-        });
 
         let json_resp = |status: u16, val: serde_json::Value| PlatformHttpResponse {
             status,
@@ -194,16 +180,6 @@ impl PlatformTransport for DeterministicMockTransport {
             body: serde_json::to_vec(&val).unwrap(),
         };
         let json_ok = |val: serde_json::Value| json_resp(200, val);
-
-        if url.contains("/xrpc/com.atproto.space.getSpace") {
-            return Ok(json_resp(
-                400,
-                serde_json::json!({
-                    "error": "InvalidRequest",
-                    "message": "space parameter required"
-                }),
-            ));
-        }
 
         if url.contains("/xrpc/com.atproto.repo.putRecord") {
             if let Some(ref b) = request.body {
@@ -455,49 +431,8 @@ impl PlatformTransport for DeterministicMockTransport {
                 serde_json::json!({ "error": "RecordNotFound" }),
             ));
         }
-        if url.contains("/xrpc/com.atproto.space.applyWrites") {
-            let body_json: serde_json::Value =
-                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
-                    .unwrap_or_default();
-            let space = body_json["space"].as_str().unwrap_or_default().to_string();
-            let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
-            let mut store = self.space_records.lock().unwrap();
-            let base_idx = store.len();
-            let mut results = Vec::new();
-            for (idx, w) in body_json["writes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .enumerate()
-            {
-                let coll = w["collection"].as_str().unwrap_or_default().to_string();
-                let rkey = w["rkey"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("3kzzzzzzzz{:03}", base_idx + idx));
-                let uri = format!("at://{repo}/{coll}/{rkey}");
-                if w["$type"].as_str().unwrap_or_default().ends_with("#delete") {
-                    store.remove(&(space.clone(), repo.clone(), coll, rkey));
-                } else {
-                    store.insert(
-                        (space.clone(), repo.clone(), coll, rkey),
-                        w["value"].clone(),
-                    );
-                }
-                results.push(serde_json::json!({ "uri": uri }));
-            }
-            return Ok(json_ok(serde_json::json!({
-                "results": results,
-                "commit": { "rev": "3kzzzzzzzzzzz", "data": { "$bytes": BASE64.encode([0x11_u8; 32]) } }
-            })));
-        }
 
-        if url.contains("/xrpc/com.atproto.space.getRecord")
-            || url.contains("/xrpc/com.atproto.space.listRecords")
-            || url.contains("/xrpc/com.atproto.space.listRepos")
-            || url.contains("/xrpc/blue.catbird.labyrinth.")
-        {
+        if url.contains("/xrpc/blue.catbird.labyrinth.") {
             let mut q = std::collections::BTreeMap::new();
             if let Some((_, qs)) = url.split_once('?') {
                 for pair in qs.split('&').filter(|s| !s.is_empty()) {
@@ -506,67 +441,6 @@ impl PlatformTransport for DeterministicMockTransport {
                         q.insert(k.to_string(), decoded);
                     }
                 }
-            }
-            if url.contains("/xrpc/com.atproto.space.getRecord") {
-                let key = (
-                    q.get("space").cloned().unwrap_or_default(),
-                    q.get("repo")
-                        .cloned()
-                        .unwrap_or_else(|| "did:plc:aliceaaaaaaaaaaaaaaaaaaa".to_string()),
-                    q.get("collection").cloned().unwrap_or_default(),
-                    q.get("rkey").cloned().unwrap_or_default(),
-                );
-                if let Some(val) = self.space_records.lock().unwrap().get(&key).cloned() {
-                    return Ok(json_ok(serde_json::json!({
-                        "uri": format!("at://{}/{}/{}", key.1, key.2, key.3),
-                        "value": val,
-                    })));
-                }
-                return Ok(json_resp(
-                    404,
-                    serde_json::json!({ "error": "RecordNotFound" }),
-                ));
-            }
-            if url.contains("/xrpc/com.atproto.space.listRecords") {
-                let space = q.get("space").cloned().unwrap_or_default();
-                let repo_opt = q.get("repo").cloned();
-                let coll = q.get("collection").cloned().unwrap_or_default();
-                let records: Vec<serde_json::Value> = self
-                    .space_records
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|((s, r, c, _), _)| {
-                        s == &space && c == &coll && repo_opt.as_ref().is_none_or(|rp| r == rp)
-                    })
-                    .map(|((_, r, c, rk), val)| {
-                        serde_json::json!({
-                            "uri": format!("at://{r}/{c}/{rk}"),
-                            "rkey": rk,
-                            "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                            "value": val,
-                        })
-                    })
-                    .collect();
-                return Ok(json_ok(serde_json::json!({ "records": records })));
-            }
-            if url.contains("/xrpc/com.atproto.space.listRepos") {
-                let space = q.get("space").cloned().unwrap_or_default();
-                let mut dids: Vec<String> = self
-                    .space_records
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .filter(|(s, _, _, _)| s == &space)
-                    .map(|(_, r, _, _)| r.clone())
-                    .collect();
-                dids.sort();
-                dids.dedup();
-                let repos: Vec<serde_json::Value> = dids
-                    .into_iter()
-                    .map(|d| serde_json::json!({ "did": d }))
-                    .collect();
-                return Ok(json_ok(serde_json::json!({ "repos": repos })));
             }
             if url.contains("/xrpc/blue.catbird.labyrinth.publishEpochHead") {
                 let body_json: serde_json::Value =
@@ -621,6 +495,46 @@ impl PlatformTransport for DeterministicMockTransport {
             "uri": "at://did:plc:aliceaaaaaaaaaaaaaaaaaaa/record/1",
             "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         })))
+    }
+}
+
+impl PlatformTransport for DeterministicMockTransport {
+    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+        let method = &request.method;
+        let url = &request.url;
+        if let Some(probe) = self.probe.get() {
+            assert!(
+                !probe.is_in_transaction(),
+                "I6 violation: probe.is_in_transaction() true during execute_http({method} {url})!"
+            );
+        }
+        if let Some(client) = self.client_ref.get() {
+            assert!(
+                !client.is_in_transaction(),
+                "I6 violation: client.is_in_transaction() true during execute_http({method} {url})!"
+            );
+            assert!(
+                !client.is_in_write_transaction(),
+                "I6 violation: client.is_in_write_transaction() true during execute_http({method} {url})!"
+            );
+        }
+        let mut sorted_headers = request.headers.clone();
+        sorted_headers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.value.cmp(&b.value)));
+        self.calls.lock().unwrap().push(RecordedHttpCall {
+            method: request.method.clone(),
+            url: request.url.clone(),
+            headers: sorted_headers,
+            body: request.body.clone(),
+        });
+        #[cfg(feature = "labyrinth")]
+        {
+            self.archive_auth
+                .execute(&request, |request| self.execute_http_raw(request))
+        }
+        #[cfg(not(feature = "labyrinth"))]
+        {
+            self.execute_http_raw(&request)
+        }
     }
 
     fn connect_realtime_stream(
@@ -727,7 +641,7 @@ fn two_seeded_clients_produce_byte_identical_enrollment_and_ciphertexts() {
 
         let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
         let keystore = Arc::new(DeterministicKeyStore::new());
-        let transport = Arc::new(DeterministicMockTransport::new());
+        let transport = Arc::new(DeterministicMockTransport::new(hooks.clock.clone()));
         let client =
             CatbirdMlsClient::open_with_hooks(cfg, keystore, transport.clone(), None, hooks)
                 .unwrap();
@@ -752,6 +666,8 @@ fn two_seeded_clients_produce_byte_identical_enrollment_and_ciphertexts() {
             .unwrap();
         let flushed = client.flush_labyrinth_queue().unwrap();
         assert_eq!(flushed, 1);
+        #[cfg(feature = "labyrinth")]
+        assert!(transport.archive_auth.committed_space_write_count() > 0);
 
         let send_call = transport
             .recorded_calls()
@@ -809,7 +725,7 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
         );
         let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
         let keystore = Arc::new(DeterministicKeyStore::new());
-        let transport = Arc::new(DeterministicMockTransport::new());
+        let transport = Arc::new(DeterministicMockTransport::new(hooks.clock.clone()));
         let client =
             CatbirdMlsClient::open_with_hooks(cfg, keystore, transport.clone(), None, hooks)
                 .unwrap();
@@ -835,6 +751,24 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
             .unwrap();
         let flushed = client.flush_labyrinth_queue().unwrap();
         assert_eq!(flushed, 1);
+        #[cfg(feature = "labyrinth")]
+        {
+            assert!(transport.archive_auth.committed_space_write_count() > 0);
+            let calls = transport.recorded_calls();
+            // A sender flush creates the MEK and writes its batch with one conversation-Space
+            // applyWrites to the writer's PDS; Space reads (and their home-DS relays) happen
+            // only when loading history (`find_meks`/`load_*`), never on a solo-group flush.
+            assert!(!calls
+                .iter()
+                .any(|call| call.url.contains("/xrpc/blue.catbird.chat.relaySpace")));
+            assert!(calls.iter().any(|call| {
+                call.url.ends_with("/xrpc/com.atproto.space.applyWrites")
+                    && call.body.as_deref().is_some_and(|body| {
+                        String::from_utf8_lossy(body)
+                            .contains("/space/blue.catbird.labyrinth.conversation/")
+                    })
+            }));
+        }
         transport.recorded_calls()
     };
 
@@ -844,9 +778,12 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     assert!(!t1.is_empty());
     assert_eq!(t1, t2);
     assert_ne!(t1, t3);
+    // Moved in Task 4 R1 (two separate processes agree; seed 99_102 gives 96be9104…): the flush
+    // is the native LabyrinthSession sealing the I13 `ArchivedReceipt { signed, generation }`
+    // against the account-bound native Space host, and a solo-group flush makes no Space reads.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "b81fda193d1f301e161e8a2508a2b54ad2c91b22ff7157d8f881cd9793fd3a11",
+        "e165fd614c5ea0633807b768462b11725ea4c5cfa639f4fda7c4fd596535eb77",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -862,7 +799,7 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
         );
         let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
         let keystore = Arc::new(DeterministicKeyStore::new());
-        let transport = Arc::new(DeterministicMockTransport::new());
+        let transport = Arc::new(DeterministicMockTransport::new(hooks.clock.clone()));
         let client =
             CatbirdMlsClient::open_with_hooks(cfg, keystore, transport.clone(), None, hooks)
                 .unwrap();
@@ -887,6 +824,7 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
             .map(|c| c.body.expect("applyWrites body present"))
             .collect();
         assert!(apply_writes_bodies.len() >= 4);
+        assert!(transport.archive_auth.committed_space_write_count() > 0);
 
         (offer.formatted_code, recovery_code, apply_writes_bodies)
     };
@@ -904,9 +842,14 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
         hasher.update(&(body.len() as u64).to_le_bytes());
         hasher.update(body);
     }
+    // Moved in Task 4 R1 (two separate processes agree; seed 8_492_015 gives c9265718…): native
+    // mailbox reads became authenticated (`native_archive_space.rs`: a PoP-bound Space credential
+    // and a Want-MAC KEM share per read, drawn from SimEntropy) against the account-bound
+    // `NativeArchiveAuthFixture`, shifting the seeded draws and clock ticks that precede the
+    // device/epoch/virtualDevice records.
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "ca900b9413ca6cff6c598ee2c807f6b7dadd110b49a27070a5bf4f419c91a7ee",
+        "31b6c6f54e85df43826bb6e913f1948e8904b8f04eca7f5cbf456b0a46a30903",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }
@@ -1405,7 +1348,7 @@ fn buggify_controller_fires_all_three_initial_sites_under_sim_feature() {
     );
     let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
     let keystore = Arc::new(DeterministicKeyStore::new());
-    let transport = Arc::new(DeterministicMockTransport::new());
+    let transport = Arc::new(DeterministicMockTransport::new(hooks.clock.clone()));
     let client =
         CatbirdMlsClient::open_with_hooks(cfg, keystore, transport.clone(), None, hooks).unwrap();
     transport.attach_client(&client);

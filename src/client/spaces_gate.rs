@@ -12,14 +12,14 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::MLSError;
 
-/// Exact OAuth scopes required for Catbird MLS + Labyrinth over ATProto Spaces (`Spec §6.7`).
+/// OAuth requests explicitly state delegation read, record verbs, and declared collections.
 pub const REQUIRED_LABYRINTH_OAUTH_SCOPES: &[&str; 6] = &[
     "atproto",
     "blob:*/*",
     "repo:blue.catbird.labyrinth.mailboxKeys",
     "repo:blue.catbird.chat.device",
-    "space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete",
-    "space:blue.catbird.labyrinth.conversation?authority=*",
+    "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
+    "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
 ];
 
 /// Reason why MLS chat over ATProto Spaces is available or unavailable (`I15`).
@@ -52,10 +52,73 @@ pub struct SpacesEligibilityStatus {
     pub user_message: String,
 }
 
-fn scope_granted(granted_scopes: &[String], required: &str) -> bool {
-    granted_scopes.iter().any(|g| {
-        let trimmed = g.trim();
-        trimmed == required || trimmed == "transition:generic" && required == "atproto"
+// Static scope coverage is not a credential authorization result. Returned scope
+// strings cannot prove the issuer retained original explicit-action provenance.
+fn scope_granted(granted_scopes: &[String], required: &str, account_did: &str) -> bool {
+    let Some((family, required_query)) = required
+        .split_once('?')
+        .filter(|(family, _)| family.starts_with("space:"))
+    else {
+        return granted_scopes.iter().any(|grant| {
+            let grant = grant.trim();
+            grant == required || grant == "transition:generic" && required == "atproto"
+        });
+    };
+    let required: Vec<_> = required_query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    granted_scopes.iter().any(|grant| {
+        let Some((granted_family, query)) = grant.trim().split_once('?') else {
+            return false;
+        };
+        if granted_family != family {
+            return false;
+        }
+        let mut params = Vec::new();
+        let mut authority = None;
+        let mut skey = None;
+        for pair in query.split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                return false;
+            };
+            if value.is_empty() {
+                return false;
+            }
+            match key {
+                "authority" if authority.is_none() => authority = Some(value),
+                "skey" if skey.is_none() => skey = Some(value),
+                "collection"
+                    if value == "*"
+                        || value
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-')) => {}
+                "action"
+                    if matches!(value, "read" | "read_self" | "create" | "update" | "delete") => {}
+                "manage" if matches!(value, "create" | "update" | "delete") => {}
+                _ => return false,
+            }
+            params.push((key, value));
+        }
+        let authority = authority.unwrap_or("self");
+        let any_authority = required.contains(&("authority", "*"));
+        let authority_matches = if any_authority {
+            authority == "*"
+        } else {
+            authority == "self" || authority == account_did || authority == "*"
+        };
+        if !authority_matches {
+            return false;
+        }
+        let personal = family == "space:blue.catbird.labyrinth.mailbox";
+        if skey.is_some_and(|key| key != "*" && !(personal && key == "self")) {
+            return false;
+        }
+        required.iter().all(|&(key, value)| {
+            key == "authority"
+                || params.contains(&(key, value))
+                || key == "collection" && params.contains(&("collection", "*"))
+        })
     })
 }
 
@@ -75,7 +138,7 @@ pub fn evaluate_spaces_eligibility(input: &SpacesEligibilityInput) -> SpacesElig
 
     let missing_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
         .iter()
-        .filter(|req| !scope_granted(&input.granted_oauth_scopes, req))
+        .filter(|req| !scope_granted(&input.granted_oauth_scopes, req, &input.account_did))
         .map(|s| (*s).to_string())
         .collect();
 
@@ -97,7 +160,7 @@ pub fn evaluate_spaces_eligibility(input: &SpacesEligibilityInput) -> SpacesElig
         eligible: true,
         reason: SpacesUnavailableReason::Available,
         bluesky_dms_available: true,
-        user_message: "ATProto Spaces and Labyrinth post-quantum backup are ready.".to_string(),
+        user_message: "ATProto Spaces and required backup scopes are available; archive operations still authenticate each Space credential.".to_string(),
     }
 }
 
@@ -131,10 +194,12 @@ pub fn probe_and_check_spaces_eligibility(
     // On an ATProto PDS implementing `com.atproto.space.*`, calling `getSpace` without params
     // returns 400 InvalidRequest / 401 AuthMissing (or 200), whereas a PDS without Spaces
     // returns 404 / 501 XRPCNotSupported / MethodNotImplemented.
-    let body_text = String::from_utf8_lossy(&response.body);
+    let error = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
     let not_implemented = matches!(response.status, 404 | 501)
-        || body_text.contains("XRPCNotSupported")
-        || body_text.contains("MethodNotImplemented");
+        || matches!(
+            error.as_ref().and_then(|value| value["error"].as_str()),
+            Some("XRPCNotSupported" | "MethodNotImplemented")
+        );
     let pds_supports_spaces = !not_implemented && response.status < 500;
 
     Ok(evaluate_spaces_eligibility(&SpacesEligibilityInput {
@@ -143,4 +208,43 @@ pub fn probe_and_check_spaces_eligibility(
         pds_supports_spaces,
         granted_oauth_scopes: granted_oauth_scopes.to_vec(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegation_scope_gate_requires_explicit_actions_and_collection_coverage() {
+        let did = "did:plc:scopeuser";
+        for required in &REQUIRED_LABYRINTH_OAUTH_SCOPES[4..] {
+            assert!(scope_granted(&[required.to_string()], required, did));
+            let (family, query) = required.split_once('?').unwrap();
+            let mut pairs: Vec<_> = query.split('&').collect();
+            pairs.reverse();
+            let reordered = format!("{family}?{}", pairs.join("&"));
+            assert!(scope_granted(&[reordered], required, did));
+            let no_read = required.replace("&action=read", "");
+            assert!(!scope_granted(&[no_read], required, did));
+            let no_collections = format!(
+                "{family}?{}",
+                query
+                    .split('&')
+                    .filter(|pair| !pair.starts_with("collection="))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            );
+            assert!(!scope_granted(&[no_collections], required, did));
+            let duplicate_authority = format!("{required}&authority=did:plc:other&authority=*");
+            assert!(!scope_granted(&[duplicate_authority], required, did));
+        }
+        for legacy in [
+            "space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete",
+            "space:blue.catbird.labyrinth.conversation?authority=*",
+        ] {
+            assert!(!REQUIRED_LABYRINTH_OAUTH_SCOPES[4..]
+                .iter()
+                .any(|required| scope_granted(&[legacy.into()], required, did)));
+        }
+    }
 }

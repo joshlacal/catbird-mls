@@ -103,7 +103,50 @@ struct ChatProtocolFailure<'a> {
     error: std::borrow::Cow<'a, str>,
 }
 
-fn canonical_labyrinth_frame_for_text(input: &str) -> (String, String) {
+pub(super) fn chat_response_error(
+    context: impl std::fmt::Display,
+    resp: &PlatformHttpResponse,
+) -> MLSError {
+    match serde_json::from_slice::<ChatProtocolFailure<'_>>(&resp.body) {
+        Ok(failure) => MLSError::InvalidState(failure.error.into_owned()),
+        Err(_) => MLSError::Internal(format!(
+            "{context} failed with HTTP {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body),
+        )),
+    }
+}
+
+fn active_member_dids(group: &MlsGroup) -> Result<Vec<String>, MLSError> {
+    group
+        .members()
+        .map(|member| {
+            crate::push::root_did_from_credential_bytes(member.credential.serialized_content())
+                .map(|(did, _)| did)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|dids| dids.into_iter().collect())
+}
+
+/// Queue verified archive evidence for `flush_labyrinth_queue`, inside the caller's write
+/// transaction: an own send, or a witness copy of a received message whose frame, nonce and
+/// `I13` receipt were verified at receive time (the receive-time MLS roster travels with it).
+pub(super) fn enqueue_labyrinth_archive(
+    tx: &crate::storage::SqlTx<'_>,
+    payload: &QueuedLabyrinthArchivePayload,
+) -> Result<(), MLSError> {
+    tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
+        item_id: payload.message_id.clone(),
+        conversation_id: payload.conversation_id.clone(),
+        group_id_hex: payload.group_id_hex.clone(),
+        seq: payload.seq,
+        payload_bytes: serde_json::to_vec(payload)
+            .map_err(|e| MLSError::Internal(format!("serialize queue payload: {e}")))?,
+        created_at_ms: payload.created_at_ms,
+    })
+}
+
+pub(super) fn canonical_labyrinth_frame_for_text(input: &str) -> (String, String) {
     if serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(input).is_ok() {
         return (input.to_string(), input.to_string());
     }
@@ -253,11 +296,7 @@ impl CatbirdMlsClient {
                     })?;
                 }
             }
-            let snippet = String::from_utf8_lossy(&resp.body);
-            return Err(MLSError::Internal(format!(
-                "POST {url} failed with HTTP {}: {snippet}",
-                resp.status
-            )));
+            return Err(chat_response_error(format_args!("POST {url}"), &resp));
         }
         Ok(resp)
     }
@@ -327,11 +366,7 @@ impl CatbirdMlsClient {
             body: None,
         })?;
         if resp.status >= 400 {
-            let snippet = String::from_utf8_lossy(&resp.body);
-            return Err(MLSError::Internal(format!(
-                "GET {url} failed with HTTP {}: {snippet}",
-                resp.status
-            )));
+            return Err(chat_response_error(format_args!("GET {url}"), &resp));
         }
         if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
             return Err(MLSError::Internal(format!(
@@ -866,7 +901,6 @@ impl CatbirdMlsClient {
         if is_untitle_one_to_one {
             return self.create_c33_direct_request_live(
                 &canonical_convo_id,
-                sequencer_did,
                 &canonical_dev_id,
                 &peers[0],
                 description,
@@ -888,7 +922,6 @@ impl CatbirdMlsClient {
     fn create_c33_direct_request_live(
         &self,
         canonical_convo_id: &str,
-        sequencer_did: &str,
         canonical_dev_id: &str,
         peer_did: &str,
         description: Option<String>,
@@ -1007,26 +1040,44 @@ impl CatbirdMlsClient {
             refs.push(kp_ref);
         }
 
-        let authority_did = preparation
-            .get("authorityDid")
-            .and_then(|v| v.as_str())
-            .unwrap_or(sequencer_did);
+        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
+            MLSError::Cryptography("C33 peer home DS authority unavailable".into())
+        })?;
+        let effective_sequencer = dr_transcript::derive_deterministic_coordinator(
+            self.config.home_ds_did.trim(),
+            &peer_ds,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
+        let authority_did = effective_sequencer.as_str();
+        if preparation["authorityDid"].as_str() != Some(authority_did) {
+            return Err(MLSError::Cryptography(
+                "C33 preparation authority mismatch".into(),
+            ));
+        }
         let receipt_kid = preparation
             .get("receiptKeyId")
             .and_then(|v| v.as_str())
-            .unwrap_or("#mls-receipt-1");
-        let authority_key = self
-            .resolve_sequencer_receipt_key(authority_did, receipt_kid)?
-            .ok_or_else(|| {
-                MLSError::Cryptography(format!(
-                    "C33/I13: unable to resolve `{authority_did}` DID document for `{receipt_kid}`"
-                ))
-            })?;
+            .ok_or_else(|| MLSError::Cryptography("C33 preparation missing receiptKeyId".into()))?;
+        let authority_doc = self.resolve_did_document(authority_did)?.ok_or_else(|| {
+            MLSError::Cryptography(format!(
+                "C33: missing receipt authority DID document {authority_did}"
+            ))
+        })?;
+        let authority_key = dr_transcript::resolve_direct_request_receipt_key_for_authority(
+            authority_did,
+            &authority_doc,
+            receipt_kid,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 receipt authority: {e}")))?;
+        let sequencer_receipt_key = self
+            .resolve_sequencer_receipt_key(&effective_sequencer, "#mls-receipt-1")?
+            .ok_or_else(|| MLSError::Cryptography("C33: missing sequencer receipt key".into()))?;
 
         let effective_convo_id = preparation
             .get("conversationId")
             .and_then(|v| v.as_str())
-            .unwrap_or(canonical_convo_id)
+            .filter(|cid| *cid == canonical_convo_id)
+            .ok_or_else(|| MLSError::Cryptography("C33 preparation conversation mismatch".into()))?
             .to_string();
         let prep_digest_b64 =
             STANDARD.encode(chat_wire::json_bytes(&preparation["preparationDigest"])?);
@@ -1069,7 +1120,9 @@ impl CatbirdMlsClient {
                         expected_package_refs: refs,
                         authority_import_until: min_deadline,
                         preparation_request_digest: *prepare_verified.request_digest(),
-                        receipt_authority_key: authority_key,
+                        receipt_authority_key: authority_key.clone(),
+                        sequencer_did: effective_sequencer.clone(),
+                        sequencer_receipt_authority_key: sequencer_receipt_key.clone(),
                         text: intro_text.clone(),
                         invitation: None,
                         metadata: GroupMetadataV1 {
@@ -1137,6 +1190,7 @@ impl CatbirdMlsClient {
             json!(STANDARD.encode(prepare_verified.request_digest()));
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
         publish_body["next"] = bootstrap.coordinates.clone();
+        publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
         publish_body["importUntil"] = json!(import_until_str);
         publish_body["artifacts"] = json!({
             "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
@@ -1165,6 +1219,12 @@ impl CatbirdMlsClient {
             publish_body,
             &signer,
         )?;
+        let verified_publication = dr_transcript::verify_signed_request(
+            DirectRequestKind::Publish,
+            &publish_wrapper_bytes,
+            signer.public(),
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 signed publication: {e}")))?;
         let publish_wrapper_val: Value = serde_json::from_slice(&publish_wrapper_bytes)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
         let publish_url = format!(
@@ -1179,23 +1239,72 @@ impl CatbirdMlsClient {
                 Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
             })?;
         }
-        let _ = self.execute_json_post(
+        let published_http = self.execute_json_post(
             publish_url,
             serde_json::to_vec(&json!({ "signedRequest": publish_wrapper_val }))
                 .map_err(|e| MLSError::Internal(e.to_string()))?,
         )?;
 
-        let own_ds = self.config.home_ds_did.trim();
-        let effective_sequencer = if !own_ds.is_empty() && own_ds <= authority_did {
-            own_ds.to_string()
-        } else {
-            authority_did.to_string()
-        };
+        let published: Value = serde_json::from_slice(&published_http.body)?;
+        let outcome = published.get("outcome").ok_or_else(|| {
+            MLSError::Cryptography("C33 publication response missing signed outcome".into())
+        })?;
+        let outcome = dr_transcript::normalize_read_presentation(
+            &serde_json::to_vec(outcome)?,
+            "signedDirectRequestReceipt",
+            outcome.get("$type").is_some(),
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 publication outcome: {e}")))?;
+        let verified_outcome = dr_transcript::verify_signed_request_for_authority(
+            &effective_sequencer,
+            DirectRequestKind::Outcome,
+            &serde_json::to_vec(&outcome)?,
+            &authority_key,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 outcome signature: {e}")))?;
+        let publication_receipt = &verified_outcome.body()["receipt"];
+        if publication_receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+            || publication_receipt["requestId"] != request_id
+            || publication_receipt["conversationId"] != effective_convo_id
+            || publication_receipt["firstMessageId"] != first_message_id
+            || publication_receipt["requestKind"] != "publish"
+            || publication_receipt["actorDid"].as_str() != Some(self.normalized_did.as_str())
+            || publication_receipt["actorDeviceId"].as_str() != Some(canonical_dev_id)
+            || publication_receipt["actorKeyId"] != key_id
+            || publication_receipt["authGeneration"].as_i64() != Some(auth_generation)
+            || publication_receipt["requestDigest"].as_str()
+                != Some(
+                    STANDARD
+                        .encode(verified_publication.request_digest())
+                        .as_str(),
+                )
+            || publication_receipt["preparationRequestDigest"].as_str()
+                != Some(STANDARD.encode(prepare_verified.request_digest()).as_str())
+            || publication_receipt["coordinates"] != bootstrap.coordinates
+        {
+            return Err(MLSError::Cryptography(
+                "C33 publication outcome binding mismatch".into(),
+            ));
+        }
+        let (opening_seq, _, opening_receipt_json) =
+            direct_request_bootstrap::verify_opening_receipt(
+                &bootstrap,
+                &publication_receipt["sequencerReceipt"],
+                &effective_sequencer,
+                &sequencer_receipt_key,
+            )?;
+        let opening_seq = i64::try_from(opening_seq)
+            .map_err(|_| MLSError::Cryptography("C33 sequence overflow".into()))?;
+        let opening = bootstrap.opening.as_ref().ok_or_else(|| {
+            MLSError::Cryptography("C33 sender missing authenticated opening frame".into())
+        })?;
         let space_uri = Some(format!(
             "at://{effective_sequencer}/space/blue.catbird.labyrinth.conversation/{effective_convo_id}-0"
         ));
         let now_ms = self.hooks.now_ms();
-        let (display_json, frame_json) = canonical_labyrinth_frame_for_text(&intro_text);
+        let display_json = json!({ "text": intro_text }).to_string();
+        let frame_json = String::from_utf8(opening.canonical_payload_bytes.clone())
+            .map_err(|e| MLSError::Cryptography(format!("C33 opening frame: {e}")))?;
         let coords_str = serde_json::to_string(&bootstrap.coordinates)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
 
@@ -1208,12 +1317,18 @@ impl CatbirdMlsClient {
         let convo_row = self.db.write_tx(|tx| {
             kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
             self.clear_cached_groups();
+            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let provider = self.hooks.openmls_provider(storage);
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id_bytes))
+                .map_err(|e| MLSError::Internal(format!("load C33 roster: {e:?}")))?
+                .ok_or_else(|| MLSError::group_not_found(&effective_convo_id))?;
+            let expected_member_dids = active_member_dids(&group)?;
             let row = ConversationRow {
                 conversation_id: effective_convo_id.clone(),
                 group_id: group_id_bytes.clone(),
                 generation: 0,
                 epoch: 1,
-                last_seq: 1,
+                last_seq: opening_seq,
                 sequencer_did: effective_sequencer.clone(),
                 space_uri: space_uri.clone(),
                 title: None,
@@ -1243,7 +1358,7 @@ impl CatbirdMlsClient {
                 conversation_id: effective_convo_id.clone(),
                 group_id: group_id_bytes.clone(),
                 epoch: 1,
-                seq: 1,
+                seq: opening_seq,
                 sender_did: self.normalized_did.clone(),
                 sender_device_id: canonical_dev_id.to_string(),
                 plaintext_json: display_json.clone(),
@@ -1258,7 +1373,8 @@ impl CatbirdMlsClient {
                 conversation_id: effective_convo_id.clone(),
                 group_id_hex: hex::encode(&group_id_bytes),
                 epoch: 1,
-                seq: 1,
+                expected_member_dids,
+                seq: opening_seq,
                 sender_did: self.normalized_did.clone(),
                 sender_device_id: canonical_dev_id.to_string(),
                 sequencer_did: effective_sequencer,
@@ -1266,10 +1382,18 @@ impl CatbirdMlsClient {
                 plaintext_json: display_json,
                 labyrinth_frame_json: frame_json,
                 mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
-                frame_nonce_b64: None,
-                sequencer_receipt_json: None,
+                frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
+                sequencer_receipt_json: Some(opening_receipt_json),
                 created_at_ms: now_ms,
             };
+            tx.put_labyrinth_state(
+                &format!(
+                    "native.message:{effective_convo_id}:{}",
+                    staged_opening.message_id
+                ),
+                &serde_json::to_vec(&staged_opening)?,
+                now_ms,
+            )?;
             tx.put_account_meta(
                 &format!("c33_pending_opening:{effective_convo_id}"),
                 &serde_json::to_string(&staged_opening)
@@ -1724,10 +1848,10 @@ impl CatbirdMlsClient {
         })?;
 
         if needs_gap_sync {
-            let _ = self.sync_conversation_entries(&canonical_dev_id, &signer, &updated);
+            self.sync_conversation_entries(&canonical_dev_id, &signer, &updated)?;
         }
 
-        let _ = self.fulfill_pending_leaf_recoveries(&canonical_dev_id, &signer, auth_generation);
+        self.fulfill_pending_leaf_recoveries(&canonical_dev_id, &signer, auth_generation)?;
         let refreshed = self
             .db
             .read_tx(|tx| tx.get_conversation(conversation_id))?
@@ -1900,7 +2024,7 @@ impl CatbirdMlsClient {
             let ciphertext = {
                 let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
                 let provider = self.hooks.openmls_provider(storage);
-                let (ct, active_epoch) = self
+                let (ct, active_epoch, expected_member_dids) = self
                     .with_cached_sender_group(
                         &convo.group_id,
                         || {
@@ -1911,6 +2035,20 @@ impl CatbirdMlsClient {
                             .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))
                         },
                         |group| {
+                            if group.epoch().as_u64() != epoch_u64
+                                || convo.generation != generation
+                                || convo.epoch != epoch_u64 as i64
+                                || chat_wire::json_bytes(&prior_coords["groupId"])?
+                                    != convo.group_id
+                            {
+                                return Err(MLSError::InvalidState("StaleCoordinates".into()));
+                            }
+                            let (active_gch, active_ctag) =
+                                chat_wire::compute_group_context_hash_and_tag(group, &provider)?;
+                            if active_gch.as_slice() != gch.as_slice() || active_ctag != ctag {
+                                return Err(MLSError::InvalidState("StaleCoordinates".into()));
+                            }
+                            let expected_member_dids = active_member_dids(group)?;
                             group.set_aad(aad_bytes);
                             let mls_out = group
                                 .create_message(&provider, &signer, &inner_plaintext)
@@ -1921,13 +2059,13 @@ impl CatbirdMlsClient {
                             let ct = mls_out?.tls_serialize_detached().map_err(|e| {
                                 MLSError::Internal(format!("serialize message: {e:?}"))
                             })?;
-                            Ok((ct, group.epoch().as_u64() as i64))
+                            Ok((ct, group.epoch().as_u64() as i64, expected_member_dids))
                         },
                     )?
                     .ok_or_else(|| MLSError::GroupNotFound {
                         message: format!("MlsGroup missing for {canonical_convo_id}"),
                     })?;
-                (ct, active_epoch)
+                (ct, active_epoch, expected_member_dids)
             };
 
             let body = json!({
@@ -1957,6 +2095,7 @@ impl CatbirdMlsClient {
                     conversation_id: canonical_convo_id.clone(),
                     group_id_hex: hex::encode(&convo.group_id),
                     epoch: ciphertext.1,
+                    expected_member_dids: ciphertext.2,
                     seq: 0,
                     sender_did: self.normalized_did.clone(),
                     sender_device_id: canonical_dev_id.clone(),
@@ -2101,6 +2240,14 @@ impl CatbirdMlsClient {
                 is_own: true,
             };
             tx.insert_message(&row)?;
+            tx.put_labyrinth_state(
+                &format!(
+                    "native.message:{}:{}",
+                    queued.conversation_id, queued.message_id
+                ),
+                &serde_json::to_vec(&queued)?,
+                self.hooks.now_ms(),
+            )?;
             let mut gap = false;
             if let Some(mut c) = tx.get_conversation(&queued.conversation_id)? {
                 if ordered_seq.is_some() || seq == c.last_seq.saturating_add(1) {
@@ -2116,17 +2263,8 @@ impl CatbirdMlsClient {
                     crate::planted::PlantedBug::P4SkipLabyrinthEnqueueAfterSendRetry,
                 ))
             {
-                let payload_bytes = serde_json::to_vec(&queued)
-                    .map_err(|e| MLSError::Internal(format!("serialize queue payload: {e}")))?;
                 tx.dequeue_labyrinth_item(&queued.message_id)?;
-                tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                    item_id: queued.message_id.clone(),
-                    conversation_id: queued.conversation_id.clone(),
-                    group_id_hex: queued.group_id_hex.clone(),
-                    seq,
-                    payload_bytes,
-                    created_at_ms: queued.created_at_ms,
-                })?;
+                enqueue_labyrinth_archive(tx, &queued)?;
             }
             tx.delete_pending_op("application_send", &queued.message_id)?;
             Ok((row, gap))
@@ -2192,7 +2330,7 @@ impl CatbirdMlsClient {
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
         if self.complete_participant_removals(conversation_id, &canonical_dev_id, &signer)? {
             if let Some(convo_now) = self.db.read_tx(|tx| tx.get_conversation(conversation_id))? {
-                let _ = self.sync_conversation_entries(&canonical_dev_id, &signer, &convo_now);
+                self.sync_conversation_entries(&canonical_dev_id, &signer, &convo_now)?;
             }
         }
         self.notify_change(PlatformChangeEvent::ConversationsUpdated);
@@ -2493,25 +2631,6 @@ impl CatbirdMlsClient {
                     Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
                 })?;
             }
-            #[cfg(feature = "sim")]
-            if first_attempt
-                && crate::planted::is_planted_bug_active(
-                    crate::planted::PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes,
-                )
-            {
-                if let (GenericCommitOp::RemoveLeaves { target_did }, Some(space)) =
-                    (op, &convo.space_uri)
-                {
-                    self.execute_json_post(
-                        format!(
-                            "{}/xrpc/com.atproto.memberspace.removeMember",
-                            self.pds_base()
-                        ),
-                        serde_json::to_vec(&json!({ "space": space, "did": target_did }))
-                            .map_err(|e| MLSError::Internal(e.to_string()))?,
-                    )?;
-                }
-            }
             let resp_val = match self.submit_signed_chat_op(
                 canonical_dev_id,
                 Some(auth_gen),
@@ -2737,7 +2856,7 @@ impl CatbirdMlsClient {
                     signer,
                 ) {
                     Ok(current) => current,
-                    Err(MLSError::Internal(msg)) if msg.contains("ConversationNotFound") => {
+                    Err(MLSError::InvalidState(code)) if code == "ConversationNotFound" => {
                         forget(op_key.as_str())?;
                         continue;
                     }
@@ -2810,11 +2929,7 @@ impl CatbirdMlsClient {
                     // Definitively refused (e.g. this device is no longer an admin).
                     forget(op_key.as_str())?;
                 }
-                return Err(MLSError::Internal(format!(
-                    "participant removal policy failed with HTTP {}: {}",
-                    resp.status,
-                    String::from_utf8_lossy(&resp.body)
-                )));
+                return Err(chat_response_error("participant removal policy", &resp));
             }
             let resp_val: Value = serde_json::from_slice(&resp.body)
                 .map_err(|e| MLSError::Internal(format!("parse policy response: {e}")))?;
@@ -3174,7 +3289,7 @@ impl CatbirdMlsClient {
             })?;
             if needs_gap_sync {
                 if let Some(convo) = self.db.read_tx(|tx| tx.get_conversation(conversation_id))? {
-                    let _ = self.sync_conversation_entries(&dev_id, &signer, &convo);
+                    self.sync_conversation_entries(&dev_id, &signer, &convo)?;
                 }
             }
         } else {
@@ -3295,16 +3410,10 @@ impl CatbirdMlsClient {
                             Ok(())
                         })?;
                     }
-                    if serde_json::from_slice::<ChatProtocolFailure<'_>>(&resp.body)
-                        .is_ok_and(|failure| failure.error == "StaleCoordinates")
-                    {
-                        return Err(MLSError::InvalidState("StaleCoordinates".into()));
-                    }
-                    return Err(MLSError::Internal(format!(
-                        "POST {accept_url} failed with HTTP {}: {}",
-                        resp.status,
-                        String::from_utf8_lossy(&resp.body)
-                    )));
+                    return Err(chat_response_error(
+                        format_args!("POST {accept_url}"),
+                        &resp,
+                    ));
                 }
                 let resp_val: Value = serde_json::from_slice(&resp.body).map_err(|e| {
                     MLSError::Internal(format!("parse acceptConversation JSON: {e}"))
@@ -3362,7 +3471,7 @@ impl CatbirdMlsClient {
                         .db
                         .read_tx(|tx| tx.get_conversation(&req.conversation_id))?
                     {
-                        let _ = self.sync_conversation_entries(&canonical_dev_id, &signer, &convo);
+                        self.sync_conversation_entries(&canonical_dev_id, &signer, &convo)?;
                     }
                 }
                 self.archive_accepted_opening_messages(&req.conversation_id)?;
@@ -3492,6 +3601,77 @@ impl CatbirdMlsClient {
         })
     }
 
+    /// Erase terminal conversation secrets and every associated plaintext mutation journal
+    /// in the same transaction as the terminal marker. Both local and received closes use it.
+    pub(crate) fn apply_terminal_close(
+        &self,
+        cid: &str,
+        retired: Option<&Value>,
+        terminal_seq: Option<i64>,
+    ) -> Result<(), MLSError> {
+        let now_ms = self.hooks.now_ms();
+        self.db.write_tx(|tx| {
+            self.clear_cached_groups();
+            if let Some(mut convo) = tx.get_conversation(cid)? {
+                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                let provider = self.hooks.openmls_provider(storage);
+                if let Some(mut group) =
+                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                        .map_err(|e| MLSError::Internal(format!("load closing group: {e:?}")))?
+                {
+                    group
+                        .delete(provider.storage())
+                        .map_err(|e| MLSError::Internal(format!("delete closing group: {e:?}")))?;
+                }
+                tx.conn()
+                    .execute(
+                        "DELETE FROM epoch_secrets WHERE group_id_hex = ?1 OR group_id_hex = ?2",
+                        rusqlite::params![hex::encode(&convo.group_id), cid],
+                    )
+                    .map_err(|e| map_rusqlite_err("erase closed epoch secrets", &e))?;
+                if let Some(seq) = terminal_seq {
+                    convo.last_seq = convo.last_seq.max(seq);
+                }
+                convo.updated_at_ms = now_ms;
+                tx.upsert_conversation(&convo)?;
+            }
+            tx.conn()
+                .execute(
+                    "DELETE FROM pending_ops WHERE \
+                 json_extract(payload_json, '$.conversation_id') = ?1 OR \
+                 json_extract(payload_json, '$.archive.conversation_id') = ?1 OR \
+                 json_extract(payload_json, '$.prior.conversationId') = ?1 OR \
+                 json_extract(payload_json, '$.next.conversationId') = ?1 OR \
+                 json_extract(payload_json, '$.body.prior.conversationId') = ?1 OR \
+                 (op_kind = 'direct_request_acceptance' AND op_key IN \
+                    (SELECT request_id FROM requests WHERE conversation_id = ?1))",
+                    [cid],
+                )
+                .map_err(|e| map_rusqlite_err("erase closed pending journals", &e))?;
+            tx.delete_account_meta(&format!("c33_pending_opening:{cid}"))?;
+            tx.conn()
+                .execute(
+                    "DELETE FROM labyrinth_queue WHERE conversation_id = ?1",
+                    [cid],
+                )
+                .map_err(|e| map_rusqlite_err("erase closed archive queue", &e))?;
+            tx.conn()
+                .execute(
+                    "DELETE FROM labyrinth_state WHERE substr(state_key, 1, length(?1)) = ?1",
+                    [format!("native.message:{cid}:")],
+                )
+                .map_err(|e| map_rusqlite_err("erase closed archive evidence", &e))?;
+            if let Some(retired) = retired {
+                tx.put_account_meta(
+                    &format!("conversation_coords:{cid}"),
+                    &serde_json::to_string(retired)?,
+                    now_ms,
+                )?;
+            }
+            tx.put_account_meta(&format!("conversation_closed:{cid}"), "true", now_ms)
+        })
+    }
+
     /// Close a conversation on the authoritative `mls-ds` (`Spec §6.3`, `O7`, `I14`).
     ///
     /// Signs a canonical `CATBIRD-CHAT-CLOSE\0` `conversationCloseBody` and submits
@@ -3505,7 +3685,6 @@ impl CatbirdMlsClient {
         if trimmed.is_empty() {
             return Err(MLSError::invalid_input("conversation_id must not be empty"));
         }
-        let now_ms = self.hooks.now_ms();
         let is_direct = self.db.read_tx(|tx| {
             let rows = tx.list_requests(None)?;
             Ok(rows.iter().any(|r| r.conversation_id == trimmed))
@@ -3523,16 +3702,16 @@ impl CatbirdMlsClient {
                         message: format!("conversation {trimmed} not found"),
                     });
                 }
-                tx.put_account_meta(&format!("conversation_closed:{trimmed}"), "true", now_ms)?;
                 Ok(())
             })?;
+            self.apply_terminal_close(trimmed, None, None)?;
             self.notify_change(PlatformChangeEvent::ConversationsUpdated);
             return Ok(());
         };
 
         let canonical_cid = convo_uuid.hyphenated().to_string();
         if self.is_conversation_closed(&canonical_cid)? {
-            return Ok(());
+            return self.apply_terminal_close(&canonical_cid, None, None);
         }
         let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
         let prior_coords = self.load_or_build_conversation_coords(&canonical_cid)?;
@@ -3571,14 +3750,9 @@ impl CatbirdMlsClient {
             .pointer("/result/tombstone/terminalSeq")
             .or_else(|| resp.pointer("/result/entry/seq"))
             .and_then(Value::as_i64);
-        let retired_wire = resp
-            .pointer("/result/tombstone/retired")
-            .cloned()
-            .unwrap_or(retired_coords);
-        let retired_canon =
-            chat_wire::canonicalize_wire_coordinate(&retired_wire, Some(&canonical_cid))?;
-        let retired_str =
-            serde_json::to_string(&retired_canon).map_err(|e| MLSError::Internal(e.to_string()))?;
+        // The terminal coordinate is the one this device signed, not a mutable
+        // response/tombstone presentation supplied by the DS.
+        let retired_canon = chat_wire::canonicalize_wire_coordinate(&retired_coords, None)?;
 
         if crate::buggify!("after_http_2xx_before_db_commit") {
             return Err(MLSError::Internal(
@@ -3586,27 +3760,7 @@ impl CatbirdMlsClient {
             ));
         }
 
-        self.db.write_tx(|tx| {
-            if let Some(mut convo) = tx.get_conversation(&canonical_cid)? {
-                if let Some(seq) = terminal_seq {
-                    convo.last_seq = convo.last_seq.max(seq);
-                }
-                convo.updated_at_ms = now_ms;
-                tx.upsert_conversation(&convo)?;
-            }
-            tx.put_account_meta(
-                &format!("conversation_coords:{canonical_cid}"),
-                &retired_str,
-                now_ms,
-            )?;
-            tx.put_account_meta(
-                &format!("conversation_closed:{canonical_cid}"),
-                "true",
-                now_ms,
-            )?;
-            Self::prune_pending_commit_transitions(tx, &canonical_cid, 0, i64::MAX, true)?;
-            Ok(())
-        })?;
+        self.apply_terminal_close(&canonical_cid, Some(&retired_canon), terminal_seq)?;
 
         self.notify_change(PlatformChangeEvent::ConversationsUpdated);
         Ok(())
@@ -3615,7 +3769,7 @@ impl CatbirdMlsClient {
     pub fn list_members(&self, conversation_id: &str) -> Result<Vec<String>, MLSError> {
         self.db.read_tx(|tx| {
             let Some(convo) = tx.get_conversation(conversation_id)? else {
-                return Ok(Vec::new());
+                return Err(MLSError::group_not_found(conversation_id));
             };
             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
             let provider = self.hooks.openmls_provider(storage);
@@ -3623,21 +3777,15 @@ impl CatbirdMlsClient {
                 MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
                     .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
             else {
-                return Ok(vec![self.normalized_did.clone()]);
+                return Err(MLSError::group_not_found(conversation_id));
             };
-            let mut dids = std::collections::BTreeSet::new();
-            for member in group.members() {
-                if let Ok(id_str) = std::str::from_utf8(member.credential.serialized_content()) {
-                    let did = id_str.split('#').next().unwrap_or(id_str).trim();
-                    if !did.is_empty() {
-                        dids.insert(did.to_string());
-                    }
-                }
-            }
+            let dids = active_member_dids(&group)?;
             if dids.is_empty() {
-                dids.insert(self.normalized_did.clone());
+                return Err(MLSError::Cryptography(
+                    "MLS group has no authenticated members".into(),
+                ));
             }
-            Ok(dids.into_iter().collect())
+            Ok(dids)
         })
     }
 

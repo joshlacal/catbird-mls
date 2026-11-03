@@ -6930,7 +6930,8 @@
         "protocolVersion",
         "contextHash",
         "coordinates",
-        "messageId"
+        "messageId",
+        "archiveCommitment"
       ],
       "properties": {
         "protocolVersion": {
@@ -6948,6 +6949,11 @@
         "messageId": {
           "type": "ref",
           "ref": "#operationId"
+        },
+        "archiveCommitment": {
+          "type": "ref",
+          "ref": "#artifactHash",
+          "description": "I13 archive commitment bound to the encrypted initial application frame; the blinding frame nonce remains encrypted."
         }
       }
     },
@@ -7125,7 +7131,8 @@
         "artifacts",
         "idempotencyKey",
         "signedAt",
-        "preparationRequestDigest"
+        "preparationRequestDigest",
+        "archiveCommitment"
       ],
       "properties": {
         "signatureDomain": {
@@ -7209,6 +7216,11 @@
         "preparationRequestDigest": {
           "type": "ref",
           "ref": "#artifactHash"
+        },
+        "archiveCommitment": {
+          "type": "ref",
+          "ref": "#artifactHash",
+          "description": "Required I13 commitment, repeated in the initial private MLS application AAD."
         }
       }
     },
@@ -7473,7 +7485,8 @@
         "actorDeviceId",
         "actorKeyId",
         "authGeneration",
-        "requestKind"
+        "requestKind",
+        "sequencerReceipt"
       ],
       "properties": {
         "requestId": {
@@ -7524,6 +7537,10 @@
         "requestKind": {
           "type": "string",
           "const": "publish"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         }
       }
     },
@@ -7929,7 +7946,9 @@
         "conversationId",
         "seq",
         "signedRequest",
-        "receivedAt"
+        "receivedAt",
+        "sequencerReceipt",
+        "publicationReceipt"
       ],
       "properties": {
         "entryId": {
@@ -7952,6 +7971,18 @@
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
+        "publicationReceipt": {
+          "type": "union",
+          "refs": [
+            "#signedDirectRequestReceipt"
+          ],
+          "closed": true,
+          "description": "Authoritative signed published outcome, including its mandatory I13 proof, available before recipient Welcome import."
         }
       }
     },

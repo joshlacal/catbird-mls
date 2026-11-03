@@ -18,12 +18,20 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use openmls::prelude::*;
 use openmls_traits::OpenMlsProvider;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use crate::chat_v2::transcript::{
+    normalize_read_presentation, project_signed_body, SignedMutationKind, SignedWrapper,
+    VerifiedMutation,
+};
+use crate::client::chat_wire;
 use crate::error::MLSError;
 use crate::keychain::KeychainAccess;
 use crate::metadata::{decrypt_metadata_snapshot, derive_metadata_key_from_group};
@@ -35,6 +43,8 @@ use crate::storage::{
 use super::{
     should_inline_push_ciphertext, DARWIN_NSE_DID_COMMIT_NOTIFICATION, INLINE_CIPHERTEXT_MAX_BYTES,
 };
+
+pub(crate) const NATIVE_ARCHIVE_RECEIPT_OP: &str = "native_archive_receipt";
 
 /// Structured metadata-only push wake delivered via `nest` (`Spec §6.2`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +243,165 @@ fn extract_message_epoch_hint(mls_bytes: &[u8]) -> Option<u64> {
         MlsMessageBodyIn::PublicMessage(pm) => Some(pm.epoch().as_u64()),
         _ => None,
     }
+}
+
+pub(crate) fn verify_signed_mutation_body(
+    signed_request: &serde_json::Value,
+    kind: SignedMutationKind,
+    public_key: &[u8],
+) -> Result<serde_json::Value, MLSError> {
+    let wrapper_name = match kind {
+        SignedMutationKind::CommitTransition => "signedCommitTransition",
+        SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
+        SignedMutationKind::PolicyTransition => "signedPolicyTransition",
+        SignedMutationKind::ConversationClose => "signedConversationClose",
+        _ => {
+            return Err(MLSError::Cryptography(
+                "unexpected signed transition kind".into(),
+            ))
+        }
+    };
+    let mut normalized =
+        normalize_read_presentation(&serde_json::to_vec(signed_request)?, wrapper_name, false)
+            .map_err(|e| MLSError::Cryptography(format!("normalize signed transition: {e}")))?;
+    let wrapper = SignedWrapper::decode(&serde_json::to_vec(&normalized)?)
+        .map_err(|e| MLSError::Cryptography(format!("decode signed transition: {e}")))?;
+    if wrapper.kind() != Some(kind) {
+        return Err(MLSError::Cryptography(
+            "signed transition has the wrong kind".into(),
+        ));
+    }
+    let projected = project_signed_body(kind, &wrapper.body)
+        .map_err(|e| MLSError::Cryptography(format!("project signed transition: {e}")))?;
+    VerifiedMutation::verify(projected, wrapper.signature, public_key)
+        .map_err(|e| MLSError::Cryptography(format!("verify signed transition: {e}")))?;
+    Ok(normalized["body"].take())
+}
+
+fn deserialize_cbor_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    struct Bytes;
+    impl<'de> serde::de::Visitor<'de> for Bytes {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a CBOR byte string")
+        }
+        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(bytes.to_vec())
+        }
+        fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_bytes(Bytes)
+}
+
+fn authenticated_application_message_id(
+    aad: &[u8],
+    conversation_id: &str,
+    _fixture_message_id: &str,
+) -> Result<String, MLSError> {
+    if let Some(cbor) = aad.strip_prefix(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0") {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ApplicationIdentity {
+            #[serde(deserialize_with = "deserialize_cbor_bytes")]
+            conversation_id: Vec<u8>,
+            #[serde(deserialize_with = "deserialize_cbor_bytes")]
+            message_id: Vec<u8>,
+        }
+        let identity: ApplicationIdentity = serde_ipld_dagcbor::from_slice(cbor).map_err(|e| {
+            MLSError::Cryptography(format!("invalid application identity AAD: {e}"))
+        })?;
+        let cid = uuid::Uuid::parse_str(conversation_id).map_err(|e| {
+            MLSError::Cryptography(format!("invalid application conversation UUID: {e}"))
+        })?;
+        let message_id = uuid::Uuid::from_slice(&identity.message_id).map_err(|e| {
+            MLSError::Cryptography(format!("invalid application message UUID: {e}"))
+        })?;
+        if identity.conversation_id.as_slice() != cid.as_bytes()
+            || message_id.get_version_num() != 4
+        {
+            return Err(MLSError::Cryptography(
+                "application AAD conversation/message identity mismatch".into(),
+            ));
+        }
+        return Ok(message_id.to_string());
+    }
+    #[cfg(any(test, feature = "sim", feature = "test-utils"))]
+    if crate::messaging::receive::PrivateMessageAadEnvelope::from_aad_bytes(aad).is_ok() {
+        // Standalone MLS fixtures predate the canonical transport; never a production fallback.
+        return Ok(_fixture_message_id.to_owned());
+    }
+    Err(MLSError::Cryptography(
+        "push application is missing canonical authenticated identity".into(),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitAadPrior {
+    #[serde(deserialize_with = "deserialize_cbor_bytes")]
+    conversation_id: Vec<u8>,
+    generation: i64,
+    state_version: i64,
+    #[serde(deserialize_with = "deserialize_cbor_bytes")]
+    group_id: Vec<u8>,
+    epoch: u64,
+    #[serde(deserialize_with = "deserialize_cbor_bytes")]
+    group_context_hash: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_cbor_bytes")]
+    confirmation_tag: Vec<u8>,
+    lifecycle: String,
+}
+
+/// The MLS signature authenticates this prior even though the push ABI deliberately
+/// carries only MLS bytes, not the DS's unsigned `coordinates` presentation.
+fn authenticated_commit_prior<P: OpenMlsProvider>(
+    aad: &[u8],
+    convo: &ConversationRow,
+    group: &MlsGroup,
+    provider: &P,
+) -> Result<Option<Value>, MLSError> {
+    let Some(cbor) = aad.strip_prefix(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0") else {
+        return Ok(None);
+    };
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CommitAad {
+        #[serde(deserialize_with = "deserialize_cbor_bytes")]
+        conversation_id: Vec<u8>,
+        generation: i64,
+        prior: CommitAadPrior,
+    }
+    let parsed: CommitAad = serde_ipld_dagcbor::from_slice(cbor)
+        .map_err(|e| MLSError::Cryptography(format!("invalid authenticated commitAad: {e}")))?;
+    let prior = parsed.prior;
+    let cid = uuid::Uuid::parse_str(&convo.conversation_id)
+        .map_err(|e| MLSError::Cryptography(format!("invalid commit conversation UUID: {e}")))?;
+    let (gch, tag) = chat_wire::compute_group_context_hash_and_tag(group, provider)?;
+    if parsed.conversation_id.as_slice() != cid.as_bytes()
+        || prior.conversation_id.as_slice() != cid.as_bytes()
+        || parsed.generation != convo.generation
+        || prior.generation != convo.generation
+        || prior.group_id != convo.group_id
+        || prior.epoch != group.epoch().as_u64()
+        || prior.group_context_hash.as_slice() != gch.as_slice()
+        || prior.confirmation_tag != tag
+        || prior.lifecycle != "active"
+        || prior.state_version < 0
+    {
+        return Err(MLSError::Cryptography(
+            "authenticated commitAad does not bind the local conversation prior".into(),
+        ));
+    }
+    Ok(Some(json!({
+        "conversationId": convo.conversation_id, "generation": prior.generation,
+        "stateVersion": prior.state_version, "groupId": { "$bytes": STANDARD.encode(prior.group_id) },
+        "epoch": prior.epoch, "groupContextHash": { "$bytes": STANDARD.encode(gch) },
+        "confirmationTag": { "$bytes": STANDARD.encode(tag) }, "lifecycle": "active",
+    })))
 }
 
 pub(crate) fn verify_leaf_binding_i4(
@@ -725,7 +894,7 @@ pub fn process_push_notification_with_hooks(
         let mut target_decrypted: Option<(String, String, i64, i64)> = None;
 
         for entry in entries_to_apply {
-            if entry.seq <= current_convo.last_seq && entry.entry_id != wake.message_id {
+            if entry.seq <= current_convo.last_seq && entry.seq != wake.entry_seq {
                 continue;
             }
             if entry.mls_bytes.is_empty() {
@@ -752,6 +921,9 @@ pub fn process_push_notification_with_hooks(
             let aad_bytes = processed.aad().to_vec();
             let msg_epoch = processed.epoch().as_u64() as i64;
             let sender = processed.sender().clone();
+            let previous_epoch = group.epoch().as_u64();
+            let commit_prior =
+                authenticated_commit_prior(&aad_bytes, &current_convo, &group, &provider)?;
 
             match processed.into_content() {
                 ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
@@ -804,6 +976,64 @@ pub fn process_push_notification_with_hooks(
                     let decrypted_bytes = app_msg.into_bytes();
                     let (body, plaintext_json, commitment_opt) =
                         extract_plaintext_body_and_verify_aad(&decrypted_bytes, &aad_bytes)?;
+                    let message_id = authenticated_application_message_id(
+                        &aad_bytes, &wake.conversation_id, &entry.entry_id,
+                    )?;
+                    if entry.seq == wake.entry_seq && message_id != wake.message_id {
+                        return Err(MLSError::Cryptography("push wake messageId differs from authenticated MLS AAD".into()));
+                    }
+                    let inner: crate::messaging::receive::PrivateMessagePlaintextEnvelope =
+                        serde_json::from_slice(&decrypted_bytes).map_err(|e| {
+                            MLSError::Cryptography(format!("missing authenticated push archive frame: {e}"))
+                        })?;
+                    let frame = std::str::from_utf8(&inner.canonical_payload_bytes)
+                        .map_err(|e| MLSError::Cryptography(format!("push archive frame UTF-8: {e}")))?;
+                    serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(frame)
+                        .map_err(|e| MLSError::Cryptography(format!("push archive payload: {e}")))?;
+                    if commitment_opt.is_none() {
+                        return Err(MLSError::Cryptography("push message has no authenticated archive commitment".into()));
+                    }
+                    // The full archive payload with the authenticated receive-time roster; the
+                    // app enqueues it once the entry's I13 receipt verifies.
+                    let evidence = crate::client::QueuedLabyrinthArchivePayload {
+                        version: 1,
+                        message_id: message_id.clone(),
+                        conversation_id: wake.conversation_id.clone(),
+                        group_id_hex: hex::encode(&current_convo.group_id),
+                        epoch: msg_epoch,
+                        expected_member_dids: group
+                            .members()
+                            .map(|m| {
+                                root_did_from_credential_bytes(m.credential.serialized_content())
+                                    .map(|(did, _)| did)
+                            })
+                            .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+                            .into_iter()
+                            .collect(),
+                        seq: entry.seq,
+                        sender_did: verified_sender_did.clone(),
+                        sender_device_id: verified_device_id.clone(),
+                        sequencer_did: current_convo.sequencer_did.clone(),
+                        space_uri: current_convo.space_uri.clone(),
+                        plaintext_json: plaintext_json.clone(),
+                        labyrinth_frame_json: frame.to_owned(),
+                        mls_ciphertext_b64: STANDARD.encode(&entry.mls_bytes),
+                        frame_nonce_b64: Some(STANDARD.encode(inner.frame_nonce)),
+                        sequencer_receipt_json: None,
+                        created_at_ms: now_ms,
+                    };
+                    tx.put_labyrinth_state(
+                        &format!("native.message:{}:{message_id}", wake.conversation_id),
+                        &serde_json::to_vec(&evidence)?, now_ms,
+                    )?;
+                    tx.put_pending_op(
+                        NATIVE_ARCHIVE_RECEIPT_OP, &message_id,
+                        &json!({
+                            "conversation_id": wake.conversation_id, "seq": entry.seq,
+                            "entry_id": fetch_bundle.as_ref().map(|_| entry.entry_id.as_str()),
+                        }).to_string(),
+                        now_ms,
+                    )?;
 
                     let is_own = preflight
                         .owner_did
@@ -811,7 +1041,7 @@ pub fn process_push_notification_with_hooks(
                         .is_some_and(|o| o == verified_sender_did);
 
                     tx.insert_message(&MessageRow {
-                        message_id: entry.entry_id.clone(),
+                        message_id: message_id.clone(),
                         conversation_id: wake.conversation_id.clone(),
                         group_id: current_convo.group_id.clone(),
                         epoch: msg_epoch,
@@ -827,7 +1057,7 @@ pub fn process_push_notification_with_hooks(
                         tx.conn()
                             .execute(
                                 "UPDATE messages SET archive_commitment = ?1 WHERE message_id = ?2;",
-                                rusqlite::params![commitment.as_slice(), entry.entry_id],
+                                rusqlite::params![commitment.as_slice(), message_id],
                             )
                             .map_err(|e| {
                                 MLSError::Internal(format!("persist archive_commitment: {e}"))
@@ -839,7 +1069,7 @@ pub fn process_push_notification_with_hooks(
                         current_convo.unread_count = current_convo.unread_count.saturating_add(1);
                     }
 
-                    if entry.entry_id == wake.message_id || target_decrypted.is_none() {
+                    if message_id == wake.message_id || target_decrypted.is_none() {
                         target_decrypted = Some((verified_sender_did, body, msg_epoch, entry.seq));
                     }
                 }
@@ -870,6 +1100,32 @@ pub fn process_push_notification_with_hooks(
                     return Err(MLSError::InvalidInput {
                         message: "unexpected UnresolvedAppDataCommit in push processor".to_string(),
                     });
+                }
+            }
+            if group.epoch().as_u64() != previous_epoch {
+                if let Some(mut next) = commit_prior {
+                    if group.epoch().as_u64() != previous_epoch + 1 {
+                        return Err(MLSError::Cryptography("push Commit skipped an MLS epoch".into()));
+                    }
+                    let (gch, tag) =
+                        chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+                    let state_version = next["stateVersion"].as_i64()
+                        .and_then(|version| version.checked_add(1))
+                        .ok_or_else(|| MLSError::Cryptography("commit stateVersion overflow".into()))?;
+                    next["stateVersion"] = json!(state_version);
+                    next["epoch"] = json!(group.epoch().as_u64());
+                    next["groupContextHash"] = json!({ "$bytes": STANDARD.encode(gch) });
+                    next["confirmationTag"] = json!({ "$bytes": STANDARD.encode(tag) });
+                    tx.put_account_meta(
+                        &format!("conversation_coords:{}", current_convo.conversation_id),
+                        &serde_json::to_string(&next)?, now_ms,
+                    )?;
+                } else {
+                    #[cfg(not(any(test, feature = "sim", feature = "test-utils")))]
+                    return Err(MLSError::Cryptography(
+                        "push Commit is missing a canonical authenticated prior".into(),
+                    ));
+                    // Raw MLS-only commits are supported exclusively by standalone crypto fixtures.
                 }
             }
         }

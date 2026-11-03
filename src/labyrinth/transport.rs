@@ -585,14 +585,6 @@ fn normalize_sequencer_did(raw: &str) -> String {
         .to_owned()
 }
 
-fn decode_wire_bytes_any(v: &serde_json::Value) -> Option<Vec<u8>> {
-    let encoded = v.as_str().or_else(|| v.get("$bytes")?.as_str())?;
-    STANDARD_NO_PAD
-        .decode(encoded)
-        .or_else(|_| STANDARD.decode(encoded))
-        .ok()
-}
-
 fn parse_did_doc_sequencer_keys(
     expected_did: &str,
     doc_bytes: &[u8],
@@ -897,6 +889,7 @@ impl DsDirectoryStore {
         &self,
         thread_id: &str,
     ) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+        let mut sequencer_did = self.saved_thread_authority(thread_id)?;
         if let Some(cached) = self
             .thread_keys
             .lock()
@@ -904,6 +897,19 @@ impl DsDirectoryStore {
             .get(thread_id)
             .cloned()
         {
+            if let Some(expected) = sequencer_did.as_deref() {
+                if cached
+                    .redaction_key
+                    .as_ref()
+                    .is_some_and(|key| key.did != expected)
+                    || cached
+                        .receipt_key
+                        .as_ref()
+                        .is_some_and(|key| key.did != expected)
+                {
+                    return Err(labyrinth::Error::Unattested);
+                }
+            }
             return Ok((cached.redaction_key, cached.receipt_key));
         }
 
@@ -915,63 +921,39 @@ impl DsDirectoryStore {
             )
             .await;
 
-        let mut sequencer_did: Option<String> = None;
-        let mut inline_redaction: Option<SequencerKey> = None;
-        let mut inline_receipt: Option<SequencerReceiptKey> = None;
-
         match state_res {
             Ok(body) => {
                 let parsed: serde_json::Value = serde_json::from_slice(&body)
                     .map_err(|_| labyrinth::Error::Malformed("getConversationState JSON"))?;
-                if let Some(raw_ds) = parsed["state"]["sequencerDid"]
+                // State may bootstrap an unpinned authority, never replace a pin
+                // or supply verification keys. Key bytes come from trusted resolvers.
+                let state_did = parsed["state"]["sequencerDid"]
                     .as_str()
-                    .filter(|s| !s.is_empty())
-                {
-                    let norm_ds = normalize_sequencer_did(raw_ds);
-                    if let Some(raw_ed) = parsed["state"]
-                        .get("sequencerPublicKey")
-                        .and_then(decode_wire_bytes_any)
-                    {
-                        if let Ok(key) = <[u8; 32]>::try_from(raw_ed.as_slice()) {
-                            inline_redaction = Some(SequencerKey {
-                                did: norm_ds.clone(),
-                                key,
-                            });
-                        }
-                    }
-                    if let Some(raw_p256) = parsed["state"]
-                        .get("sequencerReceiptPublicKey")
-                        .and_then(decode_wire_bytes_any)
-                    {
-                        if p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw_p256).is_ok() {
-                            inline_receipt = Some(SequencerReceiptKey {
-                                did: norm_ds.clone(),
-                                public_key_sec1: raw_p256,
-                            });
-                        }
-                    }
-                    sequencer_did = Some(norm_ds);
-                } else if let Some(space_uri) = parsed["state"]["conversationSpace"]
+                    .filter(|did| !did.is_empty())
+                    .map(normalize_sequencer_did);
+                let space_did = parsed["state"]["conversationSpace"]
                     .as_str()
-                    .filter(|s| !s.is_empty())
-                {
-                    let space_ref = labyrinth::store::space::SpaceRef::parse(space_uri)?;
-                    sequencer_did = Some(normalize_sequencer_did(&space_ref.space_did));
+                    .filter(|uri| !uri.is_empty())
+                    .map(labyrinth::store::space::SpaceRef::parse)
+                    .transpose()?
+                    .map(|space| normalize_sequencer_did(&space.space_did));
+                for candidate in [state_did, space_did].into_iter().flatten() {
+                    if sequencer_did
+                        .as_ref()
+                        .is_some_and(|expected| expected != &candidate)
+                    {
+                        return Err(labyrinth::Error::Unattested);
+                    }
+                    sequencer_did = Some(candidate);
                 }
             }
             Err(e) => {
                 let mapped = map_xrpc_error(e);
                 match mapped {
-                    labyrinth::Error::Forbidden | labyrinth::Error::NotFound("conversation") => {
-                        sequencer_did = self.saved_thread_authority(thread_id)?;
-                    }
+                    labyrinth::Error::Forbidden | labyrinth::Error::NotFound("conversation") => {}
                     other => return Err(other),
                 }
             }
-        }
-
-        if sequencer_did.is_none() {
-            sequencer_did = self.saved_thread_authority(thread_id)?;
         }
 
         // Fail closed: NEVER match home DS keys when `sequencer_did` is unknown (`None`)
@@ -981,7 +963,7 @@ impl DsDirectoryStore {
             None => false,
         };
 
-        let mut redaction_key = inline_redaction;
+        let mut redaction_key = None;
         if redaction_key.is_none() {
             if let Some(ref sk) = self.sequencer_key {
                 if matches_expected(&sk.did, sequencer_did.as_deref()) {
@@ -992,23 +974,20 @@ impl DsDirectoryStore {
                 }
             }
         }
-        if redaction_key.is_none() {
+        if redaction_key.is_none() && sequencer_did.is_some() {
             if let Some((did, key)) = self
                 .transport
                 .resolve_sequencer_key_for(thread_id, sequencer_did.as_deref())
                 .await
             {
                 let norm = normalize_sequencer_did(&did);
-                if sequencer_did.as_deref().is_none_or(|exp| norm == exp) {
-                    if sequencer_did.is_none() {
-                        sequencer_did = Some(norm.clone());
-                    }
+                if matches_expected(&norm, sequencer_did.as_deref()) {
                     redaction_key = Some(SequencerKey { did: norm, key });
                 }
             }
         }
 
-        let mut receipt_key = inline_receipt;
+        let mut receipt_key = None;
         if receipt_key.is_none() {
             if let Some(ref rk) = self.sequencer_receipt_key {
                 if matches_expected(&rk.did, sequencer_did.as_deref())
@@ -1021,19 +1000,16 @@ impl DsDirectoryStore {
                 }
             }
         }
-        if receipt_key.is_none() {
+        if receipt_key.is_none() && sequencer_did.is_some() {
             if let Some((did, sec1)) = self
                 .transport
                 .resolve_sequencer_receipt_key_for(thread_id, sequencer_did.as_deref())
                 .await
             {
                 let norm = normalize_sequencer_did(&did);
-                if sequencer_did.as_deref().is_none_or(|exp| norm == exp)
+                if matches_expected(&norm, sequencer_did.as_deref())
                     && p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).is_ok()
                 {
-                    if sequencer_did.is_none() {
-                        sequencer_did = Some(norm.clone());
-                    }
                     receipt_key = Some(SequencerReceiptKey {
                         did: norm,
                         public_key_sec1: sec1,
@@ -1082,7 +1058,7 @@ impl DsDirectoryStore {
 
     pub async fn purge_mailbox_heads(&self) -> labyrinth::Result<()> {
         let mut op_id = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut op_id);
+        labyrinth::encoding::random(&mut op_id)?;
         self.transport
             .procedure("blue.catbird.labyrinth.purgeMailbox", b"{}", op_id)
             .await
@@ -1092,7 +1068,7 @@ impl DsDirectoryStore {
 
     pub async fn delete_account_data(&self) -> labyrinth::Result<()> {
         let mut op_id = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut op_id);
+        labyrinth::encoding::random(&mut op_id)?;
         self.transport
             .procedure("blue.catbird.labyrinth.deleteAccountData", b"{}", op_id)
             .await
@@ -1298,6 +1274,45 @@ impl MailboxDirectory for DsDirectoryStore {
         let (_, receipt_key) = self.resolve_thread_sequencer_keys(thread_id).await?;
         Ok(receipt_key)
     }
+
+    async fn sequencer_receipt_key_for_authority(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
+        let authority = normalize_sequencer_did(expected_authority);
+        if self
+            .saved_thread_authority(thread_id)?
+            .is_some_and(|pinned| pinned != authority)
+        {
+            return Err(labyrinth::Error::Unattested);
+        }
+        if let Some(key) = &self.sequencer_receipt_key {
+            if normalize_sequencer_did(&key.did) == authority
+                && p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_key_sec1).is_ok()
+            {
+                return Ok(Some(SequencerReceiptKey {
+                    did: authority,
+                    public_key_sec1: key.public_key_sec1.clone(),
+                }));
+            }
+        }
+        if let Some((did, public_key_sec1)) = self
+            .transport
+            .resolve_sequencer_receipt_key_for(thread_id, Some(&authority))
+            .await
+        {
+            if normalize_sequencer_did(&did) == authority
+                && p256::ecdsa::VerifyingKey::from_sec1_bytes(&public_key_sec1).is_ok()
+            {
+                return Ok(Some(SequencerReceiptKey {
+                    did: authority,
+                    public_key_sec1,
+                }));
+            }
+        }
+        Ok(self.resolve_did_doc_keys(&authority).await?.1)
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -1316,6 +1331,315 @@ impl KeyPublisher for DsDirectoryStore {
 mod tests {
     use super::*;
     use labyrinth::store::space::SpaceRpc;
+
+    #[tokio::test]
+    async fn sequencer_keys_require_pinned_authority_and_trusted_key_material() {
+        use crate::labyrinth::state::StateVault;
+        use crate::MLSError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const AUTHORITY: &str = "did:web:sequencer.example";
+        const ATTACKER: &str = "did:web:attacker.example";
+        const OWNER: &str = "did:plc:alice";
+        const THREAD: &str = "thread";
+
+        struct Fixture {
+            state: Vec<u8>,
+            status: u16,
+            state_queries: AtomicUsize,
+            document: Option<Vec<u8>>,
+            pins: Option<Vec<u8>>,
+        }
+        #[async_trait::async_trait]
+        impl LabyrinthGateway for Fixture {
+            async fn submit_labyrinth(
+                &self,
+                _request: LabyrinthRequest,
+            ) -> Result<GatewayResponse, String> {
+                panic!("expected canonical conversation-state query")
+            }
+            async fn submit_canonical(
+                &self,
+                _request: PreparedRequest,
+            ) -> Result<GatewayResponse, String> {
+                self.state_queries.fetch_add(1, Ordering::SeqCst);
+                Ok(GatewayResponse {
+                    status: self.status,
+                    content_type: Some("application/json".into()),
+                    body: self.state.clone(),
+                })
+            }
+            async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
+                assert_eq!(
+                    did, AUTHORITY,
+                    "must resolve only the pinned/bootstrap authority"
+                );
+                Ok(self.document.clone())
+            }
+        }
+        impl ChatKeySigner for Fixture {
+            fn public_key(&self) -> [u8; 32] {
+                [0; 32]
+            }
+            fn sign(&self, _message: &[u8]) -> Result<[u8; 64], String> {
+                panic!("canonical state query must not sign a mutation")
+            }
+        }
+        impl StateVault for Fixture {
+            fn load(&self, key: &str) -> Result<Option<Vec<u8>>, MLSError> {
+                assert_eq!(key, super::super::space::thread_placement_key(OWNER));
+                Ok(self.pins.clone())
+            }
+            fn compare_exchange(
+                &self,
+                _key: &str,
+                _expected: Option<&[u8]>,
+                _next: &[u8],
+            ) -> Result<bool, MLSError> {
+                panic!("directory reads must not rewrite authority pins")
+            }
+            fn delete(&self, _key: &str) -> Result<(), MLSError> {
+                panic!("directory reads must not remove authority pins")
+            }
+        }
+
+        let receipt_public = p256::ecdsa::SigningKey::from_bytes((&[0x42; 32]).into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let inline_public = p256::ecdsa::SigningKey::from_bytes((&[0x43; 32]).into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let document = serde_json::to_vec(&serde_json::json!({
+            "id": AUTHORITY,
+            "verificationMethod": [
+                {
+                    "id": format!("{AUTHORITY}#mls-receipt-1"),
+                    "controller": AUTHORITY,
+                    "publicKeyMultibase": multibase::encode(
+                        multibase::Base::Base58Btc, [&[0x80, 0x24][..], &receipt_public].concat()
+                    )
+                },
+                {
+                    "id": format!("{AUTHORITY}#labyrinth-redaction-1"),
+                    "controller": AUTHORITY,
+                    "publicKeyMultibase": multibase::encode(
+                        multibase::Base::Base58Btc, [&[0xed, 0x01][..], &[7; 32][..]].concat()
+                    )
+                }
+            ]
+        }))
+        .unwrap();
+        let pins = serde_json::to_vec(&std::collections::BTreeMap::from([(
+            THREAD.to_owned(),
+            super::super::space::ThreadPlacement {
+                space: Some(
+                    labyrinth::store::space::SpaceRef::conversation(AUTHORITY, THREAD).to_string(),
+                ),
+                generation: 1,
+            },
+        )]))
+        .unwrap();
+
+        for (reported, pinned, has_document, configured) in [
+            (AUTHORITY, true, true, false),
+            (ATTACKER, true, true, false),
+            (AUTHORITY, false, true, false),
+            (AUTHORITY, true, false, false),
+            (AUTHORITY, true, false, true),
+        ] {
+            let fixture = Arc::new(Fixture {
+                status: 200,
+                state_queries: AtomicUsize::new(0),
+                state: serde_json::to_vec(&serde_json::json!({"state": {
+                    "sequencerDid": reported,
+                    "sequencerPublicKey": {"$bytes": STANDARD.encode([9; 32])},
+                    "sequencerReceiptPublicKey": {"$bytes": STANDARD.encode(&inline_public)}
+                }}))
+                .unwrap(),
+                document: has_document.then(|| document.clone()),
+                pins: pinned.then(|| pins.clone()),
+            });
+            let transport = Arc::new(GatewayXrpcTransport::new(
+                fixture.clone(),
+                fixture.clone(),
+                OWNER.into(),
+                "11111111-1111-4111-8111-111111111111".into(),
+            ));
+            let directory = DsDirectoryStore::new(
+                transport,
+                configured.then(|| SequencerKey {
+                    did: AUTHORITY.into(),
+                    key: [7; 32],
+                }),
+                configured.then(|| SequencerReceiptKey {
+                    did: AUTHORITY.into(),
+                    public_key_sec1: receipt_public.clone(),
+                }),
+            )
+            .with_placements(OWNER, fixture.clone());
+            let result = directory.resolve_thread_sequencer_keys(THREAD).await;
+            if reported == ATTACKER {
+                assert_eq!(result.unwrap_err(), labyrinth::Error::Unattested);
+            } else {
+                let (redaction, receipt) = result.unwrap();
+                if has_document || configured {
+                    assert_eq!(redaction.unwrap().key, [7; 32]);
+                    assert_eq!(receipt.unwrap().public_key_sec1, receipt_public);
+                } else {
+                    assert!(
+                        redaction.is_none() && receipt.is_none(),
+                        "inline keys must not be trusted"
+                    );
+                }
+            }
+            let before = fixture.state_queries.load(Ordering::SeqCst);
+            let authenticated = directory
+                .sequencer_receipt_key_for_authority(THREAD, AUTHORITY)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.state_queries.load(Ordering::SeqCst),
+                before,
+                "authenticated issuer lookup must not consult unsigned state"
+            );
+            if has_document || configured {
+                assert_eq!(authenticated.unwrap().public_key_sec1, receipt_public);
+            } else {
+                assert!(authenticated.is_none());
+            }
+            if pinned {
+                assert_eq!(
+                    directory
+                        .sequencer_receipt_key_for_authority(THREAD, ATTACKER)
+                        .await
+                        .unwrap_err(),
+                    labyrinth::Error::Unattested,
+                );
+            }
+        }
+
+        // A fresh kicked device has neither a placement pin nor live state
+        // access. Only its authenticated owner receipt can name this authority.
+        let fixture = Arc::new(Fixture {
+            state: br#"{"error":"NotEntitled"}"#.to_vec(),
+            status: 403,
+            state_queries: AtomicUsize::new(0),
+            document: Some(document),
+            pins: None,
+        });
+        let transport = Arc::new(GatewayXrpcTransport::new(
+            fixture.clone(),
+            fixture.clone(),
+            OWNER.into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+        ));
+        let directory =
+            DsDirectoryStore::new(transport, None, None).with_placements(OWNER, fixture.clone());
+        assert!(directory
+            .sequencer_receipt_key(THREAD)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(fixture.state_queries.load(Ordering::SeqCst), 1);
+        let authenticated = directory
+            .sequencer_receipt_key_for_authority(THREAD, AUTHORITY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authenticated.public_key_sec1, receipt_public);
+        assert_eq!(fixture.state_queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn destructive_directory_operation_ids_follow_scoped_entropy() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Capture(Mutex<Vec<LabyrinthRequest>>);
+        #[async_trait::async_trait]
+        impl LabyrinthGateway for Capture {
+            async fn submit_labyrinth(
+                &self,
+                request: LabyrinthRequest,
+            ) -> Result<GatewayResponse, String> {
+                self.0.lock().unwrap().push(request);
+                Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: b"{}".to_vec(),
+                })
+            }
+            async fn submit_canonical(
+                &self,
+                _request: PreparedRequest,
+            ) -> Result<GatewayResponse, String> {
+                panic!("directory mutations must use the Labyrinth route")
+            }
+        }
+        impl ChatKeySigner for Capture {
+            fn public_key(&self) -> [u8; 32] {
+                [7; 32]
+            }
+            fn sign(&self, _msg: &[u8]) -> Result<[u8; 64], String> {
+                Ok([0; 64])
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let transport = Arc::new(GatewayXrpcTransport::new(
+            capture.clone(),
+            capture.clone(),
+            "did:plc:alice".into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+        ));
+        let directory = DsDirectoryStore::new(transport, None, None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let next = AtomicU8::new(1);
+            labyrinth::encoding::with_random_hook(
+                Arc::new(move |out| {
+                    out.fill(next.fetch_add(1, Ordering::Relaxed));
+                    Ok(())
+                }),
+                || {
+                    runtime.block_on(async {
+                        directory.purge_mailbox_heads().await.unwrap();
+                        directory.delete_account_data().await.unwrap();
+                    })
+                },
+            );
+        }
+
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (i, request) in requests.iter().enumerate() {
+            let nsid = if i % 2 == 0 {
+                "blue.catbird.labyrinth.purgeMailbox"
+            } else {
+                "blue.catbird.labyrinth.deleteAccountData"
+            };
+            assert_eq!(request.nsid, nsid);
+            let header = request
+                .headers
+                .iter()
+                .find(|(name, _)| name == super::super::write_auth::WRITE_BODY_HEADER)
+                .unwrap();
+            let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&header.1)
+                .unwrap();
+            let body: WriteBody = serde_json::from_slice(&json).unwrap();
+            assert_eq!(body.operation_id, hex::encode([1 + (i % 2) as u8; 16]));
+        }
+    }
 
     #[test]
     fn space_error_names_pass_through_decoding() {

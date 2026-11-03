@@ -5,6 +5,20 @@ use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
+use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
+use catbird_mls::client::chat_wire;
+use catbird_mls::orchestrator::canonical_transport::{derive_key_id, CanonicalOperation};
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::OpenMlsProvider;
+use p256::ecdsa::signature::Signer as _;
+
+#[path = "fixtures/direct_request_i13.rs"]
+mod direct_request_i13;
+#[allow(dead_code)]
+#[path = "support/native_archive_auth.rs"]
+mod native_archive_auth;
+use native_archive_auth::NativeArchiveAuthFixture;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::RngCore;
 use serde_json::{json, Value};
@@ -94,6 +108,7 @@ struct MockDsState {
     deferred_commit_transition: Option<PlatformHttpRequest>,
     lose_next_commit_response: bool,
     fail_next_commit_status: Option<u16>,
+    next_ack_error: Option<(u16, String)>,
     // PDS records: (repo, collection, rkey) -> value
     pds_records: BTreeMap<(String, String, String), Value>,
     // Direct request published keys: actor_did -> (device_id, key_package_val, grant_val)
@@ -112,15 +127,15 @@ struct MockDsState {
     acked_welcomes: Vec<String>,
     // Acked entry watermarks: (cid, device_id) -> i64
     acked_watermarks: BTreeMap<(String, String), i64>,
-    // Space applyWrites records
-    space_writes: Vec<Value>,
-    space_records: BTreeMap<(String, String, String, String), Value>,
+    // Verified `getEpochHead` chains: account DID -> `epochPublic`s in epoch order.
     labyrinth_epochs: BTreeMap<String, Vec<Value>>,
-    chat_device_pubkeys: BTreeMap<String, Vec<Value>>,
+    // Enrolled chat device keys: (account DID, device ID) -> Ed25519 signing key.
+    device_keys: BTreeMap<(String, String), [u8; 32]>,
 }
 
 struct SharedMockDs {
     inner: Mutex<MockDsState>,
+    archive_auth: NativeArchiveAuthFixture,
 }
 
 impl SharedMockDs {
@@ -138,6 +153,7 @@ impl SharedMockDs {
                 deferred_commit_transition: None,
                 lose_next_commit_response: false,
                 fail_next_commit_status: None,
+                next_ack_error: None,
                 pds_records: BTreeMap::new(),
                 dr_keys: BTreeMap::new(),
                 convo_kps: BTreeMap::new(),
@@ -147,32 +163,38 @@ impl SharedMockDs {
                 leaf_recoveries: BTreeMap::new(),
                 acked_welcomes: Vec::new(),
                 acked_watermarks: BTreeMap::new(),
-                space_writes: Vec::new(),
-                space_records: BTreeMap::new(),
                 labyrinth_epochs: BTreeMap::new(),
-                chat_device_pubkeys: BTreeMap::new(),
+                device_keys: BTreeMap::new(),
             }),
+            archive_auth: NativeArchiveAuthFixture::new(
+                ALICE_DID,
+                Arc::new(|| chrono::Utc::now().timestamp_millis()),
+            ),
         })
     }
 
-    fn receipt_jwk_did_doc(&self) -> Value {
+    fn receipt_did_doc(&self) -> Value {
         let g = self.inner.lock().unwrap();
-        let pt = g.receipt_sk.verifying_key().to_encoded_point(false);
-        let x = URL_SAFE_NO_PAD.encode(pt.x().unwrap());
-        let y = URL_SAFE_NO_PAD.encode(pt.y().unwrap());
-        json!({
-            "id": DS_DID,
-            "verificationMethod": [{
-                "id": format!("{DS_DID}#mls-receipt-1"),
-                "type": "JsonWebKey2020",
-                "controller": DS_DID,
-                "publicKeyJwk": {
-                    "kty": "EC",
-                    "crv": "P-256",
-                    "x": x,
-                    "y": y
-                }
-            }]
+        let method = dr_transcript::direct_request_receipt_key_id_for_authority(
+            DS_DID,
+            g.receipt_sk
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        )
+        .unwrap();
+        serde_json::from_slice(&direct_request_i13::authority_document(
+            &g.receipt_sk,
+            &method,
+            DS_DID,
+        ))
+        .unwrap()
+    }
+
+    fn for_account(self: &Arc<Self>, account_did: &str) -> Arc<dyn PlatformTransport> {
+        Arc::new(AccountTransport {
+            ds: self.clone(),
+            account_did: account_did.to_owned(),
         })
     }
 }
@@ -225,8 +247,98 @@ fn query_map(url: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-impl PlatformTransport for SharedMockDs {
-    fn execute_http(&self, req: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+fn xrpc_error(status: u16, code: &str, message: &str) -> Result<PlatformHttpResponse, MLSError> {
+    Ok(PlatformHttpResponse {
+        status,
+        headers: vec![PlatformHttpHeader {
+            name: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }],
+        body: serde_json::to_vec(&json!({ "error": code, "message": message })).unwrap(),
+    })
+}
+
+/// `mls-ds` device-signed Labyrinth request (`labyrinth::auth::verify_signed_write`,
+/// `read_auth::verify`): base64url claim `header`, and Ed25519 `{header}-signature` over
+/// `domain || claim` by the session account's enrolled key for the claim's `device_field`.
+fn device_signed_claim(
+    g: &MockDsState,
+    account: &str,
+    req: &PlatformHttpRequest,
+    header: &str,
+    device_field: &str,
+    domain: &[u8],
+) -> Result<(Value, [u8; 32]), &'static str> {
+    let decoded = |name: &str| {
+        req.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| URL_SAFE_NO_PAD.decode(&h.value).ok())
+    };
+    let claim_bytes = decoded(header).ok_or("missing device-signed claim")?;
+    let signature: [u8; 64] = decoded(&format!("{header}-signature"))
+        .and_then(|s| s.try_into().ok())
+        .ok_or("missing device signature")?;
+    let claim: Value = serde_json::from_slice(&claim_bytes).map_err(|_| "malformed claim")?;
+    let device = claim[device_field]
+        .as_str()
+        .ok_or("claim names no device")?;
+    let key = *g
+        .device_keys
+        .get(&(account.to_owned(), device.to_owned()))
+        .ok_or("device is not enrolled for the session account")?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .and_then(|k| {
+            k.verify_strict(
+                &[domain, &claim_bytes].concat(),
+                &ed25519_dalek::Signature::from_bytes(&signature),
+            )
+        })
+        .map_err(|_| "device signature does not verify")?;
+    Ok((claim, key))
+}
+
+/// `read_auth::verify`: the claim names the session account, this route, and this exact
+/// canonical query (every decoded pair, sorted, RFC 3986 re-encoded), signed by `actorDeviceId`.
+fn verify_read(
+    g: &MockDsState,
+    account: &str,
+    req: &PlatformHttpRequest,
+    nsid: &str,
+) -> Result<(), &'static str> {
+    use catbird_mls::labyrinth::write_auth::{canonical_query_params, READ_DOMAIN, READ_HEADER};
+    let (claim, _) = device_signed_claim(g, account, req, READ_HEADER, "deviceId", READ_DOMAIN)?;
+    let pairs: Vec<(String, String)> = req
+        .url
+        .split_once('?')
+        .map_or("", |(_, q)| q)
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (pct_decode(k), pct_decode(v)))
+        .collect();
+    let params: Vec<(&str, String)> = pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let device = pairs
+        .iter()
+        .filter(|(k, _)| k == "actorDeviceId")
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>();
+    if claim["did"] != account
+        || claim["nsid"] != nsid
+        || claim["query"] != canonical_query_params(&params)
+        || device != [claim["deviceId"].as_str().unwrap_or_default()]
+    {
+        return Err("read claim does not bind this account, route, and query");
+    }
+    Ok(())
+}
+
+impl SharedMockDs {
+    /// One request on `account`'s authenticated session (the DPoP/service-auth principal).
+    fn execute(
+        &self,
+        account: &str,
+        req: PlatformHttpRequest,
+    ) -> Result<PlatformHttpResponse, MLSError> {
         let url = req.url.as_str();
         let q = query_map(url);
         let body_json: Value = req
@@ -239,7 +351,7 @@ impl PlatformTransport for SharedMockDs {
             || (url.contains("/xrpc/com.atproto.identity.resolveDid")
                 && q.get("did").map(String::as_str) == Some(DS_DID))
         {
-            return ok_json(self.receipt_jwk_did_doc());
+            return ok_json(self.receipt_did_doc());
         }
 
         if url.contains("/xrpc/com.atproto.identity.resolveDid") {
@@ -292,173 +404,147 @@ impl PlatformTransport for SharedMockDs {
             return ok_json(json!({ "records": records }));
         }
 
-        if url.contains("/xrpc/com.atproto.space.getSpace")
-            || url.contains("/xrpc/com.atproto.space.putSpace")
-        {
-            return ok_json(json!({ "uri": q.get("space").cloned().unwrap_or_default() }));
-        }
-
-        if url.contains("/xrpc/com.atproto.space.uploadBlob") {
-            let digest = hex::encode(Sha256::digest(req.body.as_deref().unwrap_or(&[])));
-            return ok_json(json!({
-                "blob": {
-                    "$type": "blob",
-                    "ref": { "$link": format!("bafkrei{}", &digest[..32]) },
-                    "mimeType": "application/octet-stream",
-                    "size": req.body.as_ref().map(|b| b.len()).unwrap_or(0)
-                }
-            }));
-        }
-
-        if url.contains("/xrpc/com.atproto.space.applyWrites") {
-            g.space_writes.push(body_json.clone());
-            let space = body_json["space"].as_str().unwrap_or_default().to_string();
-            let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
-            let mut results = Vec::new();
-            for (idx, w) in body_json["writes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .enumerate()
-            {
-                let coll = w["collection"].as_str().unwrap_or_default().to_string();
-                let rkey = w["rkey"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("3kzzzzzzzz{:03}", g.space_writes.len() * 10 + idx));
-                let uri = format!("at://{repo}/{coll}/{rkey}");
-                if w["$type"].as_str().unwrap_or_default().ends_with("#delete") {
-                    g.space_records
-                        .remove(&(space.clone(), repo.clone(), coll, rkey));
-                } else {
-                    g.space_records.insert(
-                        (space.clone(), repo.clone(), coll, rkey),
-                        w["value"].clone(),
-                    );
-                }
-                results.push(json!({ "uri": uri }));
-            }
-            return ok_json(json!({
-                "results": results,
-                "commit": { "rev": "3kzzzzzzzzzzz", "data": { "$bytes": STANDARD.encode([0x11_u8; 32]) } }
-            }));
-        }
-
-        if url.contains("/xrpc/com.atproto.space.getRecord") {
+        if url.contains("/xrpc/com.atproto.repo.getRecord") {
             let key = (
-                q.get("space").cloned().unwrap_or_default(),
                 q.get("repo").cloned().unwrap_or_default(),
                 q.get("collection").cloned().unwrap_or_default(),
                 q.get("rkey").cloned().unwrap_or_default(),
             );
-            if let Some(val) = g.space_records.get(&key) {
-                return ok_json(json!({
-                    "uri": format!("at://{}/{}/{}", key.1, key.2, key.3),
-                    "value": val,
-                }));
-            }
-            return Ok(PlatformHttpResponse {
-                status: 404,
-                headers: vec![PlatformHttpHeader {
-                    name: "content-type".to_string(),
-                    value: "application/json".to_string(),
-                }],
-                body: br#"{"error":"RecordNotFound"}"#.to_vec(),
-            });
-        }
-
-        if url.contains("/xrpc/com.atproto.space.listRecords") {
-            let space = q.get("space").cloned().unwrap_or_default();
-            let repo = q.get("repo").cloned().unwrap_or_default();
-            let coll = q.get("collection").cloned().unwrap_or_default();
-            let records: Vec<Value> = g
-                .space_records
-                .iter()
-                .filter(|((s, r, c, _), _)| s == &space && r == &repo && c == &coll)
-                .map(|((_, r, c, rk), val)| {
-                    json!({
-                        "uri": format!("at://{r}/{c}/{rk}"),
-                        "rkey": rk,
-                        "cid": "bafyreimock",
-                        "value": val,
-                    })
-                })
-                .collect();
-            return ok_json(json!({ "records": records }));
-        }
-
-        if url.contains("/xrpc/com.atproto.space.listRepos") {
-            let space = q.get("space").cloned().unwrap_or_default();
-            let mut dids: Vec<String> = g
-                .space_records
-                .keys()
-                .filter(|(s, _, _, _)| s == &space)
-                .map(|(_, r, _, _)| r.clone())
-                .collect();
-            dids.sort();
-            dids.dedup();
-            let repos: Vec<Value> = dids.into_iter().map(|d| json!({ "did": d })).collect();
-            return ok_json(json!({ "repos": repos }));
+            let Some(value) = g.pds_records.get(&key).cloned() else {
+                return Ok(PlatformHttpResponse {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: br#"{"error":"RecordNotFound"}"#.to_vec(),
+                });
+            };
+            let (repo, collection, rkey) = key;
+            return ok_json(json!({
+                "uri": format!("at://{repo}/{collection}/{rkey}"),
+                "cid": "bafyreimock",
+                "value": value
+            }));
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.publishEpochHead") {
-            let did = body_json["epoch"]["did"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| {
-                    req.headers
-                        .iter()
-                        .find(|h| h.name.eq_ignore_ascii_case("catbird-labyrinth-write"))
-                        .and_then(|h| URL_SAFE_NO_PAD.decode(h.value.as_bytes()).ok())
-                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                        .and_then(|v| v["did"].as_str().map(str::to_owned))
-                })
-                .unwrap_or_default();
-            g.labyrinth_epochs
-                .entry(did)
-                .or_default()
-                .push(body_json["epoch"].clone());
+            // `mls-ds` `record_head`: a chat device of the session account signed this exact
+            // body and attested a head that verifies and extends the account's chain by one.
+            use catbird_mls::labyrinth::write_auth::{WRITE_BODY_HEADER, WRITE_DOMAIN};
+            let nsid = "blue.catbird.labyrinth.publishEpochHead";
+            let (write, device_key) = match device_signed_claim(
+                &g,
+                account,
+                &req,
+                WRITE_BODY_HEADER,
+                "actorDeviceId",
+                WRITE_DOMAIN,
+            ) {
+                Ok(verified) => verified,
+                Err(message) => return xrpc_error(401, "InvalidSignature", message),
+            };
+            let payload_sha256 =
+                hex::encode(Sha256::digest(req.body.as_deref().unwrap_or_default()));
+            if write["endpointNsid"] != nsid || write["payloadSha256"] != payload_sha256 {
+                return xrpc_error(
+                    400,
+                    "InvalidRequest",
+                    "write body does not bind this payload",
+                );
+            }
+            let parse = |value: &Value| {
+                serde_json::from_value::<labyrinth::records::EpochPublicDef>(value.clone())
+                    .ok()
+                    .and_then(|def| def.to_public().ok())
+            };
+            let epoch_json = body_json["epoch"].clone();
+            let Some(epoch) = parse(&epoch_json).filter(|e| e.verify(account, None).is_ok()) else {
+                return xrpc_error(400, "InvalidRequest", "epoch head does not verify");
+            };
+            if epoch.attestation.transport_public_key != device_key {
+                return xrpc_error(400, "AttestationNotCaller", "head not attested by caller");
+            }
+            let chain = g.labyrinth_epochs.entry(account.to_owned()).or_default();
+            if let Some(existing) = chain
+                .iter()
+                .find(|e| e["epochNumber"] == epoch_json["epochNumber"])
+            {
+                return if *existing == epoch_json {
+                    ok_json(json!({}))
+                } else {
+                    xrpc_error(409, "EpochHeadConflict", "different head at this epoch")
+                };
+            }
+            let links = match chain.last().and_then(parse) {
+                None => epoch.seq == 0,
+                Some(latest) => epoch
+                    .verify_link(latest.seq, &latest.head, &latest.keys.sig)
+                    .is_ok(),
+            };
+            if !links {
+                return xrpc_error(400, "InvalidEpochChain", "head does not extend the chain");
+            }
+            chain.push(epoch_json);
             return ok_json(json!({}));
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getEpochHead") {
-            let did = q.get("did").cloned().unwrap_or_default();
-            if let Some(chain) = g.labyrinth_epochs.get(&did).filter(|c| !c.is_empty()) {
-                let latest = chain.last().unwrap().clone();
-                return ok_json(json!({ "epoch": latest, "chain": chain }));
+            if let Err(message) =
+                verify_read(&g, account, &req, "blue.catbird.labyrinth.getEpochHead")
+            {
+                return xrpc_error(401, "InvalidSignature", message);
             }
-            return Ok(PlatformHttpResponse {
-                status: 404,
-                headers: vec![PlatformHttpHeader {
-                    name: "content-type".to_string(),
-                    value: "application/json".to_string(),
-                }],
-                body: br#"{"error":"EpochNotFound"}"#.to_vec(),
-            });
+            let chain = g
+                .labyrinth_epochs
+                .get(q.get("did").map_or("", String::as_str))
+                .cloned()
+                .unwrap_or_default();
+            let end = match q.get("epochNumber") {
+                Some(n) => n.parse::<u64>().ok().and_then(|n| {
+                    chain
+                        .iter()
+                        .position(|e| e["epochNumber"].as_u64() == Some(n))
+                }),
+                None => chain.len().checked_sub(1),
+            };
+            let Some(end) = end else {
+                return xrpc_error(404, "EpochNotFound", "no such epoch head");
+            };
+            let chain = &chain[..=end];
+            return ok_json(json!({
+                "epoch": chain[end], "chain": chain, "floorSeq": chain[0]["epochNumber"],
+            }));
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getChatDeviceKeys") {
+            let nsid = "blue.catbird.labyrinth.getChatDeviceKeys";
+            if let Err(message) = verify_read(&g, account, &req, nsid) {
+                return xrpc_error(401, "InvalidSignature", message);
+            }
             let did = q.get("did").cloned().unwrap_or_default();
-            let items = g.chat_device_pubkeys.get(&did).cloned().unwrap_or_default();
+            let items: Vec<Value> = g
+                .device_keys
+                .iter()
+                .filter(|((owner, _), _)| *owner == did)
+                .map(|(_, key)| {
+                    json!({
+                        "keyId": derive_key_id(key),
+                        "signingPublicKey": { "$bytes": STANDARD.encode(key) },
+                    })
+                })
+                .collect();
             return ok_json(json!({ "items": items }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.enrollDevice") {
             let b = &body_json["signedRequest"]["body"];
             let did = b["actorDid"].as_str().unwrap().to_string();
+            if did != account {
+                return xrpc_error(403, "NotAuthorized", "actorDid is not the session account");
+            }
             let dev = b["deviceId"].as_str().unwrap().to_string();
             let kps = b["keyPackages"].as_array().cloned().unwrap_or_default();
-            let pk = &b["signaturePublicKey"];
-            let wrapped_pk = if pk.is_string() {
-                json!({ "$bytes": pk })
-            } else {
-                pk.clone()
-            };
-            g.chat_device_pubkeys
-                .entry(did.clone())
-                .or_default()
-                .push(json!({ "signingPublicKey": wrapped_pk }));
+            let key = chat_wire::json_bytes(&b["signaturePublicKey"]).unwrap();
+            g.device_keys
+                .insert((did.clone(), dev.clone()), key.try_into().unwrap());
             g.convo_kps.entry((did, dev)).or_default().extend(kps);
             return ok_json(json!({
                 "device": { "authGeneration": 1 }
@@ -505,7 +591,9 @@ impl PlatformTransport for SharedMockDs {
                 "outcome": {
                     "conversationId": cid,
                     "authorityDid": DS_DID,
-                    "receiptKeyId": "#mls-receipt-1",
+                    "receiptKeyId": dr_transcript::direct_request_receipt_key_id_for_authority(
+                        DS_DID, g.receipt_sk.verifying_key().to_encoded_point(true).as_bytes(),
+                    ).unwrap(),
                     "preparationDigest": { "$bytes": prep_digest },
                     "selectedDevices": [{
                         "actorDid": recipient_did,
@@ -522,6 +610,42 @@ impl PlatformTransport for SharedMockDs {
             let b = &sr["body"];
             let cid = b["conversationId"].as_str().unwrap().to_string();
             let coords = b["next"].clone();
+            let opening_receipt = direct_request_i13::receipt(&g.receipt_sk, b, 1, DS_DID);
+            let publication_transcript = dr_transcript::direct_request_signing_bytes(
+                DirectRequestKind::Publish,
+                &serde_json::to_vec(b).unwrap(),
+            )
+            .unwrap();
+            let outcome_body = json!({
+                "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+                "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+                "protocolVersion": "2", "authorityDid": DS_DID,
+                "keyId": dr_transcript::direct_request_receipt_key_id_for_authority(
+                    DS_DID, g.receipt_sk.verifying_key().to_encoded_point(true).as_bytes(),
+                ).unwrap(),
+                "receipt": {
+                    "$type": "blue.catbird.chat.defs#directRequestPublishedReceipt",
+                    "requestId": b["requestId"], "requestKind": "publish",
+                    "requestDigest": STANDARD.encode(Sha256::digest(&publication_transcript)),
+                    "recordedAt": b["signedAt"], "conversationId": cid,
+                    "firstMessageId": b["firstMessageId"], "coordinates": coords,
+                    "preparationRequestDigest": b["preparationRequestDigest"],
+                    "actorDid": b["actorDid"], "actorDeviceId": b["actorDeviceId"],
+                    "actorKeyId": b["keyId"], "authGeneration": b["authGeneration"],
+                    "sequencerReceipt": opening_receipt,
+                },
+            });
+            let transcript = dr_transcript::direct_request_signing_bytes(
+                DirectRequestKind::Outcome,
+                &serde_json::to_vec(&outcome_body).unwrap(),
+            )
+            .unwrap();
+            let signature: p256::ecdsa::Signature = g.receipt_sk.sign(&transcript);
+            let signature = signature.normalize_s().unwrap_or(signature);
+            let outcome = json!({
+                "$type": "blue.catbird.chat.defs#signedDirectRequestReceipt",
+                "body": outcome_body, "signature": STANDARD.encode(signature.to_bytes()),
+            });
             g.conversations.insert(
                 cid.clone(),
                 json!({
@@ -534,13 +658,15 @@ impl PlatformTransport for SharedMockDs {
                     ]
                 }),
             );
-            g.entries.entry(cid).or_default().push(json!({
+            g.entries.entry(cid.clone()).or_default().push(json!({
                 "$type": "blue.catbird.chat.defs#directRequestEntry",
+                "entryId": b["firstMessageId"], "conversationId": cid,
+                "publicationReceipt": outcome.clone(), "sequencerReceipt": opening_receipt,
                 "seq": 1,
                 "sequencerDid": DS_DID,
                 "signedRequest": sr,
             }));
-            return ok_json(json!({ "seq": 1 }));
+            return ok_json(json!({ "outcome": outcome }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.createConversation") {
@@ -829,9 +955,9 @@ impl PlatformTransport for SharedMockDs {
             let msg_id = b["messageId"].as_str().unwrap().to_string();
             let lose_response = std::mem::take(&mut g.lose_next_send_response);
             if let Some(entry) = g.entries.get(&cid).and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry["messageId"].as_str() == Some(msg_id.as_str()))
+                entries.iter().find(|entry| {
+                    entry["signedRequest"]["body"]["messageId"].as_str() == Some(msg_id.as_str())
+                })
             }) {
                 assert_eq!(
                     entry["signedRequest"], sr,
@@ -842,8 +968,9 @@ impl PlatformTransport for SharedMockDs {
                         "send response lost after publication".into(),
                     ));
                 }
+                // An idempotent replay returns the original accepted outcome.
                 return ok_json(json!({
-                    "seq": entry["seq"],
+                    "entry": entry,
                     "sequencerReceipt": entry["sequencerReceipt"],
                 }));
             }
@@ -866,13 +993,15 @@ impl PlatformTransport for SharedMockDs {
             }
 
             let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
+            // `mls-ds` mints the entry ID and signs the I13 receipt over that sequenced entry.
+            let entry_id = uuid::Uuid::new_v4().to_string();
             let mut payload = SequencerReceiptPayload {
                 sequencer_did: DS_DID.to_string(),
                 conversation_id: cid.clone(),
                 group_id,
                 epoch,
                 sender_device_did_url: format!("{actor_did}#{actor_dev}"),
-                entry_id: msg_id.clone(),
+                entry_id: entry_id.clone(),
                 archive_commitment: commit_arr,
                 seq,
                 issued_at_ms: 1_762_000_000_000,
@@ -898,22 +1027,23 @@ impl PlatformTransport for SharedMockDs {
                 "issuedAtMs": signed.payload.issued_at_ms,
                 "signature": { "$bytes": STANDARD.encode(signed.signature) },
             });
-            g.entries.entry(cid.clone()).or_default().push(json!({
-                "$type": "blue.catbird.chat.defs#applicationMessageEntry",
+            let received_at = b["signedAt"].clone();
+            let entry = json!({
+                "$type": "blue.catbird.chat.defs#applicationEntry",
+                "entryId": entry_id,
+                "conversationId": cid.clone(),
                 "seq": seq,
-                "messageId": msg_id,
                 "signedRequest": sr,
                 "sequencerReceipt": rcpt_json.clone(),
-            }));
+                "receivedAt": received_at,
+            });
+            g.entries.entry(cid).or_default().push(entry.clone());
             if lose_response {
                 return Err(MLSError::Internal(
                     "send response lost after publication".into(),
                 ));
             }
-            return ok_json(json!({
-                "seq": seq,
-                "sequencerReceipt": rcpt_json,
-            }));
+            return ok_json(json!({ "entry": entry, "sequencerReceipt": rcpt_json }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.getConversations") {
@@ -1011,6 +1141,16 @@ impl PlatformTransport for SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.chat.acknowledgeEntries") {
+            if let Some((status, code)) = g.next_ack_error.take() {
+                return Ok(PlatformHttpResponse {
+                    status,
+                    headers: vec![],
+                    body: serde_json::to_vec(&json!({
+                        "error": code, "message": "unrelated HTTP 404 detail",
+                    }))
+                    .unwrap(),
+                });
+            }
             let cid = body_json["conversationId"]
                 .as_str()
                 .unwrap_or_default()
@@ -1063,6 +1203,21 @@ impl PlatformTransport for SharedMockDs {
 
         ok_json(json!({}))
     }
+}
+
+struct AccountTransport {
+    ds: Arc<SharedMockDs>,
+    account_did: String,
+}
+
+impl PlatformTransport for AccountTransport {
+    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+        self.ds
+            .archive_auth
+            .execute_for(&self.account_did, &request, |raw| {
+                self.ds.execute(&self.account_did, raw.clone())
+            })
+    }
 
     fn connect_realtime_stream(&self, _url: String, _cursor: Option<i64>) -> Result<(), MLSError> {
         Ok(())
@@ -1095,7 +1250,7 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
             pds_endpoint: PDS_URL.to_string(),
         },
         Arc::new(MemKeyStore::new()),
-        ds.clone(),
+        ds.for_account(ALICE_DID),
         None,
     )
     .expect("open alice");
@@ -1110,7 +1265,7 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
             pds_endpoint: PDS_URL.to_string(),
         },
         Arc::new(MemKeyStore::new()),
-        ds.clone(),
+        ds.for_account(BOB_DID),
         None,
     )
     .expect("open bob");
@@ -1144,7 +1299,7 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
             pds_endpoint: PDS_URL.to_string(),
         },
         Arc::new(MemKeyStore::new()),
-        ds.clone(),
+        ds.for_account(EVE_DID),
         None,
     )
     .expect("open eve");
@@ -1266,12 +1421,117 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
     let flushed = alice.flush_labyrinth_queue().expect("flush labyrinth");
     assert!(flushed >= 1);
     assert!(
-        !ds.inner.lock().unwrap().space_writes.is_empty(),
+        ds.archive_auth.committed_space_write_count() > 0,
         "Labyrinth sealed batch must be written via com.atproto.space.applyWrites"
     );
 
     let bob_applied = bob.sync().expect("bob sync message");
     assert!(bob_applied >= 1);
+
+    // NSE already consumed this message's MLS ratchet. Retain its genuine authenticated
+    // frame/nonce, require the real I13 receipt even after payload pruning, and do not replay MLS.
+    let archive_key = format!("native.message:{dm_cid}:{msg1_id}");
+    let mut pending_evidence: Value = bob
+        .db()
+        .read_tx(|tx| {
+            Ok(serde_json::from_slice(&tx.get_labyrinth_state(&archive_key)?.unwrap()).unwrap())
+        })
+        .unwrap();
+    pending_evidence["sequencer_receipt_json"] = Value::Null;
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &archive_key,
+                &serde_json::to_vec(&pending_evidence).unwrap(),
+                1,
+            )?;
+            tx.put_pending_op(
+                "native_archive_receipt",
+                &msg1_id,
+                &json!({
+                    "conversation_id": dm_cid, "seq": sent1.seq,
+                })
+                .to_string(),
+                1,
+            )
+        })
+        .unwrap();
+    let mls_snapshot = || {
+        bob.db()
+            .read_tx(|tx| {
+                let mut stmt = tx
+                    .conn()
+                    .prepare(
+                        "SELECT value_bytes FROM openmls_kv ORDER BY version, scope, key_bytes",
+                    )
+                    .unwrap();
+                let bytes = stmt
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                Ok(bytes)
+            })
+            .unwrap()
+    };
+    let before_receipt_replay = mls_snapshot();
+    let receipt = {
+        let mut state = ds.inner.lock().unwrap();
+        let entry = state
+            .entries
+            .get_mut(&dm_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == msg1_id)
+            .unwrap();
+        let receipt = entry["sequencerReceipt"].clone();
+        let entry_id = entry["entryId"].as_str().unwrap_or(&msg1_id).to_owned();
+        *entry = json!({
+            "$type": "blue.catbird.chat.defs#applicationEntry",
+            "conversationId": dm_cid, "entryId": entry_id, "seq": sent1.seq,
+            "payloadPruned": true, "sequencerReceipt": receipt,
+        });
+        entry["sequencerReceipt"]["signature"] = json!({ "$bytes": STANDARD.encode([0u8; 64]) });
+        receipt
+    };
+    assert!(
+        bob.sync().is_err(),
+        "cached plaintext is not a substitute for a valid receipt"
+    );
+    assert_eq!(mls_snapshot(), before_receipt_replay);
+    assert!(bob
+        .db()
+        .read_tx(|tx| tx.get_pending_op("native_archive_receipt", &msg1_id))
+        .unwrap()
+        .is_some());
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state
+            .entries
+            .get_mut(&dm_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["seq"] == sent1.seq)
+            .unwrap()["sequencerReceipt"] = receipt;
+    }
+    bob.sync()
+        .expect("cached NSE evidence completes against retained I13 metadata after pruning");
+    assert_eq!(
+        mls_snapshot(),
+        before_receipt_replay,
+        "receipt replay must not consume another ratchet"
+    );
+    bob.db()
+        .read_tx(|tx| {
+            let evidence: Value =
+                serde_json::from_slice(&tx.get_labyrinth_state(&archive_key)?.unwrap()).unwrap();
+            assert!(evidence["sequencer_receipt_json"].is_string());
+            assert!(tx
+                .get_pending_op("native_archive_receipt", &msg1_id)?
+                .is_none());
+            Ok(())
+        })
+        .unwrap();
     let bob_msgs_after = bob.list_messages(&dm_cid, None, 20).expect("bob msgs");
     assert!(bob_msgs_after
         .iter()
@@ -1369,7 +1629,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             pds_endpoint: PDS_URL.to_string(),
         },
         alice_keys.clone(),
-        ds.clone(),
+        ds.for_account(ALICE_DID),
         None,
     )
     .expect("open alice");
@@ -1383,7 +1643,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             pds_endpoint: PDS_URL.to_string(),
         },
         Arc::new(MemKeyStore::new()),
-        ds.clone(),
+        ds.for_account(BOB_DID),
         None,
     )
     .expect("open bob");
@@ -1397,7 +1657,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             pds_endpoint: PDS_URL.to_string(),
         },
         Arc::new(MemKeyStore::new()),
-        ds.clone(),
+        ds.for_account(EVE_DID),
         None,
     )
     .expect("open eve");
@@ -1647,9 +1907,10 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         let list = g.entries.entry(clean_cid.clone()).or_default();
         let pruned_seq = (list.len() as i64) + 1;
         list.push(json!({
-            "$type": "blue.catbird.chat.defs#applicationMessageEntry",
+            "$type": "blue.catbird.chat.defs#applicationEntry",
+            "entryId": uuid::Uuid::new_v4().to_string(),
+            "conversationId": clean_cid,
             "seq": pruned_seq,
-            "messageId": uuid::Uuid::new_v4().to_string(),
             "payloadPruned": true
         }));
     }
@@ -1700,13 +1961,14 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             .is_err(),
         "the follow-up gap fetch fails after the later send is durable"
     );
-    let mut historical = alice
+    // Verified history carries its I13 receipt's epoch (native restore writes `receipt.epoch`);
+    // the next sync re-verifies this cached row against that receipt.
+    let historical = alice
         .list_messages(&clean_cid, None, 100)
         .unwrap()
         .into_iter()
         .find(|m| m.message_id == later_mid)
         .expect("later send was durably accepted");
-    historical.epoch = 0;
     alice
         .import_conversation_history(&clean_cid, vec![historical])
         .expect("import ahead-of-cursor history");
@@ -1731,13 +1993,13 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             pds_endpoint: PDS_URL.to_string(),
         },
         alice_keys,
-        ds.clone(),
+        ds.for_account(ALICE_DID),
         None,
     )
     .expect("reopen alice");
     let published_entry = ds.inner.lock().unwrap().entries[&clean_cid]
         .iter()
-        .find(|entry| entry["messageId"].as_str() == Some(uncertain_mid.as_str()))
+        .find(|entry| entry["signedRequest"]["body"]["messageId"] == uncertain_mid.as_str())
         .unwrap()
         .clone();
     for tamper_ciphertext in [true, false] {
@@ -1748,7 +2010,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
                 .get_mut(&clean_cid)
                 .unwrap()
                 .iter_mut()
-                .find(|entry| entry["messageId"].as_str() == Some(uncertain_mid.as_str()))
+                .find(|entry| entry["signedRequest"]["body"]["messageId"] == uncertain_mid.as_str())
                 .unwrap();
             if tamper_ciphertext {
                 entry["signedRequest"]["body"]["applicationMessage"]["bytes"] =
@@ -1768,7 +2030,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             .get_mut(&clean_cid)
             .unwrap()
             .iter_mut()
-            .find(|entry| entry["messageId"].as_str() == Some(uncertain_mid.as_str()))
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == uncertain_mid.as_str())
             .unwrap() = published_entry.clone();
     }
     alice
@@ -1822,7 +2084,7 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
                 pds_endpoint: PDS_URL.to_string(),
             },
             keys,
-            ds.clone(),
+            ds.for_account(did),
             None,
         )
         .unwrap()
@@ -2064,7 +2326,7 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
         assert_eq!(mls_state(&alice), before);
         let deferred = ds.inner.lock().unwrap().deferred_commit_transition.take();
         if let Some(request) = deferred {
-            ds.execute_http(request)
+            ds.execute(ALICE_DID, request)
                 .expect("server accepts the reordered commit after restart");
         }
         bob.sync().expect("peer applies the accepted commit");
@@ -2259,13 +2521,13 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
         CatbirdMlsClientConfig {
             storage_root: tmp.path().join("alice").to_string_lossy().into_owned(),
             account_did: ALICE_DID.to_string(),
-            device_id: alice_dev,
+            device_id: alice_dev.clone(),
             home_ds_did: DS_DID.to_string(),
             home_ds_endpoint: DS_URL.to_string(),
             pds_endpoint: PDS_URL.to_string(),
         },
         Arc::new(MemKeyStore::new()),
-        ds.clone(),
+        ds.for_account(ALICE_DID),
         None,
     )
     .expect("open alice");
@@ -2279,11 +2541,331 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
     alice
         .send_message(&cid, &msg_id, "retained before close")
         .expect("send before close");
+    let outsider_dev = uuid::Uuid::new_v4().to_string();
+    let outsider = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("outsider").to_string_lossy().into_owned(),
+            account_did: EVE_DID.into(),
+            device_id: outsider_dev.clone(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(EVE_DID),
+        None,
+    )
+    .unwrap();
+    outsider.enroll_device(&scopes).unwrap();
+    let load_signer = |client: &CatbirdMlsClient| -> SignatureKeyPair {
+        client
+            .db()
+            .read_tx(|tx| {
+                Ok(
+                    serde_json::from_str(&tx.get_account_meta("enrolled_signer_json")?.unwrap())
+                        .unwrap(),
+                )
+            })
+            .unwrap()
+    };
+    let signer = load_signer(&alice);
+    let outsider_signer = load_signer(&outsider);
+    let coordinates = || -> Value {
+        alice
+            .db()
+            .read_tx(|tx| {
+                Ok(serde_json::from_str(
+                    &tx.get_account_meta(&format!("conversation_coords:{cid}"))?
+                        .unwrap(),
+                )
+                .unwrap())
+            })
+            .unwrap()
+    };
+    let mls_bytes = || {
+        alice.db().read_tx(|tx| {
+            let mut stmt = tx.conn().prepare(
+                "SELECT scope, key_bytes, value_bytes FROM openmls_kv ORDER BY version, scope, key_bytes",
+            ).unwrap();
+            let rows = stmt.query_map([], |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?,
+            ))).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            Ok(rows)
+        }).unwrap()
+    };
+    let signed_control = |close: bool, case: u8, prior: Value| {
+        let nonmember = case == 4;
+        let (did, device, key) = if nonmember {
+            (EVE_DID, outsider_dev.as_str(), &outsider_signer)
+        } else {
+            (ALICE_DID, alice_dev.as_str(), &signer)
+        };
+        let mut prior = prior;
+        let mut next = prior.clone();
+        next["stateVersion"] = json!(prior["stateVersion"].as_i64().unwrap() + 1);
+        if close {
+            next["lifecycle"] = json!("superseded");
+        }
+        if case == 2 {
+            prior["conversationId"] = json!(uuid::Uuid::new_v4().to_string());
+        }
+        if case == 3 {
+            next["conversationId"] = json!(uuid::Uuid::new_v4().to_string());
+        }
+        let tid = uuid::Uuid::new_v4().to_string();
+        let mut body = json!({
+            "$type": if close { "blue.catbird.chat.defs#conversationCloseBody" }
+                else { "blue.catbird.chat.defs#policyTransitionBody" },
+            "signatureDomain": if close { "CATBIRD-CHAT-CLOSE\0" } else { "CATBIRD-CHAT-POLICY\0" },
+            "transitionId": tid, "idempotencyKey": tid, "actorDid": did, "actorDeviceId": device,
+            "keyId": derive_key_id(key.public()), "authGeneration": 1,
+            "signedAt": "2026-11-03T00:00:00.000Z", "prior": prior,
+        });
+        let operation = if close {
+            body["retired"] = next;
+            body["conversationKind"] = json!("group");
+            CanonicalOperation::CloseConversation
+        } else {
+            body["next"] = next;
+            body["participantChanges"] = json!([{
+                "$type": "blue.catbird.chat.defs#removeParticipant", "userDid": EVE_DID,
+            }]);
+            CanonicalOperation::SubmitTransition
+        };
+        let prepared =
+            chat_wire::sign_clean_chat_mutation(did, device, Some(1), operation, &body, key)
+                .unwrap();
+        let mut wrapper: Value = serde_json::from_slice::<Value>(&prepared.body.unwrap()).unwrap()
+            ["signedRequest"]
+            .clone();
+        if case == 0 {
+            wrapper = body;
+        }
+        if case == 1 {
+            wrapper["signature"] = json!({ "$bytes": STANDARD.encode([0u8; 64]) });
+        }
+        wrapper
+    };
+
+    // Valid signatures from an unrelated PDS DID are still not conversation authority;
+    // raw, forged, and cross-CID bodies must have no close or coordinate effect.
+    for close in [false, true] {
+        for case in 0..5 {
+            let before = coordinates();
+            let mls_before = mls_bytes();
+            let seq = alice
+                .db()
+                .read_tx(|tx| Ok(tx.get_conversation(&cid)?.unwrap().last_seq + 1))
+                .unwrap();
+            ds.inner
+                .lock()
+                .unwrap()
+                .entries
+                .get_mut(&cid)
+                .unwrap()
+                .push(json!({
+                    "$type": if close { "blue.catbird.chat.defs#conversationCloseEntry" }
+                        else { "blue.catbird.chat.defs#policyTransitionEntry" },
+                    "seq": seq, "signedRequest": signed_control(close, case, before.clone()),
+                }));
+            assert!(
+                alice.sync().is_err(),
+                "case {case}, close={close} must fail closed"
+            );
+            ds.inner
+                .lock()
+                .unwrap()
+                .entries
+                .get_mut(&cid)
+                .unwrap()
+                .pop();
+            assert_eq!(coordinates(), before);
+            assert_eq!(mls_bytes(), mls_before);
+            assert!(alice
+                .db()
+                .read_tx(|tx| tx.get_account_meta(&format!("conversation_closed:{cid}")))
+                .unwrap()
+                .is_none());
+        }
+    }
+    let pinned = alice
+        .db()
+        .read_tx(|tx| tx.get_conversation(&cid))
+        .unwrap()
+        .unwrap();
+    ds.inner
+        .lock()
+        .unwrap()
+        .conversations
+        .get_mut(&cid)
+        .unwrap()["sequencerDid"] = json!(EVE_DID);
+    alice
+        .sync()
+        .expect("unsigned inventory does not replace pinned authority");
+    assert_eq!(
+        alice
+            .db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+            .sequencer_did,
+        pinned.sequencer_did
+    );
+    ds.inner
+        .lock()
+        .unwrap()
+        .conversations
+        .get_mut(&cid)
+        .unwrap()["sequencerDid"] = json!(DS_DID);
+
+    for code in ["RouteNotFound", "ConversationNotFound"] {
+        let seq = alice
+            .db()
+            .read_tx(|tx| Ok(tx.get_conversation(&cid)?.unwrap().last_seq + 1))
+            .unwrap();
+        ds.inner
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&cid)
+            .unwrap()
+            .push(json!({
+                "$type": "blue.catbird.chat.defs#policyTransitionEntry", "seq": seq,
+                "signedRequest": signed_control(false, 5, coordinates()),
+            }));
+        ds.inner.lock().unwrap().next_ack_error = Some((404, code.into()));
+        let result = alice.sync();
+        if code == "ConversationNotFound" {
+            result.expect("only the exact close-race code is ignored");
+        } else {
+            assert!(
+                matches!(&result, Err(MLSError::InvalidState(actual)) if actual == code),
+                "{code}: {result:?}"
+            );
+        }
+    }
+
+    let good_coordinates = coordinates();
+    let mut stale = good_coordinates.clone();
+    stale["epoch"] = json!(good_coordinates["epoch"].as_u64().unwrap() + 1);
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_account_meta(&format!("conversation_coords:{cid}"), &stale.to_string(), 1)
+        })
+        .unwrap();
+    let before_stale_send = mls_bytes();
+    let stale_mid = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        &alice.send_message(&cid, &stale_mid, "must not reserve a stale sender generation"),
+        Err(MLSError::InvalidState(code)) if code == "StaleCoordinates",
+    ));
+    assert_eq!(mls_bytes(), before_stale_send);
+    assert!(alice
+        .db()
+        .read_tx(|tx| tx.get_pending_op("application_send", &stale_mid))
+        .unwrap()
+        .is_none());
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("conversation_coords:{cid}"),
+                &good_coordinates.to_string(),
+                1,
+            )
+        })
+        .unwrap();
+
+    let group_id = pinned.group_id;
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_epoch_secret(&hex::encode(&group_id), 0, b"epoch secret", 1)?;
+            tx.put_epoch_secret(&cid, 0, b"conversation secret", 1)?;
+            for (kind, payload) in [
+                (
+                    "application_send",
+                    json!({"archive":{"conversation_id":cid,"plaintext_json":"secret"}}),
+                ),
+                (
+                    "participant_removal",
+                    json!({"conversation_id":cid,"target_did":EVE_DID}),
+                ),
+                (
+                    "commit_transition",
+                    json!({"conversation_id":cid,"kv_batch":"private"}),
+                ),
+                (
+                    "direct_request_acceptance",
+                    json!({"next":{"conversationId":cid},"wrapper":"private"}),
+                ),
+                (
+                    "native_archive_receipt",
+                    json!({"conversation_id":cid,"seq":3,"entry_id":"receipt-entry"}),
+                ),
+            ] {
+                tx.put_pending_op(kind, kind, &payload.to_string(), 1)?;
+            }
+            tx.put_pending_op(
+                "application_send",
+                "other-cid",
+                r#"{"archive":{"conversation_id":"unrelated"}}"#,
+                1,
+            )?;
+            tx.put_account_meta(
+                &format!("c33_pending_opening:{cid}"),
+                r#"{"plaintext_json":"secret"}"#,
+                1,
+            )
+        })
+        .unwrap();
 
     alice.close_conversation(&cid).expect("close conversation");
     alice
         .close_conversation(&cid)
         .expect("close conversation idempotent");
+    alice
+        .db()
+        .read_tx(|tx| {
+            let provider =
+                alice
+                    .sim_hooks()
+                    .openmls_provider(catbird_mls::storage::OpenMlsKvStorage::new(
+                        catbird_mls::storage::RusqliteKvBackend(tx.conn()),
+                    ));
+            assert!(
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
+                    .unwrap()
+                    .is_none()
+            );
+            let secrets: i64 = tx
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM epoch_secrets WHERE group_id_hex IN (?1, ?2)",
+                    rusqlite::params![hex::encode(&group_id), cid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(secrets, 0);
+            let journals: i64 = tx
+                .conn()
+                .query_row("SELECT count(*) FROM pending_ops", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                journals, 1,
+                "only the unrelated conversation journal survives"
+            );
+            assert!(tx
+                .get_account_meta(&format!("c33_pending_opening:{cid}"))?
+                .is_none());
+            assert!(tx.list_labyrinth_queue(Some(&cid), 100)?.is_empty());
+            assert!(tx
+                .get_labyrinth_state(&format!("native.message:{cid}:{msg_id}"))?
+                .is_none());
+            Ok(())
+        })
+        .unwrap();
 
     assert!(
         !ds.inner.lock().unwrap().conversations.contains_key(&cid),
@@ -2294,6 +2876,10 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
         1,
         "local decrypted history remains readable after close"
     );
+    assert!(matches!(
+        alice.list_members(&cid),
+        Err(MLSError::GroupNotFound { .. })
+    ));
     let post_close_msg = uuid::Uuid::new_v4().to_string();
     assert!(
         alice
@@ -2304,4 +2890,73 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
     alice
         .sync()
         .expect("sync skips closed/wiped conversation cleanly");
+
+    let remote_closed_cid = uuid::Uuid::new_v4().to_string();
+    let remote_closed = alice
+        .create_group(
+            &remote_closed_cid,
+            DS_DID,
+            Vec::new(),
+            Some("Received Close".into()),
+            None,
+        )
+        .unwrap();
+    let prior: Value = alice
+        .db()
+        .read_tx(|tx| {
+            Ok(serde_json::from_str(
+                &tx.get_account_meta(&format!("conversation_coords:{remote_closed_cid}"))?
+                    .unwrap(),
+            )
+            .unwrap())
+        })
+        .unwrap();
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_epoch_secret(&hex::encode(&remote_closed.group_id), 0, b"remote epoch", 1)?;
+            tx.put_pending_op("application_send", "received-close", &json!({
+            "archive": { "conversation_id": remote_closed_cid, "plaintext_json": "private" },
+        }).to_string(), 1)
+        })
+        .unwrap();
+    ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(&remote_closed_cid)
+        .unwrap()
+        .push(json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseEntry",
+            "seq": remote_closed.last_seq + 1, "signedRequest": signed_control(true, 5, prior),
+        }));
+    alice
+        .sync()
+        .expect("authorized signed close applies shared terminal cleanup");
+    alice
+        .db()
+        .read_tx(|tx| {
+            let provider =
+                alice
+                    .sim_hooks()
+                    .openmls_provider(catbird_mls::storage::OpenMlsKvStorage::new(
+                        catbird_mls::storage::RusqliteKvBackend(tx.conn()),
+                    ));
+            assert!(MlsGroup::load(
+                provider.storage(),
+                &GroupId::from_slice(&remote_closed.group_id)
+            )
+            .unwrap()
+            .is_none());
+            assert!(tx
+                .get_pending_op("application_send", "received-close")?
+                .is_none());
+            assert_eq!(
+                tx.get_account_meta(&format!("conversation_closed:{remote_closed_cid}"))?
+                    .as_deref(),
+                Some("true")
+            );
+            Ok(())
+        })
+        .unwrap();
 }

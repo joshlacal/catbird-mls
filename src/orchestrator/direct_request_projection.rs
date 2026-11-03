@@ -117,6 +117,24 @@ impl DirectRequestProjection {
         {
             return Err(invalid());
         }
+        let i13_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+            &self.trusted_authority_document,
+            &auth_did,
+            "#mls-receipt-1",
+        )?;
+        let commitment: [u8; 32] = STANDARD
+            .decode(body["archiveCommitment"].as_str().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?
+            .try_into()
+            .map_err(|_| invalid())?;
+        super::super::direct_request_bootstrap::verify_opening_receipt_binding(
+            body,
+            &body["next"],
+            &commitment,
+            &receipt["sequencerReceipt"],
+            &auth_did,
+            &i13_key,
+        )?;
         let mut consent = if body["actorDid"] == owner {
             RequestConsent::OutgoingPending
         } else if body["recipientDid"] == owner {
@@ -163,6 +181,16 @@ impl DirectRequestProjection {
             consent = RequestConsent::Closed;
         }
         if let Some(entry) = &self.publication_entry {
+            let attached = verify_signed_request_for_authority(
+                &auth_did,
+                DirectRequestKind::Outcome,
+                &serde_json::to_vec(&entry["publicationReceipt"]).map_err(|_| invalid())?,
+                &authority_key,
+            )
+            .map_err(|_| invalid())?;
+            if attached.body()["receipt"] != *receipt {
+                return Err(invalid());
+            }
             verify_request_publication_entry(
                 entry,
                 &self.publication,
@@ -408,6 +436,10 @@ pub(crate) fn verify_request_publication_entry(
         || entry["seq"]
             != expected.body()["artifacts"]["metadataSnapshot"]["authorProof"]["originSeq"]
         || entry["receivedAt"] != receipt["recordedAt"]
+        || entry["entryId"] != expected.body()["firstMessageId"]
+        || entry["seq"] != receipt["sequencerReceipt"]["seq"]
+        || entry["sequencerReceipt"] != receipt["sequencerReceipt"]
+        || entry["publicationReceipt"]["body"]["receipt"] != *receipt
     {
         return Err(invalid());
     }

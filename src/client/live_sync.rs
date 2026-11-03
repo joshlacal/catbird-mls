@@ -18,10 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
-use crate::chat_v2::transcript::{
-    normalize_read_presentation, project_signed_body, SignedMutationKind, SignedWrapper,
-    VerifiedMutation,
-};
+use crate::chat_v2::transcript::SignedMutationKind;
 use crate::client::chat_wire;
 use crate::client::traits::PlatformChangeEvent;
 use crate::client::QueuedLabyrinthArchivePayload;
@@ -37,6 +34,7 @@ use crate::orchestrator::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
 };
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
+use crate::push::processor::{verify_signed_mutation_body, NATIVE_ARCHIVE_RECEIPT_OP};
 use crate::push::{root_did_from_credential_bytes, AuthorizedPeerDeviceKey};
 use crate::storage::driver_native::map_rusqlite_err;
 use crate::storage::{
@@ -73,29 +71,233 @@ fn verify_own_commit_body(signed_request: &Value, public_key: &[u8]) -> Result<V
         .and_then(Value::as_str)
         .and_then(SignedMutationKind::from_type_id)
         .ok_or_else(|| MLSError::Cryptography("own Commit has no signed mutation kind".into()))?;
-    let wrapper_name = match kind {
-        SignedMutationKind::CommitTransition => "signedCommitTransition",
-        SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
-        SignedMutationKind::PolicyTransition => "signedPolicyTransition",
-        _ => {
-            return Err(MLSError::Cryptography(
-                "own transition has the wrong signed kind".into(),
-            ))
-        }
-    };
-    let raw = serde_json::to_vec(signed_request)?;
-    let mut normalized = normalize_read_presentation(&raw, wrapper_name, false)
-        .map_err(|e| MLSError::Cryptography(format!("normalize own Commit: {e}")))?;
-    let wrapper = SignedWrapper::decode(&serde_json::to_vec(&normalized)?)
-        .map_err(|e| MLSError::Cryptography(format!("decode own Commit signature: {e}")))?;
-    let projected = project_signed_body(kind, &wrapper.body)
-        .map_err(|e| MLSError::Cryptography(format!("project own Commit: {e}")))?;
-    VerifiedMutation::verify(projected, wrapper.signature, public_key)
-        .map_err(|e| MLSError::Cryptography(format!("verify own Commit signature: {e}")))?;
-    Ok(normalized["body"].take())
+    verify_signed_mutation_body(signed_request, kind, public_key)
+}
+
+/// An account deletion also ends this member's archive duty for that account: witness copies
+/// still queued for the conversation Space, and the retained evidence that a kick rescue or
+/// re-archive would publish, go with the local messages, so the history is never re-published.
+fn drop_archive_duty_of(tx: &crate::storage::SqlTx<'_>, deleted_did: &str) -> Result<(), MLSError> {
+    tx.conn()
+        .execute(
+            "DELETE FROM labyrinth_queue WHERE item_id IN \
+             (SELECT message_id FROM messages WHERE sender_did = ?1)",
+            [deleted_did],
+        )
+        .map_err(|e| map_rusqlite_err("drop deleted account witness queue", &e))?;
+    tx.conn()
+        .execute(
+            "DELETE FROM labyrinth_state WHERE state_key IN \
+             (SELECT 'native.message:' || conversation_id || ':' || message_id \
+              FROM messages WHERE sender_did = ?1)",
+            [deleted_did],
+        )
+        .map_err(|e| map_rusqlite_err("drop deleted account archive evidence", &e))?;
+    Ok(())
+}
+
+/// `labyrinth_state` key: `cid` sequenced `did`'s account deletion; the value is its seq.
+pub(super) fn account_deletion_key(cid: &str, did: &str) -> String {
+    format!("native.account_deleted:{cid}:{did}")
+}
+
+/// Records an applied, sequenced `accountDeletedEntry`. Archive history loads and restores hide
+/// every copy of `deleted_did`'s messages that orders before it: no server redaction covers the
+/// witness and owner copies other members already published.
+pub(super) fn record_account_deletion(
+    tx: &crate::storage::SqlTx<'_>,
+    cid: &str,
+    deleted_did: &str,
+    seq: i64,
+    now_ms: i64,
+) -> Result<(), MLSError> {
+    tx.put_labyrinth_state(
+        &account_deletion_key(cid, deleted_did),
+        seq.to_string().as_bytes(),
+        now_ms,
+    )
 }
 
 impl CatbirdMlsClient {
+    /// PDS authorization alone does not grant conversation authority. Bind the signing
+    /// device to a current local MLS leaf, reloading after each preceding Commit.
+    fn verify_participant_control_body(
+        &self,
+        cid: &str,
+        signed_request: &Value,
+        kind: SignedMutationKind,
+        keys: &[AuthorizedPeerDeviceKey],
+        canonical_dev_id: &str,
+        signer: &SignatureKeyPair,
+    ) -> Result<Value, MLSError> {
+        let actor_did = signed_request
+            .pointer("/body/actorDid")
+            .and_then(Value::as_str);
+        let actor_dev = signed_request
+            .pointer("/body/actorDeviceId")
+            .and_then(Value::as_str);
+        let public_key = self.db.read_tx(|tx| {
+            let convo = tx.get_conversation(cid)?.ok_or_else(|| {
+                MLSError::Cryptography("control entry has no local conversation".into())
+            })?;
+            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let provider = self.hooks.openmls_provider(storage);
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                .map_err(|e| MLSError::Internal(format!("load control authority: {e:?}")))?
+                .ok_or_else(|| {
+                    MLSError::Cryptography("control entry has no active MLS group".into())
+                })?;
+            for member in group.members() {
+                let (did, device) =
+                    root_did_from_credential_bytes(member.credential.serialized_content())?;
+                if actor_did != Some(did.as_str()) || actor_dev != Some(device.as_str()) {
+                    continue;
+                }
+                let public_key = member.signature_key.as_slice();
+                let own_key = did == self.normalized_did
+                    && device == canonical_dev_id
+                    && public_key == signer.public();
+                if own_key
+                    || keys.iter().any(|key| {
+                        key.did == did
+                            && key.device_id == device
+                            && key.signature_public_key.as_slice() == public_key
+                    })
+                {
+                    return Ok(public_key.to_vec());
+                }
+            }
+            Err(MLSError::Cryptography(
+                "I4: control entry signer is not an authorized active participant device".into(),
+            ))
+        })?;
+        let body = verify_signed_mutation_body(signed_request, kind, &public_key)?;
+        let next_field = if kind == SignedMutationKind::ConversationClose {
+            "retired"
+        } else {
+            "next"
+        };
+        if body["prior"]["conversationId"].as_str() != Some(cid)
+            || body[next_field]["conversationId"].as_str() != Some(cid)
+        {
+            return Err(MLSError::Cryptography(
+                "control entry is signed for a different conversation".into(),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Complete NSE-retained plaintext proof without replaying its consumed MLS ratchet.
+    /// Payload pruning is safe here: the retained frame/nonce and signed I13 receipt suffice.
+    fn finish_received_archive_evidence(
+        &self,
+        cid: &str,
+        message_id: &str,
+        entry_seq: i64,
+        entry_id: &str,
+        receipt: &Value,
+    ) -> Result<(), MLSError> {
+        let authority = self.db.read_tx(|tx| {
+            tx.get_conversation(cid)?
+                .map(|row| row.sequencer_did)
+                .ok_or_else(|| MLSError::group_not_found(cid))
+        })?;
+        let kid = receipt
+            .get("kid")
+            .and_then(Value::as_str)
+            .unwrap_or("#mls-receipt-1");
+        let key = self
+            .resolve_sequencer_receipt_key(&authority, kid)?
+            .ok_or_else(|| {
+                MLSError::Cryptography("I13: cached message receipt authority unavailable".into())
+            })?;
+        let now_ms = self.hooks.now_ms();
+        self.db.write_tx(|tx| {
+            let mut convo = tx
+                .get_conversation(cid)?
+                .ok_or_else(|| MLSError::group_not_found(cid))?;
+            let message = tx.get_message(message_id)?.ok_or_else(|| {
+                MLSError::Cryptography(
+                    "cached message disappeared before receipt validation".into(),
+                )
+            })?;
+            let state_key = format!("native.message:{cid}:{message_id}");
+            let raw = tx.get_labyrinth_state(&state_key)?.ok_or_else(|| {
+                MLSError::Cryptography(
+                    "cached message has no retained authenticated archive frame".into(),
+                )
+            })?;
+            let mut evidence: Value = serde_json::from_slice(&raw)?;
+            let frame = evidence["labyrinth_frame_json"].as_str().ok_or_else(|| {
+                MLSError::Cryptography("cached message archive frame missing".into())
+            })?;
+            serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(frame)
+                .map_err(|e| MLSError::Cryptography(format!("cached archive payload: {e}")))?;
+            let nonce = STANDARD
+                .decode(evidence["frame_nonce_b64"].as_str().ok_or_else(|| {
+                    MLSError::Cryptography("cached message archive nonce missing".into())
+                })?)
+                .map_err(|e| MLSError::Cryptography(format!("cached archive nonce: {e}")))?;
+            let nonce: [u8; 32] = nonce.try_into().map_err(|_| {
+                MLSError::Cryptography("cached archive nonce must be 32 bytes".into())
+            })?;
+            let commitment =
+                labyrinth_protocol::receipt::compute_archive_commitment(&nonce, frame.as_bytes());
+            let (seq, generation, stored_receipt) =
+                chat_wire::parse_and_verify_i13_sequencer_receipt(
+                    receipt,
+                    &key,
+                    &authority,
+                    cid,
+                    &message.group_id,
+                    message.epoch.max(0) as u64,
+                    entry_id,
+                    &commitment,
+                )?;
+            if evidence["message_id"].as_str() != Some(message_id)
+                || evidence["conversation_id"].as_str() != Some(cid)
+                || message.conversation_id != cid
+                || convo.sequencer_did != authority
+                || message.group_id != convo.group_id
+                || generation != convo.generation.max(0) as u64
+                || i64::try_from(seq).ok() != Some(entry_seq)
+                || receipt["senderDid"].as_str() != Some(message.sender_did.as_str())
+                || receipt["senderDeviceId"].as_str() != Some(message.sender_device_id.as_str())
+                || evidence["sequencer_receipt_json"]
+                    .as_str()
+                    .is_some_and(|prior| prior != stored_receipt.as_str())
+            {
+                return Err(MLSError::Cryptography(
+                    "I13: cached archive proof binding mismatch".into(),
+                ));
+            }
+            // NSE-retained evidence becomes archivable only once its I13 receipt verifies.
+            let completes = evidence["sequencer_receipt_json"].is_null();
+            evidence["sequencer_receipt_json"] = json!(stored_receipt);
+            if completes {
+                evidence["seq"] = json!(entry_seq);
+            }
+            tx.put_labyrinth_state(&state_key, &serde_json::to_vec(&evidence)?, now_ms)?;
+            if completes && message.sender_did != self.normalized_did {
+                let archive: QueuedLabyrinthArchivePayload = serde_json::from_value(evidence)
+                    .map_err(|e| {
+                        MLSError::Cryptography(format!("retained archive payload: {e}"))
+                    })?;
+                super::live_plane::enqueue_labyrinth_archive(tx, &archive)?;
+            }
+            tx.delete_pending_op(NATIVE_ARCHIVE_RECEIPT_OP, message_id)?;
+            tx.conn()
+                .execute(
+                    "UPDATE messages SET seq = ?1 WHERE message_id = ?2",
+                    rusqlite::params![entry_seq, message_id],
+                )
+                .map_err(|e| map_rusqlite_err("update authenticated cached message seq", &e))?;
+            convo.last_seq = convo.last_seq.max(entry_seq);
+            convo.updated_at_ms = now_ms;
+            tx.upsert_conversation(&convo)
+        })
+    }
+
     /// Reconcile conversations, `C33` direct requests, pending `Welcome`s, leaf-recovery requests,
     /// and ordered `getEntries` deltas from the home `mls-ds` (`Spec §6.3`, `I2`, `I4`, `I6`, `I13`, `I14`).
     pub fn sync(&self) -> Result<u32, MLSError> {
@@ -141,11 +343,7 @@ impl CatbirdMlsClient {
             )?);
             // A leaf-removal Commit accepted without its response (and recovered from its
             // journal above) still owes the participant-removal policy transition.
-            let _ = self.complete_participant_removals(
-                &convo.conversation_id,
-                &canonical_dev_id,
-                &signer,
-            );
+            self.complete_participant_removals(&convo.conversation_id, &canonical_dev_id, &signer)?;
         }
 
         if total_applied > 0 {
@@ -201,11 +399,6 @@ impl CatbirdMlsClient {
                 .or_else(|| state.get("kind"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("group");
-            let sequencer_did = state
-                .get("sequencerDid")
-                .or_else(|| state.get("authorityDid"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(&self.config.home_ds_did);
 
             let local = self.db.read_tx(|tx| tx.get_conversation(cid))?;
             let has_local = local.is_some();
@@ -213,18 +406,13 @@ impl CatbirdMlsClient {
             if let (Some(row), Some(authority), "group") =
                 (&local, state_view_sequencer_did(state), kind)
             {
-                if row.sequencer_did != authority {
+                if row.sequencer_did.is_empty() {
                     self.repair_conversation_authority(cid, authority)?;
                 }
             }
 
             if kind == "direct" && !has_local {
-                if self.import_incoming_c33_direct_request(
-                    canonical_dev_id,
-                    signer,
-                    cid,
-                    sequencer_did,
-                )? {
+                if self.import_incoming_c33_direct_request(canonical_dev_id, signer, cid)? {
                     count = count.saturating_add(1);
                 }
                 continue;
@@ -259,9 +447,8 @@ impl CatbirdMlsClient {
         Ok((count, inventory_session_id))
     }
 
-    /// Re-points a joined conversation, its Labyrinth Space, and its journaled sends at the
-    /// sequencing authority its state view names. Rows joined from a `welcomeView` (which
-    /// names none) used to default to the home DS and then failed every `I13` receipt.
+    /// Pin an initially unknown authority. Inventory JSON is not a transfer proof and
+    /// must never replace an existing `I13` trust anchor or its journaled sends.
     fn repair_conversation_authority(&self, cid: &str, authority: &str) -> Result<(), MLSError> {
         self.db.write_tx(|tx| {
             let Some(mut row) = tx.get_conversation(cid)? else {
@@ -269,6 +456,11 @@ impl CatbirdMlsClient {
             };
             if row.sequencer_did == authority {
                 return Ok(());
+            }
+            if !row.sequencer_did.is_empty() {
+                return Err(MLSError::Cryptography(
+                    "unsigned conversation inventory cannot replace a pinned sequencer".into(),
+                ));
             }
             let space_uri = row
                 .space_uri
@@ -339,7 +531,6 @@ impl CatbirdMlsClient {
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
         cid: &str,
-        sequencer_did_fallback: &str,
     ) -> Result<bool, MLSError> {
         let entries_val = self.query_signed_chat_ds(
             "blue.catbird.chat.getEntries",
@@ -414,6 +605,15 @@ impl CatbirdMlsClient {
         .map_err(|e| MLSError::Cryptography(format!("verify C33 publication signature: {e}")))?;
 
         let vp = verified_pub.body();
+        if vp["conversationId"].as_str() != Some(cid)
+            || vp["next"]["conversationId"].as_str() != Some(cid)
+            || (vp["actorDid"].as_str() != Some(self.normalized_did.as_str())
+                && vp["recipientDid"].as_str() != Some(self.normalized_did.as_str()))
+        {
+            return Err(MLSError::Cryptography(
+                "C33 publication conversation/participant mismatch".into(),
+            ));
+        }
         let ctx_val = json!({
             "protocolVersion": "2",
             "requestId": vp["requestId"],
@@ -476,48 +676,112 @@ impl CatbirdMlsClient {
                 &artifact["metadataSnapshot"]["ciphertext"],
             )?,
             initial_ciphertext: chat_wire::json_bytes(&artifact["initialCiphertext"])?,
+            archive_commitment: chat_wire::json_bytes(&vp["archiveCommitment"])?
+                .try_into()
+                .map_err(|_| {
+                    MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into())
+                })?,
+            opening: None,
         };
 
         let own_pds_keys = self.fetch_and_cache_authorized_pds_device_keys(&self.normalized_did)?;
         let mut all_auth_keys = sender_pds_keys;
         all_auth_keys.extend(own_pds_keys);
 
+        let peer_did = if sender_did == self.normalized_did {
+            vp["recipientDid"]
+                .as_str()
+                .ok_or_else(|| MLSError::Cryptography("C33 missing recipient".into()))?
+        } else {
+            sender_did
+        };
+        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
+            MLSError::Cryptography("C33 peer home DS authority unavailable".into())
+        })?;
+        let effective_seq_did = dr_transcript::derive_deterministic_coordinator(
+            self.config.home_ds_did.trim(),
+            &peer_ds,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
+        let publication_receipt = raw_dr_entry.get("publicationReceipt").ok_or_else(|| {
+            MLSError::Cryptography("C33 entry missing signed publicationReceipt".into())
+        })?;
+        let publication_receipt = dr_transcript::normalize_read_presentation(
+            &serde_json::to_vec(publication_receipt)?,
+            "signedDirectRequestReceipt",
+            publication_receipt.get("$type").is_some(),
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 publication receipt: {e}")))?;
+        let authority_doc = self
+            .resolve_did_document(&effective_seq_did)?
+            .ok_or_else(|| {
+                MLSError::Cryptography("C33 receipt authority document unavailable".into())
+            })?;
+        let receipt_method = publication_receipt
+            .pointer("/body/keyId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MLSError::Cryptography("C33 outcome missing receipt keyId".into()))?;
+        let receipt_key = dr_transcript::resolve_direct_request_receipt_key_for_authority(
+            &effective_seq_did,
+            &authority_doc,
+            receipt_method,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 receipt key: {e}")))?;
+        let sequencer_receipt_key = chat_wire::decode_p256_sec1_from_did_doc(
+            &authority_doc,
+            &effective_seq_did,
+            "#mls-receipt-1",
+        )?;
+        let entry_receipt = raw_dr_entry.get("sequencerReceipt").ok_or_else(|| {
+            MLSError::Cryptography("C33 entry missing I13 sequencerReceipt".into())
+        })?;
+        let (entry_seq, _, dr_rcpt_json) =
+            crate::orchestrator::direct_request_bootstrap::verify_opening_receipt(
+                &bootstrap,
+                entry_receipt,
+                &effective_seq_did,
+                &sequencer_receipt_key,
+            )?;
+        let (_, _, outcome_rcpt_json) =
+            crate::orchestrator::direct_request_bootstrap::verify_opening_receipt(
+                &bootstrap,
+                &publication_receipt["body"]["receipt"]["sequencerReceipt"],
+                &effective_seq_did,
+                &sequencer_receipt_key,
+            )?;
+        let entry_seq = i64::try_from(entry_seq)
+            .map_err(|_| MLSError::Cryptography("C33 entry sequence overflow".into()))?;
+        if raw_dr_entry["seq"].as_i64() != Some(entry_seq)
+            || dr_rcpt_json != outcome_rcpt_json
+            || raw_dr_entry["entryId"].as_str() != Some(first_message_id)
+        {
+            return Err(MLSError::Cryptography(
+                "C33 entry and outcome receipt mismatch".into(),
+            ));
+        }
+
         let welcome_input = DirectRequestWelcomeInput {
             bootstrap: bootstrap.clone(),
             publication_request: pub_norm_bytes.clone(),
             actor_signature_public_key: candidate_key,
-            preparation_request_digest: [0u8; 32],
+            preparation_request_digest: chat_wire::json_bytes(&vp["preparationRequestDigest"])?
+                .try_into()
+                .map_err(|_| {
+                    MLSError::Cryptography("C33 preparation digest must be 32 bytes".into())
+                })?,
             local_identity: format!("{}#{}", self.normalized_did, canonical_dev_id).into_bytes(),
             local_package_ref: local_pkg_ref
                 .or_else(|| refs.into_iter().next())
                 .unwrap_or_default(),
-            published_receipt: Vec::new(),
-            receipt_authority_did: sequencer_did_fallback.to_string(),
-            receipt_authority_key: Vec::new(),
+            published_receipt: serde_json::to_vec(&publication_receipt)?,
+            receipt_authority_did: effective_seq_did.clone(),
+            receipt_authority_key: receipt_key,
+            sequencer_receipt_authority_key: sequencer_receipt_key,
         };
+        crate::orchestrator::direct_request_shared_crypto::validate_request_welcome_receipt(
+            &welcome_input,
+        )?;
 
-        let entry_seq = raw_dr_entry
-            .get("seq")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(1)
-            .max(1);
-        let effective_seq_did = raw_dr_entry
-            .get("sequencerDid")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .or_else(|| {
-                let sender_ds = self.resolve_peer_home_ds_did(sender_did)?;
-                let own_ds = self.config.home_ds_did.trim();
-                if !own_ds.is_empty() && own_ds <= sender_ds.as_str() {
-                    Some(own_ds.to_string())
-                } else {
-                    Some(sender_ds)
-                }
-            })
-            .unwrap_or_else(|| sequencer_did_fallback.to_string());
-        let dr_rcpt_json = raw_dr_entry
-            .get("sequencerReceipt")
-            .and_then(|r| serde_json::to_string(r).ok());
         let now_ms = self.hooks.now_ms();
         let pub_norm_str = String::from_utf8(pub_norm_bytes)
             .map_err(|e| MLSError::Internal(format!("C33 pub UTF-8: {e}")))?;
@@ -567,19 +831,20 @@ impl CatbirdMlsClient {
 
             let group_id = group.group_id().as_slice().to_vec();
             let epoch = group.epoch().as_u64() as i64;
-            let intro_json =
+            let (intro_json, opening) =
                 match decrypt_introduction_with_provider(&provider, &mut group, &welcome_input)? {
-                    DirectRequestIntroductionResult::Ready { plaintext } => {
+                    DirectRequestIntroductionResult::Ready { plaintext, opening } => {
                         let intro_val = dr_transcript::decode_direct_request_introduction(
                             &plaintext,
                         )
                         .map_err(|e| MLSError::Cryptography(format!("decode C33 intro: {e}")))?;
                         let txt = intro_val.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        json!({ "text": txt }).to_string()
+                        (json!({ "text": txt }).to_string(), Some(opening))
                     }
-                    DirectRequestIntroductionResult::Unavailable { code } => {
-                        json!({ "text": format!("[unavailable:{code}]") }).to_string()
-                    }
+                    DirectRequestIntroductionResult::Unavailable { code } => (
+                        json!({ "text": format!("[unavailable:{code}]") }).to_string(),
+                        None,
+                    ),
                 };
 
             let space_uri = Some(format!(
@@ -636,30 +901,49 @@ impl CatbirdMlsClient {
             })?;
 
             // Stage C33 opening message so `accept_direct_request` archives it ONLY after consent!
-            let staged_opening = QueuedLabyrinthArchivePayload {
-                version: 1,
-                message_id: first_message_id.to_string(),
-                conversation_id: cid.to_string(),
-                group_id_hex: hex::encode(&group_id),
-                epoch,
-                seq: entry_seq,
-                sender_did: sender_did.to_string(),
-                sender_device_id: sender_device_id.to_string(),
-                sequencer_did: effective_seq_did,
-                space_uri,
-                plaintext_json: intro_json.clone(),
-                labyrinth_frame_json: intro_json,
-                mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
-                frame_nonce_b64: None,
-                sequencer_receipt_json: dr_rcpt_json,
-                created_at_ms: now_ms,
-            };
-            tx.put_account_meta(
-                &format!("c33_pending_opening:{cid}"),
-                &serde_json::to_string(&staged_opening)
-                    .map_err(|e| MLSError::Internal(e.to_string()))?,
-                now_ms,
-            )?;
+            if let Some(opening) = opening {
+                let staged_opening = QueuedLabyrinthArchivePayload {
+                    expected_member_dids: group
+                        .members()
+                        .map(|member| {
+                            root_did_from_credential_bytes(member.credential.serialized_content())
+                                .map(|(did, _)| did)
+                        })
+                        .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+                        .into_iter()
+                        .collect(),
+                    version: 1,
+                    message_id: first_message_id.to_string(),
+                    conversation_id: cid.to_string(),
+                    group_id_hex: hex::encode(&group_id),
+                    epoch,
+                    seq: entry_seq,
+                    sender_did: sender_did.to_string(),
+                    sender_device_id: sender_device_id.to_string(),
+                    sequencer_did: effective_seq_did,
+                    space_uri,
+                    plaintext_json: intro_json.clone(),
+                    labyrinth_frame_json: String::from_utf8(opening.canonical_payload_bytes)
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!("C33 canonical opening frame: {e}"))
+                        })?,
+                    mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
+                    frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
+                    sequencer_receipt_json: Some(dr_rcpt_json),
+                    created_at_ms: now_ms,
+                };
+                tx.put_labyrinth_state(
+                    &format!("native.message:{cid}:{first_message_id}"),
+                    &serde_json::to_vec(&staged_opening)?,
+                    now_ms,
+                )?;
+                tx.put_account_meta(
+                    &format!("c33_pending_opening:{cid}"),
+                    &serde_json::to_string(&staged_opening)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?,
+                    now_ms,
+                )?;
+            }
             Ok(())
         })?;
 
@@ -789,25 +1073,22 @@ impl CatbirdMlsClient {
                         CanonicalOperation::AcknowledgeWelcome,
                         &ack_body,
                         signer,
-                    );
+                    )?;
                 }
                 continue;
             }
 
             // The frozen `welcomeView` names no sequencer; the conversation state view does.
-            let sequencer_did = match self.query_signed_chat_ds(
-                "blue.catbird.chat.getConversationState",
-                &[("actorDeviceId", canonical_dev_id), ("conversationId", cid)],
-                canonical_dev_id,
-                signer,
-            ) {
-                Ok(resp) => resp
-                    .get("state")
-                    .and_then(state_view_sequencer_did)
-                    .map(str::to_owned),
-                Err(MLSError::ContextClosed) => return Err(MLSError::ContextClosed),
-                Err(_) => None,
-            };
+            let sequencer_did = self
+                .query_signed_chat_ds(
+                    "blue.catbird.chat.getConversationState",
+                    &[("actorDeviceId", canonical_dev_id), ("conversationId", cid)],
+                    canonical_dev_id,
+                    signer,
+                )?
+                .get("state")
+                .and_then(state_view_sequencer_did)
+                .map(str::to_owned);
             let Some(sequencer_did) = sequencer_did else {
                 // Joining without the authority would fail every `I13` receipt; the Welcome
                 // stays pending until a later sync can read the state view.
@@ -1038,7 +1319,16 @@ impl CatbirdMlsClient {
                 signer,
             ) {
                 Ok(resp) => resp,
-                Err(MLSError::Internal(msg)) if msg.contains("ConversationNotFound") => continue,
+                // A removed device is no current leaf and owes no fulfillment; Phase 4
+                // still delivers its removal (and the kick rescue) from `getEntries`.
+                Err(MLSError::InvalidState(code))
+                    if matches!(
+                        code.as_str(),
+                        "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval"
+                    ) =>
+                {
+                    continue
+                }
                 Err(err) => return Err(err),
             };
             let Some(prior) = resp.pointer("/state/coordinates") else {
@@ -1490,6 +1780,39 @@ impl CatbirdMlsClient {
 
         let mut sorted_entries: Vec<Value> = Vec::new();
         let mut cursor_seq = convo.last_seq.max(0);
+        let pending_receipts: BTreeMap<i64, (String, Option<String>)> = self.db.read_tx(|tx| {
+            let mut stmt = tx
+                .conn()
+                .prepare(
+                    "SELECT op_key, json_extract(payload_json, '$.seq'), \
+                        json_extract(payload_json, '$.entry_id') FROM pending_ops \
+                 WHERE op_kind = ?1 AND json_extract(payload_json, '$.conversation_id') = ?2",
+                )
+                .map_err(|e| map_rusqlite_err("pending archive receipts.prepare", &e))?;
+            let rows = stmt
+                .query_map(rusqlite::params![NATIVE_ARCHIVE_RECEIPT_OP, cid], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| map_rusqlite_err("pending archive receipts.query", &e))?;
+            let mut pending = BTreeMap::new();
+            for row in rows {
+                let (message_id, seq, entry_id) =
+                    row.map_err(|e| map_rusqlite_err("pending archive receipts.row", &e))?;
+                if seq < 1 || pending.insert(seq, (message_id, entry_id)).is_some() {
+                    return Err(MLSError::Cryptography(
+                        "ambiguous pending archive receipt sequence".into(),
+                    ));
+                }
+            }
+            Ok(pending)
+        })?;
+        if let Some((seq, _)) = pending_receipts.first_key_value() {
+            cursor_seq = cursor_seq.min(seq.saturating_sub(1));
+        }
         for _ in 0..50 {
             let after_seq_str = cursor_seq.to_string();
             let resp = match self.query_signed_chat_ds(
@@ -1504,7 +1827,7 @@ impl CatbirdMlsClient {
                 signer,
             ) {
                 Ok(resp) => resp,
-                Err(MLSError::Internal(msg)) if msg.contains("ConversationNotFound") => break,
+                Err(MLSError::InvalidState(code)) if code == "ConversationNotFound" => break,
                 Err(err) => return Err(err),
             };
             let Some(page_entries) = resp.get("entries").and_then(|v| v.as_array()) else {
@@ -1586,6 +1909,20 @@ impl CatbirdMlsClient {
             let body = signed_req.get("body").unwrap_or(signed_req);
             let body_type = body.get("$type").and_then(|v| v.as_str()).unwrap_or("");
             let now_ms = self.hooks.now_ms();
+            let is_application = entry_type.ends_with("applicationMessageEntry")
+                || entry_type.ends_with("applicationEntry")
+                || body_type.ends_with("applicationSendBody")
+                || body.get("applicationMessage").is_some()
+                || entry.get("applicationMessage").is_some();
+            if pending_receipts.contains_key(&entry_seq) && !is_application {
+                return Err(MLSError::Cryptography(
+                    "pending archive receipt was replaced by a non-application entry".into(),
+                ));
+            }
+            if entry_seq <= convo.last_seq && !is_application {
+                // Receipt-only replay must not reapply already accepted control effects.
+                continue;
+            }
 
             if entry_type.ends_with("accountDeletedEntry") || entry_type == "accountDeleted" {
                 if let Some(deleted_did) = entry
@@ -1593,7 +1930,11 @@ impl CatbirdMlsClient {
                     .or_else(|| body.get("actorDid"))
                     .and_then(|v| v.as_str())
                 {
-                    let _ = handle_account_deleted_event(&self.db, deleted_did);
+                    self.db.write_tx(|tx| {
+                        drop_archive_duty_of(tx, deleted_did)?;
+                        record_account_deletion(tx, cid, deleted_did, entry_seq, now_ms)
+                    })?;
+                    handle_account_deleted_event(&self.db, deleted_did)?;
                     self.clear_cached_groups();
                 }
                 max_seq = max_seq.max(entry_seq);
@@ -1603,29 +1944,20 @@ impl CatbirdMlsClient {
             if entry_type.ends_with("conversationCloseEntry")
                 || body_type.ends_with("conversationCloseBody")
             {
-                let retired_opt = body
-                    .get("retired")
-                    .or_else(|| entry.pointer("/tombstone/retired"))
-                    .and_then(|c| chat_wire::canonicalize_wire_coordinate(c, Some(cid)).ok());
-                self.db.write_tx(|tx| {
-                    if let Some(rc) = &retired_opt {
-                        let s = serde_json::to_string(rc)
-                            .map_err(|e| MLSError::Internal(e.to_string()))?;
-                        tx.put_account_meta(&format!("conversation_coords:{cid}"), &s, now_ms)?;
-                    }
-                    tx.put_account_meta(&format!("conversation_closed:{cid}"), "true", now_ms)?;
-                    if let Some(mut c) = tx.get_conversation(cid)? {
-                        c.last_seq = c.last_seq.max(entry_seq);
-                        c.updated_at_ms = now_ms;
-                        tx.upsert_conversation(&c)?;
-                    }
-                    Self::prune_pending_commit_transitions(tx, cid, 0, i64::MAX, true)?;
-                    Ok(())
-                })?;
+                let verified = self.verify_participant_control_body(
+                    cid,
+                    signed_req,
+                    SignedMutationKind::ConversationClose,
+                    &flat_auth_keys,
+                    canonical_dev_id,
+                    signer,
+                )?;
+                let retired = chat_wire::canonicalize_wire_coordinate(&verified["retired"], None)?;
+                self.apply_terminal_close(cid, Some(&retired), Some(entry_seq))?;
                 was_closed = true;
                 max_seq = max_seq.max(entry_seq);
                 applied_count = applied_count.saturating_add(1);
-                continue;
+                break;
             }
 
             if entry_type.ends_with("directRequestAcceptanceEntry")
@@ -1672,46 +2004,14 @@ impl CatbirdMlsClient {
             if entry_type.ends_with("policyTransitionEntry")
                 || body_type.ends_with("policyTransitionBody")
             {
-                let actor_did = body
-                    .get("actorDid")
-                    .or_else(|| entry.get("actorDid"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let actor_dev = body
-                    .get("actorDeviceId")
-                    .or_else(|| entry.get("actorDeviceId"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let verified_body = if actor_did == self.normalized_did
-                    && actor_dev == canonical_dev_id
-                {
-                    verify_own_commit_body(signed_req, signer.public())?
-                } else {
-                    let mut verified = None;
-                    for key in flat_auth_keys
-                        .iter()
-                        .filter(|k| k.did == actor_did && k.device_id == actor_dev)
-                    {
-                        if let Ok(ok_body) =
-                            verify_own_commit_body(signed_req, &key.signature_public_key)
-                        {
-                            verified = Some(ok_body);
-                            break;
-                        }
-                    }
-                    verified.ok_or_else(|| {
-                        MLSError::Cryptography(format!(
-                            "I4: policyTransitionEntry at seq {entry_seq} failed authorized device signature verification"
-                        ))
-                    })?
-                };
-                if verified_body["prior"]["conversationId"].as_str() != Some(cid)
-                    || verified_body["next"]["conversationId"].as_str() != Some(cid)
-                {
-                    return Err(MLSError::Cryptography(
-                        "policyTransitionEntry is signed for a different conversation".into(),
-                    ));
-                }
+                let verified_body = self.verify_participant_control_body(
+                    cid,
+                    signed_req,
+                    SignedMutationKind::PolicyTransition,
+                    &flat_auth_keys,
+                    canonical_dev_id,
+                    signer,
+                )?;
                 if let Some(nc) = verified_body
                     .get("next")
                     .and_then(|c| chat_wire::canonicalize_wire_coordinate(c, Some(cid)).ok())
@@ -2101,31 +2401,26 @@ impl CatbirdMlsClient {
                 continue;
             }
 
-            if entry_type.ends_with("applicationMessageEntry")
-                || entry_type.ends_with("applicationEntry")
-                || body_type.ends_with("applicationSendBody")
-                || body.get("applicationMessage").is_some()
-                || entry.get("applicationMessage").is_some()
-            {
-                if entry.get("payloadPruned").and_then(|v| v.as_bool()) == Some(true) {
-                    self.db.write_tx(|tx| {
-                        if let Some(mut c) = tx.get_conversation(cid)? {
-                            c.last_seq = c.last_seq.max(entry_seq);
-                            c.updated_at_ms = now_ms;
-                            tx.upsert_conversation(&c)?;
-                        }
-                        Ok(())
-                    })?;
-                    max_seq = max_seq.max(entry_seq);
-                    applied_count = applied_count.saturating_add(1);
-                    continue;
-                }
-
-                let msg_id = body
+            if is_application {
+                let pending = pending_receipts.get(&entry_seq);
+                let wire_message_id = body
                     .get("messageId")
                     .or_else(|| entry.get("messageId"))
-                    .or_else(|| entry.get("entryId"))
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str);
+                if pending.is_some_and(|(mid, expected_entry_id)| {
+                    wire_message_id.is_some_and(|wire| wire != mid.as_str())
+                        || expected_entry_id.as_deref().is_some_and(|expected| {
+                            entry.get("entryId").and_then(Value::as_str) != Some(expected)
+                        })
+                }) {
+                    return Err(MLSError::Cryptography(
+                        "entry differs from retained NSE message identity".into(),
+                    ));
+                }
+                let msg_id = pending
+                    .map(|(mid, _)| mid.as_str())
+                    .or(wire_message_id)
+                    .or_else(|| entry.get("entryId").and_then(Value::as_str))
                     .unwrap_or("");
                 if msg_id.is_empty() {
                     max_seq = max_seq.max(entry_seq);
@@ -2140,13 +2435,27 @@ impl CatbirdMlsClient {
                             crate::planted::PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart,
                         ));
                 if already_have {
-                    self.db.write_tx(|tx| {
-                        tx.conn()
-                            .execute(
-                                "UPDATE messages SET seq = ?1 WHERE message_id = ?2;",
-                                rusqlite::params![entry_seq, msg_id],
+                    let receipt = entry
+                        .get("sequencerReceipt")
+                        .filter(|value| value.is_object())
+                        .ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "I13: cached application entry missing sequencerReceipt".into(),
                             )
-                            .map_err(|e| MLSError::Internal(format!("update echo seq: {e}")))?;
+                        })?;
+                    let entry_id = entry
+                        .get("entryId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(msg_id);
+                    self.finish_received_archive_evidence(
+                        cid, msg_id, entry_seq, entry_id, receipt,
+                    )?;
+                    max_seq = max_seq.max(entry_seq);
+                    applied_count = applied_count.saturating_add(1);
+                    continue;
+                }
+                if entry.get("payloadPruned").and_then(|v| v.as_bool()) == Some(true) {
+                    self.db.write_tx(|tx| {
                         if let Some(mut c) = tx.get_conversation(cid)? {
                             c.last_seq = c.last_seq.max(entry_seq);
                             c.updated_at_ms = now_ms;
@@ -2155,6 +2464,7 @@ impl CatbirdMlsClient {
                         Ok(())
                     })?;
                     max_seq = max_seq.max(entry_seq);
+                    applied_count = applied_count.saturating_add(1);
                     continue;
                 }
 
@@ -2304,8 +2614,9 @@ impl CatbirdMlsClient {
                             "expected ApplicationMessage".to_string(),
                         ));
                     };
+                    let plaintext = app_msg.into_bytes();
                     let (display_body, json_str, verified_commitment_opt) =
-                        extract_plaintext_body_and_verify_aad(&app_msg.into_bytes(), &aad_bytes)?;
+                        extract_plaintext_body_and_verify_aad(&plaintext, &aad_bytes)?;
                     let _ = display_body;
                     let verified_commitment = verified_commitment_opt.ok_or_else(|| {
                         MLSError::Cryptography(
@@ -2314,20 +2625,72 @@ impl CatbirdMlsClient {
                         )
                     })?;
 
-                    let (rcpt_seq, _, _) = chat_wire::parse_and_verify_i13_sequencer_receipt(
-                        rcpt_val,
-                        &rcpt_sec1,
-                        &c.sequencer_did,
-                        cid,
-                        &c.group_id,
-                        msg_epoch.max(0) as u64,
-                        expected_rcpt_entry_id,
-                        &verified_commitment,
-                    )?;
+                    let (rcpt_seq, _, archived_receipt_json) =
+                        chat_wire::parse_and_verify_i13_sequencer_receipt(
+                            rcpt_val,
+                            &rcpt_sec1,
+                            &c.sequencer_did,
+                            cid,
+                            &c.group_id,
+                            msg_epoch.max(0) as u64,
+                            expected_rcpt_entry_id,
+                            &verified_commitment,
+                        )?;
                     if rcpt_seq as i64 != entry_seq {
                         return Err(MLSError::Cryptography(format!(
                             "I13: receipt seq {rcpt_seq} != entry seq {entry_seq}"
                         )));
+                    }
+                    let inner: crate::messaging::receive::PrivateMessagePlaintextEnvelope =
+                        serde_json::from_slice(&plaintext).map_err(|e| {
+                            MLSError::Cryptography(format!(
+                                "missing authenticated archive frame: {e}"
+                            ))
+                        })?;
+                    let canonical_frame = String::from_utf8(inner.canonical_payload_bytes)
+                        .map_err(|e| MLSError::Cryptography(format!("archive frame UTF-8: {e}")))?;
+                    serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(
+                        &canonical_frame,
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("archive frame payload: {e}")))?;
+                    let archive = QueuedLabyrinthArchivePayload {
+                        version: 1,
+                        message_id: msg_id.to_owned(),
+                        conversation_id: cid.to_owned(),
+                        group_id_hex: hex::encode(&c.group_id),
+                        epoch: msg_epoch,
+                        expected_member_dids: group
+                            .members()
+                            .map(|member| {
+                                root_did_from_credential_bytes(
+                                    member.credential.serialized_content(),
+                                )
+                                .map(|(did, _)| did)
+                            })
+                            .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+                            .into_iter()
+                            .collect(),
+                        seq: entry_seq,
+                        sender_did: sender_did.to_owned(),
+                        sender_device_id: sender_dev_id.to_owned(),
+                        sequencer_did: c.sequencer_did.clone(),
+                        space_uri: c.space_uri.clone(),
+                        plaintext_json: json_str.clone(),
+                        labyrinth_frame_json: canonical_frame,
+                        mls_ciphertext_b64: STANDARD.encode(&ct_bytes),
+                        frame_nonce_b64: Some(STANDARD.encode(inner.frame_nonce)),
+                        sequencer_receipt_json: Some(archived_receipt_json),
+                        created_at_ms: now_ms,
+                    };
+                    tx.put_labyrinth_state(
+                        &format!("native.message:{cid}:{msg_id}"),
+                        &serde_json::to_vec(&archive)?,
+                        now_ms,
+                    )?;
+                    // Witness copy: pre-removal history must not depend on its sender flushing.
+                    // An own-account message stays the sending device's archive duty.
+                    if sender_did != self.normalized_did {
+                        super::live_plane::enqueue_labyrinth_archive(tx, &archive)?;
                     }
 
                     tx.insert_message(&MessageRow {
@@ -2379,17 +2742,17 @@ impl CatbirdMlsClient {
             max_seq = max_seq.max(entry_seq);
         }
 
-        if saw_c33_accept {
-            let _ = self.archive_accepted_opening_messages(cid);
+        if saw_c33_accept && !was_closed {
+            self.archive_accepted_opening_messages(cid)?;
             self.notify_change(PlatformChangeEvent::RequestsUpdated);
         }
-        if was_kicked {
-            let _ = self.rescue_conversation_on_kick(cid);
+        if was_kicked && !was_closed {
+            self.rescue_conversation_on_kick(cid)?;
         }
         if max_seq >= 1 && applied_count > 0 && !was_kicked && !was_closed {
             match self.acknowledge_entries_up_to(cid, max_seq) {
                 Ok(()) => {}
-                Err(MLSError::Internal(msg)) if msg.contains("HTTP 404") => {}
+                Err(MLSError::InvalidState(code)) if code == "ConversationNotFound" => {}
                 Err(err) => return Err(err),
             }
         }
@@ -2607,5 +2970,65 @@ impl CatbirdMlsClient {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_archive_duty_of;
+    use crate::storage::{LabyrinthQueueRow, MessageRow, MlsAccountDb, OpenMode};
+
+    #[test]
+    fn a_deleted_accounts_queued_witness_copies_and_evidence_are_dropped() {
+        const CID: &str = "conversation";
+        let dir = tempfile::tempdir().unwrap();
+        let db = MlsAccountDb::open_native(dir.path().join("witness.db"), &[7; 32], OpenMode::App)
+            .unwrap();
+        db.write_tx(|tx| {
+            for (seq, (id, sender)) in [("m-alice", "did:plc:alice"), ("m-bob", "did:plc:bob")]
+                .into_iter()
+                .enumerate()
+            {
+                tx.insert_message(&MessageRow {
+                    message_id: id.into(),
+                    conversation_id: CID.into(),
+                    group_id: vec![1; 32],
+                    epoch: 1,
+                    seq: seq as i64 + 1,
+                    sender_did: sender.into(),
+                    sender_device_id: "device".into(),
+                    plaintext_json: "{}".into(),
+                    created_at_ms: 1,
+                    is_own: false,
+                })?;
+                tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
+                    item_id: id.into(),
+                    conversation_id: CID.into(),
+                    group_id_hex: "01".into(),
+                    seq: seq as i64 + 1,
+                    payload_bytes: b"{}".to_vec(),
+                    created_at_ms: 1,
+                })?;
+                tx.put_labyrinth_state(&format!("native.message:{CID}:{id}"), b"{}", 1)?;
+            }
+            drop_archive_duty_of(tx, "did:plc:alice")
+        })
+        .unwrap();
+        db.read_tx(|tx| {
+            let queued: Vec<String> = tx
+                .list_labyrinth_queue(None, 10)?
+                .into_iter()
+                .map(|row| row.item_id)
+                .collect();
+            assert_eq!(queued, ["m-bob"]);
+            assert!(tx
+                .get_labyrinth_state(&format!("native.message:{CID}:m-alice"))?
+                .is_none());
+            assert!(tx
+                .get_labyrinth_state(&format!("native.message:{CID}:m-bob"))?
+                .is_some());
+            Ok(())
+        })
+        .unwrap();
     }
 }

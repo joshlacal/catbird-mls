@@ -3,6 +3,8 @@
 //! On reopen, projection is replayed only, first-message count stays one,
 //! and native ratchet never rolls back.
 #![allow(dead_code)]
+#[path = "fixtures/direct_request_i13.rs"]
+mod direct_request_i13;
 mod e2e_harness;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -25,18 +27,7 @@ fn receipt_authority() -> (p256::ecdsa::SigningKey, Vec<u8>, String) {
     let key = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
     let point = key.verifying_key().to_encoded_point(true);
     let id = protocol::direct_request_receipt_key_id(point.as_bytes()).unwrap();
-    let mut multikey = vec![0x80, 0x24];
-    multikey.extend(point.as_bytes());
-    let doc = serde_json::to_vec(&json!({
-        "id": "did:web:chat.catbird.blue",
-        "verificationMethod": [{
-            "id": id,
-            "controller": "did:web:chat.catbird.blue",
-            "type": "Multikey",
-            "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
-        }]
-    }))
-    .unwrap();
+    let doc = direct_request_i13::authority_document(&key, &id, "did:web:chat.catbird.blue");
     (key, doc, id)
 }
 
@@ -283,6 +274,7 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
             "firstMessageId": p["firstMessageId"],
             "coordinates": p["next"],
             "recordedAt": utc(0),
+            "sequencerReceipt": direct_request_i13::receipt(&authority, p, 1, "did:web:chat.catbird.blue"),
         }
     });
     let receipt = json!({
@@ -452,22 +444,19 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
     // Bob receives the published direct request entries and outcome receipt.
     let publication_entry = json!({
         "$type": "blue.catbird.chat.defs#directRequestEntry",
-        "entryId": uuid::Uuid::new_v4().to_string(),
+        "entryId": p["firstMessageId"],
         "conversationId": cid,
         "seq": 1,
         "signedRequest": publication["signedRequest"],
         "receivedAt": receipt["body"]["receipt"]["recordedAt"].clone(),
+        "sequencerReceipt": receipt["body"]["receipt"]["sequencerReceipt"],
+        "publicationReceipt": receipt,
     });
 
     world.delivery_service().queue_request_operation_response(
         Op::GetEntries,
         200,
         json!({"entries": [publication_entry], "hasMore": false, "nextAfterSeq": 1}),
-    );
-    world.delivery_service().queue_request_operation_response(
-        Op::GetDirectRequestOutcome,
-        200,
-        json!({"outcome": receipt}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,

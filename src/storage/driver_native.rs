@@ -1279,11 +1279,7 @@ impl<'a> SqlReadTx<'a> {
             .map_err(|e| map_rusqlite_err("get_epoch_secret", &e))
     }
 
-    pub(crate) fn get_pending_op(
-        &self,
-        op_kind: &str,
-        op_key: &str,
-    ) -> Result<Option<String>, MLSError> {
+    pub fn get_pending_op(&self, op_kind: &str, op_key: &str) -> Result<Option<String>, MLSError> {
         self.conn
             .query_row(
                 "SELECT payload_json FROM pending_ops WHERE op_kind = ?1 AND op_key = ?2",

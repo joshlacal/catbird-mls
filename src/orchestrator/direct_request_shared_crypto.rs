@@ -71,6 +71,7 @@ impl DirectRequestJournal {
             .and_then(|s| STANDARD.decode(s).ok())
             .ok_or(MLSError::StorageFailed)?;
         if proof["requestId"] != id
+            || verified.body()["authorityDid"] != record.sequencer_did
             || preparation_digest != record.preparation_request_digest
             || (published
                 && (proof["requestKind"] != "publish"
@@ -100,6 +101,12 @@ impl DirectRequestJournal {
                     "Published receipt coordinate mismatch",
                 ));
             }
+            bootstrap::verify_opening_receipt(
+                &record.bootstrap,
+                &proof["sequencerReceipt"],
+                &record.sequencer_did,
+                &record.sequencer_receipt_authority_key,
+            )?;
         } else if ![
             "blue.catbird.chat.defs#directRequestCancelledReceipt",
             "blue.catbird.chat.defs#directRequestExpiredReceipt",
@@ -130,6 +137,8 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
         preparation_request_digest: input.preparation_request_digest,
         receipt_authority_key: input.receipt_authority_key.clone(),
         bootstrap: input.bootstrap.clone(),
+        sequencer_did: input.receipt_authority_did.clone(),
+        sequencer_receipt_authority_key: input.sequencer_receipt_authority_key.clone(),
         phase: DirectRequestJournalPhase::PreparedCrypto,
         publish_request: None,
         publish_request_sha256: None,
@@ -176,6 +185,7 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
         || receipt["coordinates"] != input.bootstrap.coordinates
         || receipt["conversationId"] != record.conversation_id
         || receipt["firstMessageId"] != record.first_message_id
+        || receipt["authGeneration"] != publication["body"]["authGeneration"]
         || receipt["requestDigest"].as_str() != Some(STANDARD.encode(digest).as_str())
         || receipt["preparationRequestDigest"].as_str()
             != Some(STANDARD.encode(input.preparation_request_digest).as_str())
@@ -187,6 +197,12 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
             return Err(invalid("Request Welcome receipt actor mismatch"));
         }
     }
+    bootstrap::verify_opening_receipt(
+        &input.bootstrap,
+        &receipt["sequencerReceipt"],
+        &input.receipt_authority_did,
+        &input.sequencer_receipt_authority_key,
+    )?;
     Ok(())
 }
 
@@ -195,6 +211,7 @@ pub fn decrypt_introduction_with_provider<P: OpenMlsProvider>(
     group: &mut MlsGroup,
     input: &DirectRequestWelcomeInput,
 ) -> Result<DirectRequestIntroductionResult, MLSError> {
+    validate_request_welcome_receipt(input)?;
     let (ctx, hash) = bootstrap::context(&input.bootstrap.context_json)?;
     if hash != input.bootstrap.context_hash {
         return Err(invalid("Introduction context mismatch"));
@@ -203,6 +220,7 @@ pub fn decrypt_introduction_with_provider<P: OpenMlsProvider>(
         &hash,
         &serde_json::to_vec(&input.bootstrap.coordinates).map_err(error)?,
         ctx["firstMessageId"].as_str().unwrap(),
+        &input.bootstrap.archive_commitment,
     )
     .map_err(crypto_error)?;
     let expected_sender = format!(
@@ -210,7 +228,7 @@ pub fn decrypt_introduction_with_provider<P: OpenMlsProvider>(
         ctx["actorDid"].as_str().unwrap(),
         ctx["actorDeviceId"].as_str().unwrap()
     );
-    let mut process = || -> Result<Vec<u8>, MLSError> {
+    let mut process = || -> Result<(Vec<u8>, bootstrap::DirectRequestOpening), MLSError> {
         let protocol = MlsMessageIn::tls_deserialize_exact(&input.bootstrap.initial_ciphertext)
             .map_err(crypto_error)?
             .try_into_protocol_message()
@@ -236,22 +254,28 @@ pub fn decrypt_introduction_with_provider<P: OpenMlsProvider>(
             return Err(invalid("Introduction is not an application message"));
         };
         let plaintext = application.into_bytes();
-        let value = crate::chat_v2::transcript::direct_request::decode_direct_request_introduction(
-            &plaintext,
-        )
-        .map_err(crypto_error)?;
+        let (value, opening) = transcript::decode_direct_request_introduction_parts(&plaintext)
+            .map_err(crypto_error)?;
+        use subtle::ConstantTimeEq;
+        if !bool::from(
+            opening
+                .archive_commitment
+                .ct_eq(&input.bootstrap.archive_commitment),
+        ) {
+            return Err(invalid("Introduction archive commitment mismatch"));
+        }
         if value
             .get("invitation")
             .is_some_and(|i| i["recipientDid"] != ctx["recipientDid"])
         {
             return Err(invalid("Introduction invitation recipient mismatch"));
         }
-        Ok(plaintext)
+        Ok((plaintext, opening))
     };
     // This classified result is persisted with the ratchet write. An invalid
     // intro never rolls back its successful Welcome import or implies consent.
     let outcome = match process() {
-        Ok(plaintext) => DirectRequestIntroductionResult::Ready { plaintext },
+        Ok((plaintext, opening)) => DirectRequestIntroductionResult::Ready { plaintext, opening },
         Err(MLSError::StorageFailed) => return Err(MLSError::StorageFailed),
         Err(_) => DirectRequestIntroductionResult::Unavailable {
             code: "InvalidIntroduction".into(),

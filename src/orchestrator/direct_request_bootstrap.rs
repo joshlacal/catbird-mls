@@ -1,4 +1,5 @@
 //! Isolated request bootstrap. No live-group mapping is created during preparation.
+pub use crate::chat_v2::transcript::direct_request::DirectRequestOpening;
 use crate::error::MLSError;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use openmls::prelude::*;
@@ -30,6 +31,9 @@ pub struct DirectRequestBootstrapInput {
     pub preparation_request_digest: [u8; 32],
     /// Independently pinned dedicated server receipt key (compressed P256 SEC1).
     pub receipt_authority_key: Vec<u8>,
+    pub sequencer_did: String,
+    /// Independently pinned `{sequencer_did}#mls-receipt-1` P256 SEC1 key.
+    pub sequencer_receipt_authority_key: Vec<u8>,
     pub text: String,
     pub invitation: Option<super::direct_request_types::GroupInvitationReference>,
     pub metadata: crate::metadata::GroupMetadataV1,
@@ -49,6 +53,9 @@ pub struct DirectRequestBootstrap {
     pub metadata_nonce: Vec<u8>,
     pub metadata_ciphertext: Vec<u8>,
     pub initial_ciphertext: Vec<u8>,
+    pub archive_commitment: [u8; 32],
+    /// Sender capture; incoming bootstraps acquire this only after MLS decrypt.
+    pub opening: Option<DirectRequestOpening>,
 }
 fn invalid(reason: &str) -> MLSError {
     MLSError::invalid_input(reason)
@@ -120,6 +127,7 @@ pub fn encrypt_bound_introduction<P: OpenMlsProvider>(
     coordinates: &Value,
     message_id: &str,
     plaintext: &[u8],
+    archive_commitment: &[u8; 32],
 ) -> Result<Vec<u8>, MLSError> {
     let expected = group_coordinates(
         group,
@@ -141,10 +149,14 @@ pub fn encrypt_bound_introduction<P: OpenMlsProvider>(
     {
         return Err(invalid("Invalid request application binding"));
     }
+    crate::chat_v2::transcript::direct_request::decode_direct_request_opening(plaintext)
+        .and_then(|opening| opening.verify(archive_commitment))
+        .map_err(crypto_error)?;
     let aad = crate::chat_v2::transcript::direct_request::direct_request_application_aad(
         context_hash,
         &serde_json::to_vec(coordinates).map_err(crypto_error)?,
         message_id,
+        archive_commitment,
     )
     .map_err(crypto_error)?;
     group.set_aad(aad);
@@ -327,6 +339,8 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         .map_err(crypto_error)?
         .tls_serialize_detached()
         .map_err(crypto_error)?;
+    let frame_nonce = provider.rand().random_array().map_err(crypto_error)?;
+    let (plaintext, opening) = introduction_plaintext(input, &frame_nonce)?;
     let initial_ciphertext = encrypt_bound_introduction(
         &mut group,
         provider,
@@ -334,7 +348,8 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         &context_hash,
         &coordinates,
         ctx["firstMessageId"].as_str().unwrap(),
-        &introduction_plaintext(input)?,
+        &plaintext,
+        &opening.archive_commitment,
     )?;
     let metadata_nonce: [u8; 12] = provider.rand().random_array().map_err(crypto_error)?;
     let metadata_ciphertext = encrypt_request_metadata(
@@ -359,6 +374,8 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         metadata_nonce: metadata_nonce.to_vec(),
         metadata_ciphertext,
         initial_ciphertext,
+        archive_commitment: opening.archive_commitment,
+        opening: Some(opening),
     };
     if bundle.decoded_size() > 8388608
         || bundle.initial_ciphertext.len()
@@ -378,6 +395,79 @@ impl DirectRequestBootstrap {
             + self.metadata_nonce.len()
             + self.initial_ciphertext.len()
     }
+}
+
+/// Verify authoritative I13 evidence against the signed opening's exact identity.
+/// Sequence comes from the authenticated receipt (legacy reopening need not be 1).
+pub fn verify_opening_receipt(
+    bootstrap: &DirectRequestBootstrap,
+    receipt: &Value,
+    sequencer_did: &str,
+    sequencer_receipt_authority_key: &[u8],
+) -> Result<(u64, u64, String), MLSError> {
+    let (ctx, hash) = context(&bootstrap.context_json)?;
+    if hash != bootstrap.context_hash {
+        return Err(invalid("Opening receipt context mismatch"));
+    }
+    if let Some(opening) = &bootstrap.opening {
+        opening
+            .verify(&bootstrap.archive_commitment)
+            .map_err(crypto_error)?;
+    }
+    verify_opening_receipt_binding(
+        &ctx,
+        &bootstrap.coordinates,
+        &bootstrap.archive_commitment,
+        receipt,
+        sequencer_did,
+        sequencer_receipt_authority_key,
+    )
+}
+
+pub(crate) fn verify_opening_receipt_binding(
+    ctx: &Value,
+    coordinates: &Value,
+    archive_commitment: &[u8; 32],
+    receipt: &Value,
+    sequencer_did: &str,
+    sequencer_receipt_authority_key: &[u8],
+) -> Result<(u64, u64, String), MLSError> {
+    let generation = coordinates["generation"]
+        .as_u64()
+        .ok_or_else(|| invalid("Missing generation"))?;
+    if receipt["generation"].as_u64() != Some(generation)
+        || receipt["senderDid"] != ctx["actorDid"]
+        || receipt["senderDeviceId"] != ctx["actorDeviceId"]
+    {
+        return Err(invalid("Opening receipt sender or generation mismatch"));
+    }
+    let group_id = STANDARD
+        .decode(
+            coordinates["groupId"]
+                .as_str()
+                .ok_or_else(|| invalid("Missing group"))?,
+        )
+        .map_err(crypto_error)?;
+    let verified = crate::client::chat_wire::parse_and_verify_i13_sequencer_receipt(
+        receipt,
+        sequencer_receipt_authority_key,
+        sequencer_did,
+        ctx["conversationId"]
+            .as_str()
+            .ok_or_else(|| invalid("Missing conversation"))?,
+        &group_id,
+        coordinates["epoch"]
+            .as_u64()
+            .ok_or_else(|| invalid("Missing epoch"))?,
+        ctx["firstMessageId"]
+            .as_str()
+            .ok_or_else(|| invalid("Missing first message"))?,
+        archive_commitment,
+    )?;
+    if ctx["origin"]["$type"] == "blue.catbird.chat.defs#freshDirectOrigin" && verified.0 != 1 {
+        return Err(invalid("Fresh opening receipt sequence mismatch"));
+    }
+    Ok(verified)
 }
 
 /// Request-only multi-secret importer. Caller must wrap this operation and its
@@ -658,7 +748,10 @@ pub fn encrypt_request_metadata<P: OpenMlsProvider>(
     seal_request_metadata(&key, coordinates, request_id, nonce, &plaintext)
 }
 
-pub fn introduction_plaintext(input: &DirectRequestBootstrapInput) -> Result<Vec<u8>, MLSError> {
+pub fn introduction_plaintext(
+    input: &DirectRequestBootstrapInput,
+    frame_nonce: &[u8; 32],
+) -> Result<(Vec<u8>, DirectRequestOpening), MLSError> {
     if input.text.is_empty() || input.text.len() > 16384 {
         return Err(invalid("Introduction text exceeds limit"));
     }
@@ -675,8 +768,11 @@ pub fn introduction_plaintext(input: &DirectRequestBootstrapInput) -> Result<Vec
         value["invitation"] = serde_json::to_value(invitation).map_err(crypto_error)?;
     }
     let bytes = serde_json::to_vec(&value).map_err(crypto_error)?;
-    crate::chat_v2::transcript::direct_request::encode_direct_request_introduction(&bytes)
-        .map_err(crypto_error)
+    crate::chat_v2::transcript::direct_request::encode_direct_request_introduction(
+        &bytes,
+        frame_nonce,
+    )
+    .map_err(crypto_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -692,6 +788,7 @@ pub struct DirectRequestWelcomeInput {
     pub receipt_authority_did: String,
     /// Resolved independently through the trusted service DID by the caller.
     pub receipt_authority_key: Vec<u8>,
+    pub sequencer_receipt_authority_key: Vec<u8>,
     pub preparation_request_digest: [u8; 32],
 }
 
@@ -825,8 +922,13 @@ pub(crate) fn adopt_request_welcome(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DirectRequestIntroductionResult {
-    Ready { plaintext: Vec<u8> },
-    Unavailable { code: String },
+    Ready {
+        plaintext: Vec<u8>,
+        opening: DirectRequestOpening,
+    },
+    Unavailable {
+        code: String,
+    },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -914,4 +1016,77 @@ pub(crate) fn decrypt_introduction(
         inner.manifest_storage.flush_database()?;
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod opening_vector_tests {
+    use super::*;
+    use crate::chat_v2::transcript::direct_request::encode_direct_request_introduction;
+    use crate::orchestrator::{MLSEmbedData, MLSMessagePayload};
+    use serde_json::json;
+
+    /// chat_v2 mirrors the v1 text frame; these bytes pin it to `MLSMessagePayload` and
+    /// to the shared opening/I13 vectors.
+    #[test]
+    fn chat_v2_opening_frame_is_the_v1_payload_and_binds_the_i13_vector() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../chat_v2/transcript/vectors/direct_request_vectors.json"
+        ))
+        .unwrap();
+        let oracle = &vectors["openingArchiveFixture"];
+        let nonce: [u8; 32] = STANDARD
+            .decode(oracle["frameNonceBase64"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let text = serde_json::from_str::<Value>(oracle["canonicalPayloadUtf8"].as_str().unwrap())
+            .unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let invitation = json!({"authorityDid":"did:web:chat.catbird.blue","conversationId":"12345678-1234-4234-8234-123456789abc","invitationTransitionId":"22345678-1234-4234-8234-123456789abc","invitedByDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","invitedByDeviceId":"32345678-1234-4234-8234-123456789abc","recipientDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"});
+        for embed in [None, Some(invitation)] {
+            let mut host = json!({ "text": text });
+            let mut payload = MLSMessagePayload::text(&text);
+            if let Some(data) = embed {
+                host["invitation"] = data.clone();
+                payload.embed = Some(MLSEmbedData {
+                    kind: "groupInvitation".into(),
+                    data,
+                });
+            }
+            let (_, opening) =
+                encode_direct_request_introduction(&serde_json::to_vec(&host).unwrap(), &nonce)
+                    .unwrap();
+            let v1 = serde_json::to_vec(&serde_json::to_value(&payload).unwrap()).unwrap();
+            assert_eq!(opening.canonical_payload_bytes, v1);
+        }
+        let (_, opening) = encode_direct_request_introduction(
+            &serde_json::to_vec(&json!({ "text": text })).unwrap(),
+            &nonce,
+        )
+        .unwrap();
+        let rows = vectors["signed"].as_array().unwrap();
+        let publication = &rows.iter().find(|row| row["kind"] == "Publish").unwrap()["body"];
+        let published = &rows
+            .iter()
+            .find(|row| {
+                row["kind"] == "Outcome"
+                    && row["body"]["receipt"]["$type"]
+                        == "blue.catbird.chat.defs#directRequestPublishedReceipt"
+            })
+            .unwrap()["body"];
+        let key = STANDARD
+            .decode(oracle["sequencerPublicKeyBase64"].as_str().unwrap())
+            .unwrap();
+        verify_opening_receipt_binding(
+            publication,
+            &publication["next"],
+            &opening.archive_commitment,
+            &published["receipt"]["sequencerReceipt"],
+            "did:web:chat.catbird.blue",
+            &key,
+        )
+        .unwrap();
+    }
 }

@@ -1,6 +1,8 @@
 //! C17: real XWING/SQLCipher poisoned introduction isolation.
 //! HTTP authority is a signed synthetic fixture; this is not a DS admission test.
 #![allow(dead_code)]
+#[path = "fixtures/direct_request_i13.rs"]
+mod direct_request_i13;
 mod e2e_harness;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -57,7 +59,7 @@ impl Proof {
             .unwrap();
         let publication = json!({"body":self.body,"signature":STANDARD.encode(signature)});
         let key = self.authority.verifying_key().to_encoded_point(true);
-        let receipt_body = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":protocol::direct_request_receipt_key_id(key.as_bytes()).unwrap(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":self.body["requestId"],"requestKind":"publish","requestDigest":STANDARD.encode(Sha256::digest(signing)),"preparationRequestDigest":self.body["preparationRequestDigest"],"actorDid":self.body["actorDid"],"actorDeviceId":self.body["actorDeviceId"],"actorKeyId":self.body["keyId"],"authGeneration":1,"conversationId":self.body["conversationId"],"firstMessageId":self.body["firstMessageId"],"coordinates":self.body["next"],"recordedAt":self.body["signedAt"]}});
+        let receipt_body = json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":protocol::direct_request_receipt_key_id(key.as_bytes()).unwrap(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":self.body["requestId"],"requestKind":"publish","requestDigest":STANDARD.encode(Sha256::digest(signing)),"preparationRequestDigest":self.body["preparationRequestDigest"],"actorDid":self.body["actorDid"],"actorDeviceId":self.body["actorDeviceId"],"actorKeyId":self.body["keyId"],"authGeneration":1,"conversationId":self.body["conversationId"],"firstMessageId":self.body["firstMessageId"],"coordinates":self.body["next"],"recordedAt":self.body["signedAt"],"sequencerReceipt":direct_request_i13::receipt(&self.authority,&self.body,1,"did:web:chat.catbird.blue")}});
         let signature: p256::ecdsa::Signature = self.authority.sign(
             &protocol::direct_request_signing_bytes(
                 protocol::DirectRequestKind::Outcome,
@@ -66,9 +68,27 @@ impl Proof {
             .unwrap(),
         );
         let receipt = json!({"body":receipt_body,"signature":STANDARD.encode(signature.normalize_s().unwrap_or(signature).to_bytes())});
-        self.welcome.publication_request = serde_json::to_vec(&publication).unwrap();
-        self.welcome.published_receipt = serde_json::to_vec(&receipt).unwrap();
-        self.entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":self.body["conversationId"],"seq":1,"signedRequest":publication,"receivedAt":self.body["signedAt"]});
+        self.entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":self.body["firstMessageId"],"conversationId":self.body["conversationId"],"seq":1,"signedRequest":publication,"receivedAt":self.body["signedAt"],"sequencerReceipt":receipt_body["receipt"]["sequencerReceipt"],"publicationReceipt":{"$type":"blue.catbird.chat.defs#signedDirectRequestReceipt","body":receipt_body,"signature":receipt["signature"]}});
+        // The accepted Welcome provenance is the receiver's normalized read of this exact
+        // entry (`direct_request_receive.rs`): its signed request and bare publication receipt.
+        let read = protocol::normalize_read_presentation(
+            &serde_json::to_vec(&self.entry).unwrap(),
+            "directRequestEntry",
+            true,
+        )
+        .unwrap();
+        let mut bare_receipt = read["publicationReceipt"].clone();
+        bare_receipt.as_object_mut().unwrap().remove("$type");
+        self.welcome.publication_request = serde_json::to_vec(&read["signedRequest"]).unwrap();
+        self.welcome.published_receipt = serde_json::to_vec(
+            &protocol::normalize_read_presentation(
+                &serde_json::to_vec(&bare_receipt).unwrap(),
+                "signedDirectRequestReceipt",
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         catbird_mls::orchestrator::direct_request_shared_crypto::validate_request_welcome_receipt(
             &self.welcome,
         )
@@ -79,13 +99,6 @@ impl Proof {
             Op::GetEntries,
             200,
             json!({"entries":[self.entry],"hasMore":false,"nextAfterSeq":1}),
-        );
-        let mut outcome = serde_json::from_slice::<Value>(&self.welcome.published_receipt).unwrap();
-        outcome["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
-        world.delivery_service().queue_request_operation_response(
-            Op::GetDirectRequestOutcome,
-            200,
-            json!({"outcome": outcome}),
         );
         offline_state(world);
     }
@@ -140,9 +153,8 @@ async fn proof(world: &TestWorld) -> Proof {
     let point = authority.verifying_key().to_encoded_point(true);
     let authority_key = point.as_bytes().to_vec();
     let method = protocol::direct_request_receipt_key_id(&authority_key).unwrap();
-    let mut multikey = vec![0x80, 0x24];
-    multikey.extend(&authority_key);
-    let authority_doc=serde_json::to_vec(&json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{"id":method,"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)}]})).unwrap();
+    let authority_doc =
+        direct_request_i13::authority_document(&authority, &method, "did:web:chat.catbird.blue");
     for name in ["Alice", "Bob"] {
         world
             .client(name)
@@ -161,6 +173,8 @@ async fn proof(world: &TestWorld) -> Proof {
         authority_import_until: now + 20 * 86400,
         preparation_request_digest: [21; 32],
         receipt_authority_key: authority_key.clone(),
+        sequencer_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: authority_key.clone(),
         text: "Valid independent introduction".into(),
         invitation: None,
         metadata: catbird_mls::metadata::GroupMetadataV1 {
@@ -180,15 +194,21 @@ async fn proof(world: &TestWorld) -> Proof {
     let b = &journal.bootstrap;
     let artifact = |bytes: &Vec<u8>, kind: &str| json!({"framing":"mlsMessage","contentType":kind,"bytes":STANDARD.encode(bytes),"sha256":STANDARD.encode(Sha256::digest(bytes))});
     let metadata = json!({"coordinate":metadata_coordinate(&b.coordinates).unwrap(),"originTransitionId":ctx["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(&b.metadata_nonce),"ciphertext":STANDARD.encode(&b.metadata_ciphertext),"ciphertextSha256":STANDARD.encode(Sha256::digest(&b.metadata_ciphertext)),"ciphertextSize":b.metadata_ciphertext.len(),"authorProof":{"authorDid":alice.did,"authorDeviceId":device,"authorKeyId":ctx["actorKeyId"],"signaturePublicKey":STANDARD.encode(&public),"authGenerationAtOrigin":1,"originTransitionId":ctx["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
-    let body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\0","protocolVersion":"2","actorDid":alice.did,"actorDeviceId":device,"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":bob.did,"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"next":b.coordinates,"importUntil":utc(b.import_until),"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":[{"recipientDid":bob.did,"recipientDeviceId":bob_device,"provenance":{"requestId":ctx["requestId"],"preparationDigest":ctx["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(package.hash_ref),"importUntil":utc(b.import_until)}}]},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":utc(now)});
+    let body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\0","protocolVersion":"2","actorDid":alice.did,"actorDeviceId":device,"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":bob.did,"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"archiveCommitment":STANDARD.encode(b.archive_commitment),"next":b.coordinates,"importUntil":utc(b.import_until),"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":[{"recipientDid":bob.did,"recipientDeviceId":bob_device,"provenance":{"requestId":ctx["requestId"],"preparationDigest":ctx["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(package.hash_ref),"importUntil":utc(b.import_until)}}]},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":utc(now)});
     let welcome = DirectRequestWelcomeInput {
-        bootstrap: b.clone(),
+        // The receiver derives its bootstrap from the publication; only the sender's
+        // journal captures the opening before encryption.
+        bootstrap: catbird_mls::orchestrator::direct_request_bootstrap::DirectRequestBootstrap {
+            opening: None,
+            ..b.clone()
+        },
         local_identity: recipient.into_bytes(),
         local_package_ref: input.expected_package_refs[0].clone(),
         publication_request: vec![],
         actor_signature_public_key: public,
         published_receipt: vec![],
         receipt_authority_did: "did:web:chat.catbird.blue".into(),
+        sequencer_receipt_authority_key: authority_key.clone(),
         receipt_authority_key: authority_key,
         preparation_request_digest: input.preparation_request_digest,
     };
@@ -231,8 +251,9 @@ fn poison(world: &TestWorld, proof: &mut Proof, kind: Poison) {
             bytes
         }
         Poison::WrongAad | Poison::UnsupportedContent => {
-            let valid = protocol::encode_direct_request_introduction(
+            let (valid, _) = protocol::encode_direct_request_introduction(
                 br#"{"text":"well formed but wrong AAD"}"#,
+                &[31; 32],
             )
             .unwrap();
             let (plain, aad) = match kind {
@@ -244,6 +265,7 @@ fn poison(world: &TestWorld, proof: &mut Proof, kind: Poison) {
                         &proof.welcome.bootstrap.context_hash,
                         &serde_json::to_vec(&proof.welcome.bootstrap.coordinates).unwrap(),
                         proof.body["firstMessageId"].as_str().unwrap(),
+                        &proof.welcome.bootstrap.archive_commitment,
                     )
                     .unwrap(),
                 ),

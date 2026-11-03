@@ -118,7 +118,8 @@ async fn flush_conversation(
                     report.archived += 1;
                     continue;
                 }
-                Ok(false) => {}
+                // A deleted conversation holds no copy; the rescue below archives the row.
+                Ok(false) | Err(labyrinth::Error::NotFound("space" | "conversation")) => {}
                 Err(e) => return Ok(Err(e)),
             }
         } else {

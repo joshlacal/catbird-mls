@@ -103,6 +103,8 @@ pub struct QueuedLabyrinthArchivePayload {
     pub conversation_id: String,
     pub group_id_hex: String,
     pub epoch: i64,
+    /// Authenticated MLS account roster at send time, never replaced by a flush-time roster.
+    pub expected_member_dids: Vec<String>,
     pub seq: i64,
     pub sender_did: String,
     pub sender_device_id: String,
@@ -345,6 +347,8 @@ pub(crate) mod native_client {
         cached_groups: Arc<Mutex<std::collections::HashMap<Vec<u8>, MlsGroup>>>,
         outbox_flush_lock: Mutex<()>,
         wipe_report: PreCutoverWipeReport,
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        offline_archive_for_test: bool,
     }
 
     impl CatbirdMlsClient {
@@ -375,6 +379,55 @@ pub(crate) mod native_client {
             observer: Option<Arc<dyn PlatformChangeObserver>>,
             hooks: crate::sim_hooks::SimClientHooks,
         ) -> Result<Arc<Self>, MLSError> {
+            Self::open_internal(config, keystore, transport, observer, hooks, false)
+        }
+
+        /// Space-only test harness. Never available in production builds or selected by device ID.
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        pub fn open_offline_archive_for_test(
+            config: CatbirdMlsClientConfig,
+            keystore: Arc<dyn PlatformKeyStore>,
+            transport: Arc<dyn PlatformTransport>,
+            observer: Option<Arc<dyn PlatformChangeObserver>>,
+        ) -> Result<Arc<Self>, MLSError> {
+            Self::open_offline_archive_with_hooks_for_test(
+                config,
+                keystore,
+                transport,
+                observer,
+                crate::sim_hooks::SimClientHooks::system_default(),
+            )
+        }
+
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        pub fn open_offline_archive_with_hooks_for_test(
+            config: CatbirdMlsClientConfig,
+            keystore: Arc<dyn PlatformKeyStore>,
+            transport: Arc<dyn PlatformTransport>,
+            observer: Option<Arc<dyn PlatformChangeObserver>>,
+            hooks: crate::sim_hooks::SimClientHooks,
+        ) -> Result<Arc<Self>, MLSError> {
+            Self::open_internal(config, keystore, transport, observer, hooks, true)
+        }
+
+        fn open_internal(
+            mut config: CatbirdMlsClientConfig,
+            keystore: Arc<dyn PlatformKeyStore>,
+            transport: Arc<dyn PlatformTransport>,
+            observer: Option<Arc<dyn PlatformChangeObserver>>,
+            hooks: crate::sim_hooks::SimClientHooks,
+            offline_archive_for_test: bool,
+        ) -> Result<Arc<Self>, MLSError> {
+            if !offline_archive_for_test {
+                let device = uuid::Uuid::parse_str(config.device_id.trim())
+                    .map_err(|_| MLSError::invalid_input("device_id must be a UUIDv4"))?;
+                if device.get_version() != Some(uuid::Version::Random)
+                    || device.get_variant() != uuid::Variant::RFC4122
+                {
+                    return Err(MLSError::invalid_input("device_id must be a UUIDv4"));
+                }
+                config.device_id = device.hyphenated().to_string();
+            }
             let normalized_did = normalize_account_did(&config.account_did)?;
             let account_did_hash = account_did_hash_hex(&normalized_did)?;
             let storage_root_path = PathBuf::from(&config.storage_root);
@@ -457,6 +510,8 @@ pub(crate) mod native_client {
                 cached_groups,
                 outbox_flush_lock: Mutex::new(()),
                 wipe_report,
+                #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+                offline_archive_for_test,
             }))
         }
 
@@ -1010,6 +1065,19 @@ pub(crate) mod native_client {
                     conversation_id: conversation_id.to_string(),
                     group_id_hex: group_id_hex.clone(),
                     epoch: convo.epoch,
+                    expected_member_dids: group
+                        .members()
+                        .map(|member| {
+                            let scoped =
+                                String::from_utf8(member.credential.serialized_content().to_vec())
+                                    .map_err(|_| {
+                                        MLSError::Cryptography("invalid member identity".into())
+                                    })?;
+                            Ok(scoped.split('#').next().unwrap_or(&scoped).to_owned())
+                        })
+                        .collect::<Result<std::collections::BTreeSet<_>, MLSError>>()?
+                        .into_iter()
+                        .collect(),
                     seq: next_seq,
                     sender_did: self.normalized_did.clone(),
                     sender_device_id: self.config.device_id.clone(),
@@ -1351,10 +1419,11 @@ pub(crate) mod native_client {
                         body: Some(body),
                     })?;
                     if resp.status >= 400 {
-                        return Err(MLSError::Internal(format!(
-                            "acknowledgeEntries returned HTTP {}",
-                            resp.status
-                        )));
+                        // Declared codes (`ConversationNotFound` after a close race) reach `sync`.
+                        return Err(super::live_plane::chat_response_error(
+                            "POST acknowledgeEntries",
+                            &resp,
+                        ));
                     }
                     Ok(())
                 },
@@ -1622,30 +1691,8 @@ pub(crate) mod native_client {
             &self,
             row: &LabyrinthQueueRow,
         ) -> Result<QueuedLabyrinthArchivePayload, MLSError> {
-            if let Ok(parsed) =
-                serde_json::from_slice::<QueuedLabyrinthArchivePayload>(&row.payload_bytes)
-            {
-                return Ok(parsed);
-            }
-            let fallback_json = serde_json::json!({ "text": "" }).to_string();
-            Ok(QueuedLabyrinthArchivePayload {
-                version: 0,
-                message_id: row.item_id.clone(),
-                conversation_id: row.conversation_id.clone(),
-                group_id_hex: row.group_id_hex.clone(),
-                epoch: 0,
-                seq: row.seq,
-                sender_did: self.normalized_did.clone(),
-                sender_device_id: self.config.device_id.clone(),
-                sequencer_did: self.config.home_ds_did.clone(),
-                space_uri: None,
-                plaintext_json: fallback_json.clone(),
-                labyrinth_frame_json: canonical_labyrinth_frame_json(&fallback_json),
-                mls_ciphertext_b64: BASE64_STANDARD.encode(&row.payload_bytes),
-                frame_nonce_b64: None,
-                sequencer_receipt_json: None,
-                created_at_ms: row.created_at_ms,
-            })
+            serde_json::from_slice::<QueuedLabyrinthArchivePayload>(&row.payload_bytes)
+                .map_err(|e| MLSError::Cryptography(format!("invalid archive queue payload: {e}")))
         }
 
         #[cfg(not(feature = "labyrinth"))]
@@ -1689,6 +1736,9 @@ pub(crate) mod native_client {
     }
 
     include!("native_archive.rs");
+    #[cfg(feature = "labyrinth")]
+    include!("native_archive_space.rs");
+    #[cfg(any(test, feature = "test-utils", feature = "sim"))]
     include!("offline_archive.rs");
 }
 

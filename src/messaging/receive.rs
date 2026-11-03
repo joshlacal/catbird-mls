@@ -277,20 +277,26 @@ pub fn extract_plaintext_body_and_verify_aad(
         return Ok((body, json_str, None));
     }
 
-    if aad_bytes.starts_with(DIRECT_REQUEST_APP_AAD_PREFIX) {
-        let intro_val =
-            crate::chat_v2::transcript::direct_request::decode_direct_request_introduction(
-                decrypted_bytes,
-            )
-            .map_err(|e| MLSError::Cryptography(format!("invalid C33 introduction CBOR: {e}")))?;
-        let text = intro_val
-            .get("text")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| MLSError::invalid_input("C33 introduction missing text"))?
-            .to_string();
-        let json_str = serde_json::to_string(&intro_val)
-            .map_err(|e| MLSError::Internal(format!("serialize C33 introduction JSON: {e}")))?;
-        return Ok((text, json_str, None));
+    if let Some(cbor_aad) = aad_bytes.strip_prefix(DIRECT_REQUEST_APP_AAD_PREFIX) {
+        let aad: CanonicalApplicationAadMap = serde_ipld_dagcbor::from_slice(cbor_aad)
+            .map_err(|e| MLSError::Cryptography(format!("invalid C33 application AAD: {e}")))?;
+        let commitment: [u8; 32] = aad
+            .archive_commitment
+            .ok_or_else(|| MLSError::Cryptography("C33 opening missing archiveCommitment".into()))?
+            .0
+            .try_into()
+            .map_err(|_| {
+                MLSError::Cryptography("C33 opening archiveCommitment must be 32 bytes".into())
+            })?;
+        let opening = crate::chat_v2::transcript::direct_request::decode_direct_request_opening(
+            decrypted_bytes,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("invalid committed C33 introduction: {e}")))?;
+        opening.verify(&commitment).map_err(|e| {
+            MLSError::Cryptography(format!("C33 introduction commitment mismatch: {e}"))
+        })?;
+        let (body, frame_json) = parse_canonical_message_body(&opening.canonical_payload_bytes)?;
+        return Ok((body, frame_json, Some(commitment)));
     }
 
     // Support both PrivateMessagePlaintextEnvelope (carrying secret 32-byte frame_nonce)

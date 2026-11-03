@@ -76,6 +76,8 @@ pub struct HistoryPage {
     pub messages: Vec<LoadedMessage>,
     /// Messages this device can see but not open (e.g. sent before the account joined).
     pub undecryptable: usize,
+    /// Witness copies Labyrinth rejected because they contradict an accepted copy (ruling 3).
+    pub rejected: usize,
     /// False if the Space refused the conversation's sender records; only the owner archive is included.
     pub space_readable: bool,
     /// Redacted messages (`by_author`, `account_deleted`, or `removed_by_server`).
@@ -743,13 +745,16 @@ impl LabyrinthSession {
         let did = self.did.clone();
         let raw = self.lab.load_message(conversation_id, message_id).await;
         let h = self.try_finish(raw)?;
+        // Another member's witness copy of my message is not my own archive write.
         Ok(h.map(|h| {
-            h.messages
+            h.messages.iter().any(|m| {
+                m.message_id == message_id
+                    && m.source != labyrinth::client::MessageSource::Witness
+                    && m.sender.as_deref() == Some(did.as_str())
+            }) || h
+                .redacted
                 .iter()
-                .any(|m| m.message_id == message_id && m.sender.as_deref() == Some(did.as_str()))
-                || h.redacted
-                    .iter()
-                    .any(|r| r.message_id == message_id && r.sender == did)
+                .any(|r| r.message_id == message_id && r.sender == did)
         }))
     }
 
@@ -858,24 +863,11 @@ impl LabyrinthSession {
                                 item.created_at_ms.max(0) as u64,
                                 &nonce,
                                 item.labyrinth_frame_json.as_bytes(),
-                                &archived.signed,
+                                &archived,
                             )
                             .await?;
                     }
-                    (_, Some(_)) => {
-                        return Err(labyrinth::Error::Malformed("archive receipt missing nonce"))
-                    }
-                    _ => {
-                        self.lab
-                            .archive_outgoing(
-                                conversation_id,
-                                &roster,
-                                &item.message_id,
-                                item.created_at_ms.max(0) as u64,
-                                item.labyrinth_frame_json.as_bytes(),
-                            )
-                            .await?;
-                    }
+                    _ => return Err(labyrinth::Error::ReceiptCommitmentMismatch),
                 }
             }
             self.lab.flush_thread(conversation_id).await?;
@@ -884,6 +876,58 @@ impl LabyrinthSession {
         .await;
         let out = self.try_finish(raw);
         if !matches!(out, Ok(Ok(_))) {
+            self.lab.discard_pending(conversation_id);
+        }
+        out
+    }
+
+    /// Kick/leave fallback preserves the same canonical frame and I13 evidence as sender batches.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn archive_native_owner(
+        &mut self,
+        conversation_id: &str,
+        items: &[&crate::client::native_client::NativeArchiveEvidence],
+    ) -> Result<labyrinth::Result<()>> {
+        use base64::Engine as _;
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            for item in items {
+                let nonce: [u8; 32] = base64::engine::general_purpose::STANDARD
+                    .decode(
+                        item.frame_nonce_b64
+                            .as_ref()
+                            .ok_or(labyrinth::Error::ReceiptCommitmentMismatch)?,
+                    )
+                    .map_err(|_| labyrinth::Error::Malformed("archive nonce"))?
+                    .try_into()
+                    .map_err(|_| labyrinth::Error::Malformed("archive nonce length"))?;
+                let receipt: crate::client::chat_wire::StoredArchivedReceipt =
+                    serde_json::from_str(
+                        item.sequencer_receipt_json
+                            .as_ref()
+                            .ok_or(labyrinth::Error::ReceiptCommitmentMismatch)?,
+                    )
+                    .map_err(|_| labyrinth::Error::Malformed("archive receipt"))?;
+                let archived = receipt
+                    .to_labyrinth_archived()
+                    .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+                self.lab
+                    .archive_owner_committed(
+                        conversation_id,
+                        &item.message_id,
+                        item.created_at_ms.max(0) as u64,
+                        &nonce,
+                        item.labyrinth_frame_json.as_bytes(),
+                        &archived,
+                    )
+                    .await?;
+            }
+            self.lab.flush_owner(conversation_id).await?;
+            Ok(())
+        }
+        .await;
+        let out = self.try_finish(raw);
+        if !matches!(out, Ok(Ok(()))) {
             self.lab.discard_pending(conversation_id);
         }
         out
@@ -911,7 +955,11 @@ impl LabyrinthSession {
         &mut self,
         batch: labyrinth::records::OwnerBatch,
     ) -> Result<Vec<LoadedMessage>> {
-        let raw = self.lab.open_owner_record(batch).await;
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            self.lab.open_owner_record(batch).await
+        }
+        .await;
         let history = self.finish(raw)?;
         if !history.undecryptable.is_empty() {
             return Err(OrchestratorError::Api(
@@ -934,6 +982,7 @@ impl LabyrinthSession {
         let h = self.finish(raw)?;
         Ok(HistoryPage {
             undecryptable: h.undecryptable.len(),
+            rejected: h.rejected.len(),
             space_readable: h.space_readable,
             messages: h.messages,
             redacted: h.redacted,
@@ -960,6 +1009,7 @@ impl LabyrinthSession {
         Ok((
             HistoryPage {
                 undecryptable: p.history.undecryptable.len(),
+                rejected: p.history.rejected.len(),
                 space_readable: p.history.space_readable,
                 messages: p.history.messages,
                 redacted: p.history.redacted,

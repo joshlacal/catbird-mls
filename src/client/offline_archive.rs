@@ -1,6 +1,6 @@
-// Space-only offline archive path for non-UUIDv4 harness devices (`canonical_uuid_v4_device_id().is_none()`),
-// where no `mls-ds` directory server exists (`client_labyrinth_fault_lines`, `CatbirdMLSCore` Space mocks).
-// Live `mls-ds` clients (`canonical_uuid_v4_device_id().is_some()`) always use `native_archive.rs` (`LabyrinthSession`).
+// Space-only offline archive harness. Included only with `labyrinth` and
+// `cfg(any(test, feature = "test-utils", feature = "sim"))`, and selected explicitly
+// by `open_offline_archive_for_test`; production clients use `native_archive.rs`.
 
 fn owner_epoch_root_key(epoch_seq: u64) -> String {
     format!("owner_epoch_root:{epoch_seq}")
@@ -1542,6 +1542,12 @@ impl CatbirdMlsClient {
                         .as_ref()
                         .and_then(|nonce_b64| BASE64_STANDARD.decode(nonce_b64.as_bytes()).ok())
                         .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
+                    if payload.sequencer_receipt_json.is_some() && decoded_nonce_32.is_none() {
+                        convo_err = Some(MLSError::Cryptography(
+                            "I13 offline archive receipt requires a 32-byte frame nonce".to_string(),
+                        ));
+                        break;
+                    }
 
                     let item_seq_u64 = payload.seq.max(0) as u64;
                     let item_sub_seq = item_seq_u64 % 1_000;
@@ -1566,6 +1572,16 @@ impl CatbirdMlsClient {
                                 break;
                             }
                         };
+                        if let Err(e) = self.offline_verify_committed_frame(
+                            &payload.conversation_id,
+                            &payload.message_id,
+                            &archived,
+                            &nonce_32,
+                            payload.labyrinth_frame_json.as_bytes(),
+                        ) {
+                            convo_err = Some(e);
+                            break;
+                        }
                         match self.hooks.with_labyrinth_rng(|| {
                             labyrinth::message::seal_sender_committed(
                                 &mek,
@@ -1999,6 +2015,109 @@ impl CatbirdMlsClient {
         Ok(sealed_items.len() as u32)
     }
 
+    fn offline_verify_committed_frame<'r>(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        receipt: &'r labyrinth::message::ArchivedReceipt,
+        frame_nonce: &[u8; 32],
+        frame: &[u8],
+    ) -> Result<&'r str, MLSError> {
+        let signed = &receipt.signed;
+        if signed.payload.conversation_id != conversation_id
+            || signed.payload.entry_id != message_id
+        {
+            return Err(MLSError::Cryptography(
+                "I13 offline archive receipt coordinates mismatch".to_string(),
+            ));
+        }
+        let conversation = self
+            .db
+            .read_tx(|tx| tx.get_conversation(conversation_id))?
+            .ok_or_else(|| {
+                MLSError::Cryptography(
+                    "I13 offline archive requires a pinned conversation sequencer".to_string(),
+                )
+            })?;
+        let key = self
+            .resolve_sequencer_receipt_key(&conversation.sequencer_did, "#mls-receipt-1")?
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "I13 offline archive cannot resolve `{}` receipt key",
+                    conversation.sequencer_did
+                ))
+            })?;
+        labyrinth_protocol::receipt::verify_sequencer_receipt_sec1(
+            &key,
+            &conversation.sequencer_did,
+            signed,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("I13 offline archive receipt: {e}")))?;
+        labyrinth_protocol::receipt::verify_archived_item_commitment(signed, frame_nonce, frame)
+            .map_err(|e| MLSError::Cryptography(format!("I13 offline archive commitment: {e}")))?;
+        let (sender_did, _) = signed
+            .payload
+            .split_sender_device()
+            .map_err(|e| MLSError::Cryptography(format!("I13 offline archive sender: {e}")))?;
+        Ok(sender_did)
+    }
+
+    fn offline_open_owner_message(
+        &self,
+        msg: &labyrinth::message::OwnerMessage,
+    ) -> Result<Option<(Option<String>, Vec<u8>)>, MLSError> {
+        let root_bytes = self
+            .db
+            .read_tx(|tx| tx.get_labyrinth_state(&owner_epoch_root_key(msg.epoch_seq)))?
+            .ok_or_else(|| {
+                MLSError::InvalidState(format!(
+                    "missing owner_epoch_root for epoch {}",
+                    msg.epoch_seq
+                ))
+            })?;
+        let root: Zeroizing<[u8; 32]> = Zeroizing::new(
+            root_bytes.as_slice().try_into().map_err(|_| {
+                MLSError::Internal("invalid owner_epoch_root length".to_string())
+            })?,
+        );
+        let opened = labyrinth::message::open_owner_content(&root, msg)
+            .map_err(|e| MLSError::Cryptography(format!("open_owner_content: {e}")))?;
+        if msg.sequencer_receipt.is_some()
+            && !matches!(&opened, labyrinth::message::OwnerContent::CommittedFrame { .. })
+        {
+            return Err(MLSError::Cryptography(
+                "I13 offline archive receipt requires a committed frame".to_string(),
+            ));
+        }
+        match opened {
+            labyrinth::message::OwnerContent::Frame(frame) => Ok(Some((None, frame))),
+            labyrinth::message::OwnerContent::AttributedFrame { sender_did, frame } => {
+                Ok(Some((Some(sender_did), frame)))
+            }
+            labyrinth::message::OwnerContent::CommittedFrame { frame_nonce, frame } => {
+                let receipt = msg.sequencer_receipt.as_ref().ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "I13 offline committed frame is missing its receipt".to_string(),
+                    )
+                })?;
+                if msg.seq != Some(receipt.signed.payload.seq) {
+                    return Err(MLSError::Cryptography(
+                        "I13 offline archive receipt sequence mismatch".to_string(),
+                    ));
+                }
+                let sender = self.offline_verify_committed_frame(
+                    &msg.thread_id,
+                    &msg.message_id,
+                    receipt,
+                    &frame_nonce,
+                    &frame,
+                )?;
+                Ok(Some((Some(sender.to_string()), frame)))
+            }
+            labyrinth::message::OwnerContent::Tombstone { .. } => Ok(None),
+        }
+    }
+
     pub(super) fn offline_open_rescued_owner_batch(
         &self,
         batch_json: &[u8],
@@ -2010,40 +2129,8 @@ impl CatbirdMlsClient {
             .map_err(|e| MLSError::Internal(format!("OwnerBatch::to_messages: {e}")))?;
         let mut out = Vec::with_capacity(msgs.len());
         for msg in msgs {
-            let root_bytes = self
-                .db
-                .read_tx(|tx| tx.get_labyrinth_state(&owner_epoch_root_key(msg.epoch_seq)))?
-                .ok_or_else(|| {
-                    MLSError::InvalidState(format!(
-                        "missing owner_epoch_root for epoch {}",
-                        msg.epoch_seq
-                    ))
-                })?;
-            let root: [u8; 32] = root_bytes.as_slice().try_into().map_err(|_| {
-                MLSError::Internal("invalid owner_epoch_root length".to_string())
-            })?;
-            match labyrinth::message::open_owner_content(&root, &msg)
-                .map_err(|e| MLSError::Cryptography(format!("open_owner_content: {e}")))?
-            {
-                labyrinth::message::OwnerContent::Frame(frame) => {
-                    out.push((msg.message_id, None, frame));
-                }
-                labyrinth::message::OwnerContent::AttributedFrame { sender_did, frame } => {
-                    out.push((msg.message_id, Some(sender_did), frame));
-                }
-                labyrinth::message::OwnerContent::CommittedFrame { frame, .. } => {
-                    let sender = msg.sequencer_receipt.as_ref().and_then(|r| {
-                        r.signed
-                            .payload
-                            .sender_device_did_url
-                            .split('#')
-                            .next()
-                            .filter(|s| s.starts_with("did:"))
-                            .map(str::to_string)
-                    });
-                    out.push((msg.message_id, sender, frame));
-                }
-                labyrinth::message::OwnerContent::Tombstone { .. } => {}
+            if let Some((sender, frame)) = self.offline_open_owner_message(&msg)? {
+                out.push((msg.message_id, sender, frame));
             }
         }
         Ok(out)
@@ -2081,45 +2168,15 @@ impl CatbirdMlsClient {
                 if msg.thread_id != conversation_id {
                     continue;
                 }
-                if !seen_ids.insert(msg.message_id.clone()) {
+                let Some((sender_opt, frame_bytes)) = self.offline_open_owner_message(&msg)? else {
                     continue;
-                }
-                let root_bytes = self
-                    .db
-                    .read_tx(|tx| tx.get_labyrinth_state(&owner_epoch_root_key(msg.epoch_seq)))?
-                    .ok_or_else(|| {
-                        MLSError::InvalidState(format!(
-                            "missing owner_epoch_root for epoch {}",
-                            msg.epoch_seq
-                        ))
-                    })?;
-                let root: [u8; 32] = root_bytes.as_slice().try_into().map_err(|_| {
-                    MLSError::Internal("invalid owner_epoch_root length".to_string())
-                })?;
-                let opened = labyrinth::message::open_owner_content(&root, &msg)
-                    .map_err(|e| MLSError::Cryptography(format!("open_owner_content: {e}")))?;
-                let (sender_opt, frame_bytes) = match opened {
-                    labyrinth::message::OwnerContent::AttributedFrame { sender_did, frame } => {
-                        (Some(sender_did), frame)
-                    }
-                    labyrinth::message::OwnerContent::CommittedFrame { frame, .. } => {
-                        let sender = msg.sequencer_receipt.as_ref().and_then(|r| {
-                            r.signed
-                                .payload
-                                .sender_device_did_url
-                                .split('#')
-                                .next()
-                                .filter(|s| s.starts_with("did:"))
-                                .map(str::to_string)
-                        });
-                        (sender, frame)
-                    }
-                    labyrinth::message::OwnerContent::Frame(frame) => (None, frame),
-                    labyrinth::message::OwnerContent::Tombstone { .. } => continue,
                 };
                 let Some(sender_did) = sender_opt else {
                     continue;
                 };
+                if !seen_ids.insert(msg.message_id.clone()) {
+                    continue;
+                }
                 let plaintext_json = String::from_utf8(frame_bytes)
                     .map_err(|e| MLSError::Internal(format!("restored frame is not UTF-8: {e}")))?;
                 recovered_items.push((

@@ -68,6 +68,10 @@ fn bootstrap(publication: &Value) -> Result<DirectRequestBootstrap> {
         metadata_nonce: bytes(&artifact["metadataSnapshot"]["nonce"])?,
         metadata_ciphertext: bytes(&artifact["metadataSnapshot"]["ciphertext"])?,
         initial_ciphertext: bytes(&artifact["initialCiphertext"])?,
+        archive_commitment: bytes(&p["archiveCommitment"])?
+            .try_into()
+            .map_err(|_| invalid())?,
+        opening: None,
     })
 }
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -307,17 +311,9 @@ where
             if authorized_key != candidate_key {
                 return Err(invalid());
             }
-            let request_id = verified.body()["requestId"].as_str().ok_or_else(invalid)?;
-            let outcome = self
-                .request_query(
-                    CanonicalOperation::GetDirectRequestOutcome,
-                    format!("actorDeviceId={device}&requestId={request_id}"),
-                )
-                .await?;
-            if outcome["outcome"]["$type"] != "blue.catbird.chat.defs#signedDirectRequestReceipt" {
-                return Err(invalid());
-            }
-            let mut receipt = outcome["outcome"].clone();
+            // The opening entry retains its exact signed terminal outcome.
+            // Import never depends on a coordinator-only outcome query.
+            let mut receipt = entry["publicationReceipt"].clone();
             receipt.as_object_mut().ok_or_else(invalid)?.remove("$type");
             // Retain the canonical bare receipt, independent of presentation.
             let receipt = transcript::normalize_read_presentation(
@@ -428,6 +424,12 @@ where
                     publication_request: projection.publication.clone(),
                     actor_signature_public_key: projection.sender_public_key.clone(),
                     published_receipt: projection.publication_receipt.clone(),
+                    sequencer_receipt_authority_key:
+                        crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                            &projection.trusted_authority_document,
+                            &auth_did,
+                            "#mls-receipt-1",
+                        )?,
                     receipt_authority_did: auth_did,
                     receipt_authority_key: key,
                     preparation_request_digest: bytes(
@@ -447,7 +449,7 @@ where
                             .mls_context()
                             .decrypt_direct_request_introduction(&input)?
                         {
-                            DirectRequestIntroductionResult::Ready { plaintext } => {
+                            DirectRequestIntroductionResult::Ready { plaintext, .. } => {
                                 let intro =
                                     transcript::decode_direct_request_introduction(&plaintext)
                                         .map_err(|_| invalid())?;

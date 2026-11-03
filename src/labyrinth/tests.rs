@@ -1223,10 +1223,12 @@ async fn fault_line_2_transient_pds_outage_during_deleted_convo_owner_rescue_ret
     assert_eq!(report_ok.dropped, 0);
     assert!(queue.list(alice).unwrap().is_empty());
 
+    // The conversation no longer exists, so only the owner archive is readable (a missing
+    // active Space is an error for `load_history`).
     let hist = session
-        .load_history(gone_conv, TimeRange::ALL)
+        .load_owner_history(gone_conv)
         .await
         .expect("load rescued history");
-    assert_eq!(hist.messages.len(), 1);
-    assert_eq!(hist.messages[0].frame, b"do not drop me on pds 503");
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].frame, b"do not drop me on pds 503");
 }
