@@ -54,6 +54,12 @@ pub fn map_xrpc_error(e: XrpcTransportError) -> labyrinth::Error {
         Some("InvalidEpochChain") if e.status == 400 || e.status == 409 => {
             labyrinth::Error::Conflict
         }
+        // A kicked or never-joined device may not read live conversation state (exact
+        // protocol errors, HTTP 400); callers fall back to saved placement / owner-mode
+        // exactly as for HTTP 403.
+        Some("NotEntitled" | "AccessOutsideMembershipInterval") if e.status == 400 => {
+            labyrinth::Error::Forbidden
+        }
         _ if e.status == 401 || e.status == 403 => labyrinth::Error::Forbidden,
         name => labyrinth::Error::Backend(format!(
             "xrpc {}: {}: {}",
@@ -266,6 +272,7 @@ pub struct GatewayXrpcTransport {
     signer: Arc<dyn ChatKeySigner>,
     did: String,
     device_id: String,
+    clock: Arc<dyn labyrinth::client::Clock>,
 }
 
 impl GatewayXrpcTransport {
@@ -280,7 +287,17 @@ impl GatewayXrpcTransport {
             signer,
             did,
             device_id,
+            clock: Arc::new(labyrinth::client::SystemClock),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn labyrinth::client::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
     }
 
     fn wire_params<'a>(&self, params: &[(&'a str, String)]) -> Vec<(&'a str, String)> {
@@ -303,7 +320,7 @@ impl GatewayXrpcTransport {
         nsid: &str,
         params: &[(&str, String)],
     ) -> Result<Vec<(String, String)>, XrpcTransportError> {
-        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        let now = self.now_ms();
         let claim = ReadClaim::new(nsid, params, &self.did, &self.device_id, now);
         let json = claim.to_json();
         let signature = self
@@ -384,7 +401,8 @@ impl GatewayXrpcTransport {
             payload,
             operation_id,
             &self.device_id,
-            chrono::Utc::now(),
+            chrono::DateTime::from_timestamp_millis(self.now_ms().min(i64::MAX as u64) as i64)
+                .ok_or_else(|| transport_error("invalid archive clock"))?,
         );
         let json = body.to_json();
         let signature = self
@@ -1177,7 +1195,29 @@ impl MailboxDirectory for DsDirectoryStore {
                 all.push(ChatDeviceKey { key, removed_at });
             }
             match page.cursor {
-                None => return Ok(all),
+                None => {
+                    #[cfg(feature = "sim")]
+                    if crate::planted::is_planted_bug_active(
+                        crate::planted::PlantedBug::P5WrapMekToUnverifiedDevice,
+                    ) {
+                        // Treat the candidate epoch's own attester as an authorized chat
+                        // device. Epoch signatures/chain checks still run in Labyrinth;
+                        // only the independent device authorization is bypassed.
+                        if let Some(epoch) = self.latest(did).await? {
+                            let key = epoch.attestation.transport_public_key;
+                            if !all
+                                .iter()
+                                .any(|device| device.key == key && device.is_current())
+                            {
+                                all.push(ChatDeviceKey {
+                                    key,
+                                    removed_at: None,
+                                });
+                            }
+                        }
+                    }
+                    return Ok(all);
+                }
                 Some(next) => {
                     if !seen_cursors.insert(next.clone()) {
                         return Err(labyrinth::Error::Malformed(
@@ -1433,5 +1473,21 @@ mod tests {
             0,
             "malformed NSIDs must be rejected before invoking any gateway"
         );
+    }
+
+    #[test]
+    fn entitlement_denials_map_to_forbidden_only_as_exact_400s() {
+        let err = |status: u16, name: &str| XrpcTransportError {
+            status,
+            error: Some(name.to_owned()),
+            message: None,
+        };
+        for name in ["NotEntitled", "AccessOutsideMembershipInterval"] {
+            assert_eq!(map_xrpc_error(err(400, name)), labyrinth::Error::Forbidden);
+            assert!(matches!(
+                map_xrpc_error(err(500, name)),
+                labyrinth::Error::Backend(_)
+            ));
+        }
     }
 }

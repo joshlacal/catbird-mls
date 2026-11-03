@@ -543,6 +543,10 @@ impl ResolvingSpaceThreadStore {
         if let Some(auth) = default_authority_did {
             inner = inner.with_authority_did(auth);
         }
+        if let Some(transport) = &transport {
+            let transport = transport.clone();
+            inner = inner.with_clock(Arc::new(move || transport.now_ms()));
+        }
         Self {
             did,
             inner,

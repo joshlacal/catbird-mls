@@ -1154,6 +1154,20 @@ impl From<BTreeSet<String>> for BuggifyPolicy {
     }
 }
 
+#[cfg(feature = "sim")]
+static SIM_SQLITE_VFS_NAME: OnceLock<&'static str> = OnceLock::new();
+
+/// Register a custom SQLite VFS name used by native `MlsAccountDb` connections in simulation.
+#[cfg(feature = "sim")]
+pub fn set_sim_sqlite_vfs_name(vfs_name: &'static str) {
+    let _ = SIM_SQLITE_VFS_NAME.set(vfs_name);
+}
+
+/// Active simulation SQLite VFS name, if registered.
+#[cfg(feature = "sim")]
+pub fn sim_sqlite_vfs_name() -> Option<&'static str> {
+    SIM_SQLITE_VFS_NAME.get().copied()
+}
 /// Fault-injection hook point. Compiles to `false` unless `feature = "sim"` is enabled
 /// and a thread-local [`BuggifyController`] fires for `$site`.
 #[cfg(feature = "sim")]

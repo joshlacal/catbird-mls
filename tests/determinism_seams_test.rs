@@ -115,6 +115,11 @@ struct DeterministicMockTransport {
     pds_records: Mutex<Vec<PdsRepoRecord>>,
     sequencer_signing_key: P256SigningKey,
     sequencer_pub_multibase: String,
+    space_records:
+        Mutex<std::collections::BTreeMap<(String, String, String, String), serde_json::Value>>,
+    labyrinth_epochs: Mutex<std::collections::BTreeMap<String, Vec<serde_json::Value>>>,
+    chat_device_pubkeys: Mutex<std::collections::BTreeMap<String, Vec<serde_json::Value>>>,
+    conversations: Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 impl DeterministicMockTransport {
@@ -132,6 +137,10 @@ impl DeterministicMockTransport {
             pds_records: Mutex::new(Vec::new()),
             sequencer_signing_key: sk,
             sequencer_pub_multibase: pub_multibase,
+            space_records: Mutex::new(std::collections::BTreeMap::new()),
+            labyrinth_epochs: Mutex::new(std::collections::BTreeMap::new()),
+            chat_device_pubkeys: Mutex::new(std::collections::BTreeMap::new()),
+            conversations: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -194,18 +203,6 @@ impl PlatformTransport for DeterministicMockTransport {
                     "message": "space parameter required"
                 }),
             ));
-        }
-
-        if url.contains("/xrpc/com.atproto.space.listRecords") {
-            return Ok(json_ok(serde_json::json!({
-                "records": []
-            })));
-        }
-
-        if url.contains("/xrpc/com.atproto.space.applyWrites") {
-            return Ok(json_ok(serde_json::json!({
-                "results": []
-            })));
         }
 
         if url.contains("/xrpc/com.atproto.repo.putRecord") {
@@ -284,6 +281,25 @@ impl PlatformTransport for DeterministicMockTransport {
         }
 
         if url.contains("blue.catbird.chat.enrollDevice") {
+            if let Some(ref b) = request.body {
+                if let Ok(req_json) = serde_json::from_slice::<serde_json::Value>(b) {
+                    let sbody = req_json.pointer("/signedRequest/body").unwrap_or(&req_json);
+                    if let Some(did) = sbody["actorDid"].as_str() {
+                        let pk = &sbody["signaturePublicKey"];
+                        let wrapped_pk = if pk.is_string() {
+                            serde_json::json!({ "$bytes": pk })
+                        } else {
+                            pk.clone()
+                        };
+                        self.chat_device_pubkeys
+                            .lock()
+                            .unwrap()
+                            .entry(did.to_string())
+                            .or_default()
+                            .push(serde_json::json!({ "signingPublicKey": wrapped_pk }));
+                    }
+                }
+            }
             return Ok(json_ok(serde_json::json!({
                 "enrolled": true,
                 "authGeneration": 1
@@ -312,9 +328,54 @@ impl PlatformTransport for DeterministicMockTransport {
                 .get("next")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            if let Some(cid) = sbody["conversationId"].as_str() {
+                let mut parts = sbody["manifest"]["participants"].clone();
+                let creator_did = sbody["manifest"]["actorLeaf"]["userDid"].as_str();
+                if let Some(arr) = parts.as_array_mut() {
+                    for p in arr {
+                        let lc = usize::from(p["userDid"].as_str() == creator_did);
+                        p["leafCount"] = serde_json::json!(lc);
+                    }
+                }
+                self.conversations.lock().unwrap().insert(
+                    cid.to_string(),
+                    serde_json::json!({
+                        "conversationKind": "group",
+                        "sequencerDid": "did:web:mls.catbird.test",
+                        "coordinates": next_coords,
+                        "participants": parts,
+                        "leaves": [sbody["manifest"]["actorLeaf"]],
+                        "metadataSnapshot": sbody["metadataSnapshot"],
+                        "snapshotSeq": 1,
+                    }),
+                );
+            }
             return Ok(json_ok(serde_json::json!({
                 "seq": 1,
                 "coordinates": next_coords
+            })));
+        }
+
+        if url.contains("blue.catbird.chat.getConversationState") {
+            let cid = url
+                .split_once('?')
+                .and_then(|(_, q)| {
+                    q.split('&')
+                        .find_map(|kv| kv.strip_prefix("conversationId="))
+                })
+                .unwrap_or_default();
+            let state = self
+                .conversations
+                .lock()
+                .unwrap()
+                .get(cid)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            return Ok(json_ok(serde_json::json!({
+                "state": state,
+                "pendingLeafRecoveryRequests": [],
+                "pendingResetRequests": [],
+                "pendingLeaveRequests": [],
             })));
         }
 
@@ -394,6 +455,167 @@ impl PlatformTransport for DeterministicMockTransport {
                 serde_json::json!({ "error": "RecordNotFound" }),
             ));
         }
+        if url.contains("/xrpc/com.atproto.space.applyWrites") {
+            let body_json: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .unwrap_or_default();
+            let space = body_json["space"].as_str().unwrap_or_default().to_string();
+            let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
+            let mut store = self.space_records.lock().unwrap();
+            let base_idx = store.len();
+            let mut results = Vec::new();
+            for (idx, w) in body_json["writes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                let coll = w["collection"].as_str().unwrap_or_default().to_string();
+                let rkey = w["rkey"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("3kzzzzzzzz{:03}", base_idx + idx));
+                let uri = format!("at://{repo}/{coll}/{rkey}");
+                if w["$type"].as_str().unwrap_or_default().ends_with("#delete") {
+                    store.remove(&(space.clone(), repo.clone(), coll, rkey));
+                } else {
+                    store.insert(
+                        (space.clone(), repo.clone(), coll, rkey),
+                        w["value"].clone(),
+                    );
+                }
+                results.push(serde_json::json!({ "uri": uri }));
+            }
+            return Ok(json_ok(serde_json::json!({
+                "results": results,
+                "commit": { "rev": "3kzzzzzzzzzzz", "data": { "$bytes": BASE64.encode([0x11_u8; 32]) } }
+            })));
+        }
+
+        if url.contains("/xrpc/com.atproto.space.getRecord")
+            || url.contains("/xrpc/com.atproto.space.listRecords")
+            || url.contains("/xrpc/com.atproto.space.listRepos")
+            || url.contains("/xrpc/blue.catbird.labyrinth.")
+        {
+            let mut q = std::collections::BTreeMap::new();
+            if let Some((_, qs)) = url.split_once('?') {
+                for pair in qs.split('&').filter(|s| !s.is_empty()) {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        let decoded = urlencoding_decode(v);
+                        q.insert(k.to_string(), decoded);
+                    }
+                }
+            }
+            if url.contains("/xrpc/com.atproto.space.getRecord") {
+                let key = (
+                    q.get("space").cloned().unwrap_or_default(),
+                    q.get("repo")
+                        .cloned()
+                        .unwrap_or_else(|| "did:plc:aliceaaaaaaaaaaaaaaaaaaa".to_string()),
+                    q.get("collection").cloned().unwrap_or_default(),
+                    q.get("rkey").cloned().unwrap_or_default(),
+                );
+                if let Some(val) = self.space_records.lock().unwrap().get(&key).cloned() {
+                    return Ok(json_ok(serde_json::json!({
+                        "uri": format!("at://{}/{}/{}", key.1, key.2, key.3),
+                        "value": val,
+                    })));
+                }
+                return Ok(json_resp(
+                    404,
+                    serde_json::json!({ "error": "RecordNotFound" }),
+                ));
+            }
+            if url.contains("/xrpc/com.atproto.space.listRecords") {
+                let space = q.get("space").cloned().unwrap_or_default();
+                let repo_opt = q.get("repo").cloned();
+                let coll = q.get("collection").cloned().unwrap_or_default();
+                let records: Vec<serde_json::Value> = self
+                    .space_records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|((s, r, c, _), _)| {
+                        s == &space && c == &coll && repo_opt.as_ref().is_none_or(|rp| r == rp)
+                    })
+                    .map(|((_, r, c, rk), val)| {
+                        serde_json::json!({
+                            "uri": format!("at://{r}/{c}/{rk}"),
+                            "rkey": rk,
+                            "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "value": val,
+                        })
+                    })
+                    .collect();
+                return Ok(json_ok(serde_json::json!({ "records": records })));
+            }
+            if url.contains("/xrpc/com.atproto.space.listRepos") {
+                let space = q.get("space").cloned().unwrap_or_default();
+                let mut dids: Vec<String> = self
+                    .space_records
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|(s, _, _, _)| s == &space)
+                    .map(|(_, r, _, _)| r.clone())
+                    .collect();
+                dids.sort();
+                dids.dedup();
+                let repos: Vec<serde_json::Value> = dids
+                    .into_iter()
+                    .map(|d| serde_json::json!({ "did": d }))
+                    .collect();
+                return Ok(json_ok(serde_json::json!({ "repos": repos })));
+            }
+            if url.contains("/xrpc/blue.catbird.labyrinth.publishEpochHead") {
+                let body_json: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                        .unwrap_or_default();
+                let did = body_json["epoch"]["did"]
+                    .as_str()
+                    .unwrap_or("did:plc:aliceaaaaaaaaaaaaaaaaaaa")
+                    .to_string();
+                self.labyrinth_epochs
+                    .lock()
+                    .unwrap()
+                    .entry(did)
+                    .or_default()
+                    .push(body_json["epoch"].clone());
+                return Ok(json_ok(serde_json::json!({})));
+            }
+            if url.contains("/xrpc/blue.catbird.labyrinth.getEpochHead") {
+                let did = q.get("did").cloned().unwrap_or_default();
+                if let Some(chain) = self
+                    .labyrinth_epochs
+                    .lock()
+                    .unwrap()
+                    .get(&did)
+                    .filter(|c| !c.is_empty())
+                    .cloned()
+                {
+                    let latest = chain.last().unwrap().clone();
+                    return Ok(json_ok(
+                        serde_json::json!({ "epoch": latest, "chain": chain }),
+                    ));
+                }
+                return Ok(json_resp(
+                    404,
+                    serde_json::json!({ "error": "EpochNotFound" }),
+                ));
+            }
+            if url.contains("/xrpc/blue.catbird.labyrinth.getChatDeviceKeys") {
+                let did = q.get("did").cloned().unwrap_or_default();
+                let items = self
+                    .chat_device_pubkeys
+                    .lock()
+                    .unwrap()
+                    .get(&did)
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok(json_ok(serde_json::json!({ "items": items })));
+            }
+        }
 
         Ok(json_ok(serde_json::json!({
             "uri": "at://did:plc:aliceaaaaaaaaaaaaaaaaaaa/record/1",
@@ -412,6 +634,26 @@ impl PlatformTransport for DeterministicMockTransport {
     fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
         Ok(())
     }
+}
+
+fn urlencoding_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_s) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_s, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn default_test_scopes() -> Vec<String> {
@@ -552,7 +794,7 @@ fn two_seeded_clients_produce_byte_identical_enrollment_and_ciphertexts() {
     hasher.update(out_a.3.as_bytes());
     let digest_hex = hasher.finalize().to_hex().to_string();
     assert_eq!(
-        digest_hex, "87cc87a4b71d87b975516d578fc9264ff2b8d79a1e9592dd4d38a67c2b67189c",
+        digest_hex, "eaf7e7c3a94e2c471e35a5ba0a8f5ef5cc21b66b774e16558a8eb188e139fc8c",
         "cross-process enrollment + X-Wing ciphertext blake3 digest drifted"
     );
 }
@@ -604,7 +846,7 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     assert_ne!(t1, t3);
     assert_eq!(
         hash_recorded_calls(&t1),
-        "f22ff0ad05cfd2aa3c5437d33ad55c5c6ed980b64ae9b38c751a51388ed0c69d",
+        "b81fda193d1f301e161e8a2508a2b54ad2c91b22ff7157d8f881cd9793fd3a11",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -664,7 +906,7 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
     }
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "77506b4696c2731713cb59cc89634facf6a7a0c954914c18d22b77c17de77c7b",
+        "ca900b9413ca6cff6c598ee2c807f6b7dadd110b49a27070a5bf4f419c91a7ee",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }

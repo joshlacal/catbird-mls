@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use labyrinth::client::{
     delete_account_remote, Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport,
-    RedactedMessage, RepinProposal, RosterExclusion, SystemClock, ThreadCursor, ThreadList,
+    RedactedMessage, RepinProposal, RosterExclusion, ThreadCursor, ThreadList,
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PublicRepoBackend};
@@ -111,8 +111,16 @@ fn space_unreachable() -> OrchestratorError {
     )
 }
 
+struct TransportClock(Arc<GatewayXrpcTransport>);
+
+impl labyrinth::client::Clock for TransportClock {
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+}
+
 impl SessionDeps {
-    fn ds_directory(&self) -> DsDirectoryStore {
+    pub(crate) fn ds_directory(&self) -> DsDirectoryStore {
         DsDirectoryStore::new(
             self.transport.clone(),
             self.sequencer_key.clone(),
@@ -127,7 +135,11 @@ impl SessionDeps {
             Some(pds) => Box::new(PdsPublisher::new(pds.clone(), &self.did)),
             None => Box::new(self.ds_directory()),
         };
-        Some(SpaceMailboxStore::for_owner(&self.did, space, publisher))
+        let transport = self.transport.clone();
+        Some(
+            SpaceMailboxStore::for_owner(&self.did, space, publisher)
+                .with_clock(Arc::new(move || transport.now_ms())),
+        )
     }
 
     fn backends(&self, _placement: Placement) -> Result<Backends> {
@@ -161,7 +173,7 @@ impl SessionDeps {
             threads,
             directory,
             publishers,
-            clock: Box::new(SystemClock),
+            clock: Box::new(TransportClock(self.transport.clone())),
         })
     }
 
@@ -805,6 +817,110 @@ impl LabyrinthSession {
         self.lab.discard_pending(conversation_id);
     }
 
+    /// Native queue entries keep the verified receipt and blinded frame nonce;
+    /// delegate MEK verification/distribution and sender sealing to Labyrinth.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn archive_native_sender(
+        &mut self,
+        conversation_id: &str,
+        members: &[String],
+        items: &[crate::client::QueuedLabyrinthArchivePayload],
+    ) -> Result<labyrinth::Result<()>> {
+        use base64::Engine as _;
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            let members: Vec<&str> = members.iter().map(String::as_str).collect();
+            let resolved = self.lab.resolve_roster_report(&members).await?;
+            for excluded in &resolved.excluded {
+                tracing::warn!(conversation_id, did = %excluded.did, error = %excluded.error,
+                    "labyrinth: member excluded from the native archive roster");
+            }
+            let roster = resolved.roster;
+            for item in items {
+                match (&item.frame_nonce_b64, &item.sequencer_receipt_json) {
+                    (Some(nonce), Some(receipt)) => {
+                        let nonce: [u8; 32] = base64::engine::general_purpose::STANDARD
+                            .decode(nonce)
+                            .map_err(|_| labyrinth::Error::Malformed("archive nonce"))?
+                            .try_into()
+                            .map_err(|_| labyrinth::Error::Malformed("archive nonce length"))?;
+                        let receipt: crate::client::chat_wire::StoredArchivedReceipt =
+                            serde_json::from_str(receipt)
+                                .map_err(|_| labyrinth::Error::Malformed("archive receipt"))?;
+                        let archived = receipt
+                            .to_labyrinth_archived()
+                            .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+                        self.lab
+                            .archive_outgoing_committed(
+                                conversation_id,
+                                &roster,
+                                &item.message_id,
+                                item.created_at_ms.max(0) as u64,
+                                &nonce,
+                                item.labyrinth_frame_json.as_bytes(),
+                                &archived.signed,
+                            )
+                            .await?;
+                    }
+                    (_, Some(_)) => {
+                        return Err(labyrinth::Error::Malformed("archive receipt missing nonce"))
+                    }
+                    _ => {
+                        self.lab
+                            .archive_outgoing(
+                                conversation_id,
+                                &roster,
+                                &item.message_id,
+                                item.created_at_ms.max(0) as u64,
+                                item.labyrinth_frame_json.as_bytes(),
+                            )
+                            .await?;
+                    }
+                }
+            }
+            self.lab.flush_thread(conversation_id).await?;
+            Ok(())
+        }
+        .await;
+        let out = self.try_finish(raw);
+        if !matches!(out, Ok(Ok(_))) {
+            self.lab.discard_pending(conversation_id);
+        }
+        out
+    }
+
+    pub async fn load_owner_history(
+        &mut self,
+        conversation_id: &str,
+    ) -> Result<Vec<LoadedMessage>> {
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            self.lab.load_owner_thread(conversation_id).await
+        }
+        .await;
+        let history = self.finish(raw)?;
+        if !history.undecryptable.is_empty() {
+            return Err(OrchestratorError::Api(
+                "labyrinth: owner archive contains undecryptable messages".into(),
+            ));
+        }
+        Ok(history.messages)
+    }
+
+    pub async fn open_owner_record(
+        &mut self,
+        batch: labyrinth::records::OwnerBatch,
+    ) -> Result<Vec<LoadedMessage>> {
+        let raw = self.lab.open_owner_record(batch).await;
+        let history = self.finish(raw)?;
+        if !history.undecryptable.is_empty() {
+            return Err(OrchestratorError::Api(
+                "labyrinth: owner record is undecryptable".into(),
+            ));
+        }
+        Ok(history.messages)
+    }
+
     pub async fn load_history(
         &mut self,
         conversation_id: &str,
@@ -850,6 +966,18 @@ impl LabyrinthSession {
             },
             p.next,
         ))
+    }
+
+    pub async fn rotate_epoch(&mut self) -> Result<u64> {
+        let out = match self.lab.rotate_epoch().await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason: _ })
+                if self.try_heal_squat(seq).await =>
+            {
+                self.lab.rotate_epoch().await
+            }
+            other => other,
+        };
+        self.finish(out)
     }
 
     pub async fn revoke_device(&mut self, device_key: [u8; 32]) -> Result<u64> {

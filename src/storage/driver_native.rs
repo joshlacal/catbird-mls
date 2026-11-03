@@ -113,6 +113,14 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn open_sqlite_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    #[cfg(feature = "sim")]
+    if let Some(vfs_name) = crate::sim_hooks::sim_sqlite_vfs_name() {
+        return Connection::open_with_flags_and_vfs(path, rusqlite::OpenFlags::default(), vfs_name);
+    }
+    Connection::open(path)
+}
+
 fn open_configured_connection(
     path: &Path,
     db_key_32: &[u8; 32],
@@ -130,7 +138,8 @@ fn open_configured_connection(
         }
     }
 
-    let conn = Connection::open(path).map_err(|e| map_rusqlite_err("Connection::open", &e))?;
+    let conn =
+        open_sqlite_connection(path).map_err(|e| map_rusqlite_err("Connection::open", &e))?;
 
     let key_spec = Zeroizing::new(derive_sqlcipher_96hex_key_spec(db_key_32));
 
@@ -453,7 +462,11 @@ impl MlsAccountDb {
             }
         };
 
-        if current_dv != guard.last_reconciled_data_version {
+        if current_dv != guard.last_reconciled_data_version
+            && !crate::planted::is_planted_bug_active(
+                crate::planted::PlantedBug::P10SkipDataVersionCheckAfterNseAdvance,
+            )
+        {
             self.fire_eviction_hooks();
         }
 

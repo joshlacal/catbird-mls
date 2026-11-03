@@ -114,6 +114,9 @@ struct MockDsState {
     acked_watermarks: BTreeMap<(String, String), i64>,
     // Space applyWrites records
     space_writes: Vec<Value>,
+    space_records: BTreeMap<(String, String, String, String), Value>,
+    labyrinth_epochs: BTreeMap<String, Vec<Value>>,
+    chat_device_pubkeys: BTreeMap<String, Vec<Value>>,
 }
 
 struct SharedMockDs {
@@ -145,6 +148,9 @@ impl SharedMockDs {
                 acked_welcomes: Vec::new(),
                 acked_watermarks: BTreeMap::new(),
                 space_writes: Vec::new(),
+                space_records: BTreeMap::new(),
+                labyrinth_epochs: BTreeMap::new(),
+                chat_device_pubkeys: BTreeMap::new(),
             }),
         })
     }
@@ -306,9 +312,136 @@ impl PlatformTransport for SharedMockDs {
 
         if url.contains("/xrpc/com.atproto.space.applyWrites") {
             g.space_writes.push(body_json.clone());
+            let space = body_json["space"].as_str().unwrap_or_default().to_string();
+            let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
+            let mut results = Vec::new();
+            for (idx, w) in body_json["writes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                let coll = w["collection"].as_str().unwrap_or_default().to_string();
+                let rkey = w["rkey"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("3kzzzzzzzz{:03}", g.space_writes.len() * 10 + idx));
+                let uri = format!("at://{repo}/{coll}/{rkey}");
+                if w["$type"].as_str().unwrap_or_default().ends_with("#delete") {
+                    g.space_records
+                        .remove(&(space.clone(), repo.clone(), coll, rkey));
+                } else {
+                    g.space_records.insert(
+                        (space.clone(), repo.clone(), coll, rkey),
+                        w["value"].clone(),
+                    );
+                }
+                results.push(json!({ "uri": uri }));
+            }
             return ok_json(json!({
-                "commit": { "rev": "3kzzzzzzzzzzz", "cid": "bafyreispacecommit" }
+                "results": results,
+                "commit": { "rev": "3kzzzzzzzzzzz", "data": { "$bytes": STANDARD.encode([0x11_u8; 32]) } }
             }));
+        }
+
+        if url.contains("/xrpc/com.atproto.space.getRecord") {
+            let key = (
+                q.get("space").cloned().unwrap_or_default(),
+                q.get("repo").cloned().unwrap_or_default(),
+                q.get("collection").cloned().unwrap_or_default(),
+                q.get("rkey").cloned().unwrap_or_default(),
+            );
+            if let Some(val) = g.space_records.get(&key) {
+                return ok_json(json!({
+                    "uri": format!("at://{}/{}/{}", key.1, key.2, key.3),
+                    "value": val,
+                }));
+            }
+            return Ok(PlatformHttpResponse {
+                status: 404,
+                headers: vec![PlatformHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                body: br#"{"error":"RecordNotFound"}"#.to_vec(),
+            });
+        }
+
+        if url.contains("/xrpc/com.atproto.space.listRecords") {
+            let space = q.get("space").cloned().unwrap_or_default();
+            let repo = q.get("repo").cloned().unwrap_or_default();
+            let coll = q.get("collection").cloned().unwrap_or_default();
+            let records: Vec<Value> = g
+                .space_records
+                .iter()
+                .filter(|((s, r, c, _), _)| s == &space && r == &repo && c == &coll)
+                .map(|((_, r, c, rk), val)| {
+                    json!({
+                        "uri": format!("at://{r}/{c}/{rk}"),
+                        "rkey": rk,
+                        "cid": "bafyreimock",
+                        "value": val,
+                    })
+                })
+                .collect();
+            return ok_json(json!({ "records": records }));
+        }
+
+        if url.contains("/xrpc/com.atproto.space.listRepos") {
+            let space = q.get("space").cloned().unwrap_or_default();
+            let mut dids: Vec<String> = g
+                .space_records
+                .keys()
+                .filter(|(s, _, _, _)| s == &space)
+                .map(|(_, r, _, _)| r.clone())
+                .collect();
+            dids.sort();
+            dids.dedup();
+            let repos: Vec<Value> = dids.into_iter().map(|d| json!({ "did": d })).collect();
+            return ok_json(json!({ "repos": repos }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.publishEpochHead") {
+            let did = body_json["epoch"]["did"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| {
+                    req.headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case("catbird-labyrinth-write"))
+                        .and_then(|h| URL_SAFE_NO_PAD.decode(h.value.as_bytes()).ok())
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .and_then(|v| v["did"].as_str().map(str::to_owned))
+                })
+                .unwrap_or_default();
+            g.labyrinth_epochs
+                .entry(did)
+                .or_default()
+                .push(body_json["epoch"].clone());
+            return ok_json(json!({}));
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.getEpochHead") {
+            let did = q.get("did").cloned().unwrap_or_default();
+            if let Some(chain) = g.labyrinth_epochs.get(&did).filter(|c| !c.is_empty()) {
+                let latest = chain.last().unwrap().clone();
+                return ok_json(json!({ "epoch": latest, "chain": chain }));
+            }
+            return Ok(PlatformHttpResponse {
+                status: 404,
+                headers: vec![PlatformHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                body: br#"{"error":"EpochNotFound"}"#.to_vec(),
+            });
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.getChatDeviceKeys") {
+            let did = q.get("did").cloned().unwrap_or_default();
+            let items = g.chat_device_pubkeys.get(&did).cloned().unwrap_or_default();
+            return ok_json(json!({ "items": items }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.enrollDevice") {
@@ -316,6 +449,16 @@ impl PlatformTransport for SharedMockDs {
             let did = b["actorDid"].as_str().unwrap().to_string();
             let dev = b["deviceId"].as_str().unwrap().to_string();
             let kps = b["keyPackages"].as_array().cloned().unwrap_or_default();
+            let pk = &b["signaturePublicKey"];
+            let wrapped_pk = if pk.is_string() {
+                json!({ "$bytes": pk })
+            } else {
+                pk.clone()
+            };
+            g.chat_device_pubkeys
+                .entry(did.clone())
+                .or_default()
+                .push(json!({ "signingPublicKey": wrapped_pk }));
             g.convo_kps.entry((did, dev)).or_default().extend(kps);
             return ok_json(json!({
                 "device": { "authGeneration": 1 }
@@ -386,8 +529,8 @@ impl PlatformTransport for SharedMockDs {
                     "sequencerDid": DS_DID,
                     "coordinates": coords,
                     "participants": [
-                        { "userDid": b["actorDid"], "status": "active", "role": "admin" },
-                        { "userDid": b["recipientDid"], "status": "pending", "role": "member" }
+                        { "userDid": b["actorDid"], "status": "active", "role": "admin", "leafCount": 1 },
+                        { "userDid": b["recipientDid"], "status": "pending", "role": "member", "leafCount": 0 }
                     ]
                 }),
             );
@@ -405,7 +548,14 @@ impl PlatformTransport for SharedMockDs {
             let b = &sr["body"];
             let cid = b["conversationId"].as_str().unwrap().to_string();
             let coords = b["next"].clone();
-            let parts = b["manifest"]["participants"].clone();
+            let mut parts = b["manifest"]["participants"].clone();
+            let creator_did = b["manifest"]["actorLeaf"]["userDid"].as_str();
+            if let Some(arr) = parts.as_array_mut() {
+                for p in arr {
+                    let lc = usize::from(p["userDid"].as_str() == creator_did);
+                    p["leafCount"] = json!(lc);
+                }
+            }
             g.conversations.insert(
                 cid.clone(),
                 json!({
@@ -445,6 +595,12 @@ impl PlatformTransport for SharedMockDs {
                 }));
                 if let Some(st) = g.conversations.get_mut(&cid) {
                     st["coordinates"] = next_coords.clone();
+                    if let Some(parts) = st["participants"].as_array_mut() {
+                        for p in parts {
+                            p["status"] = json!("active");
+                            p["leafCount"] = json!(1);
+                        }
+                    }
                 }
                 return ok_json(json!({
                     "seq": next_seq,
@@ -623,6 +779,23 @@ impl PlatformTransport for SharedMockDs {
                             "deviceId": change["deviceId"],
                             "leafOrigin": "recovery",
                         }));
+                    }
+                }
+                for change in b["participantChanges"].as_array().into_iter().flatten() {
+                    if change["$type"] == "blue.catbird.chat.defs#removeParticipant" {
+                        if let Some(parts) = st["participants"].as_array_mut() {
+                            parts.retain(|p| p["userDid"] != change["userDid"]);
+                        }
+                    }
+                }
+                let leaves_snap = st["leaves"].as_array().cloned().unwrap_or_default();
+                if let Some(parts) = st["participants"].as_array_mut() {
+                    for p in parts {
+                        let lc = leaves_snap
+                            .iter()
+                            .filter(|l| l["userDid"] == p["userDid"])
+                            .count();
+                        p["leafCount"] = json!(lc);
                     }
                 }
             }
@@ -849,6 +1022,43 @@ impl PlatformTransport for SharedMockDs {
             let wm = body_json["upToSeq"].as_i64().unwrap_or(0);
             g.acked_watermarks.insert((cid, dev), wm);
             return ok_json(json!({ "watermarkSeq": wm }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.chat.closeConversation") {
+            let sr = body_json["signedRequest"].clone();
+            let b = &sr["body"];
+            assert_eq!(b["$type"], "blue.catbird.chat.defs#conversationCloseBody");
+            assert_eq!(b["signatureDomain"], "CATBIRD-CHAT-CLOSE\0");
+            let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
+            let next_seq = (g.entries.get(&cid).map(Vec::len).unwrap_or(0) as i64) + 1;
+            let tombstone = json!({
+                "$type": "blue.catbird.chat.defs#conversationCloseTombstone",
+                "conversationId": cid,
+                "conversationKind": b["conversationKind"],
+                "retired": b["retired"],
+                "terminalSeq": next_seq,
+                "closedByDid": b["actorDid"],
+                "closedByDeviceId": b["actorDeviceId"],
+                "closedAt": b["signedAt"],
+            });
+            let entry = json!({
+                "$type": "blue.catbird.chat.defs#conversationCloseEntry",
+                "entryId": b["transitionId"],
+                "conversationId": cid,
+                "seq": next_seq,
+                "receivedAt": b["signedAt"],
+                "signedRequest": sr,
+                "tombstone": tombstone,
+            });
+            g.conversations.remove(&cid);
+            g.entries.remove(&cid);
+            g.leaf_recoveries.remove(&cid);
+            return ok_json(json!({
+                "result": {
+                    "tombstone": tombstone,
+                    "entry": entry,
+                }
+            }));
         }
 
         ok_json(json!({}))
@@ -1809,7 +2019,14 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
             }
         }
 
+        let unread_before_remove = uuid::Uuid::new_v4().to_string();
         if remove {
+            eve.send_message(
+                &cid,
+                &unread_before_remove,
+                "unread application before the sender is removed",
+            )
+            .unwrap();
             ds.inner.lock().unwrap().lose_next_commit_response = true;
         } else {
             ds.inner.lock().unwrap().defer_next_commit_transition = true;
@@ -1956,6 +2173,13 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
         alice
             .sync()
             .expect("recover accepted own commit from the durable journal");
+        if remove {
+            assert!(alice
+                .list_messages(&cid, None, 100)
+                .unwrap()
+                .iter()
+                .any(|message| message.message_id == unread_before_remove));
+        }
         assert_eq!(mls_state(&alice), mls_state(&bob));
         assert_eq!(mls_state(&alice).0, before.0 + 1);
         assert_eq!(pending_count(&alice), 0);
@@ -2020,4 +2244,64 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
             );
         }
     }
+}
+
+#[test]
+fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_unsendable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let alice_dev = uuid::Uuid::new_v4().to_string();
+    let alice = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("alice").to_string_lossy().into_owned(),
+            account_did: ALICE_DID.to_string(),
+            device_id: alice_dev,
+            home_ds_did: DS_DID.to_string(),
+            home_ds_endpoint: DS_URL.to_string(),
+            pds_endpoint: PDS_URL.to_string(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.clone(),
+        None,
+    )
+    .expect("open alice");
+    alice.enroll_device(&scopes).expect("enroll alice");
+
+    let cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(&cid, DS_DID, Vec::new(), Some("Solo Close".into()), None)
+        .expect("create solo group");
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    alice
+        .send_message(&cid, &msg_id, "retained before close")
+        .expect("send before close");
+
+    alice.close_conversation(&cid).expect("close conversation");
+    alice
+        .close_conversation(&cid)
+        .expect("close conversation idempotent");
+
+    assert!(
+        !ds.inner.lock().unwrap().conversations.contains_key(&cid),
+        "DS operational state must be wiped on closeConversation"
+    );
+    assert_eq!(
+        alice.list_messages(&cid, None, 20).unwrap().len(),
+        1,
+        "local decrypted history remains readable after close"
+    );
+    let post_close_msg = uuid::Uuid::new_v4().to_string();
+    assert!(
+        alice
+            .send_message(&cid, &post_close_msg, "must fail")
+            .is_err(),
+        "closed conversation must reject subsequent sends"
+    );
+    alice
+        .sync()
+        .expect("sync skips closed/wiped conversation cleanly");
 }

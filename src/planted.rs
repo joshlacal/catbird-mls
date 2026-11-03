@@ -5,14 +5,30 @@
 //! [`with_planted_bug`]. Selection is thread-local; dispatchers must capture
 //! [`active_planted_bug`] before switching threads and restore it on the worker.
 
-/// Real client-path regressions exercised by the Phase 1 simulation oracles.
+/// Real client and server-path regressions exercised by simulation oracles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlantedBug {
     P1KeepLoserStagedCommit,
     P2PrematureMergeBeforeServerAccept,
     P3NetworkInsideWriteTx,
+    /// Omit the durable archive enqueue when recovering a previously reserved send.
+    P4SkipLabyrinthEnqueueAfterSendRetry,
+    /// Distribute a conversation MEK to a self-signed but unauthorized device epoch.
+    P5WrapMekToUnverifiedDevice,
     P6OrderTimelineByEpochSeq,
+    /// Server/simulator hook: keep application payload bytes after ack and archive flush.
+    P8RetainServerCiphertextAfterAckAndFlush,
+    /// Replace local MLS state with an external join after an application decrypt error.
+    P9AutomatedForcedRejoinOnDecryptFailure,
+    /// Skip cross-handle data-version cache eviction inside the next write transaction.
+    P10SkipDataVersionCheckAfterNseAdvance,
+    /// Revoke conversation Space membership before the removal commit is accepted.
+    P11RevokeSpaceAccessBeforeKickedMemberFlushes,
+    /// Re-decrypt a persisted message replay after reopening the account database.
+    P12SkipMessageIdDedupeAfterCrashRestart,
     P13AdvanceSeqCursorBeforeDurableStore,
+    /// Retire an uncertain commit's recovery journal and rebuild a fresh commit transition.
+    P15NonIdempotentCommitSubmitRetry,
 }
 
 #[cfg(feature = "sim")]
@@ -56,8 +72,18 @@ pub fn is_planted_bug_active(bug: PlantedBug) -> bool {
             PlantedBug::P1KeepLoserStagedCommit => cfg!(feature = "plant_p1"),
             PlantedBug::P2PrematureMergeBeforeServerAccept => cfg!(feature = "plant_p2"),
             PlantedBug::P3NetworkInsideWriteTx => cfg!(feature = "plant_p3"),
+            PlantedBug::P4SkipLabyrinthEnqueueAfterSendRetry => cfg!(feature = "plant_p4"),
+            PlantedBug::P5WrapMekToUnverifiedDevice => cfg!(feature = "plant_p5"),
             PlantedBug::P6OrderTimelineByEpochSeq => cfg!(feature = "plant_p6"),
+            PlantedBug::P8RetainServerCiphertextAfterAckAndFlush => cfg!(feature = "plant_p8"),
+            PlantedBug::P9AutomatedForcedRejoinOnDecryptFailure => cfg!(feature = "plant_p9"),
+            PlantedBug::P10SkipDataVersionCheckAfterNseAdvance => cfg!(feature = "plant_p10"),
+            PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes => {
+                cfg!(feature = "plant_p11")
+            }
+            PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart => cfg!(feature = "plant_p12"),
             PlantedBug::P13AdvanceSeqCursorBeforeDurableStore => cfg!(feature = "plant_p13"),
+            PlantedBug::P15NonIdempotentCommitSubmitRetry => cfg!(feature = "plant_p15"),
         }
     }
     #[cfg(not(feature = "sim"))]
@@ -139,6 +165,54 @@ mod tests {
         });
         assert_eq!(active_planted_bug(), None);
         assert!(!is_planted_bug_active(outer));
+        for phase2 in [
+            PlantedBug::P4SkipLabyrinthEnqueueAfterSendRetry,
+            PlantedBug::P5WrapMekToUnverifiedDevice,
+            PlantedBug::P8RetainServerCiphertextAfterAckAndFlush,
+            PlantedBug::P9AutomatedForcedRejoinOnDecryptFailure,
+            PlantedBug::P10SkipDataVersionCheckAfterNseAdvance,
+            PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes,
+            PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart,
+            PlantedBug::P15NonIdempotentCommitSubmitRetry,
+        ] {
+            assert!(!is_planted_bug_active(phase2));
+            with_planted_bug(Some(phase2), || assert!(is_planted_bug_active(phase2)));
+        }
+    }
+
+    #[cfg(all(feature = "sim", not(target_arch = "wasm32")))]
+    #[test]
+    fn p10_skips_data_version_eviction_hook_after_external_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p10.db");
+        let key = [9u8; 32];
+        let app =
+            crate::storage::MlsAccountDb::open_native(&path, &key, crate::storage::OpenMode::App)
+                .unwrap();
+        let nse = crate::storage::MlsAccountDb::open_native(
+            &path,
+            &key,
+            crate::storage::OpenMode::PushExtension,
+        )
+        .unwrap();
+        let evictions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&evictions);
+        app.register_cache_eviction_hook(std::sync::Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        nse.write_tx(|tx| tx.put_account_meta("nse_epoch", "1", 1))
+            .unwrap();
+        with_planted_bug(
+            Some(PlantedBug::P10SkipDataVersionCheckAfterNseAdvance),
+            || app.write_tx(|_tx| Ok(())).unwrap(),
+        );
+        assert_eq!(evictions.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        nse.write_tx(|tx| tx.put_account_meta("nse_epoch", "2", 2))
+            .unwrap();
+        app.write_tx(|_tx| Ok(())).unwrap();
+        assert_eq!(evictions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[cfg(all(feature = "sim", not(target_arch = "wasm32")))]

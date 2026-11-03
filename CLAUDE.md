@@ -115,7 +115,7 @@ All source is in `src/`. Single crate, no workspace.
 | `logging.rs` | `debug_log!` macro + `MLSLogger` callback for platform log routing |
 | `atproto_bytes.rs` | AT Protocol base64url serde helpers |
 | `ffi.rs` | Legacy C FFI layer (predates UniFFI, kept for interop) |
-| `planted.rs` | `PlantedBug` (`P1`/`P2`/`P3`/`P6`/`P13`) thread-local `sim` calibration hooks + `SimGroupState` |
+| `planted.rs` | `PlantedBug` (`P1`–`P6`, `P8`–`P13`, `P15`) thread-local `sim` calibration hooks + `SimGroupState` |
 
 ## Architecture
 
@@ -143,6 +143,37 @@ Joined clients discover fulfillable leaf-recovery requests through
 `getConversationState.pendingLeafRecoveryRequests`; `getLeafRecoveryInbox` belongs
 to the requesting device. Classify stale transitions by the exact XRPC
 `StaleCoordinates` error, not HTTP 409: the delivery service returns HTTP 400.
+
+A generic `#commitTransitionBody` Commit must carry zero participant changes, so
+`remove_group_member` is two steps: a Commit removing every target leaf (carrying
+`removed_participant_did` in `PendingCommitTransition` and recording a
+`participant_removal` pending op once that own Commit is accepted or recovered), then a
+`#policyTransitionBody` `removeParticipant` at the server's coordinate once the target
+has zero leaves. `sync()` authenticates `policyTransitionEntry` wrapper signatures and
+resumes the policy step after a lost response or a journal-recovered Commit.
+An accepted local Commit with a preceding entry-sequence gap stays journaled without
+advancing the durable MLS group or evicting its prior roster. Ordered entry sync first
+authenticates the preceding applications under strict `I4`, then recovers the own Commit
+and completes any participant-removal policy. The same rule applies to leaf recovery.
+
+`accept_direct_request` journals its signed `acceptConversation` request as a
+`direct_request_acceptance` pending op and replays those exact bytes until consent is
+recorded (with the journal removal) or a deterministic 4xx: the delivery service keeps
+the first acceptance even when relaying it to a remote coordinator fails, so a freshly
+signed retry is an `IdempotencyConflict`. Accepting an already accepted request is a
+no-op, and a synced acceptance entry also clears the journal.
+
+Labyrinth adapters map the exact HTTP 400 `NotEntitled` and
+`AccessOutsideMembershipInterval` errors to `labyrinth::Error::Forbidden`, like 401/403:
+a kicked or never-joined device then rescues its queue into owner batches and reads its
+owner archive. A device with no saved conversation placement cannot learn the sequencer,
+so it checks owner-archived receipts by `archiveCommitment` only.
+
+A joined group's `sequencer_did` (the `I13` receipt signer) and Space authority come from
+`getConversationState.state.sequencerDid`, never the home DS: the frozen `welcomeView`
+names no sequencer, and a remote member reads a mirror of entries another DS sequenced.
+`sync()` re-points rows and journaled sends whose stored authority differs from the
+inventory state view.
 
 ### Async Runtime Bridging
 

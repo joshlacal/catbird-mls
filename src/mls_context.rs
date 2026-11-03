@@ -835,7 +835,7 @@ fn validate_existing_sqlite_storage(
     let key_spec =
         zeroize::Zeroizing::new(crate::storage::derive_sqlcipher_96hex_key_spec(&db_key_32));
 
-    let conn = Connection::open(path)
+    let conn = crate::storage::driver_native::open_sqlite_connection(path)
         .map_err(|e| MLSError::invalid_input(format!("Failed to open existing DB: {e}")))?;
     conn.execute_batch(&format!(
         "PRAGMA cipher_memory_security = OFF;\n\

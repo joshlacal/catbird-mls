@@ -251,6 +251,11 @@ impl CatbirdMlsClient {
         self.decline_direct_request(&request_id)
     }
 
+    #[uniffi::method(name = "close_conversation")]
+    pub fn ffi_close_conversation(&self, conversation_id: String) -> Result<(), MLSError> {
+        self.close_conversation(&conversation_id)
+    }
+
     #[uniffi::method(name = "acknowledge_entries_up_to")]
     pub fn ffi_acknowledge_entries_up_to(
         &self,
