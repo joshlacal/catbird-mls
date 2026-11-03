@@ -156,11 +156,15 @@ where
     /// request keys. Its truthful view is the account's consent from the
     /// validated conversation state with crypto unavailable. Nothing is
     /// retained, so later leaf recovery never inherits a fabricated preview.
+    /// `code` names why: the device was not addressed, or its opening was
+    /// pruned before import (`sender` then binds the verified receipt actor).
     async fn unaddressed_direct_request_view(
         &self,
         cid: &str,
         owner: &str,
         device: &str,
+        code: &str,
+        sender: Option<&str>,
     ) -> Result<DirectRequestView> {
         let result = self
             .request_query(
@@ -174,7 +178,9 @@ where
         let state = view.canonical_state.as_ref().ok_or_else(invalid)?;
         super::super::admission::validate_conversation_policy(state)?;
         let request = state.direct_request.as_ref().ok_or_else(invalid)?;
-        if state.coordinates.conversation_id.as_str() != cid {
+        if state.coordinates.conversation_id.as_str() != cid
+            || sender.is_some_and(|sender| sender != request.sender_did.as_str())
+        {
             return Err(invalid());
         }
         let recipient = owner == request.recipient_did.as_str();
@@ -193,13 +199,61 @@ where
             first_message_id: None,
             consent,
             crypto: RequestCrypto::Unavailable,
-            preview: Some(RequestPreview::Unavailable {
-                code: "DeviceNotAddressed".into(),
-            }),
+            preview: Some(RequestPreview::Unavailable { code: code.into() }),
             capabilities: RequestCapabilities::derive(consent, RequestCrypto::Unavailable, false),
             state_version: u64::try_from(state.coordinates.state_version).map_err(|_| invalid())?,
             generation: u64::try_from(state.coordinates.generation).map_err(|_| invalid())?,
         })
+    }
+    /// The authenticated receipt-authority document for a request between
+    /// `actor_did` and `recipient_did`.
+    async fn request_receipt_authority(
+        &self,
+        actor_did: &str,
+        recipient_did: &str,
+    ) -> Result<Vec<u8>> {
+        let actor_auth = self
+            .credentials()
+            .get_chat_declaration_authority(actor_did)
+            .await?;
+        let recipient_auth = self
+            .credentials()
+            .get_chat_declaration_authority(recipient_did)
+            .await?;
+        let expected_coordinator = match (actor_auth, recipient_auth) {
+            (Some(a), Some(b)) => {
+                transcript::derive_deterministic_coordinator(&a, &b).map_err(|_| invalid())?
+            }
+            (None, None) => super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
+            (Some(auth), None) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+                super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+            }
+            (None, Some(auth)) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+                super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+            }
+            _ => {
+                return Err(OrchestratorError::Mls(
+                    crate::MLSError::OperationNotSupported {
+                        reason: "Direct request receipt authority resolution unavailable".into(),
+                    },
+                ));
+            }
+        };
+        let document = self
+            .credentials()
+            .direct_request_receipt_authority_document(&expected_coordinator)
+            .await?
+            .ok_or_else(|| {
+                OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
+                    reason: "Direct request receipt authority resolution unavailable".into(),
+                })
+            })?;
+        super::intent::validate_authority_document_for_expected_authority(
+            &document,
+            &expected_coordinator,
+        )
+        .map_err(|_| invalid())?;
+        Ok(document)
     }
     pub(crate) async fn request_query(
         &self,
@@ -268,7 +322,13 @@ where
                 {
                     crate::info_log!("[request] convo={} GetEntries NotEntitled: unaddressed view, nothing persisted", cid);
                     return self
-                        .unaddressed_direct_request_view(cid, &owner, &device)
+                        .unaddressed_direct_request_view(
+                            cid,
+                            &owner,
+                            &device,
+                            "DeviceNotAddressed",
+                            None,
+                        )
                         .await;
                 }
                 result => result?,
@@ -280,6 +340,33 @@ where
                 .collect::<Vec<_>>();
             if requests.len() != 1 {
                 return Err(OrchestratorError::ConversationNotFound(cid.into()));
+            }
+            if crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(requests[0]) {
+                // The opening ciphertext was pruned before this device imported
+                // it. Only its immutable receipts remain: verify them, then
+                // surface the declared terminal view. Nothing is persisted and
+                // no Welcome import, preview or acceptance can follow from it.
+                let actor = requests[0]["publicationReceipt"]["body"]["receipt"]["actorDid"]
+                    .as_str()
+                    .ok_or_else(invalid)?;
+                let document = Box::pin(self.request_receipt_authority(actor, &owner)).await?;
+                let did: Value = serde_json::from_slice(&document).map_err(|_| invalid())?;
+                crate::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
+                    requests[0],
+                    cid,
+                    did["id"].as_str().ok_or_else(invalid)?,
+                    &document,
+                )
+                .map_err(|_| invalid())?;
+                crate::info_log!("[request] convo={} opening pruned before import: terminal view, nothing persisted", cid);
+                return Box::pin(self.unaddressed_direct_request_view(
+                    cid,
+                    &owner,
+                    &device,
+                    "OpeningPruned",
+                    Some(actor),
+                ))
+                .await;
             }
             let entry = super::projection::request_control_entry(requests[0].clone())?;
             let publication = &entry["signedRequest"];
@@ -323,49 +410,7 @@ where
             )
             .map_err(|_| invalid())?;
             let actor_did = verified.body()["actorDid"].as_str().ok_or_else(invalid)?;
-            let recipient_did = &owner;
-            let actor_auth = self
-                .credentials()
-                .get_chat_declaration_authority(actor_did)
-                .await?;
-            let recipient_auth = self
-                .credentials()
-                .get_chat_declaration_authority(recipient_did)
-                .await?;
-            let expected_coordinator = match (actor_auth, recipient_auth) {
-                (Some(a), Some(b)) => {
-                    transcript::derive_deterministic_coordinator(&a, &b).map_err(|_| invalid())?
-                }
-                (None, None) => super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
-                (Some(auth), None) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
-                    super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
-                }
-                (None, Some(auth)) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
-                    super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
-                }
-                _ => {
-                    return Err(OrchestratorError::Mls(
-                        crate::MLSError::OperationNotSupported {
-                            reason: "Direct request receipt authority resolution unavailable"
-                                .into(),
-                        },
-                    ));
-                }
-            };
-            let document = self
-                .credentials()
-                .direct_request_receipt_authority_document(&expected_coordinator)
-                .await?
-                .ok_or_else(|| {
-                    OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
-                        reason: "Direct request receipt authority resolution unavailable".into(),
-                    })
-                })?;
-            super::intent::validate_authority_document_for_expected_authority(
-                &document,
-                &expected_coordinator,
-            )
-            .map_err(|_| invalid())?;
+            let document = Box::pin(self.request_receipt_authority(actor_did, &owner)).await?;
             let projection = DirectRequestProjection {
                 authorization_version: super::projection::REQUEST_AUTHORIZATION_VERSION,
                 owner_did: owner.clone(),

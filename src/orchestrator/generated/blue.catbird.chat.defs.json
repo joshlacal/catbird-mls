@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "df7653aa530cadaf5d24263ef74a54c688571169",
-    "sourceSha256": "fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39",
-    "sourceTree": "8d9ac196a76ad4e8f96538ddd304066647210c3a"
+    "sourceRevision": "0f4f58a27d161c35cf7dcc1072a570660a7fbb0f",
+    "sourceSha256": "eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad",
+    "sourceTree": "5173d7d9679b13d8e40316e050fb2394c8f0d956"
   },
   "defs": {
     "accessEndedEvent": {
@@ -43,7 +43,7 @@
       "type": "object"
     },
     "accountDeletedEntry": {
-      "description": "[I13] Sequencer-recorded control entry indicating that deletedDid deleted their account and removed their writer repo from the conversation Space.",
+      "description": "[I13] Sequencer-recorded control entry indicating that deletedDid deleted their account and removed their writer repo from the conversation Space. sequencerAuthority is the sequencer's signed evidence of exactly this entry; every home stores and returns it verbatim.",
       "properties": {
         "conversationId": {
           "ref": "#operationId",
@@ -66,6 +66,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerAuthority": {
+          "ref": "#accountDeletionAuthority",
+          "type": "ref"
+        },
         "sequencerDid": {
           "ref": "#bareDid",
           "type": "ref"
@@ -82,7 +86,32 @@
         "seq",
         "deletedDid",
         "sequencerDid",
+        "sequencerAuthority",
         "receivedAt"
+      ],
+      "type": "object"
+    },
+    "accountDeletionAuthority": {
+      "description": "[I13] The sequencer's attestation that it sequenced one exact accountDeletedEntry, signed with its dedicated receipt key and never its service-auth key. sequencerDid equals the entry's sequencerDid and keyId is exactly sequencerDid#mls-receipt-1, resolved from the sequencer's DID document. signature is low-S ES256 r||s over UTF8(catbird-mls-account-deletion-v1\\0) followed by, for each of the entry's sequencerDid, conversationId, deletedDid, seq as decimal text, entryId and receivedAt (the deletion instant), its u32 big-endian UTF-8 byte length and its UTF-8 bytes. Clients verify it before hiding deletedDid's restored history.",
+      "properties": {
+        "keyId": {
+          "maxLength": 320,
+          "type": "string"
+        },
+        "sequencerDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "sequencerDid",
+        "keyId",
+        "signature"
       ],
       "type": "object"
     },
@@ -2382,6 +2411,10 @@
           "ref": "#operationId",
           "type": "ref"
         },
+        "payloadPruned": {
+          "description": "True iff signedRequest is omitted because the opening ciphertext was pruned: every frozen-audience recipient device acknowledged it, its sender's account was deleted, the request expired, or it reached the 30-day retention ceiling; all other fields remain verbatim.",
+          "type": "boolean"
+        },
         "publicationReceipt": {
           "closed": true,
           "description": "Authoritative signed published outcome, including its mandatory I13 proof, available before recipient Welcome import.",
@@ -2412,7 +2445,6 @@
         "entryId",
         "conversationId",
         "seq",
-        "signedRequest",
         "receivedAt",
         "sequencerReceipt",
         "publicationReceipt"

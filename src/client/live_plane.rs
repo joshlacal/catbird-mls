@@ -563,11 +563,22 @@ impl CatbirdMlsClient {
             .map(str::to_owned)
     }
 
+    /// `mls-ds` bootstrap: PDS device + declaration records, `enrollDevice`, request keys and
+    /// KeyPackages. `auth_generation` is persisted only once it completes; afterwards this is a
+    /// no-op. A retry after a crash or lost response resumes: `enrollDevice` is create-only and
+    /// request-key revisions must advance by one, so it confirms what the DS already holds.
     pub(crate) fn enroll_device_live(
         &self,
         canonical_device_id: &str,
         pub_key: &[u8],
     ) -> Result<(), MLSError> {
+        if self
+            .db
+            .read_tx(|tx| tx.get_account_meta("auth_generation"))?
+            .is_some()
+        {
+            return Ok(());
+        }
         // 1. Publish ADR-009 PDS `blue.catbird.chat.device/{device_id}` + `blue.catbird.chat.declaration/self`.
         let put_record_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
         let dev_record_body = chat_wire::build_pds_device_put_record_body_at(
@@ -673,13 +684,22 @@ impl CatbirdMlsClient {
             "signedAt": self.hooks.now_rfc3339_millis(),
         });
 
-        let enroll_resp = self.submit_signed_chat_op(
+        let (enroll_resp, request_keys_published) = match self.submit_signed_chat_op(
             canonical_device_id,
             None,
             CanonicalOperation::EnrollDevice,
             &enroll_body,
             &signer,
-        )?;
+        ) {
+            Ok(resp) => (resp, false),
+            // An earlier attempt registered this device, but its response was lost.
+            Err(MLSError::InvalidState(code)) if code == "DeviceAlreadyExists" => {
+                let own = self.own_enrolled_device(canonical_device_id, &signer)?;
+                let published = own.get("directRequestKeyPool").is_some();
+                (own, published)
+            }
+            Err(e) => return Err(e),
+        };
         let auth_generation = enroll_resp
             .get("device")
             .and_then(|d| d.get("authGeneration"))
@@ -690,40 +710,69 @@ impl CatbirdMlsClient {
             })?
             .max(1);
 
-        // 3. Persist authoritative `auth_generation` + generate C33 DirectRequestKeyPublication.
+        // 3. Generate + publish the C33 DirectRequestKeyPublication unless the DS already has it.
         let now_ms = self.hooks.now_ms();
-        let dr_exact_request = self.db.write_tx(|tx| {
-            tx.put_account_meta("auth_generation", &auth_generation.to_string(), now_ms)?;
-            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-            let provider = self.hooks.openmls_provider(storage);
-            let (raw_pub_rec, _bundles) = build_request_key_publication(
-                &provider,
-                &signer,
-                &DirectRequestKeyPublicationInput {
-                    actor_did: self.normalized_did.clone(),
-                    actor_device_id: canonical_device_id.to_string(),
-                    auth_generation,
-                    revision: 1,
-                    enabled: true,
-                    count: 8,
-                },
-                now_secs as i64,
-            )?;
-            let parsed_rec: DirectRequestKeyPublication = serde_json::from_slice(&raw_pub_rec)
-                .map_err(|e| {
-                    MLSError::Internal(format!("parse DirectRequestKeyPublication: {e}"))
-                })?;
-            Ok(parsed_rec.exact_request)
-        })?;
+        if !request_keys_published {
+            let dr_exact_request = self.db.write_tx(|tx| {
+                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                let provider = self.hooks.openmls_provider(storage);
+                let (raw_pub_rec, _bundles) = build_request_key_publication(
+                    &provider,
+                    &signer,
+                    &DirectRequestKeyPublicationInput {
+                        actor_did: self.normalized_did.clone(),
+                        actor_device_id: canonical_device_id.to_string(),
+                        auth_generation,
+                        revision: 1,
+                        enabled: true,
+                        count: 8,
+                    },
+                    now_secs as i64,
+                )?;
+                let parsed_rec: DirectRequestKeyPublication = serde_json::from_slice(&raw_pub_rec)
+                    .map_err(|e| {
+                        MLSError::Internal(format!("parse DirectRequestKeyPublication: {e}"))
+                    })?;
+                Ok(parsed_rec.exact_request)
+            })?;
+            let dr_keys_url = format!(
+                "{}/xrpc/blue.catbird.chat.publishDirectRequestKeys",
+                self.ds_base()
+            );
+            let _ = self.execute_json_post(dr_keys_url, dr_exact_request)?;
+        }
 
-        // 4. Publish C33 direct-request keys + replenish conversation key packages.
-        let dr_keys_url = format!(
-            "{}/xrpc/blue.catbird.chat.publishDirectRequestKeys",
-            self.ds_base()
-        );
-        let _ = self.execute_json_post(dr_keys_url, dr_exact_request)?;
+        // 4. Persist the authoritative `auth_generation` (bootstrap complete) + replenish
+        // conversation key packages.
+        self.db.write_tx(|tx| {
+            tx.put_account_meta("auth_generation", &auth_generation.to_string(), now_ms)
+        })?;
         let _ = self.replenish_key_packages(4)?;
         Ok(())
+    }
+
+    /// The DS's active enrollment of this device under `signer` (`chat_wire::own_active_device`).
+    /// The DS also verifies this signed read against the device's registered key.
+    fn own_enrolled_device(
+        &self,
+        canonical_device_id: &str,
+        signer: &SignatureKeyPair,
+    ) -> Result<Value, MLSError> {
+        // ponytail: first page only (100 items; accounts hold at most 20 active devices); follow
+        // `nextPageCursor` if revoked devices ever push this one past it.
+        let devices = self.query_signed_chat_ds(
+            "blue.catbird.chat.getOwnDevices",
+            &[("actorDeviceId", canonical_device_id), ("limit", "100")],
+            canonical_device_id,
+            signer,
+        )?;
+        chat_wire::own_active_device(&devices, canonical_device_id, signer.public())
+            .cloned()
+            .ok_or_else(|| {
+                MLSError::InvalidState(format!(
+                    "DeviceAlreadyExists: mls-ds holds device {canonical_device_id} under another key"
+                ))
+            })
     }
 
     /// Generate and upload `count` fresh `MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519` key packages.
@@ -1772,7 +1821,6 @@ impl CatbirdMlsClient {
                     "role": "member",
                     "status": "pending",
                     "invitationProvenance": {
-                        "$type": "blue.catbird.chat.defs#invitationProvenance",
                         "invitationTransitionId": transition_id,
                         "invitedByDid": self.normalized_did,
                         "invitedByDeviceId": canonical_dev_id,
@@ -3325,6 +3373,12 @@ impl CatbirdMlsClient {
             // Accepted here or by another of this account's devices: a freshly signed
             // acceptance could only be an `IdempotencyConflict`.
             return Ok(());
+        }
+        if req_opt.as_ref().is_some_and(|r| {
+            r.consent == crate::orchestrator::direct_request_bootstrap::C33_OPENING_UNAVAILABLE
+        }) {
+            // No signed opening survives to accept against: terminal, never re-requested.
+            return Err(MLSError::InvalidState("OpeningUnavailable".into()));
         }
 
         if let (Some(canonical_dev_id), Some(req)) =

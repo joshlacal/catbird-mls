@@ -831,6 +831,16 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
     assert!(messages.is_empty());
     assert_eq!(cursor.as_deref(), Some("1"));
     assert!(bob.storage.get_conversation_messages(cid).is_empty());
+    // O7: after frozen-audience ack the DS prunes the opening ciphertext and serves the row
+    // without `signedRequest`. An importing device (or a sibling that already imported)
+    // treats it as a verified duplicate: row identity is unchanged, nothing is re-retained.
+    let pruned_entry = Box::pin(check_pruned_opening_duplicate(
+        &world,
+        cid,
+        &publication_entry,
+        &request_envelope,
+    ))
+    .await;
     let mut forged_entry = publication_entry.clone();
     forged_entry["entryId"] = json!(uuid::Uuid::new_v4().to_string());
     let forged =
@@ -1209,6 +1219,7 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
         .await
         .unwrap();
     assert!(duplicate.is_empty());
+    Box::pin(check_pruned_opening_accepted(&world, &cid, &pruned_entry)).await;
     let native_policy = world
         .client("Alice")
         .orchestrator
@@ -1894,5 +1905,143 @@ async fn request_key_pool_retries_exact_durable_batch_and_counts_reserved_custod
             .unwrap()
             .len(),
         before + 66
+    );
+}
+
+/// O7 on a device that already imported the opening: a pruned row is a verified duplicate
+/// (row identity unchanged, nothing re-retained); any receipt or shape mismatch is rejected.
+async fn check_pruned_opening_duplicate(
+    world: &TestWorld,
+    cid: &str,
+    publication_entry: &Value,
+    request_envelope: &catbird_mls::orchestrator::IncomingEnvelope,
+) -> Value {
+    let bob = world.client("Bob");
+    let mut pruned_entry = publication_entry.clone();
+    pruned_entry
+        .as_object_mut()
+        .unwrap()
+        .remove("signedRequest");
+    pruned_entry["payloadPruned"] = json!(true);
+    let retained = bob
+        .orchestrator
+        .mls_context()
+        .read_direct_request_projection(cid)
+        .unwrap();
+    let pruned_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&pruned_entry, cid)
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        pruned_envelope.server_message_id,
+        request_envelope.server_message_id
+    );
+    assert_eq!(
+        pruned_envelope.server_sequence,
+        request_envelope.server_sequence
+    );
+    assert_eq!(pruned_envelope.server_epoch, request_envelope.server_epoch);
+    assert_eq!(pruned_envelope.sender_did, request_envelope.sender_did);
+    world
+        .delivery_service()
+        .queue_incoming_page(vec![pruned_envelope], Some("1".into()));
+    let (messages, _) = Box::pin(
+        bob.orchestrator
+            .fetch_messages(cid, None, 100, None, None, None),
+    )
+    .await
+    .expect("a pruned duplicate opening is accepted on an importing device");
+    assert!(messages.is_empty());
+    assert_eq!(
+        bob.orchestrator
+            .mls_context()
+            .read_direct_request_projection(cid)
+            .unwrap(),
+        retained,
+        "a pruned row is never retained"
+    );
+    let mut swapped_receipt = pruned_entry.clone();
+    swapped_receipt["sequencerReceipt"]["seq"] = json!(2);
+    let mut swapped_entry = pruned_entry.clone();
+    swapped_entry["entryId"] = json!(uuid::Uuid::new_v4().to_string());
+    let mut pruned_with_body = publication_entry.clone();
+    pruned_with_body["payloadPruned"] = json!(true);
+    let mut unflagged = pruned_entry.clone();
+    unflagged.as_object_mut().unwrap().remove("payloadPruned");
+    for (name, tampered) in [
+        ("sequencer receipt mismatch", swapped_receipt),
+        ("entry identity mismatch", swapped_entry),
+        ("payloadPruned with a signed body", pruned_with_body),
+        ("omitted body without payloadPruned", unflagged),
+    ] {
+        let envelope =
+            catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&tampered, cid)
+                .unwrap()
+                .unwrap();
+        world
+            .delivery_service()
+            .queue_incoming_page(vec![envelope], Some("1".into()));
+        assert!(
+            Box::pin(
+                bob.orchestrator
+                    .fetch_messages(cid, None, 100, None, None, None)
+            )
+            .await
+            .is_err(),
+            "{name} must be rejected"
+        );
+        assert_eq!(
+            bob.orchestrator
+                .mls_context()
+                .read_direct_request_projection(cid)
+                .unwrap(),
+            retained
+        );
+    }
+    assert!(bob.storage.get_conversation_messages(cid).is_empty());
+    pruned_entry
+}
+
+/// O7: an accepted conversation keeps working once its opening is pruned. The sender's device
+/// verifies the pruned row against its retained publication and changes nothing.
+async fn check_pruned_opening_accepted(world: &TestWorld, cid: &str, pruned_entry: &Value) {
+    let alice = world.client("Alice");
+    let accepted = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_projection(cid)
+        .unwrap();
+    world.delivery_service().queue_incoming_page(
+        vec![
+            catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(pruned_entry, cid)
+                .unwrap()
+                .unwrap(),
+        ],
+        Some("2".into()),
+    );
+    let (messages, _) = Box::pin(
+        alice
+            .orchestrator
+            .fetch_messages(cid, None, 100, None, None, None),
+    )
+    .await
+    .expect("an accepted conversation tolerates its pruned opening");
+    assert!(messages.is_empty());
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .read_direct_request_projection(cid)
+            .unwrap(),
+        accepted
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .unwrap()[0]
+            .consent,
+        RequestConsent::Accepted
     );
 }

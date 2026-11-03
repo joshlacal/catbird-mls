@@ -599,7 +599,7 @@ impl CatbirdMlsClient {
     }
 
     /// Hides every copy (sender, witness or owner) attributed to an account whose deletion
-    /// `conversation_id` sequenced. Live sync records each authenticated `accountDeletedEntry`; no
+    /// `conversation_id` sequenced. Live sync and restore record each verified `accountDeletedEntry`; no
     /// server redaction covers the witness and owner copies other members already published. A
     /// copy stays only if its sequencer receipt orders it after the deletion. Returns how many it hid.
     fn hide_deleted_accounts(db: &MlsAccountDb, conversation_id: &str, messages: &mut Vec<labyrinth::client::LoadedMessage>) -> Result<usize, MLSError> {
@@ -621,6 +621,32 @@ impl CatbirdMlsClient {
             None => true,
         });
         Ok(before - messages.len())
+    }
+
+    /// A fresh device never sees `accountDeletedEntry` in `getEntries`, so restore applies each
+    /// deletion the conversation state lists whose sequencer authority verifies: under the pinned
+    /// sequencer, or without local state the one whose receipts authenticated the restored copies.
+    fn apply_listed_account_deletions(&self, conversation_id: &str, history: &[labyrinth::client::LoadedMessage]) -> Result<(), MLSError> {
+        let pinned = self.db.read_tx(|tx| tx.get_conversation(conversation_id))?.map(|row| row.sequencer_did).filter(|did| !did.is_empty());
+        let Some(sequencer) = pinned.or_else(|| history.iter().filter_map(|m| m.archived_receipt.as_ref())
+            .max_by_key(|r| r.signed.payload.seq).map(|r| r.signed.payload.sequencer_did.clone())) else { return Ok(()) };
+        let device = self.canonical_uuid_v4_device_id().ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
+        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+        let state = match self.query_signed_chat_ds("blue.catbird.chat.getConversationState",
+            &[("actorDeviceId", &device), ("conversationId", conversation_id)], &device, &signer) {
+            Ok(state) => state,
+            // This device may not read the state; deletions live sync recorded still apply.
+            Err(MLSError::InvalidState(code)) if matches!(code.as_str(), "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval") => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let deletions = state["accountDeletions"].as_array()
+            .ok_or_else(|| MLSError::Cryptography("getConversationState is missing accountDeletions".into()))?;
+        for entry in deletions {
+            if let Some((did, seq)) = self.verify_account_deleted_entry(conversation_id, &sequencer, entry)? {
+                self.apply_verified_account_deletion(conversation_id, &did, seq)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn open_rescued_owner_batch(&self, batch_json: &[u8]) -> Result<Vec<(String, Option<String>, Vec<u8>)>, MLSError> {
@@ -649,14 +675,25 @@ impl CatbirdMlsClient {
         if self.offline_archive_for_test { return self.offline_restore_conversation_from_owner_mailbox(conversation_id); }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.pin_native_conversation(conversation_id)?;
-        let known_removed = match self.list_members(conversation_id) {
-            Ok(members) => members.iter().all(|did| did != &self.normalized_did),
-            Err(MLSError::GroupNotFound { .. }) => false,
+        let local_has_self = match self.list_members(conversation_id) {
+            Ok(members) => Some(members.iter().any(|did| did == &self.normalized_did)),
+            Err(MLSError::GroupNotFound { .. }) => None,
             Err(error) => return Err(error),
         };
         let (mut history, rejected) = self.native_archive_run(async {
-            let mut session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
-            if known_removed { return session.load_owner_history(conversation_id).await.map(|m| (m, 0)).map_err(native_archive_error); }
+            let deps = self.native_archive_deps()?;
+            // Without local MLS state, an authenticated `ConversationNotFound` leaves only this
+            // account's owner records (as in flush); it never unlocks Conversation Space reads.
+            let owner_only = match local_has_self {
+                Some(has_self) => !has_self,
+                None => matches!(
+                    deps.transport.query("blue.catbird.chat.getConversationState", &[("conversationId", conversation_id.to_owned())]).await
+                        .map_err(crate::labyrinth::transport::map_xrpc_error),
+                    Err(labyrinth::Error::NotFound("conversation"))
+                ),
+            };
+            let mut session = deps.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
+            if owner_only { return session.load_owner_history(conversation_id).await.map(|m| (m, 0)).map_err(native_archive_error); }
             let history = session.load_history(conversation_id, labyrinth::store::TimeRange::ALL).await.map_err(native_archive_error)?;
             if history.undecryptable != 0 { return Err(MLSError::Cryptography("conversation archive contains undecryptable or unverified frames".into())); }
             let space_readable = history.space_readable;
@@ -667,6 +704,7 @@ impl CatbirdMlsClient {
         if rejected > 0 {
             tracing::warn!(conversation_id, rejected, "labyrinth restore: ignored witness copies that contradict accepted archive copies");
         }
+        self.apply_listed_account_deletions(conversation_id, &history)?;
         let deleted = Self::hide_deleted_accounts(&self.db, conversation_id, &mut history)?;
         if deleted > 0 {
             tracing::info!(conversation_id, deleted, "labyrinth restore: hid archive copies of deleted accounts' messages");

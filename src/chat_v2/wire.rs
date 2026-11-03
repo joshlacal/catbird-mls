@@ -159,7 +159,7 @@ impl<S: BosStr> AppendLogEntry for ConversationEntry<S> {
 
     fn raw_conversation_id(&self) -> &str {
         match self {
-            Self::DirectRequestEntry(entry) => entry.signed_request.body.conversation_id.as_ref(),
+            Self::DirectRequestEntry(entry) => entry.conversation_id.as_ref(),
             Self::DirectRequestAcceptanceEntry(entry) => {
                 entry.signed_request.body.prior.conversation_id.as_ref()
             }

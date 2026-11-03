@@ -414,6 +414,9 @@ pub(crate) fn request_control_entry(entry: Value) -> Result<Value> {
         .remove("$type");
     Ok(canonical)
 }
+/// Binds a presented opening row to the retained verified publication. A
+/// pruned row (`payloadPruned: true`, no `signedRequest`) is accepted only as a
+/// duplicate: every receipt and row field must equal the retained evidence.
 pub(crate) fn verify_request_publication_entry(
     entry: &Value,
     publication: &[u8],
@@ -425,13 +428,22 @@ pub(crate) fn verify_request_publication_entry(
         .map_err(|_| invalid())?;
     let expected = verify_signed_request(DirectRequestKind::Publish, publication, key)
         .map_err(|_| invalid())?;
-    let actual = verify_signed_request(
-        DirectRequestKind::Publish,
-        &serde_json::to_vec(&entry["signedRequest"]).map_err(|_| invalid())?,
-        key,
-    )
-    .map_err(|_| invalid())?;
-    if actual.request_digest() != expected.request_digest()
+    match (entry.get("signedRequest"), entry.get("payloadPruned")) {
+        (Some(signed), None | Some(Value::Bool(false))) => {
+            let actual = verify_signed_request(
+                DirectRequestKind::Publish,
+                &serde_json::to_vec(signed).map_err(|_| invalid())?,
+                key,
+            )
+            .map_err(|_| invalid())?;
+            if actual.request_digest() != expected.request_digest() {
+                return Err(invalid());
+            }
+        }
+        (None, Some(Value::Bool(true))) => {}
+        _ => return Err(invalid()),
+    }
+    if receipt["requestDigest"] != STANDARD.encode(expected.request_digest())
         || entry["conversationId"] != expected.body()["conversationId"]
         || entry["seq"]
             != expected.body()["artifacts"]["metadataSnapshot"]["authorProof"]["originSeq"]

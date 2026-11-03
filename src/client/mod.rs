@@ -620,6 +620,10 @@ pub(crate) mod native_client {
         }
 
         /// Enroll this device (`I15` Spaces gate + `I16` `X-Wing` KeyPackages + `D4` Labyrinth default-on + live `mls-ds` & PDS publication).
+        ///
+        /// Idempotent: an enrolled device keeps its signer. Its MLS leaves, the Labyrinth archive
+        /// session (transport key) and the `mls-ds` device row are bound to it, and `mls-ds` has no
+        /// key rotation: a new signing key is a new device ID.
         pub fn enroll_device(
             &self,
             granted_oauth_scopes: &[String],
@@ -636,90 +640,95 @@ pub(crate) mod native_client {
             let recovery_not_after = now_secs + RECOVERY_KP_MAX_LIFETIME_SECS;
 
             let scoped_identity = format!("{}#{}", self.normalized_did, self.config.device_id);
-            let signer = self
-                .hooks
-                .signature_keypair(CIPHERSUITE.signature_algorithm())?;
-            let pub_key = signer.public().to_vec();
-
-            let signer_bytes = serde_json::to_vec(&signer)
-                .map_err(|e| MLSError::Internal(format!("serialize signer: {e}")))?;
-            self.keystore.store_signature_keypair(
-                format!("mls-signer:{}", self.account_did_hash),
-                signer_bytes.clone(),
-            )?;
-
             let mailbox_space_uri = personal_mailbox_space_uri(&self.normalized_did);
 
-            let (direct_kp_bytes, recovery_kp_bytes) = self.db.write_tx(|tx| {
-                let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-                let provider = self.hooks.openmls_provider(storage);
-                signer.store(provider.storage()).map_err(|e| {
-                    MLSError::Internal(format!("store signer in openmls_kv: {e:?}"))
-                })?;
-
-                let cred = BasicCredential::new(scoped_identity.clone().into_bytes());
-                let cred_with_key = CredentialWithKey {
-                    credential: cred.into(),
-                    signature_key: signer.public().into(),
-                };
-
-                let direct_kp = KeyPackage::builder()
-                    .key_package_lifetime(Lifetime::init(
-                        now_secs.saturating_sub(60),
-                        direct_not_after,
-                    ))
-                    .leaf_node_capabilities(
-                        Capabilities::builder()
-                            .ciphersuites(vec![CIPHERSUITE])
-                            .build(),
-                    )
-                    .build(CIPHERSUITE, &provider, &signer, cred_with_key.clone())
-                    .map_err(|e| MLSError::Cryptography(format!("build C33 KeyPackage: {e:?}")))?;
-
-                let recovery_kp = KeyPackage::builder()
-                    .key_package_lifetime(Lifetime::init(
-                        now_secs.saturating_sub(60),
-                        recovery_not_after,
-                    ))
-                    .leaf_node_capabilities(
-                        Capabilities::builder()
-                            .ciphersuites(vec![CIPHERSUITE])
-                            .build(),
-                    )
-                    .build(CIPHERSUITE, &provider, &signer, cred_with_key)
-                    .map_err(|e| {
-                        MLSError::Cryptography(format!("build recovery KeyPackage: {e:?}"))
+            let (signer, signer_bytes, direct_kp_bytes, recovery_kp_bytes) =
+                self.db.write_tx(|tx| {
+                    let signer = match tx.get_account_meta("enrolled_signer_json")? {
+                        Some(raw) => serde_json::from_str::<SignatureKeyPair>(&raw)
+                            .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?,
+                        None => self
+                            .hooks
+                            .signature_keypair(CIPHERSUITE.signature_algorithm())?,
+                    };
+                    let signer_bytes = serde_json::to_vec(&signer)
+                        .map_err(|e| MLSError::Internal(format!("serialize signer: {e}")))?;
+                    let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                    let provider = self.hooks.openmls_provider(storage);
+                    signer.store(provider.storage()).map_err(|e| {
+                        MLSError::Internal(format!("store signer in openmls_kv: {e:?}"))
                     })?;
 
-                let direct_bytes = direct_kp
-                    .key_package()
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("serialize C33 kp: {e:?}")))?;
-                let recovery_bytes = recovery_kp
-                    .key_package()
-                    .tls_serialize_detached()
-                    .map_err(|e| MLSError::Internal(format!("serialize recovery kp: {e:?}")))?;
+                    let cred = BasicCredential::new(scoped_identity.clone().into_bytes());
+                    let cred_with_key = CredentialWithKey {
+                        credential: cred.into(),
+                        signature_key: signer.public().into(),
+                    };
 
-                tx.put_account_meta("scoped_identity", &scoped_identity, now_ms)?;
-                tx.put_account_meta(
-                    "enrolled_signer_json",
-                    &String::from_utf8_lossy(&signer_bytes),
-                    now_ms,
-                )?;
-                let own_auth = vec![AuthorizedPeerDeviceKey {
-                    did: self.normalized_did.clone(),
-                    device_id: self.config.device_id.clone(),
-                    signature_public_key: pub_key.clone(),
-                }];
-                tx.put_account_meta(
-                    &format!("authorized_device_keys:{}", self.normalized_did),
-                    &serde_json::to_string(&own_auth)
-                        .map_err(|e| MLSError::Internal(e.to_string()))?,
-                    now_ms,
-                )?;
+                    let direct_kp = KeyPackage::builder()
+                        .key_package_lifetime(Lifetime::init(
+                            now_secs.saturating_sub(60),
+                            direct_not_after,
+                        ))
+                        .leaf_node_capabilities(
+                            Capabilities::builder()
+                                .ciphersuites(vec![CIPHERSUITE])
+                                .build(),
+                        )
+                        .build(CIPHERSUITE, &provider, &signer, cred_with_key.clone())
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!("build C33 KeyPackage: {e:?}"))
+                        })?;
 
-                Ok((direct_bytes, recovery_bytes))
-            })?;
+                    let recovery_kp = KeyPackage::builder()
+                        .key_package_lifetime(Lifetime::init(
+                            now_secs.saturating_sub(60),
+                            recovery_not_after,
+                        ))
+                        .leaf_node_capabilities(
+                            Capabilities::builder()
+                                .ciphersuites(vec![CIPHERSUITE])
+                                .build(),
+                        )
+                        .build(CIPHERSUITE, &provider, &signer, cred_with_key)
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!("build recovery KeyPackage: {e:?}"))
+                        })?;
+
+                    let direct_bytes = direct_kp
+                        .key_package()
+                        .tls_serialize_detached()
+                        .map_err(|e| MLSError::Internal(format!("serialize C33 kp: {e:?}")))?;
+                    let recovery_bytes = recovery_kp
+                        .key_package()
+                        .tls_serialize_detached()
+                        .map_err(|e| MLSError::Internal(format!("serialize recovery kp: {e:?}")))?;
+
+                    tx.put_account_meta("scoped_identity", &scoped_identity, now_ms)?;
+                    tx.put_account_meta(
+                        "enrolled_signer_json",
+                        &String::from_utf8_lossy(&signer_bytes),
+                        now_ms,
+                    )?;
+                    let own_auth = vec![AuthorizedPeerDeviceKey {
+                        did: self.normalized_did.clone(),
+                        device_id: self.config.device_id.clone(),
+                        signature_public_key: signer.public().to_vec(),
+                    }];
+                    tx.put_account_meta(
+                        &format!("authorized_device_keys:{}", self.normalized_did),
+                        &serde_json::to_string(&own_auth)
+                            .map_err(|e| MLSError::Internal(e.to_string()))?,
+                        now_ms,
+                    )?;
+
+                    Ok((signer, signer_bytes, direct_bytes, recovery_bytes))
+                })?;
+            let pub_key = signer.public().to_vec();
+            self.keystore.store_signature_keypair(
+                format!("mls-signer:{}", self.account_did_hash),
+                signer_bytes,
+            )?;
 
             // Strictly outside `write_tx` (`I6`): publish PDS `blue.catbird.chat.device` +
             // `enrollDevice` + `publishDirectRequestKeys` + `replenishKeyPackages` when using a

@@ -43,6 +43,23 @@ pub fn json_bytes(v: &Value) -> Result<Vec<u8>, MLSError> {
         .map_err(|e| MLSError::invalid_input(format!("invalid base64 bytes: {e}")))
 }
 
+/// The active `getOwnDevices` item for `device_id` under `signature_public_key`. After a lost
+/// `enrollDevice` response (`DeviceAlreadyExists` on retry) it is the only proof that `mls-ds`
+/// holds this signer; without it enrollment fails closed (a new key needs a new device ID).
+pub fn own_active_device<'a>(
+    own_devices: &'a Value,
+    device_id: &str,
+    signature_public_key: &[u8],
+) -> Option<&'a Value> {
+    own_devices["items"].as_array()?.iter().find(|item| {
+        let device = &item["device"];
+        device["deviceId"] == device_id
+            && device["status"] == "active"
+            && json_bytes(&device["signaturePublicKey"])
+                .is_ok_and(|key| key == signature_public_key)
+    })
+}
+
 /// Format current UTC wall-clock time as canonical RFC 3339 milliseconds (`YYYY-MM-DDTHH:MM:SS.sssZ`).
 pub fn now_rfc3339_millis() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

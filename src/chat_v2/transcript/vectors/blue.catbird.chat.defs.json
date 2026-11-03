@@ -5988,15 +5988,40 @@
         }
       }
     },
+    "accountDeletionAuthority": {
+      "type": "object",
+      "description": "[I13] The sequencer's attestation that it sequenced one exact accountDeletedEntry, signed with its dedicated receipt key and never its service-auth key. sequencerDid equals the entry's sequencerDid and keyId is exactly sequencerDid#mls-receipt-1, resolved from the sequencer's DID document. signature is low-S ES256 r||s over UTF8(catbird-mls-account-deletion-v1\\0) followed by, for each of the entry's sequencerDid, conversationId, deletedDid, seq as decimal text, entryId and receivedAt (the deletion instant), its u32 big-endian UTF-8 byte length and its UTF-8 bytes. Clients verify it before hiding deletedDid's restored history.",
+      "required": [
+        "sequencerDid",
+        "keyId",
+        "signature"
+      ],
+      "properties": {
+        "sequencerDid": {
+          "type": "ref",
+          "ref": "#bareDid"
+        },
+        "keyId": {
+          "type": "string",
+          "maxLength": 320
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    },
     "accountDeletedEntry": {
       "type": "object",
-      "description": "[I13] Sequencer-recorded control entry indicating that deletedDid deleted their account and removed their writer repo from the conversation Space.",
+      "description": "[I13] Sequencer-recorded control entry indicating that deletedDid deleted their account and removed their writer repo from the conversation Space. sequencerAuthority is the sequencer's signed evidence of exactly this entry; every home stores and returns it verbatim.",
       "required": [
         "entryId",
         "conversationId",
         "seq",
         "deletedDid",
         "sequencerDid",
+        "sequencerAuthority",
         "receivedAt"
       ],
       "properties": {
@@ -6020,6 +6045,10 @@
         "sequencerDid": {
           "type": "ref",
           "ref": "#bareDid"
+        },
+        "sequencerAuthority": {
+          "type": "ref",
+          "ref": "#accountDeletionAuthority"
         },
         "signature": {
           "type": "bytes",
@@ -7945,7 +7974,6 @@
         "entryId",
         "conversationId",
         "seq",
-        "signedRequest",
         "receivedAt",
         "sequencerReceipt",
         "publicationReceipt"
@@ -7967,6 +7995,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedDirectRequestPublication"
+        },
+        "payloadPruned": {
+          "type": "boolean",
+          "description": "True iff signedRequest is omitted because the opening ciphertext was pruned: every frozen-audience recipient device acknowledged it, its sender's account was deleted, the request expired, or it reached the 30-day retention ceiling; all other fields remain verbatim."
         },
         "receivedAt": {
           "type": "ref",

@@ -78,27 +78,45 @@ be **the same bytes the server embeds** — the server reaches it through
 | | |
 |---|---|
 | Source path | `PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json` (canonical); mls-ds mirror `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
-| Source revision | `df7653aa530cadaf5d24263ef74a54c688571169` (PetrelCatbird, tree `8d9ac196a76ad4e8f96538ddd304066647210c3a`) |
-| SHA-256 | `fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39` |
-| Size / defs | 231,566 bytes / 257 definitions |
-| Prior SHA-256 | `a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d` @ PetrelCatbird `f102084e` (unchanged through `854142ea`), 230,449 bytes / 257 definitions |
+| Source revision | `0f4f58a27d161c35cf7dcc1072a570660a7fbb0f` (PetrelCatbird, tree `5173d7d9679b13d8e40316e050fb2394c8f0d956`) |
+| SHA-256 | `eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad` |
+| Size / defs | 233,296 bytes / 258 definitions |
+| Prior SHA-256 | `125b7462eac11e4a46cfda5c1d6de154567c8903844cf2be93ca2d7c0f301581` @ PetrelCatbird `c517b5db`, 232,961 bytes / 258 definitions |
+| Earlier SHA-256 | `fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39` @ PetrelCatbird `df7653aa`, 231,566 bytes / 257 definitions; `a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d` @ PetrelCatbird `f102084e` (unchanged through `854142ea`), 230,449 bytes / 257 definitions |
 
-**The changes between those two digests** are the C33 opening-evidence
+**The changes from `a2e783d3…` to `fca4178c…`** are the C33 opening-evidence
 extension (see the cutover section below): a required `archiveCommitment` on
 `directRequestPublicationBody` and `directRequestApplicationAad`, a required
 `sequencerReceipt` on `directRequestPublishedReceipt`, and a required
 `sequencerReceipt` plus closed `publicationReceipt` union on
 `directRequestEntry`. The definition count is unchanged at 257.
 
+**The changes from `fca4178c…` to `125b7462…`** are the account-deletion
+evidence: a new `accountDeletionAuthority` definition (the sequencer's signed
+attestation: `sequencerDid`, `keyId`, 64-byte `signature`) and a required
+`sequencerAuthority` on `accountDeletedEntry`, raising the count to 258. The
+same PetrelCatbird revision also adds a required `accountDeletions` array of
+`accountDeletedEntry` to the `blue.catbird.chat.getConversationState` output
+(SHA-256 `c0e9054443a1c56b701fc545639c8ffdc19a58b34f6e09fa273f7c3d3cd23d22`);
+that file is not vendored here.
+
+**The changes from `125b7462…` to `eb3af0eb…`** are the opening-ciphertext
+prune: `directRequestEntry.signedRequest` is no longer required, and a new
+optional `payloadPruned` boolean is true exactly when `signedRequest` is
+omitted because the opening ciphertext was pruned (every frozen-audience
+recipient device acknowledged it, the sender's account was deleted, the
+request expired, or it reached the 30-day retention ceiling). Receipts and
+all other entry fields remain verbatim. The definition count is unchanged at 258.
+
 **Verified identical across every live copy at sync time** — this vendored copy,
 `PetrelCatbird/lexicons/` (the canonical codegen source), and the mls-ds mirror
-the server embeds all hash to `fca4178c…`.
+the server embeds all hash to `eb3af0eb…`.
 
 To re-check:
 
 ```sh
 cd Catbird+Petrel/catbird-mls
-/usr/bin/git -C ../PetrelCatbird show df7653aa530cadaf5d24263ef74a54c688571169:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
+/usr/bin/git -C ../PetrelCatbird show 0f4f58a27d161c35cf7dcc1072a570660a7fbb0f:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
 shasum -a 256 src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json ../mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json
 python3 scripts/generate_chat_schema.py --check-mirror
 ```
@@ -244,9 +262,10 @@ The publication and application AAD require the same 32-byte blinded
 `archiveCommitment`. Published outcomes require an I13 `sequencerReceipt`;
 opening entries retain that receipt and the full signed `publicationReceipt`.
 The entry ID is the signed `firstMessageId`.
-The embedded lexicon for this cutover is PetrelCatbird
+The embedded lexicon for this cutover was PetrelCatbird
 `df7653aa530cadaf5d24263ef74a54c688571169`, SHA-256
-`fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39`
+`fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39`; the
+current copy (`c517b5db`, `125b7462…`) adds only the account-deletion evidence
 (see [The embedded lexicon contract](#the-embedded-lexicon-contract)).
 
 The independent opening oracle contains canonical `MLSMessagePayload` JSON,

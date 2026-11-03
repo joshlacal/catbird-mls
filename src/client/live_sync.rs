@@ -32,6 +32,7 @@ use crate::orchestrator::canonical_transport::{
 };
 use crate::orchestrator::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
+    C33_OPENING_UNAVAILABLE,
 };
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use crate::push::processor::{verify_signed_mutation_body, NATIVE_ARCHIVE_RECEIPT_OP};
@@ -116,6 +117,112 @@ pub(super) fn record_account_deletion(
         seq.to_string().as_bytes(),
         now_ms,
     )
+}
+
+/// Domain of the sequencer's `#mls-receipt-1` signature over an `accountDeletedEntry`.
+const ACCOUNT_DELETION_DOMAIN: &[u8] = b"catbird-mls-account-deletion-v1\0";
+
+/// `ACCOUNT_DELETION_DOMAIN` followed by each field as a u32-BE length-prefixed UTF-8 string.
+fn account_deletion_signing_bytes(fields: &[&str]) -> Vec<u8> {
+    let mut bytes = ACCOUNT_DELETION_DOMAIN.to_vec();
+    for field in fields {
+        bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(field.as_bytes());
+    }
+    bytes
+}
+
+impl CatbirdMlsClient {
+    /// Verifies an `accountDeletedEntry`'s `sequencerAuthority` (`I13`) before any effect: it
+    /// must bind `cid` and the conversation's pinned `sequencer_did`, and carry a low-S ES256
+    /// signature under that sequencer's `#mls-receipt-1` key. Returns the deleted DID and seq, or
+    /// `None` (logged) for an entry that does not verify; such an entry never hides anything.
+    /// `Err` only when the sequencer key cannot be resolved (retryable).
+    pub(super) fn verify_account_deleted_entry(
+        &self,
+        cid: &str,
+        sequencer_did: &str,
+        entry: &Value,
+    ) -> Result<Option<(String, i64)>, MLSError> {
+        let sequencer = sequencer_did.split('#').next().unwrap_or(sequencer_did);
+        fn text(value: &Value) -> Option<&str> {
+            value.as_str().filter(|s| !s.is_empty())
+        }
+        let authority = &entry["sequencerAuthority"];
+        let key_id = format!("{sequencer}#mls-receipt-1");
+        let bound = (|| {
+            let seq = entry["seq"].as_i64().filter(|seq| *seq > 0)?;
+            let fields = (
+                text(&entry["deletedDid"])?,
+                text(&entry["entryId"])?,
+                text(&entry["receivedAt"])?,
+            );
+            (entry
+                .get("$type")
+                .is_none_or(|t| t == crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND)
+                && text(&entry["conversationId"]) == Some(cid)
+                && text(&entry["sequencerDid"]) == Some(sequencer)
+                && text(&authority["sequencerDid"]) == Some(sequencer)
+                && text(&authority["keyId"]) == Some(key_id.as_str()))
+            .then_some((seq, fields))
+        })();
+        let Some((seq, (deleted_did, entry_id, received_at))) = bound else {
+            tracing::warn!(
+                cid,
+                "ignoring account deletion not bound to this conversation's sequencer"
+            );
+            return Ok(None);
+        };
+        let key = self
+            .resolve_sequencer_receipt_key(sequencer, "#mls-receipt-1")?
+            .ok_or_else(|| {
+                MLSError::Cryptography("I13: account deletion authority key unavailable".into())
+            })?;
+        let message = account_deletion_signing_bytes(&[
+            sequencer,
+            cid,
+            deleted_did,
+            &seq.to_string(),
+            entry_id,
+            received_at,
+        ]);
+        let verified = chat_wire::json_bytes(&authority["signature"])
+            .ok()
+            .and_then(|raw| p256::ecdsa::Signature::from_slice(&raw).ok())
+            .filter(|signature| signature.normalize_s().is_none())
+            .zip(p256::ecdsa::VerifyingKey::from_sec1_bytes(&key).ok())
+            .is_some_and(|(signature, key)| {
+                use p256::ecdsa::signature::Verifier as _;
+                key.verify(&message, &signature).is_ok()
+            });
+        if !verified {
+            tracing::warn!(
+                cid,
+                seq,
+                "ignoring account deletion with an invalid sequencer signature"
+            );
+            return Ok(None);
+        }
+        Ok(Some((deleted_did.to_owned(), seq)))
+    }
+
+    /// Effects of a verified account deletion: no more archive duty for the account, its local
+    /// messages go, and archive loads and restores hide its copies ordered before `seq`.
+    pub(super) fn apply_verified_account_deletion(
+        &self,
+        cid: &str,
+        deleted_did: &str,
+        seq: i64,
+    ) -> Result<(), MLSError> {
+        let now_ms = self.hooks.now_ms();
+        self.db.write_tx(|tx| {
+            drop_archive_duty_of(tx, deleted_did)?;
+            record_account_deletion(tx, cid, deleted_did, seq, now_ms)
+        })?;
+        handle_account_deleted_event(&self.db, deleted_did)?;
+        self.clear_cached_groups();
+        Ok(())
+    }
 }
 
 impl CatbirdMlsClient {
@@ -412,7 +519,17 @@ impl CatbirdMlsClient {
             }
 
             if kind == "direct" && !has_local {
-                if self.import_incoming_c33_direct_request(canonical_dev_id, signer, cid)? {
+                // A pruned opening's terminal state is recorded once; it is never re-fetched.
+                let terminal = self.db.read_tx(|tx| {
+                    Ok(tx
+                        .list_requests(Some(C33_OPENING_UNAVAILABLE))?
+                        .iter()
+                        .any(|r| r.conversation_id == cid))
+                })?;
+                if terminal {
+                    continue;
+                }
+                if self.import_incoming_c33_direct_request(canonical_dev_id, signer, cid, state)? {
                     count = count.saturating_add(1);
                 }
                 continue;
@@ -531,6 +648,7 @@ impl CatbirdMlsClient {
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
         cid: &str,
+        state: &Value,
     ) -> Result<bool, MLSError> {
         let entries_val = self.query_signed_chat_ds(
             "blue.catbird.chat.getEntries",
@@ -554,6 +672,15 @@ impl CatbirdMlsClient {
         }) else {
             return Ok(false);
         };
+        if raw_dr_entry["payloadPruned"] == true
+            || (raw_dr_entry.get("directRequest").is_none()
+                && raw_dr_entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
+                && crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(
+                    raw_dr_entry,
+                ))
+        {
+            return self.record_pruned_c33_opening(cid, state, raw_dr_entry);
+        }
 
         let pub_wrapper = raw_dr_entry
             .get("signedRequest")
@@ -952,6 +1079,72 @@ impl CatbirdMlsClient {
             conversation_id: cid.to_string(),
         });
         Ok(true)
+    }
+
+    /// An opening pruned before this device imported it keeps only its receipts: no Welcome,
+    /// preview or acceptance can follow. Verify them under the coordinator, then record the
+    /// declared terminal request state once; the history is reachable only via Spaces.
+    fn record_pruned_c33_opening(
+        &self,
+        cid: &str,
+        state: &Value,
+        entry: &Value,
+    ) -> Result<bool, MLSError> {
+        let missing = |what: &str| MLSError::Cryptography(format!("C33 pruned opening: {what}"));
+        let sender_did = entry
+            .pointer("/publicationReceipt/body/receipt/actorDid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| missing("actorDid"))?;
+        let peer_did = if sender_did == self.normalized_did {
+            state["participants"]
+                .as_array()
+                .and_then(|participants| {
+                    participants.iter().find_map(|p| {
+                        p["userDid"]
+                            .as_str()
+                            .filter(|did| *did != self.normalized_did)
+                    })
+                })
+                .ok_or_else(|| missing("recipient"))?
+        } else {
+            sender_did
+        };
+        let peer_ds = self
+            .resolve_peer_home_ds_did(peer_did)
+            .ok_or_else(|| missing("peer home DS authority"))?;
+        let authority = dr_transcript::derive_deterministic_coordinator(
+            self.config.home_ds_did.trim(),
+            &peer_ds,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
+        let document = self
+            .resolve_did_document(&authority)?
+            .ok_or_else(|| missing("receipt authority document"))?;
+        let receipt = crate::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
+            entry, cid, &authority, &document,
+        )?;
+        let row = RequestRow {
+            request_id: receipt["requestId"]
+                .as_str()
+                .ok_or_else(|| missing("requestId"))?
+                .to_string(),
+            conversation_id: cid.to_string(),
+            sender_did: sender_did.to_string(),
+            recipient_did: if sender_did == self.normalized_did {
+                peer_did.to_string()
+            } else {
+                self.normalized_did.clone()
+            },
+            consent: C33_OPENING_UNAVAILABLE.to_string(),
+            first_message_id: receipt["firstMessageId"].as_str().map(str::to_owned),
+            first_message_archived: false,
+            payload_json: json!({ "unavailable": "OpeningPruned" }).to_string(),
+            expires_at_ms: 0,
+            updated_at_ms: self.hooks.now_ms(),
+        };
+        self.db.write_tx(|tx| tx.upsert_request(&row))?;
+        self.notify_change(PlatformChangeEvent::RequestsUpdated);
+        Ok(false)
     }
 
     fn acquire_inventory_session_id(
@@ -1924,21 +2117,15 @@ impl CatbirdMlsClient {
                 continue;
             }
 
-            if entry_type.ends_with("accountDeletedEntry") || entry_type == "accountDeleted" {
-                if let Some(deleted_did) = entry
-                    .get("deletedDid")
-                    .or_else(|| body.get("actorDid"))
-                    .and_then(|v| v.as_str())
+            if entry_type == crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND {
+                // An entry whose sequencer authority does not verify has no effect.
+                if let Some((deleted_did, seq)) =
+                    self.verify_account_deleted_entry(cid, &convo.sequencer_did, entry)?
                 {
-                    self.db.write_tx(|tx| {
-                        drop_archive_duty_of(tx, deleted_did)?;
-                        record_account_deletion(tx, cid, deleted_did, entry_seq, now_ms)
-                    })?;
-                    handle_account_deleted_event(&self.db, deleted_did)?;
-                    self.clear_cached_groups();
+                    self.apply_verified_account_deletion(cid, &deleted_did, seq)?;
+                    applied_count = applied_count.saturating_add(1);
                 }
                 max_seq = max_seq.max(entry_seq);
-                applied_count = applied_count.saturating_add(1);
                 continue;
             }
             if entry_type.ends_with("conversationCloseEntry")

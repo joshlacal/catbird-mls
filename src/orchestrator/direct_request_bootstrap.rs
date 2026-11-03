@@ -470,6 +470,100 @@ pub(crate) fn verify_opening_receipt_binding(
     Ok(verified)
 }
 
+/// Client-store request consent for an opening pruned before this device imported it. It is
+/// terminal: never re-fetched or accepted; the conversation's history is reachable only via Spaces.
+pub const C33_OPENING_UNAVAILABLE: &str = "openingUnavailable";
+
+/// True for a `directRequestEntry` row presented in its pruned shape.
+pub fn is_pruned_opening_entry(entry: &Value) -> bool {
+    entry.get("signedRequest").is_none()
+}
+
+/// A pruned `directRequestEntry` keeps only immutable evidence: its ES256
+/// publication outcome and I13 sequencer receipt. Both must verify under the
+/// coordinator and bind this exact row. The result authorizes no Welcome
+/// import, preview, acceptance or other effect that needs the signed body.
+/// Returns the verified `directRequestPublishedReceipt`.
+pub fn verify_pruned_opening_entry(
+    raw_entry: &Value,
+    expected_conversation_id: &str,
+    authority_did: &str,
+    authority_document: &[u8],
+) -> Result<Value, MLSError> {
+    use crate::chat_v2::transcript::direct_request as dr;
+    if !is_pruned_opening_entry(raw_entry) || raw_entry["payloadPruned"] != true {
+        return Err(invalid("payloadPruned must accompany an omitted opening"));
+    }
+    let entry = dr::normalize_read_presentation(
+        &serde_json::to_vec(raw_entry).map_err(crypto_error)?,
+        "directRequestEntry",
+        raw_entry.get("$type").is_some(),
+    )
+    .map_err(crypto_error)?;
+    let mut outcome = entry["publicationReceipt"].clone();
+    outcome
+        .as_object_mut()
+        .ok_or_else(|| invalid("Pruned opening receipt"))?
+        .remove("$type");
+    let key = dr::resolve_direct_request_receipt_key_for_authority(
+        authority_did,
+        authority_document,
+        outcome["body"]["keyId"]
+            .as_str()
+            .ok_or_else(|| invalid("Pruned opening receipt key"))?,
+    )
+    .map_err(crypto_error)?;
+    let verified = dr::verify_signed_request_for_authority(
+        authority_did,
+        dr::DirectRequestKind::Outcome,
+        &serde_json::to_vec(&outcome).map_err(crypto_error)?,
+        &key,
+    )
+    .map_err(crypto_error)?;
+    let receipt = &verified.body()["receipt"];
+    let sequencer = &entry["sequencerReceipt"];
+    if receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+        || receipt["requestKind"] != "publish"
+        || receipt["conversationId"] != expected_conversation_id
+        || entry["conversationId"] != expected_conversation_id
+        || receipt["coordinates"]["conversationId"] != expected_conversation_id
+        || receipt["firstMessageId"] != entry["entryId"]
+        || receipt["recordedAt"] != entry["receivedAt"]
+        || receipt["sequencerReceipt"] != *sequencer
+        || sequencer["seq"] != entry["seq"]
+    {
+        return Err(invalid("Pruned opening entry and receipts mismatch"));
+    }
+    let commitment: [u8; 32] = STANDARD
+        .decode(
+            sequencer["archiveCommitment"]
+                .as_str()
+                .ok_or_else(|| invalid("Pruned opening commitment"))?,
+        )
+        .map_err(crypto_error)?
+        .try_into()
+        .map_err(|_| invalid("Pruned opening commitment"))?;
+    let sequencer_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+        authority_document,
+        authority_did,
+        "#mls-receipt-1",
+    )?;
+    verify_opening_receipt_binding(
+        &serde_json::json!({
+            "actorDid": receipt["actorDid"],
+            "actorDeviceId": receipt["actorDeviceId"],
+            "conversationId": receipt["conversationId"],
+            "firstMessageId": receipt["firstMessageId"],
+        }),
+        &receipt["coordinates"],
+        &commitment,
+        sequencer,
+        authority_did,
+        &sequencer_key,
+    )?;
+    Ok(receipt.clone())
+}
+
 /// Request-only multi-secret importer. Caller must wrap this operation and its
 /// accepted provenance record in one durable transaction; recovery is unchanged.
 pub fn import_with_provider<P: OpenMlsProvider>(

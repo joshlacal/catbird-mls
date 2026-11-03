@@ -88,10 +88,16 @@ where
         let device = self.require_actor_device_id().await?;
         let lock = self.direct_request_operation_lock(cid).await;
         let guard = lock.lock().await;
-        let mut raw = self
-            .mls_context()
-            .read_direct_request_projection(cid)?
-            .ok_or_else(invalid)?;
+        let Some(mut raw) = self.mls_context().read_direct_request_projection(cid)? else {
+            // A pruned opening this device never imported already reached its
+            // verified terminal view in the refresh above; nothing to retain.
+            if entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
+                && crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(&entry)
+            {
+                return Ok(None);
+            }
+            return Err(invalid());
+        };
         let mut projection = self
             .authorize_direct_request_projection(&mut raw, &owner, &device)
             .await?;
@@ -107,7 +113,9 @@ where
                     &projection.sender_public_key,
                     &receipt["body"]["receipt"],
                 )?;
-                if let Some(old) = &projection.publication_entry {
+                if crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(&entry) {
+                    // A verified pruned duplicate: the retained proof is unchanged.
+                } else if let Some(old) = &projection.publication_entry {
                     let old_hash = transcript::direct_request_entry_hash(
                         &serde_json::to_vec(old).map_err(|_| invalid())?,
                     )

@@ -77,9 +77,19 @@ impl IncomingEnvelope {
                     | "blue.catbird.chat.defs#conversationCloseEntry"
             )
         ) {
-            let body = &entry["signedRequest"]["body"];
+            // A pruned opening keeps no signed body; its row identity comes from
+            // the retained publication receipt. Verification happens on consume.
+            let pruned = entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
+                && super::direct_request_bootstrap::is_pruned_opening_entry(entry);
+            let body = if pruned {
+                &entry["publicationReceipt"]["body"]["receipt"]
+            } else {
+                &entry["signedRequest"]["body"]
+            };
             let coordinate = if entry["$type"] == "blue.catbird.chat.defs#conversationCloseEntry" {
                 &body["prior"]
+            } else if pruned {
+                &body["coordinates"]
             } else {
                 &body["next"]
             };
