@@ -28,7 +28,8 @@ use crate::metadata::{
     derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
 };
 use crate::orchestrator::canonical_transport::{
-    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
+    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
+    is_transient_wire_failure, retry_after_secs, CanonicalOperation, MAX_RETRY_AFTER_SECS,
 };
 use crate::orchestrator::direct_request_bootstrap::{self, DirectRequestBootstrapInput};
 use crate::orchestrator::direct_request_keys::{
@@ -92,9 +93,122 @@ pub(super) fn participant_removal_payload(conversation_id: &str, target_did: &st
 /// the DS retains the first acceptance even when relaying it fails, so retries replay it.
 pub(super) const DIRECT_REQUEST_ACCEPTANCE_OP: &str = "direct_request_acceptance";
 
-/// A deterministic rejection: timeouts, Too Early, rate limits, and 5xx stay uncertain.
-fn is_terminal_rejection(status: u16) -> bool {
-    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
+/// `pending_ops` kind holding the one outgoing `C33` creation per normalized peer DID. The DS
+/// fences one live preparation per pair while the app names a new conversation on every tap,
+/// so the peer keys it. Retries replay the exact signed prepare and, once prepared, the exact
+/// publication over the unapplied MLS bootstrap: a transient failure never rebuilds MLS or
+/// reserves another recipient key package.
+const DIRECT_REQUEST_CREATION_OP: &str = "direct_request_creation";
+const DIRECT_REQUEST_CREATION_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct PendingDirectRequestCreation {
+    version: u32,
+    request_id: String,
+    first_message_id: String,
+    conversation_id: String,
+    intro_text: String,
+    prepare_wrapper: Vec<u8>,
+    /// `hooks.now_ms()` before which a retry answers `retry_code` without any request.
+    retry_at_ms: i64,
+    retry_code: Option<String>,
+    /// Present once the verified preparation is built into a signed publication.
+    publish: Option<PendingDirectRequestPublication>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingDirectRequestPublication {
+    group_id: Vec<u8>,
+    sequencer_did: String,
+    receipt_authority_key: Vec<u8>,
+    sequencer_receipt_key: Vec<u8>,
+    bootstrap: direct_request_bootstrap::DirectRequestBootstrap,
+    kv_batch: KvWriteBatch,
+    publish_wrapper: Vec<u8>,
+}
+
+/// `{"signedRequest":<wrapper>}`, byte-identical on every replay of a journaled wrapper.
+fn signed_request_body(wrapper: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(wrapper.len() + 18);
+    body.extend_from_slice(b"{\"signedRequest\":");
+    body.extend_from_slice(wrapper);
+    body.push(b'}');
+    body
+}
+
+/// Verify a signed `C33` outcome under the coordinator's receipt key; returns its receipt.
+fn verify_c33_outcome(
+    outcome: &Value,
+    authority_did: &str,
+    authority_key: &[u8],
+) -> Result<Value, MLSError> {
+    let outcome = dr_transcript::normalize_read_presentation(
+        &serde_json::to_vec(outcome)?,
+        "signedDirectRequestReceipt",
+        outcome.get("$type").is_some(),
+    )
+    .map_err(|e| MLSError::Cryptography(format!("C33 outcome: {e}")))?;
+    let verified = dr_transcript::verify_signed_request_for_authority(
+        authority_did,
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&outcome)?,
+        authority_key,
+    )
+    .map_err(|e| MLSError::Cryptography(format!("C33 outcome signature: {e}")))?;
+    Ok(verified.body()["receipt"].clone())
+}
+
+/// The error code of a verified receipt that ends this attempt without publication, bound like
+/// a publication receipt: the journaled request and its preparation digest, its actor, and the
+/// digest of the journaled prepare (or sent publication) that triggered it. `None` for a
+/// publication receipt; any other kind or binding fails closed.
+fn c33_terminal_receipt_code(
+    receipt: &Value,
+    prepare: &dr_transcript::VerifiedDirectRequest,
+    publication: Option<&dr_transcript::VerifiedDirectRequest>,
+) -> Result<Option<String>, MLSError> {
+    let code = match receipt["$type"].as_str() {
+        Some("blue.catbird.chat.defs#directRequestPublishedReceipt") => return Ok(None),
+        Some("blue.catbird.chat.defs#directRequestRejectedReceipt") => receipt["code"].as_str(),
+        Some("blue.catbird.chat.defs#directRequestExpiredReceipt") => Some("PreparationExpired"),
+        Some("blue.catbird.chat.defs#directRequestExistingDirectReceipt") => Some("ExistingDirect"),
+        _ => None,
+    };
+    let digest =
+        |request: &dr_transcript::VerifiedDirectRequest| STANDARD.encode(request.request_digest());
+    let trigger = match receipt["requestKind"].as_str() {
+        Some("prepare") => Some(prepare),
+        Some("publish") => publication,
+        // A lease expiry is bound to the prepare, a published request's expiry to its publication.
+        Some("expiry") => [Some(prepare), publication]
+            .into_iter()
+            .flatten()
+            .find(|&request| receipt["requestDigest"] == digest(request)),
+        _ => None,
+    };
+    let p = prepare.body();
+    let bound = trigger.is_some_and(|request| receipt["requestDigest"] == digest(request))
+        && receipt["requestId"] == p["requestId"]
+        && receipt["preparationRequestDigest"] == digest(prepare)
+        && receipt["actorDid"] == p["actorDid"]
+        && receipt["actorDeviceId"] == p["actorDeviceId"]
+        && receipt["actorKeyId"] == p["keyId"]
+        && receipt["authGeneration"] == p["authGeneration"];
+    match code {
+        Some(code) if bound => Ok(Some(code.to_owned())),
+        _ => Err(MLSError::Cryptography(
+            "C33 outcome binding mismatch".into(),
+        )),
+    }
+}
+
+/// Whether the DS will refuse these exact bytes again: a semantic 4xx. A transient failure
+/// ([`is_transient_wire_failure`], e.g. `400 CapacityUnavailable`, `429`) and every 5xx keep
+/// the journaled bytes for the identical retry.
+fn is_terminal_rejection(resp: &PlatformHttpResponse) -> bool {
+    let failure = serde_json::from_slice::<ChatProtocolFailure<'_>>(&resp.body).ok();
+    (400..500).contains(&resp.status)
+        && !is_transient_wire_failure(resp.status, failure.as_ref().map(|f| &*f.error))
 }
 
 #[derive(Deserialize)]
@@ -165,6 +279,17 @@ pub(super) fn canonical_labyrinth_frame_for_text(input: &str) -> (String, String
     (display_json, frame_json)
 }
 
+/// Parses a client-generated ID that must be a UUIDv4 (`InvalidInput` otherwise).
+fn uuid_v4(raw: &str, field: &str) -> Result<uuid::Uuid, MLSError> {
+    uuid::Uuid::parse_str(raw.trim())
+        .ok()
+        .filter(|u| {
+            u.get_version() == Some(uuid::Version::Random)
+                && u.get_variant() == uuid::Variant::RFC4122
+        })
+        .ok_or_else(|| MLSError::invalid_input(format!("{field} must be a UUIDv4")))
+}
+
 impl CatbirdMlsClient {
     pub(crate) fn canonical_uuid_v4_device_id(&self) -> Option<String> {
         if crate::chat_v2::ids::BareDid::parse(&self.normalized_did).is_err() {
@@ -174,6 +299,12 @@ impl CatbirdMlsClient {
             .ok()
             .filter(|u| u.get_version_num() == 4)
             .map(|u| u.hyphenated().to_string())
+    }
+
+    /// The device ID a live mutation acts as; there is no local-only fallback.
+    fn live_device_id(&self) -> Result<String, MLSError> {
+        self.canonical_uuid_v4_device_id()
+            .ok_or_else(|| MLSError::invalid_input("device_id must be a UUIDv4"))
     }
 
     pub(crate) fn ds_base(&self) -> String {
@@ -286,9 +417,9 @@ impl CatbirdMlsClient {
             {
                 return Err(MLSError::InvalidState("StaleCoordinates".into()));
             }
-            // Other 4xx responses deterministically reject this attempt and must not retain
-            // epoch keys.
-            if is_terminal_rejection(resp.status) {
+            // A terminal refusal deterministically rejects this attempt and must not retain
+            // epoch keys; a transient one (e.g. `400 CapacityUnavailable`) keeps them.
+            if is_terminal_rejection(&resp) {
                 if let Some(transition_id) = pending_transition_id {
                     self.db.write_tx(|tx| {
                         tx.delete_pending_op("commit_transition", transition_id)?;
@@ -877,7 +1008,7 @@ impl CatbirdMlsClient {
         Ok(clamped)
     }
 
-    pub(crate) fn create_group_live_or_offline(
+    pub(crate) fn create_group_live(
         &self,
         conversation_id: &str,
         sequencer_did: &str,
@@ -898,31 +1029,8 @@ impl CatbirdMlsClient {
         }
         let peers: Vec<String> = peer_set.into_iter().collect();
 
-        let Some(canonical_dev_id) = self.canonical_uuid_v4_device_id() else {
-            return self.create_group_local_offline(
-                conversation_id,
-                sequencer_did,
-                title,
-                description,
-            );
-        };
-        let Ok(convo_uuid) = uuid::Uuid::parse_str(conversation_id.trim())
-            .ok()
-            .filter(|u| u.get_version_num() == 4)
-            .ok_or(())
-        else {
-            if peers.is_empty() {
-                return self.create_group_local_offline(
-                    conversation_id,
-                    sequencer_did,
-                    title,
-                    description,
-                );
-            }
-            return Err(MLSError::invalid_input(
-                "live create_group with member_dids requires a canonical UUIDv4 conversation_id",
-            ));
-        };
+        let canonical_dev_id = self.live_device_id()?;
+        let convo_uuid = uuid_v4(conversation_id, "conversation_id")?;
         for peer in &peers {
             if let Err(e) = crate::chat_v2::ids::BareDid::parse(peer) {
                 return Err(MLSError::invalid_input(format!(
@@ -932,29 +1040,22 @@ impl CatbirdMlsClient {
         }
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
 
-        // Verify PDS `blue.catbird.chat.device` keys (`I4`) for all peers up front.
-        let mut auth_keys_by_did: BTreeMap<String, Vec<AuthorizedPeerDeviceKey>> = BTreeMap::new();
-        auth_keys_by_did.insert(
-            self.normalized_did.clone(),
-            self.fetch_and_cache_authorized_pds_device_keys(&self.normalized_did)?,
-        );
-        for peer in &peers {
-            auth_keys_by_did.insert(
-                peer.clone(),
-                self.fetch_and_cache_authorized_pds_device_keys(peer)?,
-            );
-        }
-
         let is_untitle_one_to_one =
             peers.len() == 1 && title.as_deref().unwrap_or("").trim().is_empty();
         if is_untitle_one_to_one {
+            // Before any network effect: a journaled attempt may still be inside `Retry-After`.
             return self.create_c33_direct_request_live(
                 &canonical_convo_id,
                 &canonical_dev_id,
                 &peers[0],
                 description,
-                &auth_keys_by_did,
             );
+        }
+
+        // Verify PDS `blue.catbird.chat.device` keys (`I4`) for all peers up front.
+        self.fetch_and_cache_authorized_pds_device_keys(&self.normalized_did)?;
+        for peer in &peers {
+            self.fetch_and_cache_authorized_pds_device_keys(peer)?;
         }
 
         self.create_group_conversation_live(
@@ -968,63 +1069,178 @@ impl CatbirdMlsClient {
         )
     }
 
+    /// Untitled 1:1 creation (`C33`). The attempt is journaled per peer
+    /// ([`DIRECT_REQUEST_CREATION_OP`]) before each POST, so a retry, even after a restart,
+    /// resumes it with the exact signed bytes once any `Retry-After` has elapsed. The
+    /// journaled conversation, request and introduction win over the caller's.
     fn create_c33_direct_request_live(
         &self,
         canonical_convo_id: &str,
         canonical_dev_id: &str,
         peer_did: &str,
         description: Option<String>,
-        auth_keys_by_did: &BTreeMap<String, Vec<AuthorizedPeerDeviceKey>>,
     ) -> Result<ConversationRow, MLSError> {
         let (signer, auth_generation) = self.load_enrolled_signer_and_auth_gen()?;
         let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(signer.public()));
-        let request_id = self.hooks.uuid_v4().to_string();
-        let first_message_id = self.hooks.uuid_v4().to_string();
-
-        let prepare_body = json!({
-            "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
-            "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
-            "protocolVersion": "2",
-            "actorDid": self.normalized_did,
-            "actorDeviceId": canonical_dev_id,
-            "keyId": key_id,
-            "authGeneration": auth_generation,
-            "requestId": request_id,
-            "firstMessageId": first_message_id,
-            "conversationId": canonical_convo_id,
-            "recipientDid": peer_did,
-            "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
-            "profile": "encryptedIntroduction1",
-            "idempotencyKey": request_id,
-            "signedAt": self.hooks.now_rfc3339_millis(),
-        });
-
-        let prepare_wrapper_bytes = chat_wire::sign_direct_request_wrapper(
+        let journaled = self
+            .db
+            .read_tx(|tx| tx.get_pending_op(DIRECT_REQUEST_CREATION_OP, peer_did))?;
+        let mut pending = if let Some(raw) = journaled {
+            let pending: PendingDirectRequestCreation = serde_json::from_str(&raw)
+                .map_err(|e| MLSError::Internal(format!("parse pending direct request: {e}")))?;
+            if pending.version != DIRECT_REQUEST_CREATION_VERSION {
+                return Err(MLSError::Internal(format!(
+                    "unsupported pending direct request version {}",
+                    pending.version
+                )));
+            }
+            let wait_ms = pending.retry_at_ms.saturating_sub(self.hooks.now_ms());
+            // `Retry-After` has not elapsed: answer as the deferring refusal did, offline. A
+            // clock stepped backwards cannot stretch the bounded delay.
+            if wait_ms > 0 && wait_ms <= MAX_RETRY_AFTER_SECS as i64 * 1_000 {
+                return Err(match pending.retry_code {
+                    Some(code) => MLSError::InvalidState(code),
+                    None => MLSError::Internal("C33 direct request deferred by Retry-After".into()),
+                });
+            }
+            pending
+        } else {
+            let request_id = self.hooks.uuid_v4().to_string();
+            let first_message_id = self.hooks.uuid_v4().to_string();
+            let prepare_body = json!({
+                "$type": "blue.catbird.chat.defs#directRequestPreparationBody",
+                "signatureDomain": "CATBIRD-DIRECT-REQUEST-PREPARE\0",
+                "protocolVersion": "2",
+                "actorDid": self.normalized_did,
+                "actorDeviceId": canonical_dev_id,
+                "keyId": key_id,
+                "authGeneration": auth_generation,
+                "requestId": request_id,
+                "firstMessageId": first_message_id,
+                "conversationId": canonical_convo_id,
+                "recipientDid": peer_did,
+                "origin": { "$type": "blue.catbird.chat.defs#freshDirectOrigin" },
+                "profile": "encryptedIntroduction1",
+                "idempotencyKey": request_id,
+                "signedAt": self.hooks.now_rfc3339_millis(),
+            });
+            let pending = PendingDirectRequestCreation {
+                version: DIRECT_REQUEST_CREATION_VERSION,
+                prepare_wrapper: chat_wire::sign_direct_request_wrapper(
+                    DirectRequestKind::Prepare,
+                    prepare_body,
+                    &signer,
+                )?,
+                request_id,
+                first_message_id,
+                conversation_id: canonical_convo_id.to_string(),
+                intro_text: description
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "👋".to_string()),
+                retry_at_ms: 0,
+                retry_code: None,
+                publish: None,
+            };
+            // Journaled before the prepare can reserve a recipient key package.
+            self.save_direct_request_creation(peer_did, &pending)?;
+            pending
+        };
+        let prepare = dr_transcript::verify_signed_request(
             DirectRequestKind::Prepare,
-            prepare_body.clone(),
-            &signer,
-        )?;
-        let prepare_verified = dr_transcript::verify_signed_request(
-            DirectRequestKind::Prepare,
-            &prepare_wrapper_bytes,
+            &pending.prepare_wrapper,
             signer.public(),
         )
         .map_err(|e| MLSError::Cryptography(format!("verify self C33 prepare: {e}")))?;
-        let prepare_wrapper_val: Value = serde_json::from_slice(&prepare_wrapper_bytes)
-            .map_err(|e| MLSError::Internal(e.to_string()))?;
+        if pending.publish.is_none() {
+            self.prepare_c33_publication(
+                &mut pending,
+                &prepare,
+                peer_did,
+                canonical_dev_id,
+                &signer,
+                &key_id,
+                auth_generation,
+            )?;
+        }
+        self.publish_c33_direct_request(
+            pending,
+            &prepare,
+            peer_did,
+            canonical_dev_id,
+            &signer,
+            &key_id,
+            auth_generation,
+        )
+    }
+
+    /// Prepare stage of [`Self::create_c33_direct_request_live`]: replay the journaled prepare,
+    /// verify the preparation, build the MLS bootstrap as an unapplied overlay, sign its
+    /// publication and journal all of it before anything is published.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_c33_publication(
+        &self,
+        pending: &mut PendingDirectRequestCreation,
+        prepare: &dr_transcript::VerifiedDirectRequest,
+        peer_did: &str,
+        canonical_dev_id: &str,
+        signer: &SignatureKeyPair,
+        key_id: &str,
+        auth_generation: i64,
+    ) -> Result<(), MLSError> {
+        // Verify PDS `blue.catbird.chat.device` keys (`I4`) for both accounts up front.
+        let mut auth_keys_by_did: BTreeMap<String, Vec<AuthorizedPeerDeviceKey>> = BTreeMap::new();
+        for did in [self.normalized_did.as_str(), peer_did] {
+            auth_keys_by_did.insert(
+                did.to_string(),
+                self.fetch_and_cache_authorized_pds_device_keys(did)?,
+            );
+        }
 
         let prepare_url = format!(
             "{}/xrpc/blue.catbird.chat.prepareDirectRequest",
             self.ds_base()
         );
-        let prepare_http = self.execute_json_post(
-            prepare_url,
-            serde_json::to_vec(&json!({ "signedRequest": prepare_wrapper_val }))
-                .map_err(|e| MLSError::Internal(e.to_string()))?,
-        )?;
+        let prepare_http =
+            self.post_json_raw(&prepare_url, signed_request_body(&pending.prepare_wrapper))?;
+        if prepare_http.status >= 400 {
+            return Err(self.c33_refused(peer_did, pending, &prepare_url, &prepare_http));
+        }
 
         let prep_outer: Value = serde_json::from_slice(&prepare_http.body)
             .map_err(|e| MLSError::Internal(format!("parse prepareDirectRequest: {e}")))?;
+        // The coordinator signs both a preparation and a terminal receipt.
+        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
+            MLSError::Cryptography("C33 peer home DS authority unavailable".into())
+        })?;
+        let effective_sequencer = dr_transcript::derive_deterministic_coordinator(
+            self.config.home_ds_did.trim(),
+            &peer_ds,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
+        let authority_did = effective_sequencer.as_str();
+        let authority_doc = self.resolve_did_document(authority_did)?.ok_or_else(|| {
+            MLSError::Cryptography(format!(
+                "C33: missing receipt authority DID document {authority_did}"
+            ))
+        })?;
+        let receipt_key = |kid: &str| {
+            dr_transcript::resolve_direct_request_receipt_key_for_authority(
+                authority_did,
+                &authority_doc,
+                kid,
+            )
+            .map_err(|e| MLSError::Cryptography(format!("C33 receipt authority: {e}")))
+        };
+        let outcome = &prep_outer["outcome"];
+        if outcome["$type"] == "blue.catbird.chat.defs#signedDirectRequestReceipt" {
+            // A signed durable decision (e.g. the replayed lease expired) drops the attempt only
+            // once it verifies like a publication outcome; anything else fails closed.
+            let key = receipt_key(outcome["body"]["keyId"].as_str().unwrap_or_default())?;
+            let receipt = verify_c33_outcome(outcome, authority_did, &key)?;
+            let code = c33_terminal_receipt_code(&receipt, prepare, None)?
+                .ok_or_else(|| MLSError::Cryptography("C33 outcome binding mismatch".into()))?;
+            return Err(self.forget_c33_creation(peer_did, MLSError::InvalidState(code)));
+        }
         let preparation = prep_outer
             .pointer("/outcome/preparation")
             .or_else(|| prep_outer.get("preparation"))
@@ -1089,15 +1305,6 @@ impl CatbirdMlsClient {
             refs.push(kp_ref);
         }
 
-        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
-            MLSError::Cryptography("C33 peer home DS authority unavailable".into())
-        })?;
-        let effective_sequencer = dr_transcript::derive_deterministic_coordinator(
-            self.config.home_ds_did.trim(),
-            &peer_ds,
-        )
-        .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
-        let authority_did = effective_sequencer.as_str();
         if preparation["authorityDid"].as_str() != Some(authority_did) {
             return Err(MLSError::Cryptography(
                 "C33 preparation authority mismatch".into(),
@@ -1107,35 +1314,24 @@ impl CatbirdMlsClient {
             .get("receiptKeyId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| MLSError::Cryptography("C33 preparation missing receiptKeyId".into()))?;
-        let authority_doc = self.resolve_did_document(authority_did)?.ok_or_else(|| {
-            MLSError::Cryptography(format!(
-                "C33: missing receipt authority DID document {authority_did}"
-            ))
-        })?;
-        let authority_key = dr_transcript::resolve_direct_request_receipt_key_for_authority(
-            authority_did,
-            &authority_doc,
-            receipt_kid,
-        )
-        .map_err(|e| MLSError::Cryptography(format!("C33 receipt authority: {e}")))?;
+        let authority_key = receipt_key(receipt_kid)?;
         let sequencer_receipt_key = self
             .resolve_sequencer_receipt_key(&effective_sequencer, "#mls-receipt-1")?
             .ok_or_else(|| MLSError::Cryptography("C33: missing sequencer receipt key".into()))?;
 
-        let effective_convo_id = preparation
-            .get("conversationId")
-            .and_then(|v| v.as_str())
-            .filter(|cid| *cid == canonical_convo_id)
-            .ok_or_else(|| MLSError::Cryptography("C33 preparation conversation mismatch".into()))?
-            .to_string();
+        if preparation["conversationId"].as_str() != Some(pending.conversation_id.as_str()) {
+            return Err(MLSError::Cryptography(
+                "C33 preparation conversation mismatch".into(),
+            ));
+        }
         let prep_digest_b64 =
             STANDARD.encode(chat_wire::json_bytes(&preparation["preparationDigest"])?);
         let context_val = json!({
             "protocolVersion": "2",
-            "requestId": request_id,
-            "firstMessageId": first_message_id,
-            "conversationId": effective_convo_id,
-            "origin": prepare_body["origin"],
+            "requestId": pending.request_id,
+            "firstMessageId": pending.first_message_id,
+            "conversationId": pending.conversation_id,
+            "origin": prepare.body()["origin"],
             "actorDid": self.normalized_did,
             "actorDeviceId": canonical_dev_id,
             "actorKeyId": key_id,
@@ -1145,9 +1341,6 @@ impl CatbirdMlsClient {
         let context_json =
             serde_json::to_vec(&context_val).map_err(|e| MLSError::Internal(e.to_string()))?;
 
-        let intro_text = description
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "👋".to_string());
         let group_id_bytes = self.hooks.random_array::<32>().to_vec();
         let now_secs = self.hooks.now_secs();
 
@@ -1158,9 +1351,9 @@ impl CatbirdMlsClient {
                 let provider = self.hooks.openmls_provider(storage);
                 let (_group, boot) = direct_request_bootstrap::prepare_with_provider(
                     &provider,
-                    &signer,
+                    signer,
                     &DirectRequestBootstrapInput {
-                        draft_id: request_id.clone(),
+                        draft_id: pending.request_id.clone(),
                         context_json,
                         group_id: group_id_bytes.clone(),
                         generation: 0,
@@ -1168,11 +1361,11 @@ impl CatbirdMlsClient {
                         key_packages: packages,
                         expected_package_refs: refs,
                         authority_import_until: min_deadline,
-                        preparation_request_digest: *prepare_verified.request_digest(),
+                        preparation_request_digest: *prepare.request_digest(),
                         receipt_authority_key: authority_key.clone(),
                         sequencer_did: effective_sequencer.clone(),
                         sequencer_receipt_authority_key: sequencer_receipt_key.clone(),
-                        text: intro_text.clone(),
+                        text: pending.intro_text.clone(),
                         invitation: None,
                         metadata: GroupMetadataV1 {
                             version: 1,
@@ -1190,8 +1383,7 @@ impl CatbirdMlsClient {
             Ok((boot, overlay.into_batch()))
         })?;
 
-        let import_until = bootstrap.import_until;
-        let import_until_str = chat_wire::unix_secs_rfc3339_millis(import_until)?;
+        let import_until_str = chat_wire::unix_secs_rfc3339_millis(bootstrap.import_until)?;
         let artifact = |data: &[u8], content_type: &str| {
             json!({
                 "framing": "mlsMessage",
@@ -1208,7 +1400,7 @@ impl CatbirdMlsClient {
                 "recipientDid": d["actorDid"],
                 "recipientDeviceId": d["actorDeviceId"],
                 "provenance": {
-                    "requestId": request_id,
+                    "requestId": pending.request_id,
                     "preparationDigest": prep_digest_b64,
                     "contextHash": STANDARD.encode(bootstrap.context_hash),
                     "grantId": d["grant"]["body"]["grantId"],
@@ -1224,19 +1416,18 @@ impl CatbirdMlsClient {
             "authorKeyId": key_id,
             "signaturePublicKey": STANDARD.encode(signer.public()),
             "authGenerationAtOrigin": auth_generation,
-            "originTransitionId": request_id,
+            "originTransitionId": pending.request_id,
             "originSeq": 1,
             "roleAtOrigin": "admin",
             "deviceStatusAtOrigin": "active",
         });
 
-        let mut publish_body = prepare_verified.body().clone();
+        let mut publish_body = prepare.body().clone();
         publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
         publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
         publish_body["signedAt"] = json!(self.hooks.now_rfc3339_millis());
         publish_body["preparationDigest"] = json!(prep_digest_b64);
-        publish_body["preparationRequestDigest"] =
-            json!(STANDARD.encode(prepare_verified.request_digest()));
+        publish_body["preparationRequestDigest"] = json!(STANDARD.encode(prepare.request_digest()));
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
         publish_body["next"] = bootstrap.coordinates.clone();
         publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
@@ -1253,7 +1444,7 @@ impl CatbirdMlsClient {
             "initialCiphertext": STANDARD.encode(&bootstrap.initial_ciphertext),
             "metadataSnapshot": {
                 "coordinate": direct_request_bootstrap::metadata_coordinate(&bootstrap.coordinates)?,
-                "originTransitionId": request_id,
+                "originTransitionId": pending.request_id,
                 "metadataVersion": 1,
                 "nonce": STANDARD.encode(&bootstrap.metadata_nonce),
                 "ciphertext": STANDARD.encode(&bootstrap.metadata_ciphertext),
@@ -1263,19 +1454,49 @@ impl CatbirdMlsClient {
             }
         });
 
-        let publish_wrapper_bytes = chat_wire::sign_direct_request_wrapper(
+        let publish_wrapper = chat_wire::sign_direct_request_wrapper(
             DirectRequestKind::Publish,
             publish_body,
-            &signer,
+            signer,
         )?;
+        pending.publish = Some(PendingDirectRequestPublication {
+            group_id: group_id_bytes,
+            sequencer_did: effective_sequencer,
+            receipt_authority_key: authority_key,
+            sequencer_receipt_key,
+            bootstrap,
+            kv_batch,
+            publish_wrapper,
+        });
+        // Journaled before it can be sent: a retry replays this exact publication and never
+        // rebuilds MLS or prepares again, which would reserve another recipient key package.
+        self.save_direct_request_creation(peer_did, pending)
+    }
+
+    /// Publish stage of [`Self::create_c33_direct_request_live`]: replay the journaled
+    /// publication and commit its bootstrap only on the verified published receipt, in the
+    /// same write that drops the journal.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_c33_direct_request(
+        &self,
+        mut pending: PendingDirectRequestCreation,
+        prepare: &dr_transcript::VerifiedDirectRequest,
+        peer_did: &str,
+        canonical_dev_id: &str,
+        signer: &SignatureKeyPair,
+        key_id: &str,
+        auth_generation: i64,
+    ) -> Result<ConversationRow, MLSError> {
+        let publication = pending
+            .publish
+            .as_ref()
+            .ok_or_else(|| MLSError::Internal("C33 creation journal has no publication".into()))?;
         let verified_publication = dr_transcript::verify_signed_request(
             DirectRequestKind::Publish,
-            &publish_wrapper_bytes,
+            &publication.publish_wrapper,
             signer.public(),
         )
         .map_err(|e| MLSError::Cryptography(format!("C33 signed publication: {e}")))?;
-        let publish_wrapper_val: Value = serde_json::from_slice(&publish_wrapper_bytes)
-            .map_err(|e| MLSError::Internal(e.to_string()))?;
         let publish_url = format!(
             "{}/xrpc/blue.catbird.chat.publishDirectRequest",
             self.ds_base()
@@ -1285,37 +1506,48 @@ impl CatbirdMlsClient {
         ) {
             self.db.write_tx(|tx| {
                 self.clear_cached_groups();
-                Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
+                Ok(publication.kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
             })?;
         }
-        let published_http = self.execute_json_post(
-            publish_url,
-            serde_json::to_vec(&json!({ "signedRequest": publish_wrapper_val }))
-                .map_err(|e| MLSError::Internal(e.to_string()))?,
+        let published_http = self.post_json_raw(
+            &publish_url,
+            signed_request_body(&publication.publish_wrapper),
         )?;
+        if published_http.status >= 400 {
+            return Err(self.c33_refused(peer_did, &mut pending, &publish_url, &published_http));
+        }
+        let PendingDirectRequestCreation {
+            request_id,
+            first_message_id,
+            conversation_id: effective_convo_id,
+            intro_text,
+            ..
+        } = &pending;
+        let PendingDirectRequestPublication {
+            group_id: group_id_bytes,
+            sequencer_did: effective_sequencer,
+            receipt_authority_key: authority_key,
+            sequencer_receipt_key,
+            bootstrap,
+            kv_batch,
+            ..
+        } = publication;
 
         let published: Value = serde_json::from_slice(&published_http.body)?;
         let outcome = published.get("outcome").ok_or_else(|| {
             MLSError::Cryptography("C33 publication response missing signed outcome".into())
         })?;
-        let outcome = dr_transcript::normalize_read_presentation(
-            &serde_json::to_vec(outcome)?,
-            "signedDirectRequestReceipt",
-            outcome.get("$type").is_some(),
-        )
-        .map_err(|e| MLSError::Cryptography(format!("C33 publication outcome: {e}")))?;
-        let verified_outcome = dr_transcript::verify_signed_request_for_authority(
-            &effective_sequencer,
-            DirectRequestKind::Outcome,
-            &serde_json::to_vec(&outcome)?,
-            &authority_key,
-        )
-        .map_err(|e| MLSError::Cryptography(format!("C33 outcome signature: {e}")))?;
-        let publication_receipt = &verified_outcome.body()["receipt"];
+        let publication_receipt = verify_c33_outcome(outcome, effective_sequencer, authority_key)?;
+        // A signed decision not to publish (e.g. the lease expired before this replay).
+        if let Some(code) =
+            c33_terminal_receipt_code(&publication_receipt, prepare, Some(&verified_publication))?
+        {
+            return Err(self.forget_c33_creation(peer_did, MLSError::InvalidState(code)));
+        }
         if publication_receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
-            || publication_receipt["requestId"] != request_id
-            || publication_receipt["conversationId"] != effective_convo_id
-            || publication_receipt["firstMessageId"] != first_message_id
+            || publication_receipt["requestId"] != *request_id
+            || publication_receipt["conversationId"] != *effective_convo_id
+            || publication_receipt["firstMessageId"] != *first_message_id
             || publication_receipt["requestKind"] != "publish"
             || publication_receipt["actorDid"].as_str() != Some(self.normalized_did.as_str())
             || publication_receipt["actorDeviceId"].as_str() != Some(canonical_dev_id)
@@ -1328,7 +1560,7 @@ impl CatbirdMlsClient {
                         .as_str(),
                 )
             || publication_receipt["preparationRequestDigest"].as_str()
-                != Some(STANDARD.encode(prepare_verified.request_digest()).as_str())
+                != Some(STANDARD.encode(prepare.request_digest()).as_str())
             || publication_receipt["coordinates"] != bootstrap.coordinates
         {
             return Err(MLSError::Cryptography(
@@ -1337,10 +1569,10 @@ impl CatbirdMlsClient {
         }
         let (opening_seq, _, opening_receipt_json) =
             direct_request_bootstrap::verify_opening_receipt(
-                &bootstrap,
+                bootstrap,
                 &publication_receipt["sequencerReceipt"],
-                &effective_sequencer,
-                &sequencer_receipt_key,
+                effective_sequencer,
+                sequencer_receipt_key,
             )?;
         let opening_seq = i64::try_from(opening_seq)
             .map_err(|_| MLSError::Cryptography("C33 sequence overflow".into()))?;
@@ -1368,9 +1600,9 @@ impl CatbirdMlsClient {
             self.clear_cached_groups();
             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
             let provider = self.hooks.openmls_provider(storage);
-            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id_bytes))
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id_bytes))
                 .map_err(|e| MLSError::Internal(format!("load C33 roster: {e:?}")))?
-                .ok_or_else(|| MLSError::group_not_found(&effective_convo_id))?;
+                .ok_or_else(|| MLSError::group_not_found(effective_convo_id))?;
             let expected_member_dids = active_member_dids(&group)?;
             let row = ConversationRow {
                 conversation_id: effective_convo_id.clone(),
@@ -1399,7 +1631,7 @@ impl CatbirdMlsClient {
                 first_message_id: Some(first_message_id.clone()),
                 first_message_archived: false,
                 payload_json: display_json.clone(),
-                expires_at_ms: (import_until as i64).saturating_mul(1000),
+                expires_at_ms: (bootstrap.import_until as i64).saturating_mul(1000),
                 updated_at_ms: now_ms,
             })?;
             tx.insert_message(&MessageRow {
@@ -1418,15 +1650,15 @@ impl CatbirdMlsClient {
             // Stage C33 opening message for conversation Space archival ONLY after recipient acceptance!
             let staged_opening = QueuedLabyrinthArchivePayload {
                 version: 1,
-                message_id: first_message_id,
+                message_id: first_message_id.clone(),
                 conversation_id: effective_convo_id.clone(),
-                group_id_hex: hex::encode(&group_id_bytes),
+                group_id_hex: hex::encode(group_id_bytes),
                 epoch: 1,
                 expected_member_dids,
                 seq: opening_seq,
                 sender_did: self.normalized_did.clone(),
                 sender_device_id: canonical_dev_id.to_string(),
-                sequencer_did: effective_sequencer,
+                sequencer_did: effective_sequencer.clone(),
                 space_uri,
                 plaintext_json: display_json,
                 labyrinth_frame_json: frame_json,
@@ -1449,12 +1681,69 @@ impl CatbirdMlsClient {
                     .map_err(|e| MLSError::Internal(e.to_string()))?,
                 now_ms,
             )?;
+            // The attempt is resolved in the same write that applies its bootstrap.
+            tx.delete_pending_op(DIRECT_REQUEST_CREATION_OP, peer_did)?;
             Ok(row)
         })?;
 
         self.notify_change(PlatformChangeEvent::ConversationsUpdated);
         self.notify_change(PlatformChangeEvent::RequestsUpdated);
         Ok(convo_row)
+    }
+
+    /// Journal `pending` in its own write transaction, never around HTTP (`I6`).
+    fn save_direct_request_creation(
+        &self,
+        peer_did: &str,
+        pending: &PendingDirectRequestCreation,
+    ) -> Result<(), MLSError> {
+        let payload = serde_json::to_string(pending)
+            .map_err(|e| MLSError::Internal(format!("serialize pending direct request: {e}")))?;
+        self.db.write_tx(|tx| {
+            tx.put_pending_op(
+                DIRECT_REQUEST_CREATION_OP,
+                peer_did,
+                &payload,
+                self.hooks.now_ms(),
+            )
+        })
+    }
+
+    /// Drop the creation journal after a terminal answer and return `error` (or the DB failure).
+    fn forget_c33_creation(&self, peer_did: &str, error: MLSError) -> MLSError {
+        match self
+            .db
+            .write_tx(|tx| tx.delete_pending_op(DIRECT_REQUEST_CREATION_OP, peer_did))
+        {
+            Ok(_) => error,
+            Err(db) => db,
+        }
+    }
+
+    /// A refused creation POST: a transient refusal keeps the exact attempt, deferred by a
+    /// bounded delta-seconds `Retry-After` on `hooks.now_ms()`; a terminal one drops it so the
+    /// next attempt starts afresh. Returns the error the platform sees either way.
+    fn c33_refused(
+        &self,
+        peer_did: &str,
+        pending: &mut PendingDirectRequestCreation,
+        url: &str,
+        resp: &PlatformHttpResponse,
+    ) -> MLSError {
+        let error = chat_response_error(format_args!("POST {url}"), resp);
+        if is_terminal_rejection(resp) {
+            return self.forget_c33_creation(peer_did, error);
+        }
+        let delay_ms = retry_after_secs(resp.header("retry-after")).unwrap_or(0) * 1_000;
+        pending.retry_at_ms = self.hooks.now_ms().saturating_add(delay_ms as i64);
+        pending.retry_code = match &error {
+            MLSError::InvalidState(code) => Some(code.clone()),
+            _ => None,
+        };
+        match self.save_direct_request_creation(peer_did, pending) {
+            Ok(()) => error,
+            Err(db) => db,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1783,6 +2072,13 @@ impl CatbirdMlsClient {
             }
         }
         let peers: Vec<String> = peer_set.into_iter().collect();
+        uuid_v4(conversation_id, "conversation_id")?;
+        if peers.is_empty() {
+            return Err(MLSError::invalid_input(
+                "member_dids must name another account",
+            ));
+        }
+        let canonical_dev_id = self.live_device_id()?;
 
         let existing = self
             .db
@@ -1790,13 +2086,6 @@ impl CatbirdMlsClient {
             .ok_or_else(|| MLSError::GroupNotFound {
                 message: format!("conversation {conversation_id} not found"),
             })?;
-        if peers.is_empty() {
-            return Ok(existing);
-        }
-
-        let Some(canonical_dev_id) = self.canonical_uuid_v4_device_id() else {
-            return Ok(existing);
-        };
 
         for peer in &peers {
             let _ = self.fetch_and_cache_authorized_pds_device_keys(peer)?;
@@ -1950,40 +2239,24 @@ impl CatbirdMlsClient {
         })
     }
 
-    pub(crate) fn send_message_live_or_offline(
+    pub(crate) fn send_message_live(
         &self,
         conversation_id: &str,
         message_id: &str,
         text: &str,
     ) -> Result<MessageRow, MLSError> {
         let (display_json, frame_json) = canonical_labyrinth_frame_for_text(text);
+        // Validate before any MLS, DB or archive effect: a non-UUIDv4 send has no live path.
+        let convo_uuid = uuid_v4(conversation_id, "conversation_id")?;
+        let msg_uuid = uuid_v4(message_id, "message_id")?;
+        let canonical_dev_id = self.live_device_id()?;
+
         let frame_nonce = self.hooks.random_array::<32>();
         let archive_commitment = labyrinth_protocol::receipt::compute_archive_commitment(
             &frame_nonce,
             frame_json.as_bytes(),
         );
         let now_ms = self.hooks.now_ms();
-
-        let live_ids = self.canonical_uuid_v4_device_id().and_then(|dev_id| {
-            let c_uuid = uuid::Uuid::parse_str(conversation_id.trim())
-                .ok()
-                .filter(|u| u.get_version_num() == 4)?;
-            let m_uuid = uuid::Uuid::parse_str(message_id.trim())
-                .ok()
-                .filter(|u| u.get_version_num() == 4)?;
-            Some((dev_id, c_uuid, m_uuid))
-        });
-
-        let Some((canonical_dev_id, convo_uuid, msg_uuid)) = live_ids else {
-            return self.send_message_local_offline(
-                conversation_id,
-                message_id,
-                &display_json,
-                &frame_json,
-                frame_nonce,
-                now_ms,
-            );
-        };
 
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
         let canonical_msg_id = msg_uuid.hyphenated().to_string();
@@ -2319,7 +2592,7 @@ impl CatbirdMlsClient {
         })
     }
 
-    pub(crate) fn remove_group_member_live_or_offline(
+    pub(crate) fn remove_group_member_live(
         &self,
         actor_role: MemberRole,
         conversation_id: &str,
@@ -2329,31 +2602,14 @@ impl CatbirdMlsClient {
             return Err(MLSError::invalid_input("target_did must not be empty"));
         }
         enforce_admin_removal_policy(&self.normalized_did, actor_role, &[target_did.to_string()])?;
+        let convo_uuid = uuid_v4(conversation_id, "conversation_id")?;
+        let canonical_dev_id = self.live_device_id()?;
         let now_ms = self.hooks.now_ms();
-        let convo = self
-            .db
+        self.db
             .read_tx(|tx| tx.get_conversation(conversation_id))?
             .ok_or_else(|| MLSError::GroupNotFound {
                 message: format!("conversation {conversation_id} not found"),
             })?;
-
-        let live_ids = self.canonical_uuid_v4_device_id().and_then(|dev_id| {
-            let c_uuid = uuid::Uuid::parse_str(conversation_id.trim())
-                .ok()
-                .filter(|u| u.get_version_num() == 4)?;
-            Some((dev_id, c_uuid))
-        });
-        let Some((canonical_dev_id, convo_uuid)) = live_ids else {
-            self.db.write_tx(|tx| {
-                tx.put_account_meta(
-                    &format!("last_removed_member:{}", convo.conversation_id),
-                    target_did,
-                    now_ms,
-                )
-            })?;
-            self.notify_change(PlatformChangeEvent::ConversationsUpdated);
-            return Ok(());
-        };
 
         // Step 1 removes every target leaf; its journal carries the durable removal intent.
         let removal = GenericCommitOp::RemoveLeaves { target_did };
@@ -2973,7 +3229,7 @@ impl CatbirdMlsClient {
                     // Another transition took this coordinate; a later sync retries.
                     continue;
                 }
-                if is_terminal_rejection(resp.status) {
+                if is_terminal_rejection(&resp) {
                     // Definitively refused (e.g. this device is no longer an admin).
                     forget(op_key.as_str())?;
                 }
@@ -3457,8 +3713,9 @@ impl CatbirdMlsClient {
                 );
                 let resp = self.post_json_raw(&accept_url, wire)?;
                 if resp.status >= 400 {
-                    if is_terminal_rejection(resp.status) {
-                        // The DS will never accept these bytes; a later attempt signs afresh.
+                    if is_terminal_rejection(&resp) {
+                        // The DS will never accept these bytes (a transient refusal such as
+                        // `400 CapacityUnavailable` keeps them); a later attempt signs afresh.
                         self.db.write_tx(|tx| {
                             tx.delete_pending_op(DIRECT_REQUEST_ACCEPTANCE_OP, &req.request_id)?;
                             Ok(())

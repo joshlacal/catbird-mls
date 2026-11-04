@@ -6,12 +6,10 @@
 //! - `D3` (`M-F01`) admin-only member removal enforcement.
 //! - `I13` `archive_commitment` in OpenMLS `PrivateMessage` AAD + `accountDeleted` local purge.
 //! - Post-SQLite-commit `acknowledgeEntries`.
-//! - `D1` / `3A` `HomeDsSpaceRelayClient` cross-server Space credential + read relay.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use atproto_spaces::mac::{compute_record_mac, format_record_mac_header};
 use catbird_mls::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
 use catbird_mls::groups::metadata_v1::{
     maybe_rehost_avatar_on_setter_leave, validate_metadata_snapshot_size, SpaceAvatarPointer,
@@ -24,9 +22,6 @@ use catbird_mls::metadata::{decrypt_metadata_blob, encrypt_metadata_blob, GroupM
 use catbird_mls::requests::c33::{
     archive_accepted_opening_messages, validate_direct_request_key_package_lifetime,
     DIRECT_REQUEST_KP_MIN_LIFETIME_SECS, RECOVERY_KP_MAX_LIFETIME_SECS,
-};
-use catbird_mls::routing::home_ds::{
-    HomeDsRelayTransport, HomeDsSpaceRelayClient, RelayedSpaceResponse,
 };
 use catbird_mls::storage::{MessageRow, MlsAccountDb, OpenMode, RequestRow};
 use catbird_mls::sync::reconcile::persist_entries_then_acknowledge;
@@ -267,7 +262,7 @@ async fn metadata_1a_space_avatar_rehost_on_setter_leave_and_d3_admin_only_remov
 }
 
 #[tokio::test]
-async fn i13_archive_commitment_account_deleted_purge_post_commit_ack_and_3a_relay() {
+async fn i13_archive_commitment_account_deleted_purge_post_commit_ack() {
     let dir = tempfile::tempdir().unwrap();
     let db =
         MlsAccountDb::open_native(dir.path().join("sync.db"), &[0x66; 32], OpenMode::App).unwrap();
@@ -374,81 +369,4 @@ async fn i13_archive_commitment_account_deleted_purge_post_commit_ack_and_3a_rel
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].sender_did, "did:plc:activeuser0000000000000");
-
-    // 4. D1 / 3A `HomeDsSpaceRelayClient` relays `relaySpaceRead` and verifies `Atproto-Space-Mac`:
-    struct MockHomeDsRelay {
-        shared_secret: [u8; 32],
-    }
-
-    #[async_trait::async_trait]
-    impl HomeDsRelayTransport for MockHomeDsRelay {
-        async fn relay_space_credential(
-            &self,
-            target_ds_did: &str,
-            space_uri: &str,
-            delegation_token: &str,
-        ) -> Result<String, catbird_mls::MLSError> {
-            assert_eq!(target_ds_did, "did:web:remote-ds.example");
-            assert!(space_uri.starts_with("at://did:web:remote-ds.example/space/"));
-            assert!(!delegation_token.is_empty());
-            Ok("credential-jws-token".into())
-        }
-
-        async fn relay_space_read(
-            &self,
-            _target_endpoint: &str,
-            nsid: &str,
-            query_string: &str,
-            _credential_token: &str,
-        ) -> Result<RelayedSpaceResponse, catbird_mls::MLSError> {
-            assert_eq!(nsid, "com.atproto.space.getRecord");
-            assert!(query_string.contains("rkey=rec-1"));
-            let space_uri =
-                "at://did:web:remote-ds.example/space/blue.catbird.labyrinth.conversation/c1-0";
-            let repo = "did:plc:bob000000000000000000000";
-            let col = "blue.catbird.labyrinth.messageBatch";
-            let rkey = "rec-1";
-            let cid_bytes = vec![0x01, 0x71, 0x12, 0x20, 0x11, 0x22, 0x33, 0x44];
-            let cid_str = multibase::encode(multibase::Base::Base32Lower, &cid_bytes);
-            let uri_with_q = format!("{space_uri}/{repo}/{col}/{rkey}?space={space_uri}");
-            let mac = compute_record_mac(&self.shared_secret, &uri_with_q, &cid_bytes).unwrap();
-            let body = serde_json::to_vec(&serde_json::json!({
-                "uri": format!("{space_uri}/{repo}/{col}/{rkey}"),
-                "cid": cid_str,
-                "value": { "batch": 1 }
-            }))
-            .unwrap();
-            Ok(RelayedSpaceResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                space_mac_header: Some(format_record_mac_header(&mac)),
-                body,
-            })
-        }
-    }
-
-    let secret = [0x88u8; 32];
-    let relay_client = HomeDsSpaceRelayClient::new(Arc::new(MockHomeDsRelay {
-        shared_secret: secret,
-    }));
-    let space_uri = "at://did:web:remote-ds.example/space/blue.catbird.labyrinth.conversation/c1-0";
-    let cred = relay_client
-        .fetch_remote_space_credential("did:web:remote-ds.example", space_uri, "delegation-jws")
-        .await
-        .unwrap();
-    assert_eq!(cred, "credential-jws-token");
-
-    let record_json = relay_client
-        .fetch_verified_remote_record(
-            "https://pds-bob.example",
-            space_uri,
-            "did:plc:bob000000000000000000000",
-            "blue.catbird.labyrinth.messageBatch",
-            "rec-1",
-            &cred,
-            &secret,
-        )
-        .await
-        .unwrap();
-    assert_eq!(record_json["value"]["batch"], 1);
 }

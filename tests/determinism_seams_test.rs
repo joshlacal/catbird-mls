@@ -1272,6 +1272,134 @@ fn sql_driver_reports_active_write_transaction() {
 }
 
 #[test]
+fn list_requests_breaks_equal_updated_at_ties_by_request_id_whatever_the_insertion_order() {
+    use catbird_mls::storage::RequestRow;
+    // (request_id, consent, updated_at_ms): newest first, then request_id ascending.
+    let rows = [
+        ("r0", "incomingPending", 100),
+        ("r1", "incoming_pending", 100),
+        ("r2", "outgoingPending", 100),
+        ("r3", "incomingPending", 100),
+        ("r4", "incoming_pending", 200),
+        ("r5", "incomingPending", 200),
+        ("r6", "accepted", 100),
+        ("r7", "accepted", 100),
+        ("r8", "accepted", 100),
+    ];
+    let ids = |v: Vec<RequestRow>| v.into_iter().map(|r| r.request_id).collect::<Vec<_>>();
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let mut seed = 0x9e37_79b9_u32;
+    for round in 0..8 {
+        if round == 1 {
+            order.reverse();
+        } else if round > 1 {
+            // Fixed-seed Fisher-Yates: varied, reproducible insertion orders.
+            for i in (1..order.len()).rev() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                order.swap(i, (seed >> 8) as usize % (i + 1));
+            }
+        }
+        let driver = SqlDriver::open_in_memory_for_test().unwrap();
+        driver
+            .write_tx(|tx| {
+                for &i in &order {
+                    let (id, consent, at) = rows[i];
+                    tx.upsert_request(&RequestRow {
+                        request_id: id.into(),
+                        conversation_id: format!("c-{id}"),
+                        sender_did: "did:plc:sender".into(),
+                        recipient_did: "did:plc:recipient".into(),
+                        consent: consent.into(),
+                        first_message_id: None,
+                        first_message_archived: false,
+                        payload_json: "{}".into(),
+                        expires_at_ms: 0,
+                        updated_at_ms: at,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let list =
+            |filter: Option<&str>| ids(driver.read_tx(|tx| tx.list_requests(filter)).unwrap());
+        let ctx = format!("insertion order {order:?}");
+        assert_eq!(
+            list(None),
+            ["r4", "r5", "r0", "r1", "r2", "r3", "r6", "r7", "r8"],
+            "{ctx}"
+        );
+        assert_eq!(
+            list(Some("pending")),
+            ["r4", "r5", "r0", "r1", "r2", "r3"],
+            "{ctx}"
+        );
+        assert_eq!(
+            list(Some("incomingPending")),
+            ["r4", "r5", "r0", "r1", "r3"],
+            "{ctx}"
+        );
+        assert_eq!(list(Some("accepted")), ["r6", "r7", "r8"], "{ctx}");
+    }
+}
+
+#[tokio::test]
+async fn stored_conversations_list_breaks_equal_updated_at_ties_by_conversation_id() {
+    use catbird_mls::orchestrator::MLSStorageBackend;
+    use catbird_mls::storage::ConversationRow;
+    let rows = [
+        ("c3", 100),
+        ("c0", 100),
+        ("c4", 200),
+        ("c2", 100),
+        ("c1", 200),
+    ];
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let mut seed = 0x0bad_5eed_u32;
+    for round in 0..8 {
+        if round == 1 {
+            order.reverse();
+        } else if round > 1 {
+            for i in (1..order.len()).rev() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                order.swap(i, (seed >> 8) as usize % (i + 1));
+            }
+        }
+        let driver = SqlDriver::open_in_memory_for_test().unwrap();
+        driver
+            .write_tx(|tx| {
+                for &i in &order {
+                    let (cid, at) = rows[i];
+                    tx.upsert_conversation(&ConversationRow {
+                        conversation_id: cid.into(),
+                        group_id: vec![i as u8; 16],
+                        generation: 0,
+                        epoch: 0,
+                        last_seq: 0,
+                        sequencer_did: String::new(),
+                        space_uri: None,
+                        title: None,
+                        unread_count: 0,
+                        updated_at_ms: at,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let ids: Vec<String> = MLSStorageBackend::list_conversations(&driver, "did:plc:alice")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.conversation_id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["c1", "c4", "c0", "c2", "c3"],
+            "insertion order {order:?}"
+        );
+    }
+}
+
+#[test]
 fn sql_driver_reports_active_transactions_via_sqlite_autocommit() {
     let driver = Arc::new(SqlDriver::open_in_memory_for_test().unwrap());
     let probe = driver.autocommit_probe();

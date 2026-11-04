@@ -2,7 +2,7 @@
 
 ## Overview
 
-`catbird-mls` is the core MLS (Messaging Layer Security) SDK for all Catbird clients. It implements OpenMLS 0.8 group cryptography, a platform-agnostic orchestrator (sync, recovery, messaging policy), and UniFFI bindings so Swift/Kotlin call into a single Rust library. It also contains voice encoding (Opus/OGG), blob crypto (AES-256-GCM), and a WASM client facade — making it a monolith that should eventually be split. The spec that governs all behavior is `docs/MLS_CLIENT_PROTOCOL.md`.
+`catbird-mls` is the core MLS (Messaging Layer Security) SDK for all Catbird clients. It implements OpenMLS group cryptography (pinned at `=0.9.0-rc.3`, rev `e7c2437e845eb767d2cdd22eece2b3c5d484e4e7`; do not change the pin), the `CatbirdMlsClient` SDK with its Labyrinth history archive, a platform-agnostic orchestrator (sync, recovery, messaging policy), and UniFFI bindings, so Swift and Kotlin call one Rust library. It also contains voice encoding (Opus/OGG) and blob crypto (AES-256-GCM), which makes it a monolith that should eventually be split. The spec that governs all behavior is `docs/MLS_CLIENT_PROTOCOL.md` in the Catbird+Petrel workspace root, not in this repo.
 
 ## Build & Test Commands
 
@@ -10,11 +10,15 @@
 # Standard build
 cd catbird-mls && cargo build
 
-# Tests
+# Tests (default features include `labyrinth`)
 cargo test
 cargo test --test two_user_messaging_test -- --nocapture
 cargo test --test persistence_repro -- --nocapture
 cargo test --test member_removal_test -- --nocapture
+cargo test --lib native_restore_tests        # verified restore, witness copies, account deletion
+cargo test --lib native_archive_space_auth   # Space credential PoP / KEM / MAC / CID checks
+cargo test --features sim --test client_labyrinth_fault_lines    # test-only Space archive harness
+cargo test --features sim --test push_processor_memory_and_gap   # NSE push processor
 
 # Lint
 cargo fmt --check && cargo clippy --all-targets --all-features
@@ -81,10 +85,8 @@ All source is in `src/`. Single crate, no workspace.
 
 | File | Purpose |
 |------|---------|
-| `catbird_mls.rs` | `CatbirdMls` — the UniFFI-exported entry point Swift/Kotlin calls |
-| `orchestrator_bridge.rs` | Callback interfaces (`OrchestratorStorageCallback`, `OrchestratorAPICallback`, `OrchestratorCredentialCallback`) + adapter structs |
-| `api.rs` | `MLSContext` UniFFI object — direct MLS crypto operations, traffic-analysis-resistant padding |
-| `bridge_mappers.rs` | Conversions between internal types and FFI records |
+| `ffi/uniffi_exports.rs` | UniFFI exports: `CatbirdMlsClient` methods, `process_push_notification`, `account_did_hash_hex`, `evaluate_spaces_eligibility`, `wipe_pre_cutover_local_artifacts` |
+| `client/traits.rs` | Foreign callback traits: `PlatformTransport`, `PlatformKeyStore`, `PlatformChangeObserver` |
 | `types.rs` | FFI-safe records: `KeyPackageData`, `GroupCreationResult`, `DecryptResult`, etc. |
 | `error.rs` | `MLSError` — top-level UniFFI `flat_error` enum |
 
@@ -94,16 +96,20 @@ All source is in `src/`. Single crate, no workspace.
 |------|---------|
 | `mls_context.rs` | `MLSContext` inner impl — SQLCipher connection + `MlsGroup` HashMap. All OpenMLS calls. |
 | `epoch_storage.rs` | `EpochSecretManager` — exports/stores epoch secrets for forward secrecy |
-| `hybrid_storage.rs` | `HybridStorageProvider` — wraps `openmls_sqlite_storage` + keychain (currently unused) |
 | `metadata.rs` | Encrypted group metadata. Per-epoch ChaCha20-Poly1305 keyed by the MLS exporter; `GroupMetadataV1` blob stored on the DS, `MetadataReference` pointer in AppDataDictionary component `0x8001`. The retired plaintext `0xff00` extension type ID is exported as `RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE` for the legacy-cleanup logic in `mls_context.rs` (filters it out of `RequiredCapabilities` on commits to old groups). The struct that used to wrap that extension was deleted in Phase F. |
 
-### Client Facades
+### Client SDK and archive
 
 | File | Purpose |
 |------|---------|
-| `client.rs` | `CatbirdClient<S,A,C,M>` — MLS-free chat facade for catmos desktop |
-| `client_bridge.rs` | Bridges `CatbirdClient` to UniFFI |
-| `wasm_client.rs` | `WasmClient` — same interface with `?Send` async traits for wasm32 |
+| `client/mod.rs` | `CatbirdMlsClient` (UniFFI object): `open`, `open_with_hooks`, the encrypted account DB, Labyrinth status and recovery entry points, `QueuedLabyrinthArchivePayload` |
+| `client/live_plane.rs` | Live sends, membership mutations, C33 direct requests, `close_conversation` |
+| `client/live_sync.rs` | `sync()`: ordered `getEntries`, `I4`/`I13` verification, witness enqueue, account deletions, C33 import |
+| `client/native_archive.rs` | Production Labyrinth archive: flush, kick rescue, restore, owner batches |
+| `client/native_archive_space.rs` | Space credential, PoP, KEM, MAC and CID verification for every Space read |
+| `client/offline_archive.rs` | Test-only Space archive harness (`test`, `test-utils` or `sim`) |
+| `labyrinth/` | `LabyrinthSession` and `SessionDeps` (`CompositeDirectory` over the PDS and mls-ds), the Space and mls-ds transports, and the `MLSOrchestrator` Labyrinth hooks |
+| `push/processor.rs` | NSE/FCM push processor on the shared account DB (`OpenMode::PushExtension`) |
 | `high_level_contract.rs` | Request/response structs for the easy-mode facade |
 
 ### Utilities
@@ -114,7 +120,6 @@ All source is in `src/`. Single crate, no workspace.
 | `voice.rs` | Opus/OGG encode-decode + DSP (noise gate, compressor, LUFS normalization) |
 | `logging.rs` | `debug_log!` macro + `MLSLogger` callback for platform log routing |
 | `atproto_bytes.rs` | AT Protocol base64url serde helpers |
-| `ffi.rs` | Legacy C FFI layer (predates UniFFI, kept for interop) |
 | `planted.rs` | `PlantedBug` (`P1`–`P6`, `P8`–`P13`, `P15`) thread-local `sim` calibration hooks + `SimGroupState` |
 
 ## Architecture
@@ -156,12 +161,45 @@ advancing the durable MLS group or evicting its prior roster. Ordered entry sync
 authenticates the preceding applications under strict `I4`, then recovers the own Commit
 and completes any participant-removal policy. The same rule applies to leaf recovery.
 
+Whether a refused request may be replayed with identical bytes is decided in one place,
+`canonical_transport::is_transient_wire_failure`: `CapacityUnavailable` (sent as HTTP 400
+when a coordinator or recipient home is unreachable or a relay fails; nothing durable was
+recorded), 408, 425, 429 and 500/502/503/504 are transient; any other status, including a
+semantic 4xx and 501, is terminal for those bytes. `retry_after_secs` accepts only
+delta-seconds `Retry-After`, capped at the 300-second preparation lease; an HTTP-date is
+ignored, so deferrals run on the injected clock. Pending commits, participant removals,
+request acceptances and C33 creations discard their journals only on a semantic 4xx; every
+5xx keeps them. The orchestrator's `resume_direct_request` maps a non-200 prepare or publish
+through `map_wire_error`. A transient refusal stays `OutcomeUnknown`. `GatewayResponse`
+carries no headers, so `CapacityUnavailable` uses the delivery service's 5-second contract:
+the instant is persisted on the intent (`retry_not_before_ms`, wall-clock unix ms), a resume
+before it sends nothing, and reconciliation skips the draft until then, across restarts. A
+semantic refusal returns `TerminalNotPublished` with its code; any 200 or semantic answer
+clears the deferral, and otherwise the intent is unchanged. Background reconciliation parks
+such a draft for the process lifetime instead of resending it on a timer.
+
 `accept_direct_request` journals its signed `acceptConversation` request as a
 `direct_request_acceptance` pending op and replays those exact bytes until consent is
-recorded (with the journal removal) or a deterministic 4xx: the delivery service keeps
+recorded (with the journal removal) or a terminal refusal: the delivery service keeps
 the first acceptance even when relaying it to a remote coordinator fails, so a freshly
 signed retry is an `IdempotencyConflict`. Accepting an already accepted request is a
 no-op, and a synced acceptance entry also clears the journal.
+
+An untitled 1:1 `create_group` (a C33 request) journals its attempt as one
+`direct_request_creation` pending op per peer DID, because the server fences one live
+preparation per pair while the app names a new conversation on every tap. The signed
+prepare is journaled before it is sent. After a successful prepare, the MLS bootstrap
+(an unapplied `KvWriteBatch`) and the signed publication are journaled before publishing.
+Each retry, including after a restart, resumes that attempt and returns its conversation,
+request and introduction text, not the caller's. It replays the exact bytes and never
+rebuilds MLS or prepares again, which would reserve another recipient key package. A
+transient refusal records its `Retry-After` on `hooks.now_ms()`; a retry before then
+returns the same error without any request. A terminal refusal or a signed
+non-publication receipt (rejected, expired, existing direct) discards the journal, but only
+after the receipt verifies like a publication outcome: the coordinator's receipt signature,
+the journaled request, its prepare (or publication) digests and the actor. Anything else
+fails closed and keeps the journal. The write that commits the published bootstrap also
+deletes it. A lost response keeps the journal.
 
 C33 openings use an encrypted version-2 envelope containing `frameNonce` and the
 canonical `MLSMessagePayload`. The signed publication and MLS AAD bind the same blinded
@@ -169,6 +207,17 @@ canonical `MLSMessagePayload`. The signed publication and MLS AAD bind the same 
 sequencer receipt. The versioned publication-receipt key and `#mls-receipt-1` are
 independent trust checks. Incomplete legacy openings fail closed instead of becoming
 unsigned archive frames.
+
+An imported opening is staged with its frame, nonce and I13 receipt (`c33_pending_opening:{cid}`).
+It is queued for the archive only after acceptance; a decline or close discards it.
+
+A **pruned** opening (`payloadPruned: true`, no `signedRequest`) keeps only its receipts.
+`sync()` verifies the coordinator-signed `publicationReceipt` and its I13 `sequencerReceipt`
+against the row: the conversation, `firstMessageId` equal to `entryId`, `recordedAt` equal to
+`receivedAt`, the seq and the commitment. It then records the request as `openingUnavailable`
+(`C33_OPENING_UNAVAILABLE`). That state is terminal: there is no message row, Welcome import,
+preview or acceptance (`accept_direct_request` returns `InvalidState("OpeningUnavailable")`).
+The conversation's history is reachable only through its Space.
 
 Labyrinth adapters map exact `NotEntitled` and `AccessOutsideMembershipInterval`
 protocol errors to `Forbidden`. Only a real `Forbidden` or a locally authenticated
@@ -185,18 +234,65 @@ application send; changing authority requires a verified transfer. NSE commits r
 conversation coordinates from authenticated MLS AAD and the merged group before an app
 can reserve a sender ratchet step.
 
-Native archive flushes visit queued conversations only, using each message's send-time
-MLS roster. Active-member recovery reads Conversation Space batches and MEKs, verifies
-I13 receipts and commitments, and imports canonical `MLSMessagePayload` frames. Owner
-batches use those same frame bytes only for kick/leave/Forbidden rescue. Closing a
-conversation requires an authorized, cid-bound signed wrapper and erases the live MLS
-group, caches, epoch secrets, and all conversation pending-operation journals.
+### Native archive contract (Labyrinth over Spaces)
 
-Production `open` and `open_with_hooks` require UUIDv4 device IDs. The Space-only archive
-harness is compiled only under `test`, `test-utils`, or `sim` and must use
-`open_offline_archive_for_test` or `open_offline_archive_with_hooks_for_test`; a device
-ID's shape never selects weaker archive behavior. Run its integration targets with
-`--features sim`.
+**Status (2026-11-04).** This section describes the Task 4 R1 provisional commits, not the bookmark.
+- The bookmark `clean-slate-2026-10-31` is R0 (`79a40b5f`).
+- The Task 4 R1 commits on top of the bookmark (starting at `7ab0572d`) are provisional and unsealed. They add the verified directory and Space auth, witness copies, send-time rosters, C33 I13 evidence, deleted-account hiding, pruned C33 openings and `getBlob repo=`.
+- R1 builds only against labyrinth's provisional R1 commit (path dependency `../labyrinth`).
+- The final Task 4 gate has not passed.
+
+Protocol detail is in `../labyrinth/docs/SPACE_CONVERSATIONS.md` and `../labyrinth/docs/MLSDS_BACKEND.md`.
+
+**Identity.** Production `open` and `open_with_hooks` reject any device ID that is not UUIDv4, and every archive call re-checks it. The Space-only harness (`src/client/offline_archive.rs`) uses a static per-conversation sender MEK instead of real MEK distribution. It compiles only under `test`, `test-utils` or `sim`, and only `open_offline_archive_for_test` or `open_offline_archive_with_hooks_for_test` selects it. A device ID's shape never selects weaker archive behavior. Run its integration targets with `--features sim`.
+
+**Session.** `native_archive_deps` builds a `LabyrinthSession` whose directory is always `CompositeDirectory::new(PdsDirectory, DsDirectoryStore)`. A peer head must agree between the peer's public `mailboxKeys` and mls-ds; otherwise the result is `DirectoryIncomplete` or `DirectoryFork`. Each new epoch is published to the account PDS (`mailboxKeys/<12-digit epoch>` create-only, then `self` under `swapRecord`) and to mls-ds (`publishEpochHead`). Opening a session backfills a missing or stale PDS copy. Session state and Space pins live in `labyrinth_state` (`native.session`, `native.placements`).
+
+**Space reads** pass through `native_archive_space.rs` before any byte reaches Labyrinth:
+- a fresh P-256 credential key per request, and a delegation token from the account PDS;
+- a credential exchange: `getSpaceCredential` for the mailbox, `blue.catbird.chat.relaySpaceCredential` for a conversation;
+- an HTTP-signature proof of possession, a fresh KEM share, and exactly one `Atproto-Space-Mac`;
+- URI, CID, LtHash and STAR checks.
+
+`getBlob` sends `space`, `repo` and `cid`, and the body must hash to that CID. A 401 or 403 is the Space's `Forbidden`. Any other failure fails closed.
+
+**What is queued.** `QueuedLabyrinthArchivePayload` carries:
+- the canonical `MLSMessagePayload` frame and its `frameNonce`;
+- the verified I13 receipt;
+- `expected_member_dids`, the authenticated MLS roster at send or receive time, which a flush never replaces (`I5`).
+
+Rows are created as follows:
+- An own send is enqueued, with its message row, only after the accepted response's I13 receipt verifies (`finish_application_send`).
+- Every verified message from another account is enqueued as a witness copy under the receive-time roster. NSE-decrypted messages wait until `sync()` verifies their receipt.
+- The same evidence is kept under `native.message:{cid}:{id}` for rescue.
+
+**Flush.** The platform calls `flush_labyrinth_queue`; nothing flushes on the send path. It visits queued conversations only, in 100-row pages grouped by group, epoch and roster. For each conversation:
+- `getConversationState` succeeds and the local MLS roster holds this account: sender batches;
+- the state read is `Forbidden`, or the local roster lacks this account: owner batches;
+- a sender write returns `Forbidden`: that chunk goes to owner batches;
+- anything else fails that conversation and keeps its rows. That includes `ConversationNotFound` while the local roster still holds this account, `DirectoryIncomplete` and Space verification failures.
+
+Rows are dequeued only after their page is written, so a retry can republish identical copies, which readers merge. The first error is returned after every conversation has been tried; `ContextClosed` aborts at once. Roster members that fail a trust check are excluded with a warning. A deleted account is left out of the roster only on a verified `accountDeletedEntry`, never on a 404.
+
+**Receiptless rows are not a production path.** A queued row without I13 evidence fails its conversation's native flush (`ReceiptCommitmentMismatch`) and stays queued, which also stalls the rows behind it. Production `create_group`, `send_message`, `add_group_members` and `remove_group_member` therefore reject a conversation, message or device ID that is not UUIDv4 with `InvalidInput` before any MLS, database or archive effect. `add_group_members` also rejects a call that names no other account with `InvalidInput`. Both membership calls fail with `GroupNotFound` for a conversation not held locally; neither returns an unchanged row or a silent `Ok`. The local-only `create_group_local_offline`, `send_message_local_offline` (the only producer of receiptless rows) and `remove_group_member_local_offline` compile only under `test`, `test-utils` or `sim`. They are taken only on a client opened with `open_offline_archive_for_test`, whose flush is `offline_flush_labyrinth_queue`, never the native flush. An ID's shape never selects them.
+
+**Owner fallback.** OwnerBatch is used only for `Forbidden` or an authenticated local kick or leave. `rescue_conversation_on_kick` runs from `sync()` after a verified Commit removed this device. It seals every local message from its retained evidence, plus the queued rows, with `archive_owner_committed`. A message without evidence fails the rescue. A missing active Space or conversation fails closed.
+
+**Restore.** `restore_conversation_from_owner_mailbox` restores an active member from the conversation Space (sender and witness copies). It uses owner copies only in three cases: the Space answered `Forbidden`; the local roster lacks this account; or there is no local group and the conversation is `ConversationNotFound`.
+- Any undecryptable or unverified frame fails the restore.
+- Rejected witness copies are logged and ignored.
+- When copies of one message ID disagree, the copy equal to the local message wins; with no local match, that ID is skipped.
+- Rows take the receipt's group, epoch and seq, and never advance the live cursor.
+
+**Account deletion.** `sync()` verifies each `accountDeletedEntry`: ES256 under the conversation's `{sequencerDid}#mls-receipt-1`, domain `catbird-mls-account-deletion-v1\0`. A verified entry records `native.account_deleted:{cid}:{did}`, drops that account's queued witness copies and evidence, and purges its local messages. Restore also applies the entries listed in `getConversationState.accountDeletions`. Restore and `open_rescued_owner_batch` hide every copy of the account's messages that its receipt orders before the deletion.
+
+**Close.** `apply_terminal_close` erases the MLS group, caches and epoch secrets. It also erases the conversation's pending-op journals, archive queue, retained evidence and staged C33 opening. Local message rows stay. Nothing is archived or rescued for that conversation afterwards. Closing requires an authorized, cid-bound signed wrapper.
+
+**NSE.** `process_push_notification` opens the same `<storage_root>/catbird-mls/<sha256(did)>.db` with `OpenMode::PushExtension`.
+- It stores messages and their archive evidence without a receipt, plus a `native_archive_receipt` pending op.
+- It writes `conversation_coords:{cid}` from the authenticated commit-AAD prior. Production refuses a Commit without one.
+- The app's `write_tx` reconciles `PRAGMA data_version` inside `BEGIN IMMEDIATE` and evicts cached groups before mutating (`I7`).
+- `sync()` later verifies the entry's I13 receipt against the epoch the retained evidence names, not the display row, which a history import may hold at epoch 0. Only then does it queue the witness copy.
 
 OAuth requests must use `REQUIRED_LABYRINTH_OAUTH_SCOPES` with explicitly stated
 `read/create/update/delete` actions and the declared record collections. The old
@@ -244,24 +340,23 @@ It's stored in `MLSOrchestrator.conversation_states`
 ### Layering: Rust 5 states vs spec 7 states
 
 **The `ConversationState` enum here is NOT the same state machine as the
-7-state conversation recovery machine in `docs/MLS_CLIENT_PROTOCOL.md §8.1`.**
+7-state conversation recovery machine in `docs/MLS_CLIENT_PROTOCOL.md §8.1`** (that spec
+lives in the Catbird+Petrel workspace root).
 
 The spec's 7-state machine (`HEALTHY`, `EPOCH_BEHIND`, `GROUP_MISSING`,
 `NEEDS_REJOIN`, `RECOVERING`, `UNRECOVERABLE_LOCAL`, `RESET_PENDING`) is a
-**client-layer, cross-platform contract** that lives at the Swift / Kotlin /
-catmos / catmos-cli layer. Each platform implements it independently:
+**client-layer, cross-platform contract**. Each platform's own docs describe where it keeps
+that view.
 
-- **iOS**: `CatbirdMLSCore/Sources/CatbirdMLSCore/Models/ConversationRecoveryState.swift`
-  (Bravo, Cluster B). Derives persistent states from `MLSConversationModel`
-  booleans (`needsRejoin`, `needsReset`, `isUnrecoverable`); transient
-  states live in `MLSRecoveryManager.transientStates`. iOS does **not**
-  call into `MLSOrchestrator` at all — it uses the low-level `MlsContext`
-  UniFFI object directly and runs its own sync + recovery loop in Swift
-  (`MLSConversationManager+Sync.swift`).
-- **catmos / catmos-cli / WASM clients**: use `MLSOrchestrator` via
-  `CatbirdClient` / `WasmClient`. The orchestrator's `ConversationState`
-  is a separate internal bookkeeping enum; the spec's 7 states are
-  currently mapped loosely onto it. Concretely:
+Every platform drives `CatbirdMlsClient` (`src/client/`): CatbirdMLSCore, android, catmos,
+catmos-cli, BIRDaemon, and browser WASM through `WasmMlsClient` in catbird-mls-web. `MlsContext`
+(`src/mls_context.rs`, `src/mls_engine_context.rs`) is now a crate-private engine, not a
+UniFFI object. The old Swift files `ConversationRecoveryState.swift` and
+`MLSConversationManager+Sync.swift` no longer exist.
+
+The orchestrator's `ConversationState` belongs to `MLSOrchestrator` embedders (`src/engine.rs`,
+the `echo-bot` binary). It is a separate internal bookkeeping enum, and the spec's 7 states
+map onto it only loosely. Concretely:
   - `Initializing` has no spec equivalent (pre-creation).
   - `Active` ≈ `HEALTHY`.
   - `ForkDetected` is a **Rust-specific** fork-readd path for
@@ -275,7 +370,7 @@ catmos / catmos-cli layer. Each platform implements it independently:
   - `EPOCH_BEHIND`, `GROUP_MISSING`, and `RECOVERING` have **no direct
     Rust equivalent** — they're observed indirectly via counters in
     `RecoveryTracker` (in-flight rejoin = `RECOVERING`; group-not-found
-    propagates from `MlsContext::get_epoch` failures).
+    propagates from `get_epoch` failures of the crate-private MLS engine).
 
 **Why two machines?** The Rust orchestrator's state tracks the attempt
 lifecycle inside its own sync loop: "am I currently allowed to try a
@@ -328,10 +423,15 @@ Outgoing ciphertext padded to buckets `[512, 1024, 2048, 4096, 8192]` bytes usin
 
 | Flag | Effect |
 |------|--------|
+| `labyrinth` (default) | Labyrinth 1.1 history over Spaces (`dep:labyrinth`, path `../labyrinth`) |
+| `browser` | Enables `labyrinth` |
+| `sim` | Deterministic simulation hooks (`buggify!`, `SimClock` KeyPackage lifetimes, `openmls/unchecked-conversions`); also compiles the test-only offline archive harness |
+| `plant_p1` … `plant_p15` | Planted-bug calibrations for `catbird-sim` (each implies `sim`) |
+| `test-utils` | OpenMLS test utilities; also compiles the offline archive harness |
+| `e2e-aad` | In-process AAD emitters for cross-repo container tests; never UniFFI-exported |
 | `echo-bot` | Enables the echo-bot binary (adds `reqwest`, `clap`, `tracing-subscriber`) |
-| `fork-resolution` | Gates `recover_fork_by_readding` (fork-readd recovery, `api.rs`). Does NOT toggle OpenMLS's own `fork-resolution` feature (that's enabled unconditionally) |
+| `fork-resolution` | Gates `recover_fork_by_readding`. Does NOT toggle OpenMLS's own `fork-resolution` feature (that's enabled unconditionally) |
 | `android` | Reserved, unused |
-| `browser` | Reserved, unused |
 
 **Target-conditional:**
 - Non-WASM: `openmls_sqlite_storage`, `rusqlite` (bundled-sqlcipher), Tokio `rt-multi-thread`
@@ -342,10 +442,10 @@ Outgoing ciphertext padded to buckets `[512, 1024, 2048, 4096, 8192]` bytes usin
 
 | # | Gap | Priority | Status |
 |---|-----|----------|--------|
-| 1 | ~~`recover_fork_by_readding` returns `OperationNotSupported`~~ | DONE | Implemented (gated behind the `fork-resolution` cargo feature; see `api.rs`) |
+| 1 | ~~`recover_fork_by_readding` returns `OperationNotSupported`~~ | DONE | Implemented, gated behind the `fork-resolution` cargo feature (`src/mls_engine_context.rs`, `src/orchestrator/recovery.rs`) |
 | 2 | ~~`cleanup_epoch_secrets_if_needed` never called~~ | DONE | Called after merges in `groups.rs`, `staged_commit.rs`, `recovery.rs`, `messaging.rs` |
 | 3 | External Join Authorizer is a stub | LOW (HIGH for federation) | Server enforces membership today |
-| 4 | `swap_members()` not used for device rotation (two commits instead of one) | HIGH | Implement in `MLSContext` |
+| 4 | `swap_members()` not used for device rotation (two commits instead of one) | HIGH | Implement in the crate-private MLS engine (`src/mls_engine_context.rs`) |
 | 5 | SelfRemove proposal not used for leave-group | MEDIUM | Server-mediated leave works |
 | 6 | Recovery tracker state in-memory only | ACCEPTABLE | App restart = natural cooldown |
 | 7 | `openmls/` directory is a full upstream clone (deadweight) | CLEANUP | Delete it |

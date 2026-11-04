@@ -28,6 +28,10 @@ pub struct DirectRequestIntent {
     pub cancellation_requested: bool,
     pub projection_completed: bool,
     pub previous_attempts: Vec<DirectRequestTerminalAttempt>,
+    /// Unix ms before which a resume sends nothing: a `CapacityUnavailable` deferral that
+    /// survives restart. Cleared by any non-retryable or HTTP 200 answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_not_before_ms: Option<i64>,
 }
 
 fn invalid() -> OrchestratorError {

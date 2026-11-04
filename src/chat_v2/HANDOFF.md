@@ -302,9 +302,12 @@ targets. Build each target individually before believing a regression.
 Each was decided with evidence and is pinned by a test. Changing one is a
 deliberate policy change, not a refactor.
 
-**Auto-retry set is exactly two codes**: `RateLimited` and
-`RelationshipPolicyUnavailable`. The latter signals unavailable, incomplete, or
-stale *evidence* rather than a denial. Its denial counterparts
+**Auto-retry set is exactly three codes**: `CapacityUnavailable`, `RateLimited` and
+`RelationshipPolicyUnavailable`. `CapacityUnavailable` is the delivery service's
+transient direct-request refusal (a coordinator or recipient home was unreachable,
+or a relay failed; nothing durable was recorded), added deliberately with the
+direct-request retry cutover. `RelationshipPolicyUnavailable` signals unavailable,
+incomplete, or stale *evidence* rather than a denial. Its denial counterparts
 (`BlockedRelationship`, `MessagesDisabled`, `GroupInvitesDisabled`,
 `NotFollowedByRecipient`) are never retried — waiting cannot clear a block, and
 scheduled re-attempts keep leaking activity and presence to exactly the party

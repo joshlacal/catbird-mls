@@ -39,7 +39,7 @@
 //!
 //! Read it before changing anything here. Several decisions in this tree look
 //! arbitrary from the code alone and are not — the strict `nextAfterSeq`
-//! equality, the cumulative bare-DID length rule, and the two-code auto-retry
+//! equality, the cumulative bare-DID length rule, and the three-code auto-retry
 //! set were each settled against evidence and are pinned by tests.
 
 #[cfg(test)]

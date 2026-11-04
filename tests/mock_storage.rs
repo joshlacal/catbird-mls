@@ -1089,12 +1089,18 @@ impl MLSStorageBackend for MockStorage {
                 "injected list_conversations failure".to_string(),
             ));
         }
-        let views = inner
+        let mut views: Vec<ConversationView> = inner
             .conversations
             .values()
             .filter(|c| c.user_did == user_did && c.is_active)
             .map(|c| c.view.clone())
             .collect();
+        // Same order as the SQL drivers: `updated_at_ms DESC, conversation_id ASC`.
+        views.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.conversation_id.cmp(&b.conversation_id))
+        });
         Ok(views)
     }
 

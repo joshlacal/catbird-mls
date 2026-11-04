@@ -231,12 +231,8 @@ pub(crate) mod native_client {
 
     use crate::error::MLSError;
     use crate::groups::lifecycle::MemberRole;
-    use crate::groups::metadata_v1::{validate_metadata_snapshot_size, SpaceAvatarPointer};
+    use crate::groups::metadata_v1::SpaceAvatarPointer;
     use crate::keychain::KeychainAccess;
-    use crate::messaging::receive::PrivateMessagePlaintextEnvelope;
-    use crate::metadata::{
-        derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
-    };
     use crate::push::AuthorizedPeerDeviceKey;
     use crate::requests::c33::{
         validate_direct_request_key_package_lifetime, DIRECT_REQUEST_KP_MIN_LIFETIME_SECS,
@@ -839,6 +835,8 @@ pub(crate) mod native_client {
         // Group, Message, Metadata (`1A`), and Request Mutations
         // ---------------------------------------------------------------------
 
+        /// Rejects a non-UUIDv4 conversation or device ID with `InvalidInput` before any effect.
+        /// Only the explicit test harness (`open_offline_archive_for_test`) creates a local group.
         pub fn create_group(
             &self,
             conversation_id: &str,
@@ -847,7 +845,16 @@ pub(crate) mod native_client {
             title: Option<String>,
             description: Option<String>,
         ) -> Result<ConversationRow, MLSError> {
-            self.create_group_live_or_offline(
+            #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+            if self.offline_archive_for_test {
+                return self.create_group_local_offline(
+                    conversation_id,
+                    sequencer_did,
+                    title,
+                    description,
+                );
+            }
+            self.create_group_live(
                 conversation_id,
                 sequencer_did,
                 member_dids,
@@ -856,13 +863,20 @@ pub(crate) mod native_client {
             )
         }
 
-        pub(crate) fn create_group_local_offline(
+        /// Test-harness group: a local MLS group with no delivery-service registration.
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        fn create_group_local_offline(
             &self,
             conversation_id: &str,
             sequencer_did: &str,
             title: Option<String>,
             description: Option<String>,
         ) -> Result<ConversationRow, MLSError> {
+            use crate::groups::metadata_v1::validate_metadata_snapshot_size;
+            use crate::metadata::{
+                derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce,
+                GroupMetadataV1,
+            };
             let group_id_bytes = self.hooks.random_array::<32>().to_vec();
             let now_ms = self.hooks.now_ms();
             let now_secs = self.hooks.now_secs();
@@ -983,28 +997,39 @@ pub(crate) mod native_client {
             Ok(convo)
         }
 
+        /// Rejects non-UUIDv4 conversation, message or device IDs with `InvalidInput` before any
+        /// effect. Only the explicit test harness (`open_offline_archive_for_test`) sends offline.
         pub fn send_message(
             &self,
             conversation_id: &str,
             message_id: &str,
             text: &str,
         ) -> Result<MessageRow, MLSError> {
-            self.send_message_live_or_offline(conversation_id, message_id, text)
+            #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+            if self.offline_archive_for_test {
+                return self.send_message_local_offline(conversation_id, message_id, text);
+            }
+            self.send_message_live(conversation_id, message_id, text)
         }
 
-        pub(crate) fn send_message_local_offline(
+        /// Test-harness send: a local MLS message and a receiptless queue row that only
+        /// `offline_flush_labyrinth_queue` can archive.
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        fn send_message_local_offline(
             &self,
             conversation_id: &str,
             message_id: &str,
-            display_json: &str,
-            frame_json: &str,
-            frame_nonce: [u8; 32],
-            now_ms: i64,
+            text: &str,
         ) -> Result<MessageRow, MLSError> {
-            let (inner_plaintext, aad_bytes) = PrivateMessagePlaintextEnvelope::seal_with_aad(
-                frame_nonce,
-                frame_json.as_bytes().to_vec(),
-            )?;
+            let (display_json, frame_json) =
+                super::live_plane::canonical_labyrinth_frame_for_text(text);
+            let frame_nonce = self.hooks.random_array::<32>();
+            let now_ms = self.hooks.now_ms();
+            let (inner_plaintext, aad_bytes) =
+                crate::messaging::receive::PrivateMessagePlaintextEnvelope::seal_with_aad(
+                    frame_nonce,
+                    frame_json.as_bytes().to_vec(),
+                )?;
 
             let msg_row = self.db.write_tx(|tx| {
                 let mut convo = tx.get_conversation(conversation_id)?.ok_or_else(|| {
@@ -1122,13 +1147,54 @@ pub(crate) mod native_client {
         }
 
         /// Remove a member from a group conversation (`Spec §2 D3` / `M-F01`: strictly admin-only).
+        /// Rejects a non-UUIDv4 conversation or device ID with `InvalidInput` before any effect.
         pub fn remove_group_member(
             &self,
             actor_role: MemberRole,
             conversation_id: &str,
             target_did: &str,
         ) -> Result<(), MLSError> {
-            self.remove_group_member_live_or_offline(actor_role, conversation_id, target_did)
+            #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+            if self.offline_archive_for_test {
+                return self.remove_group_member_local_offline(
+                    actor_role,
+                    conversation_id,
+                    target_did,
+                );
+            }
+            self.remove_group_member_live(actor_role, conversation_id, target_did)
+        }
+
+        /// Test-harness removal: records the removal locally; no Commit reaches a DS.
+        #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+        fn remove_group_member_local_offline(
+            &self,
+            actor_role: MemberRole,
+            conversation_id: &str,
+            target_did: &str,
+        ) -> Result<(), MLSError> {
+            if target_did.trim().is_empty() {
+                return Err(MLSError::invalid_input("target_did must not be empty"));
+            }
+            crate::groups::lifecycle::enforce_admin_removal_policy(
+                &self.normalized_did,
+                actor_role,
+                &[target_did.to_string()],
+            )?;
+            let now_ms = self.hooks.now_ms();
+            self.db.write_tx(|tx| {
+                tx.get_conversation(conversation_id)?
+                    .ok_or_else(|| MLSError::GroupNotFound {
+                        message: format!("conversation {conversation_id} not found"),
+                    })?;
+                tx.put_account_meta(
+                    &format!("last_removed_member:{conversation_id}"),
+                    target_did,
+                    now_ms,
+                )
+            })?;
+            self.notify(PlatformChangeEvent::ConversationsUpdated);
+            Ok(())
         }
 
         /// Update `1A` encrypted group metadata (`<= 16 KiB` snapshot + optional Space avatar pointer).

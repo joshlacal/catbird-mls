@@ -77,6 +77,7 @@ fn intent() -> DirectRequestIntent {
         cancellation_requested: false,
         projection_completed: false,
         previous_attempts: Vec::new(),
+        retry_not_before_ms: None,
     }
 }
 fn open(path: &std::path::Path, keychain: &TestKeychain) -> Arc<MLSContext> {

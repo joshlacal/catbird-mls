@@ -349,6 +349,13 @@ where
             {
                 continue;
             }
+            // A persisted `CapacityUnavailable` deferral schedules the draft, across restarts.
+            if intent
+                .retry_not_before_ms
+                .is_some_and(|at| commands::now_ms() < at)
+            {
+                continue;
+            }
             let id = intent.input.draft_id;
             let now = web_time::Instant::now();
             let attempts = {
@@ -376,13 +383,22 @@ where
             {
                 Ok(Ok(
                     super::DirectRequestOutcome::RequestSent { .. }
-                    | super::DirectRequestOutcome::TerminalNotPublished { .. }
                     | super::DirectRequestOutcome::ExistingDirect { .. },
                 )) => {
                     self.direct_request_reconcile_backoff
                         .lock()
                         .await
                         .remove(&id);
+                }
+                Ok(Ok(super::DirectRequestOutcome::TerminalNotPublished { .. })) => {
+                    // A semantic refusal leaves the attempt unresolved on disk (no signed
+                    // receipt); resending refused bytes on a timer cannot succeed, so park the
+                    // draft for this process instead of forgetting its backoff.
+                    let parked = now + std::time::Duration::from_secs(24 * 60 * 60);
+                    self.direct_request_reconcile_backoff
+                        .lock()
+                        .await
+                        .insert(id, (attempts, parked));
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(draft_id=id,attempts,%error,"Request reconciliation deferred; immutable attempt retained")

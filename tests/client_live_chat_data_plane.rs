@@ -138,6 +138,13 @@ struct MockDsState {
     lose_next_dr_keys_response: bool,
     // Signed `getConversationState.accountDeletions`: cid -> `#accountDeletedEntry`s.
     account_deletions: BTreeMap<String, Vec<Value>>,
+    // Every request as (session account, URL, body), for exact-replay and no-network checks.
+    http_log: Vec<(String, String, Vec<u8>)>,
+    // One-shot XRPC refusals: (route suffix, status, error code, `Retry-After`).
+    xrpc_failures: Vec<(&'static str, u16, &'static str, Option<&'static str>)>,
+    // Answer the next prepare with a signed expiry receipt: "valid", "badSignature" or
+    // "wrongRequestId" (`expired_prepare_receipt`).
+    next_prepare_receipt: Option<&'static str>,
 }
 
 struct SharedMockDs {
@@ -176,6 +183,9 @@ impl SharedMockDs {
                 lose_next_enroll_response: false,
                 lose_next_dr_keys_response: false,
                 account_deletions: BTreeMap::new(),
+                http_log: Vec::new(),
+                xrpc_failures: Vec::new(),
+                next_prepare_receipt: None,
             }),
             archive_auth: NativeArchiveAuthFixture::new(
                 ALICE_DID,
@@ -269,6 +279,51 @@ fn xrpc_error(status: u16, code: &str, message: &str) -> Result<PlatformHttpResp
     })
 }
 
+/// The coordinator's signed `#directRequestExpiredReceipt` for the prepare body `b` (a replay
+/// after its lease expired). `fault` forges it: "badSignature" signs with another key,
+/// "wrongRequestId" binds another request; "valid" leaves it intact.
+fn expired_prepare_receipt(sk: &P256SigningKey, b: &Value, fault: &str) -> Value {
+    let transcript = dr_transcript::direct_request_signing_bytes(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(b).unwrap(),
+    )
+    .unwrap();
+    let digest = STANDARD.encode(Sha256::digest(&transcript));
+    let request_id = match fault {
+        "wrongRequestId" => json!(uuid::Uuid::new_v4().to_string()),
+        _ => b["requestId"].clone(),
+    };
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+        "protocolVersion": "2", "authorityDid": DS_DID,
+        "keyId": dr_transcript::direct_request_receipt_key_id_for_authority(
+            DS_DID, sk.verifying_key().to_encoded_point(true).as_bytes(),
+        ).unwrap(),
+        "receipt": {
+            "$type": "blue.catbird.chat.defs#directRequestExpiredReceipt",
+            "requestId": request_id, "requestKind": "expiry",
+            "requestDigest": digest, "preparationRequestDigest": digest,
+            "recordedAt": b["signedAt"],
+            "actorDid": b["actorDid"], "actorDeviceId": b["actorDeviceId"],
+            "actorKeyId": b["keyId"], "authGeneration": b["authGeneration"],
+        },
+    });
+    let transcript = dr_transcript::direct_request_signing_bytes(
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    let forger = P256SigningKey::random(&mut rand::rngs::OsRng);
+    let signer = if fault == "badSignature" { &forger } else { sk };
+    let signature: p256::ecdsa::Signature = signer.sign(&transcript);
+    let signature = signature.normalize_s().unwrap_or(signature);
+    json!({
+        "$type": "blue.catbird.chat.defs#signedDirectRequestReceipt",
+        "body": body, "signature": STANDARD.encode(signature.to_bytes()),
+    })
+}
+
 /// `mls-ds` device-signed Labyrinth request (`labyrinth::auth::verify_signed_write`,
 /// `read_auth::verify`): base64url claim `header`, and Ed25519 `{header}-signature` over
 /// `domain || claim` by the session account's enrolled key for the claim's `device_field`.
@@ -350,6 +405,11 @@ impl SharedMockDs {
         account: &str,
         req: PlatformHttpRequest,
     ) -> Result<PlatformHttpResponse, MLSError> {
+        self.inner.lock().unwrap().http_log.push((
+            account.to_owned(),
+            req.url.clone(),
+            req.body.clone().unwrap_or_default(),
+        ));
         let url = req.url.as_str();
         let q = query_map(url);
         let body_json: Value = req
@@ -380,6 +440,19 @@ impl SharedMockDs {
         }
 
         let mut g = self.inner.lock().unwrap();
+
+        let path = url.split('?').next().unwrap_or(url);
+        if let Some(i) = g.xrpc_failures.iter().position(|f| path.ends_with(f.0)) {
+            let (_, status, code, retry_after) = g.xrpc_failures.remove(i);
+            let mut resp = xrpc_error(status, code, "injected refusal")?;
+            if let Some(value) = retry_after {
+                resp.headers.push(PlatformHttpHeader {
+                    name: "Retry-After".to_string(),
+                    value: value.to_string(),
+                });
+            }
+            return Ok(resp);
+        }
 
         if url.contains("/xrpc/com.atproto.repo.putRecord") {
             let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
@@ -687,6 +760,10 @@ impl SharedMockDs {
 
         if url.contains("/xrpc/blue.catbird.chat.prepareDirectRequest") {
             let b = &body_json["signedRequest"]["body"];
+            if let Some(fault) = g.next_prepare_receipt.take() {
+                let outcome = expired_prepare_receipt(&g.receipt_sk, b, fault);
+                return ok_json(json!({ "outcome": outcome }));
+            }
             let recipient_did = b["recipientDid"].as_str().unwrap().to_string();
             let cid = b["conversationId"].as_str().unwrap().to_string();
             let avail = g
@@ -3905,4 +3982,264 @@ fn c33_opening_publication_receipt_requires_exact_union_tag() {
     set_receipt_tag(Some("blue.catbird.chat.defs#signedDirectRequestReceipt"));
     bob.sync().expect("exact tag imports the opening");
     assert_eq!(bob.list_requests(Some("incomingPending")).unwrap().len(), 1);
+}
+
+/// A transient `C33` refusal (`400 CapacityUnavailable`, `Retry-After: 5`) keeps the peer-keyed
+/// creation journal. A retry inside the delay sends nothing; after it, and across a restart, the
+/// exact signed publication is replayed over the journaled bootstrap (no second prepare, no
+/// second recipient key package) and the journaled conversation and text win over the caller's.
+/// A transient `acceptConversation` refusal keeps the acceptance journal the same way, and a
+/// semantic refusal drops the creation journal so the next attempt is a fresh request.
+#[test]
+fn c33_transient_refusal_replays_the_journaled_publication_after_retry_after() {
+    use catbird_mls::sim_hooks::{FixedStepClock, OsSimEntropy, SimClientHooks, SimClock as _};
+
+    const PREPARE: &str = "/xrpc/blue.catbird.chat.prepareDirectRequest";
+    const PUBLISH: &str = "/xrpc/blue.catbird.chat.publishDirectRequest";
+    const ACCEPT: &str = "/xrpc/blue.catbird.chat.acceptConversation";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    // Alice's clock moves only when the test moves it.
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let clock = Arc::new(FixedStepClock::new(start_ms, 0));
+    let alice_dev = uuid::Uuid::new_v4().to_string();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let open_alice = || {
+        CatbirdMlsClient::open_with_hooks(
+            CatbirdMlsClientConfig {
+                storage_root: tmp.path().join("alice").to_string_lossy().into_owned(),
+                account_did: ALICE_DID.to_string(),
+                device_id: alice_dev.clone(),
+                home_ds_did: DS_DID.to_string(),
+                home_ds_endpoint: DS_URL.to_string(),
+                pds_endpoint: PDS_URL.to_string(),
+            },
+            alice_keys.clone(),
+            ds.for_account(ALICE_DID),
+            None,
+            SimClientHooks::new(clock.clone(), Arc::new(OsSimEntropy)),
+        )
+        .expect("open alice")
+    };
+    let alice = open_alice();
+    let bob_dev = uuid::Uuid::new_v4().to_string();
+    let bob = live_client(
+        tmp.path(),
+        &ds,
+        "bob",
+        BOB_DID,
+        &bob_dev,
+        &Arc::new(MemKeyStore::new()),
+    );
+    alice.enroll_device(&scopes).expect("enroll alice");
+    bob.enroll_device(&scopes).expect("enroll bob");
+    clock.advance_ms(chrono::Utc::now().timestamp_millis() - clock.now_ms());
+
+    let bob_keys_left = || ds.inner.lock().unwrap().dr_keys[BOB_DID].len();
+    let posts = |account: &str, route: &str| -> Vec<Vec<u8>> {
+        ds.inner
+            .lock()
+            .unwrap()
+            .http_log
+            .iter()
+            .filter(|(who, url, _)| who == account && url.ends_with(route))
+            .map(|(_, _, body)| body.clone())
+            .collect()
+    };
+    let alice_requests = || {
+        ds.inner
+            .lock()
+            .unwrap()
+            .http_log
+            .iter()
+            .filter(|(who, _, _)| who == ALICE_DID)
+            .count()
+    };
+    let journal = |client: &CatbirdMlsClient| {
+        client
+            .db()
+            .read_tx(|tx| tx.get_pending_op("direct_request_creation", BOB_DID))
+            .unwrap()
+    };
+    let refuse = |route: &'static str, code: &'static str, retry_after: Option<&'static str>| {
+        ds.inner
+            .lock()
+            .unwrap()
+            .xrpc_failures
+            .push((route, 400, code, retry_after));
+    };
+    let create = |client: &CatbirdMlsClient, cid: &str, text: &str| {
+        client.create_group(
+            cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            None,
+            Some(text.to_string()),
+        )
+    };
+    let refusal = |result: Result<_, MLSError>| match result {
+        Err(MLSError::InvalidState(code)) => code,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    // The DS cannot reach the coordinator: the first publication is refused as transient.
+    let keys_before = bob_keys_left();
+    refuse(PUBLISH, "CapacityUnavailable", Some("5"));
+    let first_cid = uuid::Uuid::new_v4().to_string();
+    let first = create(&alice, &first_cid, "first tap");
+    assert_eq!(refusal(first), "CapacityUnavailable");
+    // One recipient key package is reserved; the attempt is kept, uncommitted.
+    assert_eq!(bob_keys_left(), keys_before - 1);
+    assert!(journal(&alice).is_some());
+    assert!(alice
+        .list_conversations(None, 20)
+        .unwrap()
+        .iter()
+        .all(|c| c.conversation_id != first_cid));
+    let first_publish = posts(ALICE_DID, PUBLISH);
+    assert_eq!(first_publish.len(), 1);
+    let prepares = posts(ALICE_DID, PREPARE).len();
+
+    // Inside `Retry-After` a new tap answers the same error without any request.
+    clock.advance_ms(4_999);
+    let requests = alice_requests();
+    let early = create(&alice, &uuid::Uuid::new_v4().to_string(), "early tap");
+    assert_eq!(refusal(early), "CapacityUnavailable");
+    assert_eq!(alice_requests(), requests);
+
+    // After a restart and the full delay, the journaled publication is replayed exactly: no
+    // second prepare or key package, and the journaled conversation, group and text win.
+    let journaled: Value = serde_json::from_str(&journal(&alice).unwrap()).unwrap();
+    let journaled_group: Vec<u8> =
+        serde_json::from_value(journaled["publish"]["group_id"].clone()).unwrap();
+    drop(alice);
+    let alice = open_alice();
+    clock.advance_ms(1);
+    let late_cid = uuid::Uuid::new_v4().to_string();
+    let row = create(&alice, &late_cid, "late tap").expect("the journaled publication lands");
+    assert_eq!(row.conversation_id, first_cid);
+    assert_eq!(row.group_id, journaled_group);
+    let publishes = posts(ALICE_DID, PUBLISH);
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[1], first_publish[0]);
+    assert_eq!(posts(ALICE_DID, PREPARE).len(), prepares);
+    assert_eq!(bob_keys_left(), keys_before - 1);
+    assert!(journal(&alice).is_none());
+    let opening = alice.list_messages(&first_cid, None, 20).unwrap();
+    assert!(opening[0].plaintext_json.contains("first tap"));
+    bob.sync().expect("bob imports the replayed request");
+    assert!(bob
+        .list_messages(&first_cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|m| m.plaintext_json.contains("first tap")));
+
+    // A transient `acceptConversation` refusal keeps the exact signed acceptance.
+    let request_id = bob
+        .list_requests(Some("incomingPending"))
+        .unwrap()
+        .remove(0)
+        .request_id;
+    let acceptance = || {
+        bob.db()
+            .read_tx(|tx| tx.get_pending_op("direct_request_acceptance", &request_id))
+            .unwrap()
+    };
+    refuse(ACCEPT, "CapacityUnavailable", None);
+    assert!(matches!(
+        bob.accept_direct_request(&request_id),
+        Err(MLSError::InvalidState(code)) if code == "CapacityUnavailable"
+    ));
+    assert!(acceptance().is_some());
+    bob.accept_direct_request(&request_id)
+        .expect("the journaled acceptance lands");
+    assert!(acceptance().is_none());
+    let accepts = posts(BOB_DID, ACCEPT);
+    assert_eq!(accepts.len(), 2);
+    assert_eq!(accepts[0], accepts[1]);
+
+    // A semantic refusal drops the attempt; the next tap is a fresh request.
+    refuse(PUBLISH, "RequestPolicyDenied", None);
+    let refused = create(&alice, &uuid::Uuid::new_v4().to_string(), "denied");
+    assert_eq!(refusal(refused), "RequestPolicyDenied");
+    assert!(journal(&alice).is_none());
+    let fresh_cid = uuid::Uuid::new_v4().to_string();
+    let fresh = create(&alice, &fresh_cid, "fresh").expect("a fresh request");
+    assert_eq!(fresh.conversation_id, fresh_cid);
+    let request_id_of = |body: &[u8]| {
+        let body: Value = serde_json::from_slice(body).unwrap();
+        body["signedRequest"]["body"]["requestId"].clone()
+    };
+    let prepared = posts(ALICE_DID, PREPARE);
+    let [.., denied, fresh_prepare] = prepared.as_slice() else {
+        panic!("two more prepares");
+    };
+    assert_ne!(request_id_of(denied), request_id_of(fresh_prepare));
+}
+
+/// A signed terminal receipt answering a replayed prepare drops the C33 creation journal only once
+/// it verifies like a publication outcome. A forged signature or a receipt bound to another
+/// request fails closed and leaves the journal byte-for-byte untouched.
+#[test]
+fn c33_prepare_stage_terminal_receipt_must_verify_before_the_journal_is_dropped() {
+    const PREPARE: &str = "/xrpc/blue.catbird.chat.prepareDirectRequest";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let alice_dev = uuid::Uuid::new_v4().to_string();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let alice = live_client(tmp.path(), &ds, "alice", ALICE_DID, &alice_dev, &alice_keys);
+    let bob_dev = uuid::Uuid::new_v4().to_string();
+    let bob_keys = Arc::new(MemKeyStore::new());
+    let bob = live_client(tmp.path(), &ds, "bob", BOB_DID, &bob_dev, &bob_keys);
+    alice.enroll_device(&scopes).expect("enroll alice");
+    bob.enroll_device(&scopes).expect("enroll bob");
+    let journal = || {
+        alice
+            .db()
+            .read_tx(|tx| tx.get_pending_op("direct_request_creation", BOB_DID))
+            .unwrap()
+    };
+    let create = || {
+        alice.create_group(
+            &uuid::Uuid::new_v4().to_string(),
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            None,
+            Some("hello".to_string()),
+        )
+    };
+
+    // The DS cannot reach the coordinator, so the journaled attempt stays at its prepare.
+    let refusal = (PREPARE, 400, "CapacityUnavailable", None);
+    ds.inner.lock().unwrap().xrpc_failures.push(refusal);
+    assert!(create().is_err());
+    let journaled = journal().expect("a transient refusal keeps the attempt");
+
+    for fault in ["badSignature", "wrongRequestId"] {
+        ds.inner.lock().unwrap().next_prepare_receipt = Some(fault);
+        let error = create().expect_err(fault);
+        assert!(
+            matches!(error, MLSError::Cryptography(_)),
+            "{fault}: {error}"
+        );
+        assert_eq!(journal().as_ref(), Some(&journaled), "{fault}");
+    }
+
+    ds.inner.lock().unwrap().next_prepare_receipt = Some("valid");
+    assert!(matches!(
+        create(),
+        Err(MLSError::InvalidState(code)) if code == "PreparationExpired"
+    ));
+    assert!(
+        journal().is_none(),
+        "a verified terminal receipt resolves the attempt"
+    );
 }

@@ -227,7 +227,10 @@ fn load_all_conversation_envelopes(
 ) -> Result<Vec<(String, StoredConversationEnvelope)>, MLSError> {
     let mut stmt = rx
         .conn()
-        .prepare("SELECT conversation_id FROM conversations ORDER BY updated_at_ms DESC")
+        .prepare(
+            "SELECT conversation_id FROM conversations \
+             ORDER BY updated_at_ms DESC, conversation_id ASC",
+        )
         .map_err(|e| map_rusqlite_err("load_all_conversation_envelopes.prepare", &e))?;
     let ids: Vec<String> = stmt
         .query_map([], |r| r.get(0))

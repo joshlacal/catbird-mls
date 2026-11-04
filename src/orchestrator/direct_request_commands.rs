@@ -31,6 +31,12 @@ fn timestamp(value: &Value) -> Result<u64> {
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
+/// The delivery service's `Retry-After` for `CapacityUnavailable`. A gateway response carries
+/// no headers, so the contract value stands in for it.
+const CAPACITY_UNAVAILABLE_RETRY_MS: i64 = 5_000;
+pub(crate) fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 fn date(seconds: u64) -> Result<String> {
     chrono::DateTime::from_timestamp(i64::try_from(seconds).map_err(|_| invalid())?, 0)
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
@@ -248,6 +254,7 @@ where
             cancellation_requested: false,
             projection_completed: false,
             previous_attempts,
+            retry_not_before_ms: None,
         };
         let raw = intent.encode()?;
         if !self.mls_context().compare_exchange_direct_request_intent(
@@ -302,6 +309,47 @@ where
         *old = next;
         Ok(())
     }
+    /// A refusal carries no signed receipt. A transient one keeps the attempt for an identical
+    /// resume (`CapacityUnavailable` is deferred by the delivery service's 5-second contract,
+    /// persisted on the intent); a semantic one is terminal for those bytes.
+    fn direct_request_refused(
+        &self,
+        intent: &mut DirectRequestIntent,
+        raw: &mut Vec<u8>,
+        operation: CanonicalOperation,
+        response: &GatewayResponse,
+    ) -> Result<DirectRequestOutcome> {
+        let code = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body["error"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("HTTP {}", response.status));
+        let TransportError::Remote {
+            retryable, code, ..
+        } = map_wire_error(operation, response.status, &code, None)
+        else {
+            return Err(invalid());
+        };
+        let request_id = intent.request_id()?;
+        if !retryable {
+            self.clear_direct_request_retry(intent, raw)?;
+            return Ok(DirectRequestOutcome::TerminalNotPublished { request_id, code });
+        }
+        if code == "CapacityUnavailable" {
+            intent.retry_not_before_ms = Some(now_ms() + CAPACITY_UNAVAILABLE_RETRY_MS);
+            self.save_direct_request_intent(intent, raw)?;
+        }
+        Ok(DirectRequestOutcome::OutcomeUnknown { request_id })
+    }
+    fn clear_direct_request_retry(
+        &self,
+        intent: &mut DirectRequestIntent,
+        raw: &mut Vec<u8>,
+    ) -> Result<()> {
+        if intent.retry_not_before_ms.take().is_some() {
+            self.save_direct_request_intent(intent, raw)?;
+        }
+        Ok(())
+    }
     async fn resume_direct_request_locked(
         &self,
         mut intent: DirectRequestIntent,
@@ -316,6 +364,10 @@ where
                 .resolve_direct_request_receipt(&mut intent, &mut raw, &receipt)
                 .await;
         }
+        // A persisted `CapacityUnavailable` deferral: nothing is sent until it elapses.
+        if intent.retry_not_before_ms.is_some_and(|at| now_ms() < at) {
+            return Ok(unknown());
+        }
         if intent.cancellation_requested {
             let wrapper = intent.cancel_wrapper.as_ref().ok_or_else(invalid)?;
             let response = match self
@@ -329,6 +381,7 @@ where
                 Ok(r) if r.status == 200 => r,
                 _ => return Ok(unknown()),
             };
+            self.clear_direct_request_retry(&mut intent, &mut raw)?;
             return self
                 .handle_direct_request_response(&mut intent, &mut raw, &response.body)
                 .await;
@@ -355,8 +408,17 @@ where
                 .await
             {
                 Ok(r) if r.status == 200 => r,
-                _ => return Ok(unknown()),
+                Ok(r) => {
+                    return self.direct_request_refused(
+                        &mut intent,
+                        &mut raw,
+                        CanonicalOperation::PrepareDirectRequest,
+                        &r,
+                    );
+                }
+                Err(_) => return Ok(unknown()),
             };
+            self.clear_direct_request_retry(&mut intent, &mut raw)?;
             crate::chat_v2::transcript::decode_strict_json(&response.body)
                 .map_err(|_| invalid())?;
             let value: Value = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
@@ -407,8 +469,17 @@ where
         };
         let response = match self.api_client().submit_prepared_request(request).await {
             Ok(r) if r.status == 200 => r,
-            _ => return Ok(unknown()),
+            Ok(r) => {
+                return self.direct_request_refused(
+                    &mut intent,
+                    &mut raw,
+                    CanonicalOperation::PublishDirectRequest,
+                    &r,
+                );
+            }
+            Err(_) => return Ok(unknown()),
         };
+        self.clear_direct_request_retry(&mut intent, &mut raw)?;
         self.handle_direct_request_response(&mut intent, &mut raw, &response.body)
             .await
     }

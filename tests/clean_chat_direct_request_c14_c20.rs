@@ -377,6 +377,220 @@ async fn test_c15_edited_local_draft_cannot_mutate_unresolved_operation() {
     );
 }
 
+/// A refusal without a signed receipt never mutates the intent unless it defers the retry. A
+/// transient one without a deferral (`429`, `503`, `500`) stays `OutcomeUnknown` and every resume
+/// replays the identical signed prepare; a semantic `400` is terminal for those bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_prepare_refusals_split_transient_from_semantic_without_mutating_the_intent() {
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world.register_device("Alice").await.unwrap();
+
+    let (_authority, doc, _method) = receipt_authority();
+    let alice = world.client("Alice");
+    alice.credentials.set_request_authority_document(doc);
+    let input = DirectRequestInput {
+        draft_id: uuid::Uuid::new_v4().to_string(),
+        recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        text: "Refused for now".into(),
+        invitation: None,
+    };
+    let prepares = || sent_prepares(&world);
+    let intent = || {
+        alice
+            .orchestrator
+            .mls_context()
+            .read_direct_request_intent(&input.draft_id)
+            .unwrap()
+            .expect("the attempt stays retained")
+    };
+
+    for (status, code) in [
+        (429, "RateLimited"),
+        (503, "RelationshipPolicyUnavailable"),
+        (500, "InternalServerError"),
+    ] {
+        world.delivery_service().queue_request_operation_response(
+            Op::PrepareDirectRequest,
+            status,
+            json!({ "error": code, "message": "try again later" }),
+        );
+        let outcome = alice
+            .orchestrator
+            .start_direct_request(input.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, DirectRequestOutcome::OutcomeUnknown { .. }),
+            "{status} {code}: {outcome:?}"
+        );
+    }
+    let sent = prepares();
+    assert_eq!(sent.len(), 3);
+    assert!(
+        sent.iter().all(|body| *body == sent[0]),
+        "every resume replays the identical signed prepare"
+    );
+
+    let retained = intent();
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        400,
+        json!({ "error": "RequestPolicyDenied", "message": "recipient refuses requests" }),
+    );
+    let outcome = alice
+        .orchestrator
+        .start_direct_request(input.clone())
+        .await
+        .unwrap();
+    let signed: Value = serde_json::from_slice(&sent[0]).unwrap();
+    assert_eq!(
+        outcome,
+        DirectRequestOutcome::TerminalNotPublished {
+            request_id: signed["signedRequest"]["body"]["requestId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            code: "RequestPolicyDenied".into(),
+        }
+    );
+    assert_eq!(prepares().last(), Some(&sent[0]));
+    assert_eq!(
+        intent(),
+        retained,
+        "a refusal without a receipt leaves the intent untouched"
+    );
+}
+
+fn sent_prepares(world: &TestWorld) -> Vec<Vec<u8>> {
+    world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|r| r.operation == Op::PrepareDirectRequest)
+        .map(|r| r.body.unwrap())
+        .collect()
+}
+
+fn alice_intent(world: &TestWorld, draft_id: &str) -> (Vec<u8>, DirectRequestIntent) {
+    let raw = world
+        .client("Alice")
+        .orchestrator
+        .mls_context()
+        .read_direct_request_intent(draft_id)
+        .unwrap()
+        .expect("the attempt stays retained");
+    let intent = serde_json::from_slice(&raw).unwrap();
+    (raw, intent)
+}
+
+/// `CapacityUnavailable` carries no usable `Retry-After` here (a gateway response has no
+/// headers), so the delivery service's 5-second contract defers the retry. The instant is
+/// persisted on the intent: a resume before it sends nothing, also after a restart; a resume
+/// after it replays the identical signed prepare, and a semantic answer clears the deferral.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_capacity_unavailable_defers_resume_by_a_persisted_retry_instant() {
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    let (_authority, doc, _method) = receipt_authority();
+    world
+        .client("Alice")
+        .credentials
+        .set_request_authority_document(doc);
+    let input = DirectRequestInput {
+        draft_id: uuid::Uuid::new_v4().to_string(),
+        recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        text: "Deferred by capacity".into(),
+        invitation: None,
+    };
+    let draft = input.draft_id.as_str();
+
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        400,
+        json!({ "error": "CapacityUnavailable", "message": "coordinator unreachable" }),
+    );
+    let before = chrono::Utc::now().timestamp_millis();
+    let outcome = world
+        .client("Alice")
+        .orchestrator
+        .start_direct_request(input.clone())
+        .await
+        .unwrap();
+    let after = chrono::Utc::now().timestamp_millis();
+    assert!(matches!(
+        outcome,
+        DirectRequestOutcome::OutcomeUnknown { .. }
+    ));
+    let sent = sent_prepares(&world);
+    assert_eq!(sent.len(), 1);
+    let retry_at = alice_intent(&world, draft)
+        .1
+        .retry_not_before_ms
+        .expect("a persisted retry instant");
+    assert!((before + 5_000..=after + 5_000).contains(&retry_at));
+
+    // Inside the deferral a resume sends nothing, before and after a restart.
+    for restart in [false, true] {
+        if restart {
+            world.restart_client("Alice").await;
+        }
+        let resumed = world
+            .client("Alice")
+            .orchestrator
+            .resume_direct_request(draft)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resumed,
+            DirectRequestOutcome::OutcomeUnknown { .. }
+        ));
+    }
+    assert_eq!(sent_prepares(&world).len(), 1);
+    assert_eq!(
+        alice_intent(&world, draft).1.retry_not_before_ms,
+        Some(retry_at)
+    );
+
+    // Let the instant pass (rewritten into the past rather than slept through).
+    let (raw, mut elapsed) = alice_intent(&world, draft);
+    elapsed.retry_not_before_ms = Some(before - 1);
+    let elapsed = elapsed.encode().unwrap();
+    assert!(world
+        .client("Alice")
+        .orchestrator
+        .mls_context()
+        .compare_exchange_direct_request_intent(draft, Some(&raw), &elapsed)
+        .unwrap());
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        400,
+        json!({ "error": "RequestPolicyDenied", "message": "recipient refuses requests" }),
+    );
+    let outcome = world
+        .client("Alice")
+        .orchestrator
+        .resume_direct_request(draft)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        DirectRequestOutcome::TerminalNotPublished { ref code, .. } if code == "RequestPolicyDenied"
+    ));
+    let sent = sent_prepares(&world);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[1], sent[0],
+        "the resume replays the identical signed prepare"
+    );
+    assert_eq!(alice_intent(&world, draft).1.retry_not_before_ms, None);
+}
+
 // ============================================================================
 // C18: Pending authority matrix
 // Creator and recipient cannot send extra apps, edits, reactions, receipts,

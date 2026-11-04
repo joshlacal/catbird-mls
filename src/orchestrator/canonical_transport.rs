@@ -189,6 +189,8 @@ pub enum TransportError {
         operation: CanonicalOperation,
         code: String,
         retryable: bool,
+        /// Bounded delta-seconds `Retry-After`, kept only for a retryable failure.
+        retry_after_secs: Option<u64>,
     },
 }
 
@@ -1202,20 +1204,48 @@ impl CleanChatError {
     }
 }
 
-/// Map a generated clean-chat wire error without collapsing it into a legacy
-/// API error. Unknown codes remain visible and non-retryable until their
-/// lexicon contract is explicitly added.
-pub fn map_wire_error(operation: CanonicalOperation, code: &str) -> TransportError {
-    // A generation conflict means the caller's device/auth binding is stale.
-    // Replaying the same signed mutation would be unsafe; the platform must
-    // rebind or refresh its authenticated context before constructing a new
-    // Both generation conflicts and cursor expiry require a fresh operation
-    // context. Replaying the unchanged request is never a safe retry.
-    let retryable = false;
+/// The longest `Retry-After` honored: the direct-request preparation lease. Waiting
+/// longer is pointless because the reservation it would resume has expired.
+pub const MAX_RETRY_AFTER_SECS: u64 = 300;
+
+/// A delta-seconds `Retry-After` (`1*DIGIT`, surrounding whitespace ignored), capped
+/// at [`MAX_RETRY_AFTER_SECS`]. An HTTP-date or anything else is `None`, so a deferral
+/// never depends on a wall clock.
+pub fn retry_after_secs(header: Option<&str>) -> Option<u64> {
+    let value = header?.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Only overflow can fail to parse an all-digit value; it is capped like any other.
+    Some(value.parse().unwrap_or(u64::MAX).min(MAX_RETRY_AFTER_SECS))
+}
+
+/// The one decision whether an error response may be retried with the identical
+/// signed bytes. `CapacityUnavailable` is the delivery service's transient refusal
+/// (an unreachable coordinator or recipient home, a closed federation gate, a failed
+/// relay: nothing durable was recorded) and arrives as HTTP 400. Timeouts, Too Early,
+/// rate limits and 500/502/503/504 are transient by status. Every other response,
+/// including a semantic 4xx and 501, is terminal for those bytes.
+pub fn is_transient_wire_failure(status: u16, code: Option<&str>) -> bool {
+    code == Some("CapacityUnavailable") || matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Map a clean-chat error response without collapsing it into a legacy API error.
+/// Codes stay verbatim; [`is_transient_wire_failure`] alone decides `retryable`. A
+/// terminal code (a generation conflict, an expired cursor, a policy refusal) needs a
+/// freshly built request: replaying the unchanged one is never a safe retry.
+pub fn map_wire_error(
+    operation: CanonicalOperation,
+    status: u16,
+    code: &str,
+    retry_after: Option<&str>,
+) -> TransportError {
+    let retryable = is_transient_wire_failure(status, Some(code));
     TransportError::Remote {
         operation,
         code: code.to_owned(),
         retryable,
+        retry_after_secs: retry_after_secs(retry_after).filter(|_| retryable),
     }
 }
 
@@ -4671,6 +4701,78 @@ mod raw_inventory_scope_tests {
         assert_eq!(
             scope_inventory_read_path(CanonicalOperation::GetEntries, raw.clone(), true),
             raw
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_retry_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_rate_limit_and_gateway_failures_are_the_only_transient_ones() {
+        assert!(is_transient_wire_failure(400, Some("CapacityUnavailable")));
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(is_transient_wire_failure(status, None), "{status}");
+        }
+        for (status, code) in [
+            (400, Some("RequestPolicyDenied")),
+            (400, Some("InvalidRequest")),
+            (400, None),
+            (403, Some("NotAuthorized")),
+            (404, None),
+            (409, Some("PreparationConflict")),
+            (501, None),
+        ] {
+            assert!(
+                !is_transient_wire_failure(status, code),
+                "{status} {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_is_bounded_delta_seconds_only() {
+        assert_eq!(retry_after_secs(Some("5")), Some(5));
+        assert_eq!(retry_after_secs(Some(" 5 ")), Some(5));
+        assert_eq!(retry_after_secs(Some("0")), Some(0));
+        assert_eq!(retry_after_secs(Some("999999")), Some(MAX_RETRY_AFTER_SECS));
+        assert_eq!(
+            retry_after_secs(Some("99999999999999999999999")),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+        for header in [
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some("-1"),
+            Some("+5"),
+            Some("1.5"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(retry_after_secs(header), None, "{header:?}");
+        }
+    }
+
+    #[test]
+    fn mapped_remote_errors_keep_retry_after_only_when_retryable() {
+        let operation = CanonicalOperation::PublishDirectRequest;
+        assert_eq!(
+            map_wire_error(operation, 400, "CapacityUnavailable", Some("5")),
+            TransportError::Remote {
+                operation,
+                code: "CapacityUnavailable".into(),
+                retryable: true,
+                retry_after_secs: Some(5),
+            }
+        );
+        assert_eq!(
+            map_wire_error(operation, 400, "RequestPolicyDenied", Some("5")),
+            TransportError::Remote {
+                operation,
+                code: "RequestPolicyDenied".into(),
+                retryable: false,
+                retry_after_secs: None,
+            }
         );
     }
 }

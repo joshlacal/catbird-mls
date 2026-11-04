@@ -388,14 +388,21 @@ impl MLSStorageBackend for BotStorage {
             .cloned())
     }
     async fn list_conversations(&self, _user_did: &str) -> OrcResult<Vec<ConversationView>> {
-        Ok(self
+        let mut views: Vec<ConversationView> = self
             .inner
             .lock()
             .unwrap()
             .conversations
             .values()
             .cloned()
-            .collect())
+            .collect();
+        // Same order as the SQL drivers: `updated_at_ms DESC, conversation_id ASC`.
+        views.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.conversation_id.cmp(&b.conversation_id))
+        });
+        Ok(views)
     }
     async fn delete_conversations(&self, _user_did: &str, ids: &[&str]) -> OrcResult<()> {
         let mut s = self.inner.lock().unwrap();
@@ -691,6 +698,45 @@ mod bot_storage_tests {
             .map(|entry| entry.conversation_id.as_str())
             .collect();
         assert_eq!(ids, HashSet::from(["conversation-a", "conversation-b"]));
+    }
+
+    #[tokio::test]
+    async fn list_conversations_orders_by_updated_at_then_conversation_id() {
+        use chrono::TimeZone as _;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = BotStorage::with_recovery_path(directory.path().join("recovery-state.json"))
+            .expect("create bot storage");
+        let at = |ms| Utc.timestamp_millis_opt(ms).single();
+        for (cid, ms) in [
+            ("c3", 100),
+            ("c0", 100),
+            ("c4", 200),
+            ("c2", 100),
+            ("c1", 200),
+        ] {
+            storage.inner.lock().unwrap().conversations.insert(
+                cid.to_string(),
+                ConversationView {
+                    group_id: format!("group-{cid}"),
+                    conversation_id: cid.to_string(),
+                    epoch: 0,
+                    members: vec![],
+                    metadata: None,
+                    created_at: at(ms),
+                    updated_at: at(ms),
+                    sequencer_did: None,
+                    canonical_state: None,
+                },
+            );
+        }
+        let ids: Vec<String> = storage
+            .list_conversations("did:plc:bot")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.conversation_id)
+            .collect();
+        assert_eq!(ids, ["c1", "c4", "c0", "c2", "c3"]);
     }
 }
 

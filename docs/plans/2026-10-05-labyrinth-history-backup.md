@@ -1,5 +1,14 @@
 # Labyrinth history backup in catbird-mls (feature `labyrinth`)
 
+> **Superseded (2026-11-04). Read this as history, not as the current contract.** The clean-slate profile is Spaces-only. mls-ds stores no Labyrinth content: there is no mls-ds mailbox and no `appendBatch`, `getEpoch`, `XrpcDirectory` or ORF. It serves only six zero-content directory endpoints (`../labyrinth/docs/MLSDS_BACKEND.md`).
+>
+> Several things below no longer exist:
+> - the `OrchestratorAPICallback` Labyrinth, PDS and Space callbacks and their `labyrinth_*_enabled` switches;
+> - `src/labyrinth/ffi.rs`;
+> - the git-rev dependency (it is now the path dependency `../labyrinth`, on by default).
+>
+> Platforms use `CatbirdMlsClient`, whose production archive is `src/client/native_archive.rs` over `LabyrinthSession`. Its contract is in `CLAUDE.md` ("Native archive contract") and `../labyrinth/docs/SPACE_CONVERSATIONS.md`. The `MLSOrchestrator` hooks in `src/labyrinth/hooks.rs` still carry the queue (D7, amended) and the status, quarantine, re-pin and deletion-retry APIs (D10), now over Spaces. Their roster comes from the local OpenMLS snapshot, not from `getConversationState` (D8).
+
 **What this is.** Labyrinth 1.1 is Meta's protocol for encrypted chat *history*. Catbird's implementation is the private `labyrinth` crate (`~/Developer/labyrinth`, bookmark `labyrinth-1.1`), and mls-ds serves it under `blue.catbird.labyrinth.*` (local bookmark `local/labyrinth-backend-20261004` in mls-ds). This change wires the crate into the shared Rust orchestrator behind a new cargo feature, `labyrinth`, which is off by default. A device can now back up the messages it sends, restore onto a new device with a recovery code, read or import a conversation's history, revoke another device, and re-archive before leaving. Nothing here is pushed, and platform bindings are not regenerated.
 
 Code: `src/labyrinth/` (module docs list each file). Crate design: `docs/MLSDS_BACKEND.md` and `docs/DECISIONS.md` in the labyrinth repo. Server admission (headers, signature domain): mls-ds `server/src/labyrinth/auth.rs`.

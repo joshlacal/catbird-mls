@@ -181,33 +181,28 @@ fn production_constructors_reject_non_uuid_v4_devices() {
     }
 }
 
-#[test]
-fn native_empty_flush_and_uuid_only_revocation_stay_local_without_enrollment() {
-    struct NoNetworkTransport;
-    impl PlatformTransport for NoNetworkTransport {
-        fn execute_http(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformHttpResponse, MLSError> {
-            panic!(
-                "unenrolled native archive unexpectedly called {}",
-                request.url
-            );
-        }
+struct NoNetworkTransport;
 
-        fn connect_realtime_stream(
-            &self,
-            _home_ds_endpoint: String,
-            _cursor_seq: Option<i64>,
-        ) -> Result<(), MLSError> {
-            panic!("unenrolled native archive unexpectedly connected a stream");
-        }
-
-        fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
-            panic!("unenrolled native archive unexpectedly disconnected a stream");
-        }
+impl PlatformTransport for NoNetworkTransport {
+    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+        panic!("native client unexpectedly called {}", request.url);
     }
 
+    fn connect_realtime_stream(
+        &self,
+        _home_ds_endpoint: String,
+        _cursor_seq: Option<i64>,
+    ) -> Result<(), MLSError> {
+        panic!("native client unexpectedly connected a stream");
+    }
+
+    fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+        panic!("native client unexpectedly disconnected a stream");
+    }
+}
+
+#[test]
+fn native_empty_flush_and_uuid_only_revocation_stay_local_without_enrollment() {
     let tmp = TempDir::new().unwrap();
     let client = CatbirdMlsClient::open(
         CatbirdMlsClientConfig {
@@ -241,6 +236,157 @@ fn native_empty_flush_and_uuid_only_revocation_stay_local_without_enrollment() {
         .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))
         .unwrap()
         .is_none());
+}
+
+/// A non-UUIDv4 ID once selected a local offline group and a receiptless offline send whose row
+/// stalled native flush on `ReceiptCommitmentMismatch`. Production now rejects both before any
+/// effect; only the explicit harness constructor still creates and sends offline.
+#[test]
+fn production_rejects_non_uuid_v4_ids_and_harness_offline_is_explicit() {
+    let ds_did = "did:web:chat.catbird.blue";
+    let tmp = TempDir::new().unwrap();
+    let client = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            // A valid bare DID, so only the conversation or message ID shape can reject.
+            account_did: "did:plc:abcdefghijklmnopqrstuvwx".to_string(),
+            device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        Arc::new(NoNetworkTransport),
+        None,
+    )
+    .unwrap();
+    for conversation_id in [
+        "convo-offline",
+        "11111111-1111-1111-8111-111111111111",
+        "00000000-0000-0000-0000-000000000000",
+    ] {
+        assert!(
+            matches!(
+                client.create_group(conversation_id, ds_did, Vec::new(), None, None),
+                Err(MLSError::InvalidInput { .. })
+            ),
+            "production create_group accepted {conversation_id}",
+        );
+        assert!(client
+            .db()
+            .read_tx(|tx| tx.get_conversation(conversation_id))
+            .unwrap()
+            .is_none());
+    }
+    // The old local-offline group minted a signer; a rejected create must not.
+    assert!(client
+        .db()
+        .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))
+        .unwrap()
+        .is_none());
+    let valid = "22222222-2222-4222-8222-222222222222";
+    for (conversation_id, message_id) in [
+        ("convo-offline", "msg-offline"),
+        ("convo-offline", valid),
+        (valid, "msg-offline"),
+        ("11111111-1111-1111-8111-111111111111", valid),
+        (valid, "00000000-0000-0000-0000-000000000000"),
+    ] {
+        assert!(
+            matches!(
+                client.send_message(conversation_id, message_id, "must not queue"),
+                Err(MLSError::InvalidInput { .. })
+            ),
+            "production send accepted {conversation_id}/{message_id}",
+        );
+    }
+    assert!(client
+        .list_pending_labyrinth_queue(None, 100)
+        .unwrap()
+        .is_empty());
+    assert!(client
+        .list_messages("convo-offline", None, 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(client.flush_labyrinth_queue().unwrap(), 0);
+
+    // Membership calls: no local-only fallback and no success for a conversation not held.
+    use catbird_mls::groups::lifecycle::MemberRole;
+    let peer = "did:plc:bcdefghijklmnopqrstuvwxy";
+    assert!(matches!(
+        client.add_group_members("convo-offline", vec![peer.into()]),
+        Err(MLSError::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        client.add_group_members(valid, Vec::new()),
+        Err(MLSError::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        client.add_group_members(valid, vec![peer.into()]),
+        Err(MLSError::GroupNotFound { .. })
+    ));
+    assert!(matches!(
+        client.remove_group_member(MemberRole::Admin, "convo-offline", peer),
+        Err(MLSError::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        client.remove_group_member(MemberRole::Admin, valid, peer),
+        Err(MLSError::GroupNotFound { .. })
+    ));
+    assert!(client
+        .db()
+        .read_tx(|tx| tx.get_account_meta("last_removed_member:convo-offline"))
+        .unwrap()
+        .is_none());
+
+    let tmp = TempDir::new().unwrap();
+    let transport = Arc::new(RecordingSpaceTransport::new());
+    let harness = CatbirdMlsClient::open_offline_archive_for_test(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: "did:plc:alicearchiveauth00000".to_string(),
+            device_id: "dev-harness".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        transport.clone(),
+        None,
+    )
+    .unwrap();
+    let all_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    harness.enroll_device(&all_scopes).unwrap();
+    harness
+        .create_group("convo-harness", ds_did, Vec::new(), None, None)
+        .unwrap();
+    harness
+        .send_message("convo-harness", "msg-harness", "explicit harness send")
+        .unwrap();
+    let pending = harness
+        .list_pending_labyrinth_queue(Some("convo-harness"), 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].sequencer_receipt_json.is_none());
+    assert_eq!(harness.flush_labyrinth_queue().unwrap(), 1);
+    assert!(harness
+        .list_pending_labyrinth_queue(None, 10)
+        .unwrap()
+        .is_empty());
+    harness
+        .remove_group_member(MemberRole::Admin, "convo-harness", peer)
+        .unwrap();
+    assert_eq!(
+        harness
+            .db()
+            .read_tx(|tx| tx.get_account_meta("last_removed_member:convo-harness"))
+            .unwrap()
+            .as_deref(),
+        Some(peer)
+    );
 }
 
 #[test]

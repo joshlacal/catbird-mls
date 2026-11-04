@@ -76,6 +76,10 @@ chat_error_codes! {
     BlobSizeMismatch,
     BlockedRelationship,
     CancellationConflict,
+    /// The delivery service could not finish a direct request yet: a coordinator or recipient
+    /// home was unreachable, a federation gate was closed, or a relay failed. Nothing durable
+    /// was recorded, so the identical request may be retried (after `Retry-After`, 5 s).
+    CapacityUnavailable,
     CommitterSelfRemovalForbidden,
     ConversationAlreadyExists,
     ConversationCloseNotAllowed,
@@ -193,12 +197,13 @@ mod tests {
     #[test]
     fn the_known_set_covers_the_whole_protocol_surface() {
         // Extracted from every generated `*Error` enum across the 32 endpoint
-        // modules. If a lexicon change adds a code, this count moves and the
-        // classification match below stops compiling until it is triaged.
+        // modules, plus the direct-request `CapacityUnavailable`. If a lexicon change
+        // adds a code, this count moves and the classification match below stops
+        // compiling until it is triaged.
         assert_eq!(
             ChatErrorCode::KNOWN.len(),
-            93,
-            "the union of typed codes across all 32 endpoints"
+            94,
+            "the union of typed codes across all 32 endpoints, plus CapacityUnavailable"
         );
     }
 

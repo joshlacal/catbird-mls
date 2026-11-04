@@ -1385,7 +1385,7 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                 return Ok(PlatformHttpResponse {
                     status: 200,
                     headers: Vec::new(),
-                    body: br#"{"uri":"at://did:plc:signedtranscriptuser0001/blue.catbird.chat.device/self","cid":"bafyreimock"}"#.to_vec(),
+                    body: br#"{"uri":"at://did:plc:signedtranscriptuseraaaa/blue.catbird.chat.device/self","cid":"bafyreimock"}"#.to_vec(),
                 });
             }
             if request.url.contains("/xrpc/com.atproto.repo.listRecords") {
@@ -1466,7 +1466,8 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
     let client = CatbirdMlsClient::open(
         CatbirdMlsClientConfig {
             storage_root: tmp.path().display().to_string(),
-            account_did: "did:plc:signedtranscriptuser0001".to_string(),
+            // A canonical bare DID: production `create_group` has no local-only fallback.
+            account_did: "did:plc:signedtranscriptuseraaaa".to_string(),
             device_id: device_id.clone(),
             home_ds_did: "did:web:chat.catbird.blue".to_string(),
             home_ds_endpoint: "https://chat.catbird.blue".to_string(),

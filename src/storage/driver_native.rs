@@ -1188,7 +1188,7 @@ impl<'a> SqlReadTx<'a> {
                 let sql = format!(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
                             first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent IN ({}) ORDER BY updated_at_ms DESC",
+                     FROM requests WHERE consent IN ({}) ORDER BY updated_at_ms DESC, request_id ASC",
                     placeholders.join(", ")
                 );
                 let mut stmt = self
@@ -1206,7 +1206,7 @@ impl<'a> SqlReadTx<'a> {
                     .prepare(
                         "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
                                 first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                         FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
+                         FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC, request_id ASC",
                     )
                     .map_err(|e| map_rusqlite_err("list_requests.prepare", &e))?;
                 let rows = stmt
@@ -1221,7 +1221,7 @@ impl<'a> SqlReadTx<'a> {
                 .prepare(
                     "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
                             first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests ORDER BY updated_at_ms DESC",
+                     FROM requests ORDER BY updated_at_ms DESC, request_id ASC",
                 )
                 .map_err(|e| map_rusqlite_err("list_requests.prepare", &e))?;
             let rows = stmt

@@ -213,8 +213,11 @@ impl ChatErrorCode {
 
             // The only auto-retryable class. `RelationshipPolicyUnavailable` is
             // explicitly documented as retryable: it signals unavailable,
-            // incomplete, or stale evidence rather than a denial.
-            Self::RelationshipPolicyUnavailable | Self::RateLimited => C::Transient,
+            // incomplete, or stale evidence rather than a denial. `CapacityUnavailable`
+            // means the delivery service recorded nothing durable for the request.
+            Self::RelationshipPolicyUnavailable | Self::RateLimited | Self::CapacityUnavailable => {
+                C::Transient
+            }
 
             Self::CutoverRequired | Self::ProtocolUpgradeRequired => C::CutoverRequired,
 
@@ -252,9 +255,24 @@ mod tests {
             .collect();
         assert_eq!(
             retryable,
-            vec!["RateLimited", "RelationshipPolicyUnavailable"],
+            vec![
+                "CapacityUnavailable",
+                "RateLimited",
+                "RelationshipPolicyUnavailable"
+            ],
             "widening the auto-retry set is a policy change and must be deliberate"
         );
+    }
+
+    #[test]
+    fn capacity_unavailable_is_transient() {
+        // Nothing durable was recorded, so the identical request may be retried
+        // after a backoff; it is neither a denial nor a stale coordinate.
+        let class = ChatErrorCode::parse("CapacityUnavailable").classify();
+        assert_eq!(class, ChatErrorClass::Transient);
+        assert!(class.is_retryable_after_backoff());
+        assert!(!class.requires_state_resync());
+        assert!(!class.is_terminal_for_request());
     }
 
     #[test]
