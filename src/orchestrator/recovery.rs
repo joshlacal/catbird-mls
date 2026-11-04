@@ -1612,6 +1612,16 @@ where
         };
         drop(lock_guard);
 
+        // A durable server reset is not this device's rejoin loop: its
+        // recovery adopts a Welcome or bootstraps and never External-Commits,
+        // so the success gates against epoch-inflation spirals (per-convo
+        // cooldown, global interval) must not delay it. Failure backoff still
+        // applies.
+        let reset_pending = matches!(
+            self.reset_pending_payload_result(convo_id).await,
+            Ok(Some(_))
+        );
+
         // Epoch-inflation spiral guard: if we SUCCESSFULLY rejoined this
         // conversation recently and sync still thinks we need to rejoin
         if let Some(remaining) = self
@@ -1619,6 +1629,7 @@ where
             .lock()
             .await
             .success_cooldown_remaining(convo_id)
+            .filter(|_| !reset_pending)
         {
             tracing::info!(
                 convo_id,
@@ -1633,7 +1644,7 @@ where
             return false;
         }
 
-        if let Err(err) = self.enforce_rejoin_backoff(convo_id).await {
+        if let Err(err) = self.enforce_rejoin_backoff(convo_id, !reset_pending).await {
             tracing::debug!(
                 convo_id,
                 error = %err,
@@ -1920,7 +1931,7 @@ where
         Ok(report)
     }
 
-    async fn enforce_rejoin_backoff(&self, convo_id: &str) -> Result<()> {
+    async fn enforce_rejoin_backoff(&self, convo_id: &str, min_interval: bool) -> Result<()> {
         // E7 runtime expiry: a maxed-out lockout that lapsed while this
         // process was running re-opens exactly one attempt (clamp to
         // max-1), mirroring the hydration clamp and the Swift twin's
@@ -2021,7 +2032,7 @@ where
         }
 
         // Hard minimum interval between any rejoin attempts (even successful ones)
-        if let Some(last) = tracker.last_global_rejoin_at {
+        if let Some(last) = tracker.last_global_rejoin_at.filter(|_| min_interval) {
             let elapsed = last.elapsed();
             if elapsed < constants::MIN_REJOIN_INTERVAL {
                 let remaining = constants::MIN_REJOIN_INTERVAL - elapsed;
@@ -2985,8 +2996,21 @@ where
                 )))
             })?;
             Ok((nonce, ciphertext))
-        })();
-        let (nonce, ciphertext) = match metadata {
+        })()
+        .and_then(|metadata| {
+            // The signed `next` (and snapshot) coordinate is the staged
+            // successor's, as in swap_members; `tag_bytes`/`gc_hash` are prior.
+            plan.next_confirmation_tag
+                .clone()
+                .zip(plan.next_group_context_hash.clone())
+                .map(|successor| (metadata, successor))
+                .ok_or_else(|| {
+                    OrchestratorError::Mls(MLSError::Internal(
+                        "staged swap produced no successor coordinate".into(),
+                    ))
+                })
+        });
+        let ((nonce, ciphertext), (next_tag, next_gch)) = match metadata {
             Ok(metadata) => metadata,
             Err(error) => {
                 self.discard_pending_after_failed_operation(
@@ -3051,11 +3075,11 @@ where
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
+                    "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": plan.target_epoch,
                     "generation": 0,
-                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": metadata_version,
@@ -3063,11 +3087,11 @@ where
                 "originTransitionId": transition_id
             },
             "next": {
-                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
+                "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) },
                 "conversationId": resolved.conversation_id.clone(),
                 "epoch": plan.target_epoch,
                 "generation": 0,
-                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
                 "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
@@ -3656,7 +3680,7 @@ where
             )));
         }
 
-        self.enforce_rejoin_backoff(convo_id).await?;
+        self.enforce_rejoin_backoff(convo_id, true).await?;
 
         let result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match result {
@@ -3735,7 +3759,9 @@ where
                 if super::welcome_ack::bytes(&current["state"]["coordinates"]["groupId"])?
                     == receipt.delivery.group_id()?
                 {
-                    return self.join_or_rejoin_from_delivery(receipt.delivery).await;
+                    let epoch = self.join_or_rejoin_from_delivery(receipt.delivery).await?;
+                    self.clear_rejoin_failures(convo_id).await?;
+                    return Ok(epoch);
                 }
             }
         }
@@ -3761,7 +3787,13 @@ where
                 });
         if !locally_healthy {
             match self.fetch_welcome_delivery(convo_id).await {
-                Ok(delivery) => return self.join_or_rejoin_from_delivery(delivery).await,
+                Ok(delivery) => {
+                    // Like every successful join_or_rejoin_locked outcome, a
+                    // Welcome recovery arms the success cooldown (spiral guard).
+                    let epoch = self.join_or_rejoin_from_delivery(delivery).await?;
+                    self.clear_rejoin_failures(convo_id).await?;
+                    return Ok(epoch);
+                }
                 Err(OrchestratorError::ServerError {
                     status: 404 | 410, ..
                 }) => {}
@@ -3833,7 +3865,7 @@ where
         let user = self.require_user_did().await?;
         let identity = self.require_scoped_identity().await?;
         let lock = self.rejoin_lock(convo_id).await;
-        {
+        let adopted_reset_winner = {
             let _guard = lock.lock().await;
             if self.is_local_conversation_closed(convo_id).await? {
                 return Err(OrchestratorError::InvalidInput(
@@ -3936,9 +3968,25 @@ where
                 ));
             }
             self.mls_context().ensure_storage_durable()?;
-            self.storage()
-                .ensure_conversation_exists(&user, convo_id, &group_hex)
-                .await?;
+            // Under ResetPending every stable-conversation route (catch-up,
+            // process_incoming) resolves to the reset target, and only the
+            // exact completion CAS may rebind the conversation row. So the
+            // server-bound winner becomes the target before catch-up, and the
+            // row, join epoch and cached view are left to that CAS.
+            let reset_authority = self.reset_pending_payload_result(convo_id).await?;
+            let adopted_reset_winner = match &reset_authority {
+                Some(payload) if payload.new_group_id != group_hex => {
+                    self.adopt_verified_welcome_reset_target(convo_id, payload, &group_hex)
+                        .await?;
+                    true
+                }
+                _ => false,
+            };
+            if reset_authority.is_none() {
+                self.storage()
+                    .ensure_conversation_exists(&user, convo_id, &group_hex)
+                    .await?;
+            }
             let projection = GroupState {
                 conversation_id: convo_id.into(),
                 group_id: group_hex.clone(),
@@ -3950,27 +3998,43 @@ where
                     .filter_map(|id| String::from_utf8(id).ok())
                     .collect(),
             };
-            self.storage().set_group_state(&projection).await?;
-            self.storage()
-                .update_join_info(convo_id, &user, JoinMethod::Welcome, epoch)
-                .await?;
+            // The native Welcome is already durable; a failed app projection
+            // must leave a durable recovery route on the row ensured above.
+            let projected: Result<()> = async {
+                self.storage().set_group_state(&projection).await?;
+                if reset_authority.is_none() {
+                    self.storage()
+                        .update_join_info(convo_id, &user, JoinMethod::Welcome, epoch)
+                        .await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = projected {
+                self.mark_needs_rejoin_critical(convo_id).await;
+                return Err(error);
+            }
             {
                 let mut states = self.group_states().lock().await;
                 normalize_group_state(&mut states, projection);
             }
-            if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
-                if view.group_id != group_hex {
-                    view.canonical_state = None;
+            if reset_authority.is_none() {
+                if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
+                    if view.group_id != group_hex {
+                        view.canonical_state = None;
+                    }
+                    view.group_id = group_hex;
+                    view.epoch = epoch;
                 }
-                view.group_id = group_hex;
-                view.epoch = epoch;
             }
             // A preserved DeviceRemoved or ResetPending state continues to
             // block sends. New devices stay Recovering during catch-up.
             self.project_non_reset_state_locked(convo_id, ConversationState::Initializing)
                 .await?;
-        }
-        self.finish_available_welcome_adoption(convo_id).await
+            adopted_reset_winner
+        };
+        self.finish_available_welcome_adoption(convo_id, adopted_reset_winner)
+            .await
     }
 
     async fn require_current_welcome_membership(
@@ -4002,7 +4066,13 @@ where
         Ok(())
     }
 
-    pub(crate) async fn finish_available_welcome_adoption(&self, convo_id: &str) -> Result<u64> {
+    /// `adopted_reset_winner`: the caller made this Welcome's group the
+    /// ResetPending target, so a newer reset at completion keeps that group.
+    pub(crate) async fn finish_available_welcome_adoption(
+        &self,
+        convo_id: &str,
+        adopted_reset_winner: bool,
+    ) -> Result<u64> {
         // Network reads and process_incoming execute outside the transition
         // lock. Catch-up can itself need that lock for terminal/reset commits.
         for _ in 0..3 {
@@ -4044,20 +4114,13 @@ where
                 ));
             }
             if let Some(payload) = self.reset_pending_payload_result(convo_id).await? {
-                if hex::encode(&group) != payload.new_group_id {
-                    let adopted = self
-                        .adopt_verified_welcome_reset_target(
-                            convo_id,
-                            &payload,
-                            &hex::encode(&group),
-                        )
-                        .await?;
-                    self.complete_reset_recovery(convo_id, &adopted, group.clone(), false)
-                        .await?;
-                } else {
-                    self.complete_reset_recovery(convo_id, &payload, group.clone(), true)
-                        .await?;
-                }
+                self.complete_reset_recovery(
+                    convo_id,
+                    &payload,
+                    group.clone(),
+                    !adopted_reset_winner,
+                )
+                .await?;
             }
             self.mls_context().ensure_storage_durable()?;
             self.storage()

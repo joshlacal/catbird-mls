@@ -18,6 +18,11 @@ use e2e_harness::mock_credentials::MockCredentials;
 use e2e_harness::mock_storage::MockStorage;
 use e2e_harness::TestWorld;
 
+// Canonical conversation policy accepts only production bare DIDs
+// (`did:plc:` + 24 base32), like `policy_invite_tests`.
+const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
 struct InMemoryKeychain {
     store: std::sync::Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -51,6 +56,8 @@ struct GroupLifecycleFixture {
     engine: MlsEngine<MockStorage, MockDeliveryService, MockCredentials, MLSContext>,
     storage: Arc<MockStorage>,
     api: Arc<MockDeliveryService>,
+    context: Arc<MLSContext>,
+    credentials: Arc<MockCredentials>,
     _temp_dir: tempfile::TempDir,
 }
 
@@ -67,14 +74,35 @@ impl GroupLifecycleFixture {
             })
             .expect("signed genesis request");
         let body = &create["signedRequest"]["body"];
-        self.api.set_conversation_leaves_for_test(cid, vec![serde_json::json!({
-            "userDid":body["actorDid"],"deviceId":body["actorDeviceId"],"deviceStatus":"active","leafIndex":0
-        })]);
+        // `deviceLeafView` is a closed schema: no `leafIndex`, and `keyId` +
+        // `leafOrigin` are required (add_members decodes state strictly).
+        self.api.set_conversation_leaves_for_test(
+            cid,
+            vec![serde_json::json!({
+                "userDid":body["actorDid"],"deviceId":body["actorDeviceId"],"keyId":body["keyId"],
+                "deviceStatus":"active","leafOrigin":"genesis"
+            })],
+        );
+    }
+
+    /// Close/leave entries are verified against repository-published device
+    /// keys only; install Alice's local signer as that explicit authority.
+    fn authorize_own_device_key(&self) {
+        let device = self
+            .api
+            .latest_registered_device_id(ALICE)
+            .expect("registered Alice device");
+        let key = self
+            .context
+            .identity_public_key(format!("{ALICE}#{device}"))
+            .expect("Alice device signing key");
+        self.credentials
+            .set_authorized_device_keys(ALICE, vec![key]);
     }
 
     async fn with_one_recipient_key_package() -> Self {
         let mut world = TestWorld::new();
-        world.add_client("Bob").await;
+        world.add_client_with_did("Bob", BOB).await;
         let bob_did = world
             .register_device("Bob")
             .await
@@ -90,27 +118,27 @@ impl GroupLifecycleFixture {
         .expect("MLSContext");
         epoch_secret_test_support::install(&context);
         let storage = Arc::new(MockStorage::new());
-        let api = Arc::new(world.delivery_service().clone_as("did:plc:alice"));
+        let api = Arc::new(world.delivery_service().clone_as(ALICE));
         let credentials = Arc::new(MockCredentials::new());
         world.install_authorized_device_keys(&credentials, &bob_did);
         let config = OrchestratorConfig::default();
 
         let engine = MlsEngine::new(
-            context,
+            Arc::clone(&context),
             Arc::clone(&storage),
             Arc::clone(&api),
-            credentials,
+            Arc::clone(&credentials),
             Arc::new(EngineLifecycle::default()),
             config,
         );
-        engine
-            .initialize_user("did:plc:alice")
-            .expect("engine initialize");
+        engine.initialize_user(ALICE).expect("engine initialize");
 
         Self {
             engine,
             storage,
             api,
+            context,
+            credentials,
             _temp_dir: temp_dir,
         }
     }
@@ -137,13 +165,13 @@ async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
         .rekey_conversation_for_test(&created.conversation.conversation_id, stable_convo_id);
     fixture
         .storage
-        .ensure_conversation_exists("did:plc:alice", stable_convo_id, &original_group_id)
+        .ensure_conversation_exists(ALICE, stable_convo_id, &original_group_id)
         .await
         .expect("seed stable conversation mapping");
 
     let added: GroupMutationResult = fixture
         .engine
-        .add_members(stable_convo_id, &["did:plc:bob".into()])
+        .add_members(stable_convo_id, &[BOB.into()])
         .expect("add members through stable conversation id");
     assert_eq!(added.conversation.conversation_id, stable_convo_id);
     assert_eq!(added.conversation.group_id, original_group_id);
@@ -151,11 +179,11 @@ async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
         .conversation
         .members
         .iter()
-        .any(|member| member.did == "did:plc:bob"));
+        .any(|member| member.did == BOB));
 
     let removed: GroupMutationResult = fixture
         .engine
-        .remove_members(stable_convo_id, &["did:plc:bob".into()])
+        .remove_members(stable_convo_id, &[BOB.into()])
         .expect("remove members through stable conversation id");
     assert_eq!(removed.conversation.conversation_id, stable_convo_id);
     assert_eq!(removed.conversation.group_id, original_group_id);
@@ -163,7 +191,7 @@ async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
         .conversation
         .members
         .iter()
-        .any(|member| member.did == "did:plc:bob"));
+        .any(|member| member.did == BOB));
     assert!(
         fixture.api.get_group_info(stable_convo_id).await.is_ok(),
         "post-mutation GroupInfo must stay published under the stable conversation id"
@@ -186,7 +214,7 @@ async fn create_conversation_publishes_group_info_and_confirms_commit_atomically
         .engine
         .create_conversation(CreateConversationRequest {
             name: "test".into(),
-            member_dids: vec!["did:plc:bob".into()],
+            member_dids: vec![BOB.into()],
             description: None,
         })
         .expect("create conversation");
@@ -223,7 +251,7 @@ async fn add_remove_and_leave_return_updated_snapshots() {
 
     let added: GroupMutationResult = fixture
         .engine
-        .add_members(&convo_id, &["did:plc:bob".into()])
+        .add_members(&convo_id, &[BOB.into()])
         .expect("add members");
     assert_eq!(
         added.conversation.epoch, created.conversation.epoch,
@@ -233,11 +261,11 @@ async fn add_remove_and_leave_return_updated_snapshots() {
         .conversation
         .members
         .iter()
-        .any(|member| member.did == "did:plc:bob"));
+        .any(|member| member.did == BOB));
 
     let removed: GroupMutationResult = fixture
         .engine
-        .remove_members(&convo_id, &["did:plc:bob".into()])
+        .remove_members(&convo_id, &[BOB.into()])
         .expect("remove members");
     assert_eq!(
         removed.conversation.epoch, added.conversation.epoch,
@@ -247,8 +275,9 @@ async fn add_remove_and_leave_return_updated_snapshots() {
         .conversation
         .members
         .iter()
-        .any(|member| member.did == "did:plc:bob"));
+        .any(|member| member.did == BOB));
 
+    fixture.authorize_own_device_key();
     let left: LeaveResult = fixture
         .engine
         .leave_conversation(&convo_id)

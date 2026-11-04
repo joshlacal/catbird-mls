@@ -3,10 +3,14 @@
 //! Public account exit retains a terminal conversation projection and is not
 //! the destructive cleanup operation whose retry intent is exercised here.
 
+use std::sync::Arc;
+
 use crate::orchestrator::{
-    constants, ConversationState, MLSStorageBackend, OrchestratorConfig, PersistedRecoveryBackoff,
+    constants, ConversationState, CredentialStore, GroupState, MLSOrchestrator, MLSStorageBackend,
+    OrchestratorConfig, PersistedRecoveryBackoff,
 };
 use crate::recovery_e2e_harness::TestWorld;
+use crate::GroupConfig;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -348,4 +352,312 @@ async fn local_delete_clears_recovery_state_no_ghost_after_restart() {
         assert_eq!(tracker.failed_attempts(&convo_id), 0);
         assert!(!tracker.should_skip(&convo_id));
     }
+}
+
+// The three lifecycle-bound cleanup tests below came from
+// tests/resolved_conversation_context_tests.rs, where they drove cleanup via
+// `leave_group`. Since 0b6b4e90 that is the canonical account exit, which
+// retains native state (b37ace4d), so they call the cleanup boundary.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_pending_local_delete_removes_every_materialized_predecessor_and_target() {
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+
+    let conversation = alice
+        .orchestrator
+        .create_group("reset-pending local delete", None, None)
+        .await
+        .expect("create predecessor group");
+    let conversation_id = conversation.conversation_id.clone();
+    let predecessor_group = hex::decode(&conversation.group_id).expect("predecessor group id");
+    let mls_did = alice
+        .credentials
+        .get_mls_did(&alice.did)
+        .await
+        .expect("read Alice MLS DID")
+        .expect("registered Alice MLS DID");
+
+    // Simulate an additional locally materialized predecessor left by an
+    // interrupted earlier transition. Its explicit stable-conversation
+    // binding is the only durable discovery path for its epoch secrets.
+    let older_predecessor = vec![0x31; 32];
+    let older_predecessor_id = hex::encode(&older_predecessor);
+    alice
+        .orchestrator
+        .mls_context()
+        .create_group_with_id(
+            mls_did.clone().into_bytes(),
+            older_predecessor.clone(),
+            Some(GroupConfig::default()),
+        )
+        .expect("materialize older predecessor");
+    alice.orchestrator.group_states().lock().await.insert(
+        older_predecessor_id.clone(),
+        GroupState {
+            group_id: older_predecessor_id,
+            conversation_id: conversation_id.clone(),
+            epoch: 0,
+            members: vec![alice.did.clone()],
+        },
+    );
+
+    // Reproduce the crash window after the atomic reset authority commit but
+    // before record_group_reset deleted the old local groups. The durable
+    // conversation mapping still names the predecessor while reset authority
+    // names a distinct, already materialized target.
+    let reset_target = vec![0x32; 32];
+    let reset_target_id = hex::encode(&reset_target);
+    alice
+        .orchestrator
+        .mls_context()
+        .create_group_with_id(
+            mls_did.into_bytes(),
+            reset_target.clone(),
+            Some(GroupConfig::default()),
+        )
+        .expect("materialize reset target");
+    alice
+        .storage
+        .mark_reset_pending(&conversation_id, &reset_target_id, 7, 1_700_000_000_000)
+        .await
+        .expect("commit reset authority");
+
+    for group_id in [&predecessor_group, &older_predecessor, &reset_target] {
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .group_exists(group_id.clone()));
+    }
+
+    alice
+        .orchestrator
+        .force_delete_local(&conversation_id)
+        .await
+        .expect("local delete must clean every lifecycle-bound local group");
+
+    for (label, group_id) in [
+        ("mapped predecessor", predecessor_group),
+        ("older bound predecessor", older_predecessor),
+        ("reset target", reset_target),
+    ] {
+        assert!(
+            !alice.orchestrator.mls_context().group_exists(group_id),
+            "local delete must remove {label} before dropping reset authority"
+        );
+    }
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .is_none(),
+        "successful cleanup may clear reset authority only after all local groups are gone"
+    );
+    assert!(
+        alice
+            .storage
+            .get_conversation(&alice.did, &conversation_id)
+            .await
+            .expect("read durable conversation")
+            .is_none(),
+        "successful cleanup removes the durable conversation mapping"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_delete_rediscovers_all_persisted_predecessors_after_intent_crash() {
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("restart-safe predecessor delete", None, None)
+        .await
+        .expect("create mapped predecessor");
+    let conversation_id = conversation.conversation_id.clone();
+    let mapped_predecessor = hex::decode(&conversation.group_id).expect("mapped predecessor");
+    let mls_did = alice
+        .credentials
+        .get_mls_did(&alice.did)
+        .await
+        .expect("read MLS DID")
+        .expect("registered MLS DID");
+
+    let extra_predecessor = vec![0x41; 32];
+    let extra_predecessor_id = hex::encode(&extra_predecessor);
+    alice
+        .orchestrator
+        .mls_context()
+        .create_group_with_id(
+            mls_did.clone().into_bytes(),
+            extra_predecessor.clone(),
+            Some(GroupConfig::default()),
+        )
+        .expect("materialize extra predecessor");
+    let extra_state = GroupState {
+        group_id: extra_predecessor_id.clone(),
+        conversation_id: conversation_id.clone(),
+        epoch: 0,
+        members: vec![alice.did.clone()],
+    };
+    alice
+        .storage
+        .set_group_state(&extra_state)
+        .await
+        .expect("persist extra predecessor binding");
+    alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .insert(extra_predecessor_id.clone(), extra_state);
+
+    let reset_target = vec![0x42; 32];
+    let reset_target_id = hex::encode(&reset_target);
+    alice
+        .orchestrator
+        .mls_context()
+        .create_group_with_id(
+            mls_did.into_bytes(),
+            reset_target.clone(),
+            Some(GroupConfig::default()),
+        )
+        .expect("materialize reset target");
+    alice
+        .storage
+        .mark_reset_pending(&conversation_id, &reset_target_id, 9, 1_700_000_000_000)
+        .await
+        .expect("commit reset authority");
+    // Force the exact reset clear CAS to lose its race after the captured MLS
+    // groups and group-state rows were deleted. This preserves the pending
+    // intent, reset authority, and durable conversation mapping at the crash
+    // point. The retry intent must therefore remain complete and idempotent
+    // even though no live projection can rediscover the captured groups.
+    alice
+        .storage
+        .force_next_clear_reset_pending_for_delete_false();
+    let deletion_error = alice
+        .orchestrator
+        .force_delete_local(&conversation_id)
+        .await
+        .expect_err("local delete must surface incomplete lifecycle-bound deletion");
+    assert!(
+        deletion_error
+            .to_string()
+            .contains("durable retry intent retained"),
+        "unexpected incomplete deletion error: {deletion_error}"
+    );
+    assert_eq!(alice.storage.pending_local_delete_count(), 1);
+    assert!(
+        !alice.storage.has_group_state(&extra_predecessor_id),
+        "exact group-state cleanup completes before the reset-generation CAS"
+    );
+    for group_id in [&mapped_predecessor, &extra_predecessor, &reset_target] {
+        assert!(!alice
+            .orchestrator
+            .mls_context()
+            .group_exists(group_id.clone()));
+    }
+
+    // Crash before reset/conversation cleanup. A fresh process has no
+    // in-memory group-state cache and the groups are already absent from its
+    // MLS manifest, so only the durable intent can complete the exact
+    // lifecycle-bound cleanup.
+    world.restart_client("Alice").await;
+    let alice = world.client("Alice");
+
+    for (label, group_id) in [
+        ("mapped predecessor", mapped_predecessor),
+        ("persisted extra predecessor", extra_predecessor),
+        ("reset target", reset_target),
+    ] {
+        assert!(
+            !alice.orchestrator.mls_context().group_exists(group_id),
+            "startup reconcile must delete {label} before clearing its intent"
+        );
+    }
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    assert!(
+        !alice.storage.has_group_state(&extra_predecessor_id),
+        "startup retry must remove stale predecessor group-state rows named only by the durable intent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_local_delete_from_alice_never_replays_in_bob_lifecycle() {
+    let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    // Only Bob's native context is used: a separate lifecycle that shares
+    // Alice's app storage.
+    world.add_client_with_did("Bob", bob_did).await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("tenant-bound pending delete", None, None)
+        .await
+        .expect("create Alice group");
+    let conversation_id = conversation.conversation_id.clone();
+    let target = vec![0x51; 32];
+    let target_id = hex::encode(&target);
+    alice
+        .storage
+        .mark_reset_pending(&conversation_id, &target_id, 11, 1_700_000_000_000)
+        .await
+        .expect("commit Alice reset authority");
+    alice
+        .storage
+        .force_next_clear_reset_pending_for_delete_false();
+    let deletion_error = alice
+        .orchestrator
+        .force_delete_local(&conversation_id)
+        .await
+        .expect_err("Alice's incomplete deletion must remain visible to her lifecycle");
+    assert!(
+        deletion_error
+            .to_string()
+            .contains("durable retry intent retained"),
+        "unexpected incomplete deletion error: {deletion_error}"
+    );
+    assert_eq!(alice.storage.pending_local_delete_count(), 1);
+
+    let bob_context = Arc::clone(world.client("Bob").orchestrator.mls_context());
+    bob_context
+        .create_group_with_id(
+            bob_did.as_bytes().to_vec(),
+            target.clone(),
+            Some(GroupConfig::default()),
+        )
+        .expect("materialize Bob group at colliding bytes");
+    let bob_orchestrator = MLSOrchestrator::new(
+        bob_context,
+        Arc::new(alice.storage.clone()),
+        Arc::new(world.delivery_service().clone_as(bob_did)),
+        Arc::new(alice.credentials.clone()),
+        OrchestratorConfig::default(),
+    );
+    bob_orchestrator
+        .initialize(bob_did)
+        .await
+        .expect("Bob initialization must leave Alice cleanup pending");
+
+    assert!(
+        bob_orchestrator.mls_context().group_exists(target),
+        "Alice's pending delete must never remove Bob's group at colliding bytes"
+    );
+    assert_eq!(
+        alice.storage.pending_local_delete_count(),
+        1,
+        "tenant mismatch must keep Alice's intent for an Alice lifecycle"
+    );
 }

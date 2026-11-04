@@ -139,7 +139,7 @@ impl catbird_mls::orchestrator::MlsCryptoContext for FailingCrypto {
     fn commit_pending_proposals(
         &self,
         _group_id: Vec<u8>,
-    ) -> Result<Vec<u8>, catbird_mls::MLSError> {
+    ) -> Result<catbird_mls::RemoveMembersResult, catbird_mls::MLSError> {
         Err(catbird_mls::MLSError::Internal("unused in test".into()))
     }
     fn get_group_context_hash(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, catbird_mls::MLSError> {

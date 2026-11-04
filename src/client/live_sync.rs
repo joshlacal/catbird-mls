@@ -833,10 +833,11 @@ impl CatbirdMlsClient {
         let publication_receipt = raw_dr_entry.get("publicationReceipt").ok_or_else(|| {
             MLSError::Cryptography("C33 entry missing signed publicationReceipt".into())
         })?;
+        // Closed single-variant union: `$type` is required and exact.
         let publication_receipt = dr_transcript::normalize_read_presentation(
             &serde_json::to_vec(publication_receipt)?,
             "signedDirectRequestReceipt",
-            publication_receipt.get("$type").is_some(),
+            true,
         )
         .map_err(|e| MLSError::Cryptography(format!("C33 publication receipt: {e}")))?;
         let authority_doc = self

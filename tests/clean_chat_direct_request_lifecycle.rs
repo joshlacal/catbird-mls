@@ -480,7 +480,44 @@ async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
     let entry = json!({"$type":"blue.catbird.chat.defs#creationEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":wrapper["signedRequest"],"receivedAt":utc(0)});
     (state, entry)
 }
+/// State carried between the [`sender_fixture`] phases. Each phase is its own
+/// boxed future: as one body its debug poll frame was ~1.3 MB and, with the
+/// production crypto below it, overflowed the default 2 MiB test stack.
+struct SenderFixture {
+    world: TestWorld,
+    dag_json: bool,
+    authorization_checks: bool,
+    authority: p256::ecdsa::SigningKey,
+    method: String,
+    pubkey: Vec<u8>,
+    bob_device: String,
+    package: catbird_mls::KeyPackageResult,
+    bob_public: Vec<u8>,
+    input: DirectRequestInput,
+    publication: Value,
+    receipt: Value,
+}
 async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool) {
+    let Some(f) = Box::pin(sender_publishes(legacy, dag_json, authorization_checks)).await else {
+        return;
+    };
+    let (f, view, pruned_entry) = Box::pin(recipient_previews(f)).await;
+    let (f, proof, pending_accept) = Box::pin(recipient_accepts(f, view)).await;
+    let (f, state) = Box::pin(sender_observes_acceptance(
+        f,
+        pending_accept,
+        proof,
+        pruned_entry,
+    ))
+    .await;
+    Box::pin(sender_closes(f, state)).await;
+}
+/// The sender publishes after a lost prepare and a lost publish response.
+async fn sender_publishes(
+    legacy: bool,
+    dag_json: bool,
+    authorization_checks: bool,
+) -> Option<SenderFixture> {
     let mut world = TestWorld::new();
     for (name, did) in [
         ("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -670,7 +707,7 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
             &device,
         )
         .unwrap();
-        return;
+        return None;
     }
     let verified_publish = protocol::verify_signed_request(
         protocol::DirectRequestKind::Publish,
@@ -696,6 +733,42 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
         publication_bytes,
         last_request_bytes(&world, Op::PublishDirectRequest)
     );
+    Some(SenderFixture {
+        world,
+        dag_json,
+        authorization_checks,
+        authority,
+        method,
+        pubkey,
+        bob_device,
+        package,
+        bob_public,
+        input,
+        publication,
+        receipt,
+    })
+}
+/// The recipient previews the opening, refusing unauthorized and forged rows.
+async fn recipient_previews(
+    f: SenderFixture,
+) -> (SenderFixture, catbird_mls::DirectRequestView, Value) {
+    let SenderFixture {
+        world,
+        dag_json,
+        authorization_checks,
+        authority,
+        method,
+        pubkey,
+        bob_device,
+        package,
+        bob_public,
+        input,
+        publication,
+        receipt,
+    } = f;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let p = &publication["signedRequest"]["body"];
     let cid = p["conversationId"].as_str().unwrap();
     // Replaying a published outcome must validate an existing encrypted
     // projection instead of treating mere presence as completed adoption.
@@ -895,7 +968,46 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
             .is_empty());
     }
 
-    let cid = cid.to_owned();
+    (
+        SenderFixture {
+            world,
+            dag_json,
+            authorization_checks,
+            authority,
+            method,
+            pubkey,
+            bob_device,
+            package,
+            bob_public,
+            input,
+            publication,
+            receipt,
+        },
+        view,
+        pruned_entry,
+    )
+}
+/// The recipient's preview survives restart; acceptance survives a lost response.
+async fn recipient_accepts(
+    f: SenderFixture,
+    view: catbird_mls::DirectRequestView,
+) -> (SenderFixture, Value, Value) {
+    let SenderFixture {
+        mut world,
+        dag_json,
+        authorization_checks,
+        authority,
+        method,
+        pubkey,
+        bob_device,
+        package,
+        bob_public,
+        input,
+        publication,
+        receipt,
+    } = f;
+    let p = &publication["signedRequest"]["body"];
+    let cid = p["conversationId"].as_str().unwrap().to_owned();
     if authorization_checks {
         Box::pin(check_legacy_reauthorization(
             &mut world,
@@ -1001,6 +1113,49 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
             "accepted read proof and decrypted preview must survive reopen"
         );
     }
+    (
+        SenderFixture {
+            world,
+            dag_json,
+            authorization_checks,
+            authority,
+            method,
+            pubkey,
+            bob_device,
+            package,
+            bob_public,
+            input,
+            publication,
+            receipt,
+        },
+        proof,
+        pending_accept,
+    )
+}
+/// The sender verifies acceptance, resolves the group note and introduction.
+async fn sender_observes_acceptance(
+    f: SenderFixture,
+    pending_accept: Value,
+    proof: Value,
+    pruned_entry: Value,
+) -> (SenderFixture, Value) {
+    let SenderFixture {
+        world,
+        dag_json,
+        authorization_checks,
+        authority,
+        method,
+        pubkey,
+        bob_device,
+        package,
+        bob_public,
+        input,
+        publication,
+        receipt,
+    } = f;
+    let p = &publication["signedRequest"]["body"];
+    let cid = p["conversationId"].as_str().unwrap().to_owned();
+    let accepted = &pending_accept["directRequest"]["body"];
     assert_eq!(accepted["prior"]["epoch"], accepted["next"]["epoch"]);
     let state = json!({"conversationKind":"direct","coordinates":accepted["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":[{"userDid":p["actorDid"],"role":"admin","status":"active","leafCount":1},{"userDid":p["recipientDid"],"role":"admin","status":"active","leafCount":1,"invitationProvenance":{"invitationTransitionId":p["requestId"],"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]}}],"leaves":[{"userDid":p["actorDid"],"deviceId":p["actorDeviceId"],"leafOrigin":"genesis","keyId":p["keyId"],"deviceStatus":"active"},{"userDid":p["recipientDid"],"deviceId":bob_device,"leafOrigin":"keyPackage","joinKeyPackageRef":STANDARD.encode(&package.hash_ref),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"deviceStatus":"active"}],"metadataSnapshot":p["artifacts"]["metadataSnapshot"],"snapshotSeq":2,"directRequest":{"requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"senderDid":p["actorDid"],"recipientDid":p["recipientDid"],"consent":"accepted","importUntil":p["importUntil"],"contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],"acceptanceProof":proof}});
     let typed = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
@@ -1243,6 +1398,37 @@ async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool
             .len(),
         1
     );
+    (
+        SenderFixture {
+            world,
+            dag_json,
+            authorization_checks,
+            authority,
+            method,
+            pubkey,
+            bob_device,
+            package,
+            bob_public,
+            input,
+            publication,
+            receipt,
+        },
+        state,
+    )
+}
+/// The sender closes after a lost close response; the close survives restart.
+async fn sender_closes(f: SenderFixture, state: Value) {
+    let SenderFixture {
+        mut world,
+        dag_json,
+        authorization_checks,
+        pubkey,
+        input,
+        publication,
+        ..
+    } = f;
+    let p = &publication["signedRequest"]["body"];
+    let cid = p["conversationId"].as_str().unwrap().to_owned();
     let alice = world.client("Alice");
     let actor_public = alice
         .orchestrator

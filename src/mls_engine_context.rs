@@ -4981,8 +4981,13 @@ impl MLSContext {
         })
     }
 
-    /// Commit all pending proposals that have been validated and stored
-    pub fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+    /// Commit all pending proposals that have been validated and stored.
+    /// Like every staging primitive, also returns the staged successor's
+    /// confirmation tag and GroupContext hash for the signed `next` coordinate.
+    pub fn commit_pending_proposals(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<RemoveMembersResult, MLSError> {
         self.check_suspended()?;
         let mut guard = self
             .inner
@@ -5039,11 +5044,27 @@ impl MLSContext {
             let commit_data = commit
                 .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
+            let next_confirmation_tag = MlsMessageIn::tls_deserialize_exact_bytes(&commit_data)
+                .ok()
+                .and_then(|message| match message.extract() {
+                    MlsMessageBodyIn::PublicMessage(message) => message.confirmation_tag().cloned(),
+                    _ => None,
+                })
+                .and_then(|tag| tag.tls_serialize_detached().ok())
+                .map(|bytes| bytes[bytes.len().saturating_sub(32)..].to_vec());
+            let next_group_context_hash = group
+                .pending_commit()
+                .and_then(|pending| pending.group_context().tls_serialize_detached().ok())
+                .map(|bytes| Sha256::digest(bytes).to_vec());
 
             // Leave the OpenMLS commit staged. The caller must send it to the
             // delivery service and invoke merge_pending_commit only after an
             // authenticated acceptance.
-            Ok(commit_data)
+            Ok(RemoveMembersResult {
+                commit_data,
+                next_confirmation_tag,
+                next_group_context_hash,
+            })
         })
     }
 }
@@ -7286,51 +7307,62 @@ impl MLSContext {
 
         let source_epoch = self.get_epoch(group_id_bytes.clone())?;
 
-        let (commit_bytes, welcome_bytes) = match kind {
-            CommitKind::AddMembers {
-                member_dids,
-                key_packages,
-            } => {
-                crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
+        let (commit_bytes, welcome_bytes, next_confirmation_tag, next_group_context_hash) =
+            match kind {
+                CommitKind::AddMembers {
+                    member_dids,
+                    key_packages,
+                } => {
+                    crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
                     &member_dids,
                     &key_packages,
                 )
                 .map_err(|error| MLSError::invalid_input(error.to_string()))?;
-                let add_result = self.add_members(group_id_bytes.clone(), key_packages)?;
-                (add_result.commit_data, Some(add_result.welcome_data))
-            }
-            CommitKind::RemoveMembers { member_dids } => {
-                let member_identities: Vec<Vec<u8>> = member_dids
-                    .iter()
-                    .map(|did| did.as_bytes().to_vec())
-                    .collect();
-                let commit = self.remove_members(group_id_bytes.clone(), member_identities)?;
-                (commit, None)
-            }
-            CommitKind::SwapMembers {
-                remove_dids,
-                add_dids,
-                add_key_packages,
-            } => {
-                let remove_ids: Vec<Vec<u8>> =
-                    remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
-                crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
+                    let add_result = self.add_members(group_id_bytes.clone(), key_packages)?;
+                    (
+                        add_result.commit_data,
+                        Some(add_result.welcome_data),
+                        add_result.next_confirmation_tag,
+                        add_result.next_group_context_hash,
+                    )
+                }
+                CommitKind::RemoveMembers { member_dids } => {
+                    let member_identities: Vec<Vec<u8>> = member_dids
+                        .iter()
+                        .map(|did| did.as_bytes().to_vec())
+                        .collect();
+                    let commit = self.remove_members(group_id_bytes.clone(), member_identities)?;
+                    (commit, None, None, None)
+                }
+                CommitKind::SwapMembers {
+                    remove_dids,
+                    add_dids,
+                    add_key_packages,
+                } => {
+                    let remove_ids: Vec<Vec<u8>> =
+                        remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
+                    crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
                     &add_dids,
                     &add_key_packages,
                 )
                 .map_err(|error| MLSError::invalid_input(error.to_string()))?;
-                let swap_result =
-                    self.swap_members(group_id_bytes.clone(), remove_ids, add_key_packages)?;
-                (swap_result.commit_data, Some(swap_result.welcome_data))
-            }
-            CommitKind::UpdateMetadata {
-                group_info_extension,
-            } => {
-                let commit =
-                    self.update_group_metadata(group_id_bytes.clone(), group_info_extension)?;
-                (commit, None)
-            }
-        };
+                    let swap_result =
+                        self.swap_members(group_id_bytes.clone(), remove_ids, add_key_packages)?;
+                    (
+                        swap_result.commit_data,
+                        Some(swap_result.welcome_data),
+                        swap_result.next_confirmation_tag,
+                        swap_result.next_group_context_hash,
+                    )
+                }
+                CommitKind::UpdateMetadata {
+                    group_info_extension,
+                } => {
+                    let commit =
+                        self.update_group_metadata(group_id_bytes.clone(), group_info_extension)?;
+                    (commit, None, None, None)
+                }
+            };
 
         // Export GroupInfo from the pre-merge group state. OpenMLS will
         // re-export after merge; platforms that batch operations may want
@@ -7375,6 +7407,8 @@ impl MLSContext {
             group_info,
             source_epoch,
             target_epoch,
+            next_confirmation_tag,
+            next_group_context_hash,
         })
     }
 
@@ -8970,7 +9004,7 @@ impl MlsCryptoContext for MLSContext {
         MLSContext::propose_self_remove(self, group_id)
     }
 
-    fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+    fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<RemoveMembersResult, MLSError> {
         MLSContext::commit_pending_proposals(self, group_id)
     }
 

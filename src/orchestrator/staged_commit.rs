@@ -205,7 +205,12 @@ where
         // we intentionally DO NOT call the server, merge the commit, or
         // update any in-memory state here. All of that happens in
         // `confirm_commit`.
-        let (commit_bytes, welcome_bytes, kind_summary) = match kind {
+        let (
+            commit_bytes,
+            welcome_bytes,
+            (next_confirmation_tag, next_group_context_hash),
+            kind_summary,
+        ) = match kind {
             CommitKind::AddMembers {
                 member_dids,
                 key_packages,
@@ -225,6 +230,10 @@ where
                 (
                     add_result.commit_data,
                     Some(add_result.welcome_data),
+                    (
+                        add_result.next_confirmation_tag,
+                        add_result.next_group_context_hash,
+                    ),
                     StagedCommitKindSummary::AddMembers { member_dids },
                 )
             }
@@ -246,6 +255,10 @@ where
                 (
                     remove_res.commit_data,
                     None,
+                    (
+                        remove_res.next_confirmation_tag,
+                        remove_res.next_group_context_hash,
+                    ),
                     StagedCommitKindSummary::RemoveMembers { member_dids },
                 )
             }
@@ -260,7 +273,7 @@ where
                 )?;
                 let remove_ids: Vec<Vec<u8>> =
                     remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
-                let (commit_bytes, welcome_bytes) = if add_dids.is_empty() {
+                let (commit_bytes, welcome_bytes, next_coordinate) = if add_dids.is_empty() {
                     let aad_bytes = self
                         .prepare_commit_aad_context(
                             conversation_id,
@@ -275,18 +288,33 @@ where
                         remove_ids,
                         aad_bytes,
                     )?;
-                    (remove_res.commit_data, None)
+                    (
+                        remove_res.commit_data,
+                        None,
+                        (
+                            remove_res.next_confirmation_tag,
+                            remove_res.next_group_context_hash,
+                        ),
+                    )
                 } else {
                     let swap_result = self.mls_context().swap_members(
                         group_id_bytes.clone(),
                         remove_ids,
                         add_key_packages,
                     )?;
-                    (swap_result.commit_data, Some(swap_result.welcome_data))
+                    (
+                        swap_result.commit_data,
+                        Some(swap_result.welcome_data),
+                        (
+                            swap_result.next_confirmation_tag,
+                            swap_result.next_group_context_hash,
+                        ),
+                    )
                 };
                 (
                     commit_bytes,
                     welcome_bytes,
+                    next_coordinate,
                     StagedCommitKindSummary::SwapMembers {
                         remove_dids,
                         add_dids,
@@ -299,7 +327,12 @@ where
                 let commit_bytes = self
                     .mls_context()
                     .update_group_metadata(group_id_bytes.clone(), group_info_extension)?;
-                (commit_bytes, None, StagedCommitKindSummary::UpdateMetadata)
+                (
+                    commit_bytes,
+                    None,
+                    (None, None),
+                    StagedCommitKindSummary::UpdateMetadata,
+                )
             }
         };
 
@@ -379,6 +412,8 @@ where
             group_info,
             source_epoch,
             target_epoch,
+            next_confirmation_tag,
+            next_group_context_hash,
         })
     }
     /// Test-only helper to stage an AppData update commit directly and register
@@ -460,6 +495,8 @@ where
             group_info,
             source_epoch,
             target_epoch,
+            next_confirmation_tag: None,
+            next_group_context_hash: None,
         })
     }
 

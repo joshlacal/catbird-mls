@@ -181,7 +181,11 @@ fn decrypted_proposal_is_not_committable_until_explicit_acceptance() {
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].data, proposal_ref);
     assert!(
-        !alice.commit_pending_proposals(group_id).unwrap().is_empty(),
+        !alice
+            .commit_pending_proposals(group_id)
+            .unwrap()
+            .commit_data
+            .is_empty(),
         "an explicitly accepted proposal must become committable"
     );
 }

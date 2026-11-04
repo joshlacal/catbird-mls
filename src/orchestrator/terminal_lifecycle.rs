@@ -73,7 +73,7 @@ where
         if resolved.group_id != group_id {
             return Err(terminal_invalid("Welcome generation changed."));
         }
-        self.finish_available_welcome_adoption(conversation_id)
+        self.finish_available_welcome_adoption(conversation_id, false)
             .await?;
         Ok(())
     }

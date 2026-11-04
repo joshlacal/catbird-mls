@@ -20,6 +20,12 @@ use e2e_harness::mock_credentials::MockCredentials;
 use e2e_harness::mock_storage::MockStorage;
 use e2e_harness::TestWorld;
 
+// Canonical Welcome deliveries name production bare DIDs (`did:plc:` + 24
+// base32); `welcome_ack` rejects any other recipient (0b6b4e90).
+const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+
 struct InMemoryKeychain {
     store: std::sync::Mutex<HashMap<String, Vec<u8>>>,
 }
@@ -294,9 +300,9 @@ async fn reset_committed_after_send_preflight_blocks_encrypt_and_delivery() {
 #[tokio::test(flavor = "multi_thread")]
 async fn process_incoming_message_catches_up_missing_commits_before_decrypting() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
-    world.add_client("Carol").await;
+    world.add_client_with_did("Alice", ALICE).await;
+    world.add_client_with_did("Bob", BOB).await;
+    world.add_client_with_did("Carol", CAROL).await;
     let _alice_did = world
         .register_device("Alice")
         .await
@@ -339,7 +345,7 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
         .await
         .expect("alice send");
 
-    let api = world.delivery_service().clone_as("did:plc:bob");
+    let api = world.delivery_service().clone_as(BOB);
     let envelopes =
         MLSAPIClient::get_messages(&api, &convo.conversation_id, None, 20, None, None, None)
             .await
@@ -374,8 +380,8 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_fetches_app_messages_beyond_the_first_page() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
+    world.add_client_with_did("Alice", ALICE).await;
+    world.add_client_with_did("Bob", BOB).await;
     world
         .register_device("Alice")
         .await

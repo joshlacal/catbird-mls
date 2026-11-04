@@ -68,6 +68,11 @@ struct TestClientHarness {
 impl TestClientHarness {
     async fn new(name: &str, shared_server: &MockDeliveryService) -> Self {
         let did = format!("did:plc:{}", name.replace('-', "").to_lowercase());
+        Self::with_did(name, &did, shared_server).await
+    }
+
+    async fn with_did(name: &str, did: &str, shared_server: &MockDeliveryService) -> Self {
+        let did = did.to_string();
         let seq = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = std::env::temp_dir().join(format!(
             "catbird_mls_full_rust_recovery_{}_{}_{}_{}",
@@ -165,8 +170,17 @@ struct RecoverySchedulerFixture {
 impl RecoverySchedulerFixture {
     async fn with_missing_local_group_and_available_welcome() -> Self {
         let shared_server = MockDeliveryService::new("did:plc:bootstrap");
-        let alice = TestClientHarness::new("alice", &shared_server).await;
-        let bob = TestClientHarness::new("bob", &shared_server).await;
+        // Canonical Welcome deliveries name production bare DIDs (`did:plc:`
+        // + 24 base32); `welcome_ack` rejects any other recipient (0b6b4e90).
+        let alice = TestClientHarness::with_did(
+            "alice",
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            &shared_server,
+        )
+        .await;
+        let bob =
+            TestClientHarness::with_did("bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", &shared_server)
+                .await;
 
         alice.initialize().await;
         bob.initialize().await;

@@ -5752,8 +5752,8 @@ where
                 Some(aad_ctx.transition_id.clone()),
                 None,
                 None,
-                Some(next_tag),
-                Some(next_gch),
+                next_tag,
+                next_gch,
                 Some(metadata_snapshot),
             )
             .await;
@@ -5896,17 +5896,35 @@ where
         let convo_id = &resolved.conversation_id;
         let group_id_bytes = resolved.group_id_bytes()?;
 
-        let server_result = self
-            .submit_commit_transition_helper(
-                convo_id,
-                &group_id_bytes,
-                plan.target_epoch,
-                &plan.commit_bytes,
-                plan.welcome_bytes.as_deref(),
-                add_dids,
-                Some(provenance_packages.as_slice()),
-            )
-            .await;
+        // The signed `next` coordinate is the staged successor's, like the
+        // recovery and removal paths; the source epoch's tag/hash would be
+        // rejected by the DS and by every joiner of the Welcome.
+        let server_result = match (
+            plan.next_confirmation_tag.clone(),
+            plan.next_group_context_hash.clone(),
+        ) {
+            (Some(next_tag), Some(next_gch)) => {
+                self.submit_commit_transition_helper_inner(
+                    convo_id,
+                    &group_id_bytes,
+                    plan.target_epoch,
+                    &plan.commit_bytes,
+                    plan.welcome_bytes.as_deref(),
+                    add_dids,
+                    Some(provenance_packages.as_slice()),
+                    None,
+                    None,
+                    None,
+                    next_tag,
+                    next_gch,
+                    None,
+                )
+                .await
+            }
+            _ => Err(OrchestratorError::Mls(MLSError::Internal(
+                "staged swap produced no successor coordinate".into(),
+            ))),
+        };
 
         match server_result {
             Ok(result) => {
@@ -6023,17 +6041,18 @@ where
             ))
         })?;
 
-        let commit_bytes = match self
+        let staged = match self
             .mls_context()
             .commit_pending_proposals(group_id_bytes.clone())
         {
-            Ok(bytes) => bytes,
+            Ok(staged) => staged,
             Err(crate::MLSError::InvalidInput { .. }) => {
                 tracing::debug!(convo_id, "No pending proposals to commit");
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
         };
+        let commit_bytes = staged.commit_data;
 
         let hash = Sha256::digest(&commit_bytes).to_vec();
         self.track_epoch_changing_own_commit(
@@ -6046,18 +6065,32 @@ where
         )
         .await;
 
-        if let Err(send_error) = self
-            .submit_commit_transition_helper(
-                convo_id,
-                &group_id_bytes,
-                target_epoch,
-                &commit_bytes,
-                None,
-                &[],
-                None,
-            )
-            .await
-        {
+        // The signed `next` coordinate is the staged successor's, as in
+        // swap_members; the source epoch's tag/hash names the wrong epoch.
+        let send_result = match (staged.next_confirmation_tag, staged.next_group_context_hash) {
+            (Some(next_tag), Some(next_gch)) => {
+                self.submit_commit_transition_helper_inner(
+                    convo_id,
+                    &group_id_bytes,
+                    target_epoch,
+                    &commit_bytes,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    next_tag,
+                    next_gch,
+                    None,
+                )
+                .await
+            }
+            _ => Err(OrchestratorError::Mls(MLSError::Internal(
+                "pending-proposal commit produced no successor coordinate".into(),
+            ))),
+        };
+        if let Err(send_error) = send_result {
             if let Err(cleanup_error) = self
                 .mls_context()
                 .clear_pending_commit(group_id_bytes.clone())
@@ -7012,34 +7045,6 @@ where
         }
     }
 
-    async fn submit_commit_transition_helper(
-        &self,
-        conversation_id: &str,
-        group_id: &[u8],
-        target_epoch: u64,
-        commit_bytes: &[u8],
-        welcome_bytes: Option<&[u8]>,
-        member_dids: &[String],
-        key_packages_for_provenance: Option<&[crate::KeyPackageData]>,
-    ) -> Result<AddMembersServerResult> {
-        self.submit_commit_transition_helper_inner(
-            conversation_id,
-            group_id,
-            target_epoch,
-            commit_bytes,
-            welcome_bytes,
-            member_dids,
-            key_packages_for_provenance,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
     pub(crate) async fn prepare_commit_aad_context(
         &self,
         conversation_id: &str,
@@ -7182,8 +7187,8 @@ where
         custom_transition_id: Option<String>,
         custom_metadata_ciphertext: Option<Vec<u8>>,
         custom_metadata_version: Option<u64>,
-        custom_next_confirmation_tag: Option<Vec<u8>>,
-        custom_next_group_context_hash: Option<Vec<u8>>,
+        next_tag_bytes: Vec<u8>,
+        next_gch_bytes: Vec<u8>,
         custom_metadata_snapshot: Option<serde_json::Value>,
     ) -> Result<AddMembersServerResult> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -7408,9 +7413,6 @@ where
             "stateVersion": prior_sv
         });
 
-        let next_tag_bytes = custom_next_confirmation_tag.unwrap_or(tag_bytes.clone());
-        let next_gch_bytes = custom_next_group_context_hash.unwrap_or(gc_hash_bytes.clone());
-
         let next_clean = serde_json::json!({
             "confirmationTag": { "$bytes": STANDARD.encode(&next_tag_bytes) },
             "conversationId": conversation_id,
@@ -7608,28 +7610,6 @@ where
             new_epoch: server_epoch,
             receipt,
         })
-    }
-
-    async fn submit_remove_transition_helper(
-        &self,
-        conversation_id: &str,
-        group_id: &[u8],
-        target_epoch: u64,
-        commit_bytes: &[u8],
-        member_dids: &[String],
-    ) -> Result<()> {
-        let _ = self
-            .submit_commit_transition_helper(
-                conversation_id,
-                group_id,
-                target_epoch,
-                commit_bytes,
-                None,
-                member_dids,
-                None,
-            )
-            .await?;
-        Ok(())
     }
 
     pub async fn put_group_metadata_blob(

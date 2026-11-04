@@ -755,6 +755,8 @@ async fn test_concurrent_force_rejoin_deduped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_join_or_rejoin_deduped() {
+    use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     let _did = world.register_device("Alice").await.unwrap();
@@ -774,8 +776,10 @@ async fn test_concurrent_join_or_rejoin_deduped() {
         .delete_group(group_id_bytes)
         .expect("delete_group failed");
 
-    // Clean-chat has no GroupInfo: a leafless admin with no other live leaf
-    // recovers by resetting the conversation from server state.
+    // Clean-chat has no GroupInfo, and background recovery never resets a
+    // conversation on its own (9797cf6a): a leafless device whose server
+    // reports no leaf set asks a live leaf to re-add it, even when a reset
+    // would be accepted.
     world
         .delivery_service()
         .set_conversation_leaves_for_test(&convo.conversation_id, vec![]);
@@ -787,14 +791,36 @@ async fn test_concurrent_join_or_rejoin_deduped() {
     let join2 = alice.orchestrator.join_or_rejoin(&convo.conversation_id);
     let (r1, r2): (OrcResult<u64>, OrcResult<u64>) = tokio::join!(join1, join2);
 
-    assert!(r1.is_ok(), "First join_or_rejoin failed: {:?}", r1.err());
-    assert!(r2.is_ok(), "Second join_or_rejoin failed: {:?}", r2.err());
+    // 9797cf6a: both callers wait on the one open re-add request.
+    let pending = format!(
+        "leaf recovery pending for {}. Keep another current device online to finish adding this device.",
+        convo.conversation_id
+    );
+    for (label, result) in [("First", r1), ("Second", r2)] {
+        match result {
+            Err(OrchestratorError::RecoveryFailed(msg)) => {
+                assert_eq!(msg, pending, "{label} join_or_rejoin")
+            }
+            other => {
+                panic!("{label} join_or_rejoin: expected pending leaf recovery, got {other:?}")
+            }
+        }
+    }
+    let requests = world.delivery_service().submitted_prepared_requests();
     assert_eq!(
-        world
-            .delivery_service()
-            .bootstrap_reset_group_call_count(&convo.conversation_id),
+        requests
+            .iter()
+            .filter(|r| r.operation == CanonicalOperation::RequestLeafRecovery)
+            .count(),
         1,
-        "Only one reset should be activated for concurrent join_or_rejoin calls"
+        "Only one leaf recovery request should be opened for concurrent join_or_rejoin calls"
+    );
+    assert!(
+        !requests.iter().any(|r| matches!(
+            r.operation,
+            CanonicalOperation::RequestReset | CanonicalOperation::ActivateReset
+        )),
+        "background recovery must never reset the conversation"
     );
 }
 
@@ -867,6 +893,9 @@ async fn test_sync_rejoin_skips_when_attempt_in_flight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
+    use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+    use catbird_mls::orchestrator::reset_flow::ResetOutcome;
+
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.add_client("Bob").await;
@@ -935,8 +964,9 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         .delete_group(group_id_bytes.clone())
         .expect("delete_group failed");
 
-    // Clean-chat has no GroupInfo: the leafless admin recovers by resetting
-    // the conversation from server state, keyed by the stable conversation id.
+    // Clean-chat has no GroupInfo, and background recovery never resets a
+    // conversation on its own (9797cf6a): sync asks a live leaf to re-add
+    // this leafless device, keyed by the stable conversation id.
     world
         .delivery_service()
         .set_conversation_leaves_for_test(&conversation_id, vec![]);
@@ -947,33 +977,81 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     let result = alice.orchestrator.sync_with_server(false).await;
     assert!(result.is_ok(), "sync failed: {:?}", result.err());
 
+    let recovery_requests: Vec<serde_json::Value> = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|r| r.operation == CanonicalOperation::RequestLeafRecovery)
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(r.body.as_deref().expect("signed body"))
+                .expect("signed JSON body")["signedRequest"]["body"]
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        recovery_requests.len(),
+        1,
+        "sync rejoin should open one leaf recovery request"
+    );
+    assert_eq!(
+        recovery_requests[0]["prior"]["conversationId"],
+        conversation_id.as_str(),
+        "sync rejoin should request recovery by stable conversation ID"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&conversation_id),
+        0,
+        "background recovery must never reset the conversation"
+    );
+
+    // Only an explicit admin reset replaces the generation (9797cf6a); it
+    // is keyed by the same stable conversation id.
+    let outcome = alice
+        .orchestrator
+        .reset_conversation(&conversation_id, "localStateLost")
+        .await
+        .expect("explicit admin reset");
+    assert_eq!(outcome, ResetOutcome::Activated { epoch: 0 });
     assert_eq!(
         world
             .delivery_service()
             .bootstrap_reset_group_call_count(&conversation_id),
         1,
-        "sync rejoin should reset by stable conversation ID"
+        "admin reset should reset by stable conversation ID"
     );
     assert_eq!(
         world
             .delivery_service()
             .bootstrap_reset_group_call_count(&group_id),
         0,
-        "sync rejoin must not key recovery by mutable MLS group ID"
+        "recovery must not key resets by mutable MLS group ID"
     );
     let old_group_id = group_id;
+    // The sync that only opened a recovery request still projected the old
+    // server mapping; the durable mapping names the reset successor.
     let group_id = alice
-        .orchestrator
-        .group_states()
-        .lock()
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
         .await
-        .values()
-        .find(|state| state.conversation_id == conversation_id)
-        .map(|state| state.group_id.clone())
-        .expect("rejoined conversation has a current group state");
+        .expect("read conversation mapping")
+        .expect("stable conversation mapping")
+        .group_id;
     assert_ne!(
         group_id, old_group_id,
         "reset must activate a successor group"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .get(&group_id)
+            .map(|state| state.conversation_id.clone()),
+        Some(conversation_id.clone()),
+        "rejoined conversation has a current group state"
     );
     assert!(
         alice
@@ -1129,7 +1207,11 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
     };
 
     // The server reports no leaf set, so a reset is never assumed safe: the
-    // device asks a live leaf to re-add it and waits.
+    // device asks a live leaf to re-add it and waits. (A roster naming only
+    // this device's own leaf skips the request entirely: 9797cf6a.)
+    world
+        .delivery_service()
+        .set_conversation_leaves_for_test(&convo.conversation_id, vec![]);
     let first = alice
         .orchestrator
         .join_or_rejoin(&convo.conversation_id)

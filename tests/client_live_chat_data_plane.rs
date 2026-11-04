@@ -3267,11 +3267,26 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
         "queued witness duty for D must be dropped"
     );
 
+    // D's account deletion purged its mailbox: its epoch head is gone (404 `EpochNotFound`). The
+    // survivor's next message still archives, to a roster without D.
+    ds.inner.lock().unwrap().labyrinth_epochs.remove(ALICE_DID);
+    let b2 = uuid::Uuid::new_v4().to_string();
+    bob.send_message(&cid, &b2, "after D's deletion").unwrap();
+    bob.flush_labyrinth_queue()
+        .expect("a deleted account's purged epoch head never blocks the survivor's archive");
+    assert!(bob
+        .list_pending_labyrinth_queue(Some(&cid), 100)
+        .unwrap()
+        .is_empty());
+
     // Fresh restore: the peer's own copy must come back from the Space too.
     bob.db()
         .write_tx(|tx| {
             tx.conn()
-                .execute("DELETE FROM messages WHERE message_id = ?1", [&b1])
+                .execute(
+                    "DELETE FROM messages WHERE message_id IN (?1, ?2)",
+                    [&b1, &b2],
+                )
                 .unwrap();
             Ok(())
         })
@@ -3287,6 +3302,10 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
     assert!(
         restored.iter().any(|m| m.message_id == b1),
         "peer's own message stays"
+    );
+    assert!(
+        restored.iter().any(|m| m.message_id == b2),
+        "the survivor's post-deletion message is archived"
     );
 
     // A fresh recovery-code device never sees `getEntries`: only the signed state list.
@@ -3332,6 +3351,7 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
         "fresh device must hide every pre-deletion copy of D's messages"
     );
     assert!(restored2.iter().any(|m| m.message_id == b1));
+    assert!(restored2.iter().any(|m| m.message_id == b2));
 }
 
 /// Cold start: the DS authenticates `ConversationNotFound` and this device holds no local state
@@ -3802,4 +3822,85 @@ fn c33_pruned_opening_keeps_imported_devices_and_terminates_fresh_ones() {
             1
         );
     }
+}
+
+/// `directRequestEntry.publicationReceipt` is a closed union with the single
+/// option `#signedDirectRequestReceipt`: its `$type` is required and exact.
+/// A missing or wrong tag rejects the opening before any local effect.
+#[test]
+fn c33_opening_publication_receipt_requires_exact_union_tag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let open = |name: &str, did: &str| {
+        let client = CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: tmp.path().join(name).to_string_lossy().into_owned(),
+                account_did: did.to_string(),
+                device_id: uuid::Uuid::new_v4().to_string(),
+                home_ds_did: DS_DID.to_string(),
+                home_ds_endpoint: DS_URL.to_string(),
+                pds_endpoint: PDS_URL.to_string(),
+            },
+            Arc::new(MemKeyStore::new()),
+            ds.for_account(did),
+            None,
+        )
+        .expect("open client");
+        client.enroll_device(&scopes).expect("enroll");
+        client
+    };
+    let alice = open("alice", ALICE_DID);
+    let bob = open("bob", BOB_DID);
+    let cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            None,
+            Some("opening".into()),
+        )
+        .expect("alice C33 request");
+    let set_receipt_tag = |tag: Option<&str>| {
+        let mut g = ds.inner.lock().unwrap();
+        let receipt = g
+            .entries
+            .get_mut(&cid)
+            .unwrap()
+            .iter_mut()
+            .find(|e| e["$type"] == "blue.catbird.chat.defs#directRequestEntry")
+            .unwrap()["publicationReceipt"]
+            .as_object_mut()
+            .unwrap();
+        match tag {
+            Some(tag) => receipt.insert("$type".into(), json!(tag)),
+            None => receipt.remove("$type"),
+        };
+    };
+    for (name, tag, reason) in [
+        ("missing $type", None, "requires $type"),
+        (
+            "wrong $type",
+            Some("blue.catbird.chat.defs#directRequestReceiptBody"),
+            "$type must be",
+        ),
+    ] {
+        set_receipt_tag(tag);
+        // The addressed device itself: a rejected opening leaves nothing behind.
+        let error = bob.sync().expect_err(name).to_string();
+        assert!(error.contains("C33 publication receipt"), "{name}: {error}");
+        assert!(error.contains(reason), "{name}: {error}");
+        assert!(bob.list_requests(None).unwrap().is_empty(), "{name}");
+        assert!(
+            bob.list_conversations(None, 20).unwrap().is_empty(),
+            "{name}"
+        );
+    }
+    set_receipt_tag(Some("blue.catbird.chat.defs#signedDirectRequestReceipt"));
+    bob.sync().expect("exact tag imports the opening");
+    assert_eq!(bob.list_requests(Some("incomingPending")).unwrap().len(), 1);
 }

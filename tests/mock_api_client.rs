@@ -44,6 +44,9 @@ struct StoredConversation {
     /// `deviceLeafView`s reported in `state.leaves`; omitted from the wire
     /// response while `None`, like a pre-leaves server.
     leaves: Option<Vec<serde_json::Value>>,
+    /// `coordinates.stateVersion`: the DS's current version is the `next`
+    /// version of the last transition it accepted.
+    state_version: u64,
 }
 
 fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Value {
@@ -75,7 +78,7 @@ fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Val
             "groupId": base64::engine::general_purpose::STANDARD.encode(group_id_bytes),
             "epoch": conversation.view.epoch,
             "generation": 0,
-            "stateVersion": 0,
+            "stateVersion": conversation.state_version,
             "lifecycle": "active",
             "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
             "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
@@ -109,6 +112,44 @@ fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Val
         }
     }
     state
+}
+
+/// The DS binds a Welcome delivery to the KeyPackage it handed out: the
+/// delivery expires exactly at that package's `not_after`, and the Add leaf
+/// carries its RefHash and signature key id.
+#[derive(Debug, Clone)]
+struct HandedOutKeyPackage {
+    expires_at: String,
+    key_id: String,
+}
+
+/// `(RefHash, binding)` of an MLS-framed KeyPackage; `None` for fixture
+/// bytes that are not a valid package.
+fn handed_out_key_package(data: &[u8]) -> Option<(String, HandedOutKeyPackage)> {
+    use openmls::prelude::{
+        tls_codec::DeserializeBytes as _, MlsMessageBodyIn, MlsMessageIn, ProtocolVersion,
+    };
+    use openmls_traits::OpenMlsProvider as _;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let MlsMessageBodyIn::KeyPackage(package) = MlsMessageIn::tls_deserialize_exact_bytes(data)
+        .ok()?
+        .extract()
+    else {
+        return None;
+    };
+    let package = package
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .ok()?;
+    let reference = package.hash_ref(provider.crypto()).ok()?;
+    let expires_at = chrono::DateTime::from_timestamp(package.life_time().not_after() as i64, 0)?
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        package.leaf_node().signature_key().as_slice(),
+    ));
+    Some((
+        base64::engine::general_purpose::STANDARD.encode(reference.as_slice()),
+        HandedOutKeyPackage { expires_at, key_id },
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +258,8 @@ struct MockState {
 
     /// Key packages per DID (consumed FIFO by `get_key_packages`).
     key_packages: HashMap<String, Vec<StoredKeyPackage>>,
+    /// Every KeyPackage `get_key_packages` handed out, by base64 RefHash.
+    handed_out_key_packages: HashMap<String, HandedOutKeyPackage>,
 
     /// Devices per DID.
     devices: HashMap<String, Vec<StoredDevice>>,
@@ -1653,6 +1696,7 @@ impl MockDeliveryService {
             metadata_snapshot: None,
             participants: None,
             leaves: None,
+            state_version: 0,
         };
         let state_val = conversation_state_json(&stored);
         stored.view.canonical_state =
@@ -2913,6 +2957,7 @@ impl MLSAPIClient for MockDeliveryService {
                 current["metadataSnapshot"] = inner_body["metadataSnapshot"].clone();
                 let stored = guard.conversations.get_mut(&cid).unwrap();
                 stored.view.epoch = inner_body["next"]["epoch"].as_u64().unwrap();
+                stored.state_version = inner_body["next"]["stateVersion"].as_u64().unwrap();
                 stored.members.retain(|m| m != requester && !m.starts_with(&format!("{requester}#")));
                 stored.view.members.retain(|m| m.did != requester && !m.did.starts_with(&format!("{requester}#")));
                 stored.leaves = current["leaves"].as_array().cloned();
@@ -2999,6 +3044,7 @@ impl MLSAPIClient for MockDeliveryService {
                 let stored = guard.conversations.get_mut(cid).unwrap();
                 let participants = current["participants"].as_array().unwrap();
                 stored.participants = Some(participants.clone());
+                stored.state_version = inner_body["next"]["stateVersion"].as_u64().unwrap();
                 stored.members = participants.iter().map(|p| p["userDid"].as_str().unwrap().to_string()).collect();
                 stored.view.members = participants.iter().map(|p| MemberView { did:p["userDid"].as_str().unwrap().into(), role:if p["role"] == "admin" { MemberRole::Admin } else { MemberRole::Member } }).collect();
                 stored.view.canonical_state = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(&serde_json::to_vec(&current).unwrap()).ok();
@@ -3058,6 +3104,7 @@ impl MLSAPIClient for MockDeliveryService {
                 current["metadataSnapshot"]=inner_body["metadataSnapshot"].clone();
                 let stored=guard.conversations.get_mut(cid).unwrap();
                 stored.view.epoch=inner_body["next"]["epoch"].as_u64().unwrap();
+                stored.state_version=inner_body["next"]["stateVersion"].as_u64().unwrap();
                 stored.leaves=Some(leaves);
                 stored.participants=current["participants"].as_array().cloned();
                 stored.metadata_snapshot=Some(current["metadataSnapshot"].clone());
@@ -3227,6 +3274,9 @@ impl MLSAPIClient for MockDeliveryService {
                     } {
                         stored.view.epoch += 1;
                         new_epoch = stored.view.epoch;
+                        if let Some(version) = inner_body.pointer("/next/stateVersion").and_then(|v| v.as_u64()) {
+                            stored.state_version = version;
+                        }
                         if let Some(snapshot) = inner_body.get("metadataSnapshot") {
                             stored.metadata_snapshot = Some(snapshot.clone());
                         }
@@ -3348,6 +3398,7 @@ impl MLSAPIClient for MockDeliveryService {
                             .and_then(|w| w.as_str())
                             .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                     });
+                let mut added_leaves: Vec<serde_json::Value> = Vec::new();
                 if let Some(w_bytes) = welcome_bytes_opt {
                     let group_id_opt = guard.conversations.get(&convo_id).map(|c| c.view.group_id.clone());
                     let recovery_target = recovery_request_id.as_ref().and_then(|_| {
@@ -3391,6 +3442,10 @@ impl MLSAPIClient for MockDeliveryService {
                                     }
                                 }
                                 for delivery in deliveries {
+                                    let handed_out = delivery["provenance"]["keyPackageRef"]
+                                        .as_str()
+                                        .and_then(|reference| guard.handed_out_key_packages.get(reference))
+                                        .cloned();
                                     let welcome = serde_json::json!({
                                         "$type": "blue.catbird.chat.defs#welcomeView",
                                         "welcomeId": bundle["welcomeId"],
@@ -3402,10 +3457,62 @@ impl MLSAPIClient for MockDeliveryService {
                                         "opaqueWelcome": bundle["opaqueWelcome"],
                                         "sha256": bundle["sha256"],
                                         "provenance": delivery["provenance"],
-                                        "expiresAt": expires_at,
+                                        "expiresAt": handed_out.as_ref().map_or(&expires_at, |package| &package.expires_at),
                                         "status": "pending",
                                     });
                                     guard.welcome_deliveries.push(welcome);
+                                    // The accepted Add lists the recipient's exact
+                                    // device leaf (`deviceLeafView`) in the state.
+                                    if let Some(package) = handed_out {
+                                        added_leaves.push(serde_json::json!({
+                                            "userDid": delivery["recipientDid"],
+                                            "deviceId": delivery["recipientDeviceId"],
+                                            "keyId": package.key_id,
+                                            "deviceStatus": "active",
+                                            "leafOrigin": "keyPackage",
+                                            "joinKeyPackageRef": delivery["provenance"]["keyPackageRef"],
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let add_leaves = |leaves: &mut Vec<serde_json::Value>| {
+                    for leaf in &added_leaves {
+                        leaves.retain(|old| !(old["userDid"] == leaf["userDid"] && old["deviceId"] == leaf["deviceId"]));
+                        leaves.push(leaf.clone());
+                    }
+                };
+                let stored = if guard.conversations.contains_key(&convo_id) {
+                    guard.conversations.get_mut(&convo_id)
+                } else {
+                    guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+                };
+                if let Some(leaves) = stored.and_then(|stored| stored.leaves.as_mut()) {
+                    add_leaves(leaves);
+                }
+                // The DS has one current state: an accepted transition also
+                // advances a point-read state recorded by an earlier transition.
+                if !is_policy_transition && !has_inbox_recovery {
+                    if let Some(state) = guard.lifecycle_state_overrides.get_mut(&convo_id) {
+                        let mut next = inner_body["next"].clone();
+                        for key in ["groupId", "confirmationTag", "groupContextHash"] {
+                            if let Some(bytes) = next[key]["$bytes"].as_str() {
+                                next[key] = serde_json::json!(bytes);
+                            }
+                        }
+                        state["coordinates"] = next;
+                        state["snapshotSeq"] = serde_json::json!(state["snapshotSeq"].as_u64().unwrap_or(1) + 1);
+                        if let Some(snapshot) = inner_body.get("metadataSnapshot") {
+                            state["metadataSnapshot"] = snapshot.clone();
+                        }
+                        if let Some(leaves) = state["leaves"].as_array_mut() {
+                            add_leaves(leaves);
+                            let leaves = leaves.clone();
+                            if let Some(participants) = state["participants"].as_array_mut() {
+                                for participant in participants {
+                                    participant["leafCount"] = serde_json::json!(leaves.iter().filter(|leaf| leaf["userDid"] == participant["userDid"]).count());
                                 }
                             }
                         }
@@ -3660,6 +3767,7 @@ impl MLSAPIClient for MockDeliveryService {
                 current["snapshotSeq"] = serde_json::json!(seq);
                 let stored = guard.conversations.get_mut(cid).unwrap();
                 stored.view.epoch = inner_body["next"]["epoch"].as_u64().unwrap();
+                stored.state_version = inner_body["next"]["stateVersion"].as_u64().unwrap();
                 stored.participants = current["participants"].as_array().cloned();
                 guard.lifecycle_state_overrides.insert(cid.into(), current);
                 guard.leaf_recovery_inbox_items.push(recovery.clone());
@@ -4255,6 +4363,9 @@ impl MLSAPIClient for MockDeliveryService {
             if let Some(packages) = packages_opt {
                 if let Some(pkg) = packages.first().cloned() {
                     packages.remove(0);
+                    if let Some((reference, binding)) = handed_out_key_package(&pkg.data) {
+                        guard.handed_out_key_packages.insert(reference, binding);
+                    }
                     result.push(KeyPackageRef {
                         did: did.clone(),
                         key_package_data: pkg.data,

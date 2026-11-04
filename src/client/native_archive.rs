@@ -522,8 +522,18 @@ impl CatbirdMlsClient {
                                 end += 1;
                             }
                             let chunk = &payloads[start..end];
+                            // A verified account deletion purged that account's mailbox: its
+                            // missing epoch head must not block the survivors' archive. Only the
+                            // recorded `accountDeletedEntry` excludes it, never a server 404.
+                            let roster: Vec<String> = self.db.read_tx(|tx| {
+                                let mut kept = Vec::new();
+                                for did in &first.expected_member_dids {
+                                    if tx.get_labyrinth_state(&super::live_sync::account_deletion_key(&cid, did))?.is_none() { kept.push(did.clone()); }
+                                }
+                                Ok(kept)
+                            })?;
                             let denied = if owner_only { true } else {
-                                match session.archive_native_sender(&cid, &first.expected_member_dids, chunk).await.map_err(native_archive_error)? {
+                                match session.archive_native_sender(&cid, &roster, chunk).await.map_err(native_archive_error)? {
                                     Ok(()) => false,
                                     Err(labyrinth::Error::Forbidden) => true,
                                     Err(error) => return Err(MLSError::Cryptography(format!("sender archive: {error}"))),

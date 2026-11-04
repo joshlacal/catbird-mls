@@ -25,6 +25,7 @@
 
 mod e2e_harness;
 
+use base64::Engine as _;
 use catbird_mls::orchestrator::{
     ConversationState, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
     OrchestratorError, ResetRecordOutcome,
@@ -33,6 +34,11 @@ use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use std::sync::Arc;
 
 use e2e_harness::TestWorld;
+
+// Canonical Welcome deliveries name production bare DIDs (`did:plc:` + 24
+// base32); `welcome_ack` rejects any other recipient (0b6b4e90).
+const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
 
 // ---------------------------------------------------------------------------
 // 1. Idempotency: duplicate event collapses to single persisted row.
@@ -1486,45 +1492,47 @@ async fn welcome_network_error_with_reset_pending_never_authorizes_external_comm
     );
 }
 
+/// Real admission (invite → accept → fulfill): Alice invites Bob, Bob accepts,
+/// Alice adds Bob's accepted device. Bob's Welcome stays pending until he
+/// adopts it; a pending participant is never added directly.
+async fn create_and_admit_bob(
+    world: &TestWorld,
+    name: &str,
+) -> catbird_mls::orchestrator::ConversationView {
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let conversation = alice
+        .orchestrator
+        .create_group(name, Some(std::slice::from_ref(&bob.did)), None)
+        .await
+        .expect("Alice invites Bob");
+    bob.orchestrator
+        .accept_conversation(&conversation.conversation_id)
+        .await
+        .expect("Bob accepts the invitation");
+    alice
+        .orchestrator
+        .fulfill_leaf_recovery(&conversation.conversation_id)
+        .await
+        .expect("Alice adds Bob's accepted device");
+    conversation
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completion() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
+    world.add_client_with_did("Alice", ALICE).await;
+    world.add_client_with_did("Bob", BOB).await;
     world
         .register_device("Alice")
         .await
         .expect("register Alice");
     world.register_device("Bob").await.expect("register Bob");
-    let alice = world.client("Alice");
     let bob = world.client("Bob");
 
-    let original = alice
-        .orchestrator
-        .create_group(
-            "reset welcome baseline",
-            Some(std::slice::from_ref(&bob.did)),
-            None,
-        )
-        .await
-        .expect("create baseline conversation");
-    alice
-        .orchestrator
-        .swap_members(
-            &original.conversation_id,
-            &[],
-            std::slice::from_ref(&bob.did),
-        )
-        .await
-        .expect("add bob to baseline");
-    let baseline_welcome = world
-        .delivery_service()
-        .clone_as(&bob.did)
-        .get_welcome(&original.conversation_id)
-        .await
-        .expect("baseline Welcome for Bob");
+    let original = create_and_admit_bob(&world, "reset welcome baseline").await;
     bob.orchestrator
-        .join_group(&baseline_welcome)
+        .join_or_rejoin(&original.conversation_id)
         .await
         .expect("Bob joins baseline conversation");
     bob.storage
@@ -1545,16 +1553,7 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         )
         .expect("materialize loser bootstrap candidate");
 
-    let winner = alice
-        .orchestrator
-        .create_group("reset winner", Some(std::slice::from_ref(&bob.did)), None)
-        .await
-        .expect("winner creates replacement group and Welcome");
-    alice
-        .orchestrator
-        .swap_members(&winner.conversation_id, &[], std::slice::from_ref(&bob.did))
-        .await
-        .expect("add bob to winner");
+    let winner = create_and_admit_bob(&world, "reset winner").await;
     world
         .delivery_service()
         .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
@@ -1767,43 +1766,25 @@ async fn setup_winner_welcome_adoption_fixture(
     generation: i32,
 ) -> (TestWorld, String, Vec<u8>, String) {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
+    world.add_client_with_did("Alice", ALICE).await;
+    world.add_client_with_did("Bob", BOB).await;
     world
         .register_device("Alice")
         .await
         .expect("register Alice");
     world.register_device("Bob").await.expect("register Bob");
-    let alice = world.client("Alice");
     let bob = world.client("Bob");
-    let original = alice
-        .orchestrator
-        .create_group(
-            "winner adoption baseline",
-            Some(std::slice::from_ref(&bob.did)),
-            None,
-        )
-        .await
-        .expect("create baseline");
-    alice
-        .orchestrator
-        .swap_members(
-            &original.conversation_id,
-            &[],
-            std::slice::from_ref(&bob.did),
-        )
-        .await
-        .expect("add bob to baseline");
-    let baseline_welcome = world
-        .delivery_service()
-        .clone_as(&bob.did)
-        .get_welcome(&original.conversation_id)
-        .await
-        .expect("baseline Welcome");
+    let original = create_and_admit_bob(&world, "winner adoption baseline").await;
     bob.orchestrator
-        .join_group(&baseline_welcome)
+        .join_or_rejoin(&original.conversation_id)
         .await
         .expect("Bob joins baseline");
+    // A real client lists the joined conversation before any reset arrives;
+    // that sync, not the join, caches its view.
+    bob.orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("Bob syncs the joined baseline");
     let loser = vec![loser_byte; 32];
     bob.orchestrator
         .record_group_reset(&original.conversation_id, loser.clone(), generation)
@@ -1817,20 +1798,7 @@ async fn setup_winner_welcome_adoption_fixture(
             Some(catbird_mls::GroupConfig::default()),
         )
         .expect("materialize loser");
-    let winner = alice
-        .orchestrator
-        .create_group(
-            "authoritative winner",
-            Some(std::slice::from_ref(&bob.did)),
-            None,
-        )
-        .await
-        .expect("create winner");
-    alice
-        .orchestrator
-        .swap_members(&winner.conversation_id, &[], std::slice::from_ref(&bob.did))
-        .await
-        .expect("add bob to winner");
+    let winner = create_and_admit_bob(&world, "authoritative winner").await;
     world
         .delivery_service()
         .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
@@ -2020,17 +1988,43 @@ async fn welcome_not_matching_server_winner_is_deleted_without_touching_loser_au
     let (world, conversation_id, loser, welcome_group_id) =
         setup_winner_welcome_adoption_fixture(0x95, 51).await;
     let bob = world.client("Bob");
-    let competing_server_winner = hex::encode(vec![0x96; 32]);
+    // The DS point read (getConversationState) names the reset winner that a
+    // Welcome must match; the list projection is only an unverified host
+    // mapping. Here the server chose a group other than this Welcome's.
+    let competing_server_winner = vec![0x96; 32];
+    let mut state = world
+        .delivery_service()
+        .lifecycle_state(&conversation_id)
+        .expect("server conversation state");
+    state["coordinates"]["groupId"] = serde_json::json!(
+        base64::engine::general_purpose::STANDARD.encode(&competing_server_winner)
+    );
     world
         .delivery_service()
-        .set_conversation_group_id_for_test(&conversation_id, &competing_server_winner);
+        .set_lifecycle_state_for_test(&conversation_id, state);
+    world.delivery_service().set_conversation_group_id_for_test(
+        &conversation_id,
+        &hex::encode(&competing_server_winner),
+    );
+    let durable_before = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read stable conversation")
+        .expect("stable conversation persisted");
 
-    let error = bob
-        .orchestrator
+    bob.orchestrator
         .join_or_rejoin(&conversation_id)
         .await
         .expect_err("unbound Welcome must fail closed");
-    assert!(error.to_string().contains("authoritative server mapping"));
+    let durable_after = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("reread stable conversation")
+        .expect("stable conversation survives");
+    assert_eq!(durable_after.group_id, durable_before.group_id);
+    assert_eq!(durable_after.epoch, durable_before.epoch);
     let pending = bob
         .storage
         .get_persisted_reset_pending(&conversation_id)

@@ -8,6 +8,11 @@ use catbird_mls::MLSError;
 use chrono::{Duration, Utc};
 use e2e_harness::TestWorld;
 
+// Canonical Welcome deliveries name production bare DIDs (`did:plc:` + 24
+// base32); `welcome_ack` rejects any other recipient (0b6b4e90).
+const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
 #[derive(Clone, Copy)]
 enum JoinWriteFailure {
     SetGroupState,
@@ -246,8 +251,8 @@ async fn join_group_join_info_failure_rolls_back_the_whole_join() {
 #[tokio::test(flavor = "multi_thread")]
 async fn join_or_rejoin_projection_failure_withholds_cache_and_active_success() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
+    world.add_client_with_did("Alice", ALICE).await;
+    world.add_client_with_did("Bob", BOB).await;
     world.register_device("Alice").await.unwrap();
     let bob_did = world.register_device("Bob").await.unwrap();
 

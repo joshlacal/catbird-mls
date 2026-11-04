@@ -178,6 +178,189 @@ async fn test_stage_then_confirm_advances_epoch() {
     );
 }
 
+/// `(confirmationTag, groupContextHash)` of `group`'s current local epoch.
+fn local_coordinate(client: &e2e_harness::TestClient, group: &[u8]) -> (String, String) {
+    use base64::Engine as _;
+    let context = client.orchestrator.mls_context();
+    let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
+    (
+        encode(context.get_confirmation_tag(group.to_vec()).unwrap()),
+        encode(context.get_group_context_hash(group.to_vec()).unwrap()),
+    )
+}
+
+/// The signed `next` coordinate of the last submitted transition:
+/// `(epoch, (confirmationTag, groupContextHash))`.
+fn last_submitted_next(world: &TestWorld) -> (u64, (String, String)) {
+    use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+    let submit = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .rfind(|request| request.operation == CanonicalOperation::SubmitTransition)
+        .expect("a submitted transition");
+    let wrapper: serde_json::Value = serde_json::from_slice(submit.body.as_ref().unwrap()).unwrap();
+    let next = &wrapper["signedRequest"]["body"]["next"];
+    let bytes = |field: &str| {
+        next[field]
+            .as_str()
+            .or_else(|| next[field]["$bytes"].as_str())
+            .expect("coordinate bytes")
+            .to_owned()
+    };
+    (
+        next["epoch"].as_u64().expect("next epoch"),
+        (bytes("confirmationTag"), bytes("groupContextHash")),
+    )
+}
+
+/// The signed `next` coordinate of a staged swap/add is the staged
+/// successor's (post-merge) confirmation tag and GroupContext hash. The
+/// source epoch's values are rejected by the DS (CommitCoordinateMismatch)
+/// and by every Welcome joiner (cryptographic coordinate check).
+#[tokio::test(flavor = "multi_thread")]
+async fn swap_members_signs_the_staged_successor_coordinate() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("successor coordinate", None, None)
+        .await
+        .expect("create_group failed");
+    let group = hex::decode(&convo.group_id).unwrap();
+    let source = local_coordinate(alice, &group);
+
+    alice
+        .orchestrator
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+        .await
+        .expect("swap add Bob");
+    let merged = local_coordinate(alice, &group);
+    assert_ne!(merged, source, "the Add must advance the epoch coordinate");
+    assert_eq!(
+        last_submitted_next(&world),
+        (1, merged),
+        "next must carry the post-merge confirmation tag and GroupContext hash"
+    );
+}
+
+/// Same contract for a commit of queued proposals (sync's self-remove path).
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_proposal_commit_signs_the_staged_successor_coordinate() {
+    use catbird_mls::orchestrator::MLSAPIClient as _;
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("pending proposal successor", None, None)
+        .await
+        .expect("create_group failed");
+    alice
+        .orchestrator
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
+    let welcome = world
+        .delivery_service()
+        .clone_as(&bob_did)
+        .get_welcome(&convo.conversation_id)
+        .await
+        .expect("Bob Welcome");
+    bob.orchestrator
+        .join_group(&welcome)
+        .await
+        .expect("Bob joins");
+    let group = hex::decode(&convo.group_id).unwrap();
+    let proposal = bob
+        .orchestrator
+        .mls_context()
+        .propose_self_remove(group.clone())
+        .expect("Bob self-remove proposal");
+    alice
+        .orchestrator
+        .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
+            conversation_id: convo.conversation_id.clone(),
+            sender_did: bob_did.clone(),
+            ciphertext: proposal,
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some("self-remove-proposal".to_string()),
+            server_epoch: None,
+            server_sequence: None,
+        })
+        .await
+        .expect("Alice queues the authorized proposal");
+    let source = local_coordinate(alice, &group);
+
+    alice
+        .orchestrator
+        .commit_self_remove_proposals(&convo.conversation_id)
+        .await
+        .expect("commit queued proposal");
+    let merged = local_coordinate(alice, &group);
+    assert_ne!(
+        merged, source,
+        "the Commit must advance the epoch coordinate"
+    );
+    assert_eq!(
+        last_submitted_next(&world),
+        (2, merged),
+        "next must carry the post-merge confirmation tag and GroupContext hash"
+    );
+}
+
+/// Same contract for the Welcome-reissue responder's recovery fulfillment.
+#[tokio::test(flavor = "multi_thread")]
+async fn welcome_reissue_signs_the_staged_successor_coordinate() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("reissue successor", None, None)
+        .await
+        .expect("create_group failed");
+    alice
+        .orchestrator
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
+    let group = hex::decode(&convo.group_id).unwrap();
+    let source = local_coordinate(alice, &group);
+
+    alice
+        .orchestrator
+        .respond_to_welcome_reissue(
+            &convo.conversation_id,
+            &format!("{bob_did}#device-stale"),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("responder succeeds");
+    let merged = local_coordinate(alice, &group);
+    assert_ne!(
+        merged, source,
+        "the reissue must advance the epoch coordinate"
+    );
+    assert_eq!(
+        last_submitted_next(&world),
+        (2, merged),
+        "next must carry the post-merge confirmation tag and GroupContext hash"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn own_commit_echo_requires_durable_local_confirmation() {
     let mut world = TestWorld::new();
@@ -1285,6 +1468,9 @@ async fn staged_swap_rejects_exact_did_batch_before_device_resolution() {
 #[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cursor_advance() {
+    use catbird_mls::orchestrator::{MLSAPIClient, MlsDecryptOutcome};
+    use catbird_mls::DecryptContentType;
+
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.add_client("Bob").await;
@@ -1302,13 +1488,13 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     let group_bytes = hex::decode(&group_id).unwrap();
 
     // Alice adds Bob to the group using stage_add_members + confirm_commit
-    let add_plan = stage_add_members(&alice, &group_id, &[bob_did.clone()]).await;
+    let add_plan = stage_add_members(&alice, &group_id, std::slice::from_ref(&bob_did)).await;
     let server_result = alice
         .orchestrator
         .api_client()
         .add_members(
             &convo.conversation_id,
-            &[bob_did.clone()],
+            std::slice::from_ref(&bob_did),
             &add_plan.commit_bytes,
             add_plan.welcome_bytes.as_deref(),
         )

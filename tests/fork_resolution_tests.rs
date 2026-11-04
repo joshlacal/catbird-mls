@@ -338,7 +338,10 @@ impl MlsCryptoContext for UnsupportedForkCrypto {
         unsupported()
     }
 
-    fn commit_pending_proposals(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+    fn commit_pending_proposals(
+        &self,
+        _group_id: Vec<u8>,
+    ) -> Result<catbird_mls::RemoveMembersResult, MLSError> {
         unsupported()
     }
 }

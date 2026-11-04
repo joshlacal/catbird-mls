@@ -1092,8 +1092,9 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     /// Propose self-removal from a group.
     fn propose_self_remove(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
 
-    /// Commit all pending proposals for a group and return the commit bytes.
-    fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
+    /// Commit all pending proposals for a group: the commit bytes plus the
+    /// staged successor's confirmation tag and GroupContext hash.
+    fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<RemoveMembersResult, MLSError>;
 
     /// Store a proven own-message echo proof inside the encrypted MLS database.
     fn store_own_echo_proof(&self, _proof: &OwnEchoProof) -> Result<(), MLSError> {

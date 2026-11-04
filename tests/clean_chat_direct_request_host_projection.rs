@@ -453,6 +453,40 @@ async fn c16_sender_host_projection_crash_replays_projection_only() {
         "publicationReceipt": receipt,
     });
 
+    // The closed single-variant `publicationReceipt` union requires its exact
+    // `$type`: a missing or wrong tag is refused before any local effect.
+    for tag in [
+        None,
+        Some("blue.catbird.chat.defs#directRequestReceiptBody"),
+    ] {
+        let mut tampered = publication_entry.clone();
+        let receipt = tampered["publicationReceipt"].as_object_mut().unwrap();
+        match tag {
+            Some(tag) => receipt.insert("$type".into(), json!(tag)),
+            None => receipt.remove("$type"),
+        };
+        world.delivery_service().queue_request_operation_response(
+            Op::GetEntries,
+            200,
+            json!({"entries": [tampered], "hasMore": false, "nextAfterSeq": 1}),
+        );
+        let refused = world
+            .client("Bob")
+            .orchestrator
+            .refresh_request_preview(&cid)
+            .await;
+        assert!(
+            matches!(&refused, Err(OrchestratorError::Storage(msg)) if msg == "Invalid request projection proof"),
+            "{tag:?}: {refused:?}"
+        );
+        assert!(world
+            .client("Bob")
+            .orchestrator
+            .mls_context()
+            .get_epoch(gid.clone())
+            .is_err());
+    }
+
     world.delivery_service().queue_request_operation_response(
         Op::GetEntries,
         200,

@@ -647,6 +647,12 @@ pub struct CommitPlan {
     /// Epoch the group will advance to once the commit is confirmed. By
     /// MLS construction this is `source_epoch + 1`.
     pub target_epoch: u64,
+    /// Confirmation tag of the staged `target_epoch` state, when the MLS
+    /// provider exposes it. A transition's `next` coordinate must carry this,
+    /// never the source epoch's tag.
+    pub next_confirmation_tag: Option<Vec<u8>>,
+    /// SHA-256 of the staged `target_epoch` GroupContext, when exposed.
+    pub next_group_context_hash: Option<Vec<u8>>,
 }
 
 /// Summary returned from `confirm_commit` after the pending commit is merged

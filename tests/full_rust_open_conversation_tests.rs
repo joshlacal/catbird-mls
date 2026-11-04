@@ -7,6 +7,11 @@ use catbird_mls::orchestrator::{
 };
 use e2e_harness::TestWorld;
 
+// Canonical Welcome deliveries name production bare DIDs (`did:plc:` + 24
+// base32); `welcome_ack` rejects any other recipient (0b6b4e90).
+const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn healthy_local_group_returns_send_allowed_without_recovery_io() {
     let mut world = TestWorld::new();
@@ -147,8 +152,8 @@ async fn durable_reset_authority_read_failure_after_suspend_propagates_closed() 
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_local_group_uses_welcome_before_external_commit() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
+    world.add_client_with_did("Alice", ALICE).await;
+    world.add_client_with_did("Bob", BOB).await;
     let _alice_did = world.register_device("Alice").await.unwrap();
     let bob_did = world.register_device("Bob").await.unwrap();
 
