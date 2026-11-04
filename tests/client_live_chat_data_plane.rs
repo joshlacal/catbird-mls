@@ -2114,14 +2114,16 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             .is_err(),
         "the follow-up gap fetch fails after the later send is durable"
     );
-    // Verified history carries its I13 receipt's epoch (native restore writes `receipt.epoch`);
-    // the next sync re-verifies this cached row against that receipt.
-    let historical = alice
+    // Restored history rows are historical frames at epoch 0 (as the Phase 1 simulator's
+    // restore imports them); the next sync verifies the cached row's receipt against its
+    // retained archive evidence, not the row, and must not wedge on it.
+    let mut historical = alice
         .list_messages(&clean_cid, None, 100)
         .unwrap()
         .into_iter()
         .find(|m| m.message_id == later_mid)
         .expect("later send was durably accepted");
+    historical.epoch = 0;
     alice
         .import_conversation_history(&clean_cid, vec![historical])
         .expect("import ahead-of-cursor history");

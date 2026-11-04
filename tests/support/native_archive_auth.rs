@@ -580,8 +580,6 @@ impl NativeArchiveAuthFixture {
         );
         let writer = if authority_read {
             space.authority.as_str()
-        } else if nsid == "com.atproto.space.getBlob" {
-            required(params, "did")?
         } else {
             required(params, "repo")?
         };

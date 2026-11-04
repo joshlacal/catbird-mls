@@ -286,7 +286,7 @@ impl SpaceRpc for SpaceXrpcTransport {
     ) -> core::result::Result<Vec<u8>, SpaceError> {
         let nsid = "com.atproto.space.getBlob";
         let path = format!(
-            "/xrpc/{nsid}?space={}&did={}&cid={}",
+            "/xrpc/{nsid}?space={}&repo={}&cid={}",
             encode_query(space),
             encode_query(did),
             encode_query(cid)

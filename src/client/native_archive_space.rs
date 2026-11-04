@@ -133,12 +133,7 @@ mod native_archive_space_auth {
                 return Err("native_space_conflicting_auth_headers".into());
             }
             let space = SpaceUri::parse(required(&params, "space")?).map_err(|e| format!("native_space_invalid_space: {e}"))?;
-            let writer = if writer_endpoint {
-                let field = if request.nsid == "com.atproto.space.getBlob" { "did" } else { "repo" };
-                required(&params, field)?.to_owned()
-            } else {
-                space.authority.clone()
-            };
+            let writer = if writer_endpoint { required(&params, "repo")?.to_owned() } else { space.authority.clone() };
             if !atproto_spaces::is_valid_did(&writer) {
                 return Err("native_space_invalid_writer".into());
             }
@@ -605,6 +600,7 @@ mod native_archive_space_auth {
         const COLLECTION: &str = "blue.catbird.labyrinth.messageBatch";
         const REV: &str = "3jzfcijpj2z2a";
         const NOW: u64 = 1_700_000_000;
+        const BLOB: &[u8] = b"sealed attachment ciphertext";
 
         struct Host {
             signing: P256SecretKey,
@@ -724,6 +720,9 @@ mod native_archive_space_auth {
                 let params = parse_query(&LabyrinthSpaceRequest::get(&read_nsid, format!("/xrpc/{read_nsid}?{read_query}"))).unwrap();
                 let space = SpaceUri::parse(required(&params, "space").unwrap()).unwrap();
                 let writer = required(&params, "repo").unwrap();
+                if read_nsid == "com.atproto.space.getBlob" {
+                    return Ok(PlatformHttpResponse { status: 200, headers: vec![], body: BLOB.to_vec() });
+                }
                 let value = serde_json::to_value(served_record()).unwrap();
                 let bytes = value_bytes(&value);
                 let cid = compute_dagcbor_cid(&bytes);
@@ -803,15 +802,46 @@ mod native_archive_space_auth {
             (directory, gateway, host)
         }
 
+        fn space(personal: bool) -> SpaceUri {
+            if personal { SpaceUri::new(ACCOUNT, "blue.catbird.labyrinth.mailbox", "self").unwrap() }
+            else { SpaceUri::new(AUTHORITY, "blue.catbird.labyrinth.conversation", "conversation-0").unwrap() }
+        }
+
         fn request(nsid: &str, personal: bool) -> LabyrinthSpaceRequest {
-            let space = if personal { SpaceUri::new(ACCOUNT, "blue.catbird.labyrinth.mailbox", "self").unwrap() }
-                        else { SpaceUri::new(AUTHORITY, "blue.catbird.labyrinth.conversation", "conversation-0").unwrap() };
+            let space = space(personal);
             let mut params = BTreeMap::from([
                 ("space".into(), space.raw), ("repo".into(), if personal { ACCOUNT.into() } else { WRITER.into() }),
             ]);
             if matches!(nsid, GET_RECORD | LIST_RECORDS) { params.insert("collection".into(), COLLECTION.into()); }
             if nsid == GET_RECORD { params.insert("rkey".into(), "batch-1".into()); }
             LabyrinthSpaceRequest::get(nsid, query_path(nsid, &params))
+        }
+
+        #[test]
+        fn native_space_get_blob_sends_the_lexicon_repo_parameter() {
+            use labyrinth::store::space::SpaceRpc as _;
+            use sha2::{Digest as _, Sha256};
+            // CIDv1 / raw / sha2-256, as an attachment manifest references the blob.
+            let cid = multibase::encode(multibase::Base::Base32Lower, [&[1, 0x55, 0x12, 0x20][..], &Sha256::digest(BLOB)[..]].concat());
+            for personal in [true, false] {
+                let (_directory, gateway, host) = gateway();
+                let (space, writer) = (space(personal), if personal { ACCOUNT } else { WRITER });
+                let transport = crate::labyrinth::SpaceXrpcTransport::new(Arc::new(gateway));
+                assert_eq!(block_on_sync(transport.get_blob(&space.raw, writer, &cid)).unwrap(), BLOB);
+                // The query as the writer's PDS receives it: direct, or inside relaySpaceRead.
+                let query = host.requests.lock().unwrap().iter().find_map(|r| match r.url.split_once("/xrpc/com.atproto.space.getBlob?") {
+                    Some((_, query)) => Some(query.to_owned()),
+                    None if r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead") => {
+                        let body: Value = serde_json::from_slice(r.body.as_deref().unwrap()).unwrap();
+                        (body["nsid"] == "com.atproto.space.getBlob").then(|| body["query"].as_str().unwrap().to_owned())
+                    }
+                    None => None,
+                }).expect("getBlob reached the writer's PDS");
+                let sent = parse_query(&LabyrinthSpaceRequest::get("com.atproto.space.getBlob", format!("/xrpc/com.atproto.space.getBlob?{query}"))).unwrap();
+                assert_eq!(sent, BTreeMap::from([
+                    ("space".into(), space.raw.clone()), ("repo".into(), writer.into()), ("cid".into(), cid.clone()),
+                ]), "personal {personal}: the lexicon's exact params");
+            }
         }
 
         #[test]

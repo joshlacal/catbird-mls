@@ -350,6 +350,20 @@ impl CatbirdMlsClient {
             })?;
             let commitment =
                 labyrinth_protocol::receipt::compute_archive_commitment(&nonce, frame.as_bytes());
+            // Bind to the epoch the retained evidence authenticated, never the display row:
+            // restored history (`import_conversation_history`) keeps historical rows at epoch 0.
+            let bound_epoch = match evidence["sequencer_receipt_json"].as_str() {
+                Some(prior) => {
+                    serde_json::from_str::<chat_wire::StoredArchivedReceipt>(prior)
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!("cached archive receipt: {e}"))
+                        })?
+                        .epoch
+                }
+                None => evidence["epoch"].as_u64().ok_or_else(|| {
+                    MLSError::Cryptography("cached message archive epoch missing".into())
+                })?,
+            };
             let (seq, generation, stored_receipt) =
                 chat_wire::parse_and_verify_i13_sequencer_receipt(
                     receipt,
@@ -357,7 +371,7 @@ impl CatbirdMlsClient {
                     &authority,
                     cid,
                     &message.group_id,
-                    message.epoch.max(0) as u64,
+                    bound_epoch,
                     entry_id,
                     &commitment,
                 )?;

@@ -46,8 +46,7 @@ use catbird_mls::chat_v2::transcript::{
 use catbird_mls::metadata::{GroupMetadataV1, METADATA_REFERENCE_COMPONENT_ID};
 use catbird_mls::orchestrator::canonical_transport::{
     canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
-    canonical_commit_aad_bytes, canonical_metadata_aad_bytes,
-    canonical_metadata_content_signing_input, canonical_metadata_exporter_context_bytes,
+    canonical_commit_aad_bytes, canonical_metadata_exporter_context_bytes,
 };
 
 const OPT_IN_ENV: &str = "CATBIRD_REGENERATE_MLS_CHAT_CRYPTO_WIRE";
@@ -508,6 +507,7 @@ fn b64_to_hex(val: &Value, key: &str) -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_state_metadata_transition(
     alice_group: &MlsGroup,
     alice_provider: &Provider,
@@ -780,25 +780,6 @@ fn build_alice_creation_artifact(
     let confirmation_tag_bytes =
         STANDARD.decode(genesis_context["confirmationTag"].as_str().unwrap())?;
 
-    let metadata_content_json = json!({
-        "protocol": "blue.catbird.chat.metadata",
-        "version": 1,
-        "originTransitionId": STANDARD.encode(ALICE_CREATION_TRANSITION_ID),
-        "metadataVersion": CREATION_METADATA_VERSION,
-        "authorDid": ALICE_ACTOR_DID,
-        "authorDeviceId": STANDARD.encode(ALICE_DEVICE_ID),
-        "authorKeyId": key_id,
-        "title": "",
-    });
-    let content_signing_input = canonical_metadata_content_signing_input(&metadata_content_json)?;
-    let content_signature = signing_key.sign(&content_signing_input).to_bytes();
-    let plaintext_json = json!({
-        "content": metadata_content_json,
-        "contentSignature": STANDARD.encode(content_signature),
-    });
-    let plaintext_cbor = canonical_cbor_for_schema("metadataPlaintext", &plaintext_json, false)?;
-    let expected_ciphertext_size = (plaintext_cbor.len() + 16) as u64;
-
     let exporter_context_json = json!({
         "protocol": "blue.catbird.chat.metadata",
         "version": 1,
@@ -817,25 +798,6 @@ fn build_alice_creation_artifact(
             METADATA_EXPORTER_OUTPUT_LENGTH,
         )
         .map_err(|error| fail(format!("metadata exporter secret: {error}")))?;
-
-    let coordinate_json = json!({
-        "conversationId": STANDARD.encode(CONVERSATION_ID),
-        "generation": 0,
-        "groupId": STANDARD.encode(&group_id_bytes),
-        "epoch": 0,
-        "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
-        "confirmationTag": STANDARD.encode(&confirmation_tag_bytes),
-    });
-
-    let metadata_aad_json = json!({
-        "protocol": "blue.catbird.chat.metadata",
-        "version": 1,
-        "coordinate": coordinate_json,
-        "metadataVersion": CREATION_METADATA_VERSION,
-        "originTransitionId": STANDARD.encode(ALICE_CREATION_TRANSITION_ID),
-        "ciphertextSize": expected_ciphertext_size,
-    });
-    let metadata_aad = canonical_metadata_aad_bytes(&metadata_aad_json)?;
 
     let metadata_plaintext = GroupMetadataV1 {
         version: 1,
