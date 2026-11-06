@@ -1229,6 +1229,35 @@
           "type": "ref",
           "ref": "#artifactHash",
           "description": "[I13] HMAC-SHA256(key = frameNonce, data = canonicalPayloadBytes) bound into live MLS AAD and echoed in sequencerReceipt."
+        },
+        "originalSenderAttestation": {
+          "type": "object",
+          "required": [
+            "senderDid",
+            "senderDeviceId",
+            "senderTransportPubkey",
+            "signature"
+          ],
+          "properties": {
+            "senderDid": {
+              "type": "ref",
+              "ref": "#bareDid"
+            },
+            "senderDeviceId": {
+              "type": "ref",
+              "ref": "#deviceId"
+            },
+            "senderTransportPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "signature": {
+              "type": "bytes",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
         }
       },
       "description": "Exact deterministic DAG-CBOR projection prefixed by CATBIRD-CHAT-MLS-AAD-MESSAGE\\0. All UUIDs are raw 16-byte strings and prior is the active bytes-based context exactly equivalent to the outer signed transport coordinate; it never includes the enclosing MLSMessage hash."
@@ -7161,7 +7190,8 @@
         "idempotencyKey",
         "signedAt",
         "preparationRequestDigest",
-        "archiveCommitment"
+        "archiveCommitment",
+        "originalSenderAttestation"
       ],
       "properties": {
         "signatureDomain": {
@@ -7250,6 +7280,35 @@
           "type": "ref",
           "ref": "#artifactHash",
           "description": "Required I13 commitment, repeated in the initial private MLS application AAD."
+        },
+        "originalSenderAttestation": {
+          "type": "object",
+          "required": [
+            "senderDid",
+            "senderDeviceId",
+            "senderTransportPubkey",
+            "signature"
+          ],
+          "properties": {
+            "senderDid": {
+              "type": "ref",
+              "ref": "#bareDid"
+            },
+            "senderDeviceId": {
+              "type": "ref",
+              "ref": "#deviceId"
+            },
+            "senderTransportPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "signature": {
+              "type": "bytes",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
         }
       }
     },

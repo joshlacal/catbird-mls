@@ -5,7 +5,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use openmls::prelude::*;
 use openmls::treesync::LeafNodeSource;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_traits::{random::OpenMlsRand, storage::StorageProvider, OpenMlsProvider};
+use openmls_traits::{
+    random::OpenMlsRand, signatures::Signer as _, storage::StorageProvider, OpenMlsProvider,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -54,6 +56,8 @@ pub struct DirectRequestBootstrap {
     pub metadata_ciphertext: Vec<u8>,
     pub initial_ciphertext: Vec<u8>,
     pub archive_commitment: [u8; 32],
+    pub original_sender_attestation:
+        crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope,
     /// Sender capture; incoming bootstraps acquire this only after MLS decrypt.
     pub opening: Option<DirectRequestOpening>,
 }
@@ -341,6 +345,34 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         .map_err(crypto_error)?;
     let frame_nonce = provider.rand().random_array().map_err(crypto_error)?;
     let (plaintext, opening) = introduction_plaintext(input, &frame_nonce)?;
+    let attestation_transcript =
+        labyrinth_protocol::transcripts::original_sender_archive_transcript(
+            ctx["conversationId"]
+                .as_str()
+                .ok_or_else(|| invalid("Missing conversation"))?,
+            ctx["firstMessageId"]
+                .as_str()
+                .ok_or_else(|| invalid("Missing first message"))?,
+            &opening.archive_commitment,
+        );
+    let original_sender_attestation =
+        crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope {
+            sender_did: ctx["actorDid"]
+                .as_str()
+                .ok_or_else(|| invalid("Missing actor"))?
+                .to_owned(),
+            sender_device_id: ctx["actorDeviceId"]
+                .as_str()
+                .ok_or_else(|| invalid("Missing actor device"))?
+                .to_owned(),
+            sender_transport_public_key: signer.public().to_vec(),
+            signature: signer.sign(&attestation_transcript).map_err(crypto_error)?,
+        };
+    original_sender_attestation.verify(
+        ctx["conversationId"].as_str().unwrap_or_default(),
+        ctx["firstMessageId"].as_str().unwrap_or_default(),
+        &opening.archive_commitment,
+    )?;
     let initial_ciphertext = encrypt_bound_introduction(
         &mut group,
         provider,
@@ -375,6 +407,7 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         metadata_ciphertext,
         initial_ciphertext,
         archive_commitment: opening.archive_commitment,
+        original_sender_attestation,
         opening: Some(opening),
     };
     if bundle.decoded_size() > 8388608
@@ -418,6 +451,7 @@ pub fn verify_opening_receipt(
         &ctx,
         &bootstrap.coordinates,
         &bootstrap.archive_commitment,
+        Some(&bootstrap.original_sender_attestation),
         receipt,
         sequencer_did,
         sequencer_receipt_authority_key,
@@ -428,6 +462,9 @@ pub(crate) fn verify_opening_receipt_binding(
     ctx: &Value,
     coordinates: &Value,
     archive_commitment: &[u8; 32],
+    original_sender_attestation: Option<
+        &crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope,
+    >,
     receipt: &Value,
     sequencer_did: &str,
     sequencer_receipt_authority_key: &[u8],
@@ -462,7 +499,11 @@ pub(crate) fn verify_opening_receipt_binding(
         ctx["firstMessageId"]
             .as_str()
             .ok_or_else(|| invalid("Missing first message"))?,
+        ctx["firstMessageId"]
+            .as_str()
+            .ok_or_else(|| invalid("Missing first message"))?,
         archive_commitment,
+        original_sender_attestation,
     )?;
     if ctx["origin"]["$type"] == "blue.catbird.chat.defs#freshDirectOrigin" && verified.0 != 1 {
         return Err(invalid("Fresh opening receipt sequence mismatch"));
@@ -557,6 +598,7 @@ pub fn verify_pruned_opening_entry(
         }),
         &receipt["coordinates"],
         &commitment,
+        None,
         sequencer,
         authority_did,
         &sequencer_key,
@@ -1173,10 +1215,16 @@ mod opening_vector_tests {
         let key = STANDARD
             .decode(oracle["sequencerPublicKeyBase64"].as_str().unwrap())
             .unwrap();
+        let original_sender_attestation =
+            crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+                publication.get("originalSenderAttestation").unwrap(),
+            )
+            .unwrap();
         verify_opening_receipt_binding(
             publication,
             &publication["next"],
             &opening.archive_commitment,
+            Some(&original_sender_attestation),
             &published["receipt"]["sequencerReceipt"],
             "did:web:chat.catbird.blue",
             &key,

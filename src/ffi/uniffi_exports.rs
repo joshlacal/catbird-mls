@@ -347,6 +347,15 @@ impl CatbirdMlsClient {
         self.flush_labyrinth_queue()
     }
 
+    #[uniffi::method(name = "unsend_message")]
+    pub fn ffi_unsend_message(
+        &self,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<u32, MLSError> {
+        self.unsend_message(&conversation_id, &message_id)
+    }
+
     #[uniffi::method(name = "rescue_conversation_on_kick")]
     pub fn ffi_rescue_conversation_on_kick(
         &self,

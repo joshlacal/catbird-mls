@@ -212,6 +212,35 @@
           "ref": "#artifactHash",
           "type": "ref"
         },
+        "originalSenderAttestation": {
+          "type": "object",
+          "required": [
+            "senderDid",
+            "senderDeviceId",
+            "senderTransportPubkey",
+            "signature"
+          ],
+          "properties": {
+            "senderDid": {
+              "type": "ref",
+              "ref": "#bareDid"
+            },
+            "senderDeviceId": {
+              "type": "ref",
+              "ref": "#deviceId"
+            },
+            "senderTransportPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "signature": {
+              "type": "bytes",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        },
         "conversationId": {
           "ref": "#identifierBytes",
           "type": "ref"
@@ -3157,6 +3186,35 @@
           "ref": "#artifactHash",
           "type": "ref"
         },
+        "originalSenderAttestation": {
+          "type": "object",
+          "required": [
+            "senderDid",
+            "senderDeviceId",
+            "senderTransportPubkey",
+            "signature"
+          ],
+          "properties": {
+            "senderDid": {
+              "type": "ref",
+              "ref": "#bareDid"
+            },
+            "senderDeviceId": {
+              "type": "ref",
+              "ref": "#deviceId"
+            },
+            "senderTransportPubkey": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "signature": {
+              "type": "bytes",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        },
         "artifacts": {
           "ref": "#directRequestBootstrapArtifacts",
           "type": "ref"
@@ -3253,7 +3311,8 @@
         "idempotencyKey",
         "signedAt",
         "preparationRequestDigest",
-        "archiveCommitment"
+        "archiveCommitment",
+        "originalSenderAttestation"
       ],
       "type": "object"
     },

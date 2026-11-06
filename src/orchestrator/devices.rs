@@ -413,9 +413,9 @@ where
         #[cfg(feature = "labyrinth")]
         if let Some(key) = target_chat_key {
             match self.labyrinth_revoke_chat_device(key).await {
-                Ok(epochs) if !epochs.is_empty() => {
+                Ok(reports) if !reports.is_empty() => {
                     tracing::info!(
-                        ?epochs,
+                        ?reports,
                         "labyrinth: revoked the removed device's backup key"
                     )
                 }

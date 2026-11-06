@@ -96,6 +96,7 @@ impl NativeArchiveAuthFixture {
         self.world.lock().unwrap().inventory_fault = fault;
     }
 
+    #[allow(dead_code)]
     pub fn mailbox_keys_record(&self, did: &str, rkey: &str) -> Option<(Value, String)> {
         self.world
             .lock()

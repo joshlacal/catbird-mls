@@ -792,12 +792,18 @@ impl DirectRequestJournal {
                 .and_then(|s| STANDARD.decode(s).ok())
                 .is_some_and(|bytes| bytes == expected)
         };
+        let original_sender_attestation =
+            crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+                body.get("originalSenderAttestation")
+                    .ok_or(MLSError::StorageFailed)?,
+            )?;
         if body["requestId"] != record.request_id
             || body["firstMessageId"] != record.first_message_id
             || body["conversationId"] != record.conversation_id
             || body["next"] != b.coordinates
             || !eq_bytes(&body["contextHash"], &b.context_hash)
             || !eq_bytes(&body["archiveCommitment"], &b.archive_commitment)
+            || original_sender_attestation != b.original_sender_attestation
         {
             return Err(MLSError::invalid_input(
                 "Publication differs from prepared request",

@@ -595,6 +595,23 @@ struct CachedSequencerKeys {
     receipt_key: Option<SequencerReceiptKey>,
 }
 
+#[derive(Clone, Default)]
+struct ParsedSequencerKeys {
+    redaction_key: Option<SequencerKey>,
+    receipt_keys: std::collections::BTreeMap<String, SequencerReceiptKey>,
+}
+
+impl ParsedSequencerKeys {
+    fn current_receipt_key(&self) -> Option<SequencerReceiptKey> {
+        self.receipt_keys
+            .iter()
+            .max_by_key(|(key_id, key)| {
+                labyrinth::protocol::receipt_key_generation(&key.did, key_id).unwrap_or(0)
+            })
+            .map(|(_, key)| key.clone())
+    }
+}
+
 fn normalize_sequencer_did(raw: &str) -> String {
     raw.split('#')
         .next()
@@ -606,7 +623,7 @@ fn normalize_sequencer_did(raw: &str) -> String {
 fn parse_did_doc_sequencer_keys(
     expected_did: &str,
     doc_bytes: &[u8],
-) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+) -> labyrinth::Result<ParsedSequencerKeys> {
     enforce_pds_record_cap(doc_bytes).map_err(labyrinth::Error::Backend)?;
     let doc: serde_json::Value = serde_json::from_slice(doc_bytes)
         .map_err(|_| labyrinth::Error::Malformed("sequencer DID document JSON"))?;
@@ -618,10 +635,8 @@ fn parse_did_doc_sequencer_keys(
             ));
         }
     }
-    let mut redaction: Option<SequencerKey> = None;
-    let mut receipt: Option<SequencerReceiptKey> = None;
+    let mut parsed = ParsedSequencerKeys::default();
     if let Some(methods) = doc.get("verificationMethod").and_then(|v| v.as_array()) {
-        let receipt_full_id = format!("{base_did}#mls-receipt-1");
         let redaction_full_id = format!("{base_did}#labyrinth-redaction-1");
         for m in methods {
             let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
@@ -638,14 +653,24 @@ fn parse_did_doc_sequencer_keys(
             let Ok((_, raw)) = multibase::decode(mb) else {
                 continue;
             };
-            if (id == receipt_full_id || id == "#mls-receipt-1")
+            let full_id = if id.starts_with('#') {
+                format!("{base_did}{id}")
+            } else {
+                id.to_owned()
+            };
+            if labyrinth::protocol::receipt_key_generation(&base_did, &full_id).is_ok()
                 && raw.starts_with(&[0x80, 0x24])
                 && p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw[2..]).is_ok()
             {
-                receipt = Some(SequencerReceiptKey {
+                let key = SequencerReceiptKey {
                     did: base_did.clone(),
                     public_key_sec1: raw[2..].to_vec(),
-                });
+                };
+                if parsed.receipt_keys.insert(full_id, key).is_some() {
+                    return Err(labyrinth::Error::Malformed(
+                        "duplicate receipt verification method",
+                    ));
+                }
             } else if (id == redaction_full_id
                 || id == "#labyrinth-redaction-1"
                 || id == format!("{base_did}#labyrinth-1")
@@ -655,14 +680,29 @@ fn parse_did_doc_sequencer_keys(
             {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&raw[2..]);
-                redaction = Some(SequencerKey {
+                parsed.redaction_key = Some(SequencerKey {
                     did: base_did.clone(),
                     key,
                 });
             }
         }
     }
-    Ok((redaction, receipt))
+    let generations = parsed
+        .receipt_keys
+        .keys()
+        .map(|key_id| {
+            labyrinth::protocol::receipt_key_generation(&base_did, key_id)
+                .expect("receipt key IDs were validated before insertion")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(newest) = generations.last().copied() {
+        if (1..=newest).any(|generation| !generations.contains(&generation)) {
+            return Err(labyrinth::Error::Malformed(
+                "sequencer DID document omits receipt key history",
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Resolves a federated sequencer DID (`did:web:...` or `did:plc:...`) into a
@@ -816,9 +856,7 @@ pub struct DsDirectoryStore {
     sequencer_receipt_key: Option<SequencerReceiptKey>,
     placements: Option<(String, Arc<dyn super::state::StateVault>)>,
     thread_keys: std::sync::Mutex<std::collections::HashMap<String, CachedSequencerKeys>>,
-    did_doc_keys: std::sync::Mutex<
-        std::collections::HashMap<String, (Option<SequencerKey>, Option<SequencerReceiptKey>)>,
-    >,
+    did_doc_keys: std::sync::Mutex<std::collections::HashMap<String, ParsedSequencerKeys>>,
 }
 
 impl DsDirectoryStore {
@@ -874,7 +912,7 @@ impl DsDirectoryStore {
     async fn resolve_did_doc_keys(
         &self,
         sequencer_did: &str,
-    ) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+    ) -> labyrinth::Result<ParsedSequencerKeys> {
         let _validated_url = did_document_url(sequencer_did).map_err(labyrinth::Error::Backend)?;
         if let Some(cached) = self
             .did_doc_keys
@@ -891,10 +929,10 @@ impl DsDirectoryStore {
             .await
             .map_err(labyrinth::Error::Backend)?;
         let Some(doc_bytes) = doc_opt else {
-            return Ok((None, None));
+            return Ok(ParsedSequencerKeys::default());
         };
         let parsed = parse_did_doc_sequencer_keys(sequencer_did, &doc_bytes)?;
-        if parsed.0.is_some() || parsed.1.is_some() {
+        if parsed.redaction_key.is_some() || !parsed.receipt_keys.is_empty() {
             self.did_doc_keys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1036,14 +1074,15 @@ impl DsDirectoryStore {
             }
         }
 
-        if let Some(ref seq_did) = sequencer_did {
+        if let Some(seq_did) = &sequencer_did {
             if redaction_key.is_none() || receipt_key.is_none() {
-                let (doc_redaction, doc_receipt) = self.resolve_did_doc_keys(seq_did).await?;
+                let doc = self.resolve_did_doc_keys(seq_did).await?;
+                let resolved_receipt_key = doc.current_receipt_key();
                 if redaction_key.is_none() {
-                    redaction_key = doc_redaction;
+                    redaction_key = doc.redaction_key;
                 }
                 if receipt_key.is_none() {
-                    receipt_key = doc_receipt;
+                    receipt_key = resolved_receipt_key;
                 }
             }
             if redaction_key.is_some() || receipt_key.is_some() {
@@ -1329,7 +1368,73 @@ impl MailboxDirectory for DsDirectoryStore {
                 }));
             }
         }
-        Ok(self.resolve_did_doc_keys(&authority).await?.1)
+        Ok(self
+            .resolve_did_doc_keys(&authority)
+            .await?
+            .current_receipt_key())
+    }
+
+    async fn sequencer_receipt_key_by_id(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+        key_id: &str,
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
+        let authority = normalize_sequencer_did(expected_authority);
+        labyrinth::protocol::receipt_key_generation(&authority, key_id)
+            .map_err(|_| labyrinth::Error::Unattested)?;
+        if self
+            .saved_thread_authority(thread_id)?
+            .is_some_and(|pinned| pinned != authority)
+        {
+            return Err(labyrinth::Error::Unattested);
+        }
+        let parsed = self.resolve_did_doc_keys(&authority).await?;
+        if let Some(key) = parsed.receipt_keys.get(key_id) {
+            return Ok(Some(key.clone()));
+        }
+        self.did_doc_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&authority);
+        if let Some(key) = self
+            .resolve_did_doc_keys(&authority)
+            .await?
+            .receipt_keys
+            .get(key_id)
+        {
+            return Ok(Some(key.clone()));
+        }
+
+        let first = labyrinth::protocol::expected_receipt_key_id(&authority);
+        if key_id != first {
+            return Ok(None);
+        }
+        if let Some(key) = &self.sequencer_receipt_key {
+            if normalize_sequencer_did(&key.did) == authority
+                && p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.public_key_sec1).is_ok()
+            {
+                return Ok(Some(SequencerReceiptKey {
+                    did: authority,
+                    public_key_sec1: key.public_key_sec1.clone(),
+                }));
+            }
+        }
+        if let Some((did, public_key_sec1)) = self
+            .transport
+            .resolve_sequencer_receipt_key_for(thread_id, Some(&authority))
+            .await
+        {
+            if normalize_sequencer_did(&did) == authority
+                && p256::ecdsa::VerifyingKey::from_sec1_bytes(&public_key_sec1).is_ok()
+            {
+                return Ok(Some(SequencerReceiptKey {
+                    did: authority,
+                    public_key_sec1,
+                }));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1543,6 +1648,63 @@ mod tests {
             }
         }
 
+        let rotated_public = p256::ecdsa::SigningKey::from_bytes((&[0x44; 32]).into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let rotated_document = serde_json::to_vec(&serde_json::json!({
+            "id": AUTHORITY,
+            "verificationMethod": [
+                {
+                    "id": format!("{AUTHORITY}#mls-receipt-1"),
+                    "controller": AUTHORITY,
+                    "publicKeyMultibase": multibase::encode(
+                        multibase::Base::Base58Btc,
+                        [&[0x80, 0x24][..], &receipt_public].concat(),
+                    ),
+                },
+                {
+                    "id": format!("{AUTHORITY}#mls-receipt-2"),
+                    "controller": AUTHORITY,
+                    "publicKeyMultibase": multibase::encode(
+                        multibase::Base::Base58Btc,
+                        [&[0x80, 0x24][..], &rotated_public].concat(),
+                    ),
+                },
+            ],
+        }))
+        .unwrap();
+        let parsed = parse_did_doc_sequencer_keys(AUTHORITY, &rotated_document).unwrap();
+        assert_eq!(parsed.receipt_keys.len(), 2);
+        assert_eq!(
+            parsed.current_receipt_key().unwrap().public_key_sec1,
+            rotated_public,
+        );
+        assert_eq!(
+            parsed
+                .receipt_keys
+                .get(&format!("{AUTHORITY}#mls-receipt-1"))
+                .unwrap()
+                .public_key_sec1,
+            receipt_public,
+        );
+
+        let missing_history = serde_json::to_vec(&serde_json::json!({
+            "id": AUTHORITY,
+            "verificationMethod": [{
+                "id": format!("{AUTHORITY}#mls-receipt-2"),
+                "controller": AUTHORITY,
+                "publicKeyMultibase": multibase::encode(
+                    multibase::Base::Base58Btc,
+                    [&[0x80, 0x24][..], &rotated_public].concat(),
+                ),
+            }],
+        }))
+        .unwrap();
+        assert!(parse_did_doc_sequencer_keys(AUTHORITY, &missing_history).is_err());
+
         // A fresh kicked device has neither a placement pin nor live state
         // access. Only its authenticated owner receipt can name this authority.
         let fixture = Arc::new(Fixture {
@@ -1626,18 +1788,16 @@ mod tests {
         let did = "did:plc:alice";
         let device = "11111111-1111-4111-8111-111111111111";
         let nsid = CanonicalOperation::GetConversationState.nsid();
-        let params = [("conversationId", "22222222-2222-4222-8222-222222222222".into())];
+        let params = [(
+            "conversationId",
+            "22222222-2222-4222-8222-222222222222".into(),
+        )];
         let supplied = vec![("x-test".into(), "kept".into())];
-        GatewayXrpcTransport::new(
-            capture.clone(),
-            Arc::new(Signer),
-            did.into(),
-            device.into(),
-        )
-        .with_clock(Arc::new(Clock))
-        .query_with_headers(nsid, &params, &supplied)
-        .await
-        .unwrap();
+        GatewayXrpcTransport::new(capture.clone(), Arc::new(Signer), did.into(), device.into())
+            .with_clock(Arc::new(Clock))
+            .query_with_headers(nsid, &params, &supplied)
+            .await
+            .unwrap();
 
         let (request, actual) = capture.0.lock().unwrap().take().unwrap();
         let wire_params = [

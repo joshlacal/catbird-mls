@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use labyrinth::client::{
     delete_account_remote, Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport,
-    RedactedMessage, RepinProposal, RosterExclusion, ThreadCursor, ThreadList,
+    RecoveryMethod, RedactedMessage, RepinProposal, RosterExclusion, RotationReport, ThreadCursor,
+    ThreadList,
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PublicRepoBackend};
@@ -24,6 +25,61 @@ use super::space::{
 use super::state::StateVault;
 use super::transport::{DsDirectoryStore, GatewayXrpcTransport};
 use crate::orchestrator::error::{OrchestratorError, Result};
+/// One member dropped during a mailbox epoch rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationExclusion {
+    pub device_key: Option<[u8; 32]>,
+    pub reason: String,
+    pub recovery_method: Option<Mechanism>,
+}
+
+/// A rotation result whose exclusions remain visible to native clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRotationReport {
+    pub new_epoch: u64,
+    pub exclusions: Vec<RotationExclusion>,
+}
+
+fn rotation_report(
+    report: RotationReport,
+    recovery_methods: &[RecoveryMethod],
+) -> SessionRotationReport {
+    let exclusions = report
+        .excluded
+        .into_iter()
+        .map(|excluded| {
+            let recovery_method = excluded.device_key.and_then(|key| {
+                recovery_methods
+                    .iter()
+                    .find(|method| method.device_key == key)
+                    .map(|method| method.mechanism)
+            });
+            RotationExclusion {
+                device_key: excluded.device_key.map(|key| key.0),
+                reason: match excluded.reason {
+                    labyrinth::client::ExclusionReason::MalformedMember => "malformed-member",
+                    labyrinth::client::ExclusionReason::MissingDeviceRecord => {
+                        "missing-device-record"
+                    }
+                    labyrinth::client::ExclusionReason::InvalidDeviceRecord => {
+                        "invalid-device-record"
+                    }
+                    labyrinth::client::ExclusionReason::InvalidMac => "invalid-membership",
+                    labyrinth::client::ExclusionReason::Unbound => "unbound-device",
+                    labyrinth::client::ExclusionReason::ChatDeviceNotCurrent => {
+                        "chat-device-not-current"
+                    }
+                }
+                .into(),
+                recovery_method,
+            }
+        })
+        .collect();
+    SessionRotationReport {
+        new_epoch: report.new_epoch,
+        exclusions,
+    }
+}
 
 /// Authenticated local OpenMLS snapshot of a conversation's group state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,25 +412,25 @@ impl SessionDeps {
         Ok(())
     }
 
-    async fn backfill_pds(&self, s: &mut LabyrinthSession) -> Result<()> {
+    async fn reconcile_directory_publication(
+        &self,
+        session: &mut LabyrinthSession,
+    ) -> labyrinth::Result<()> {
+        if session.lab.pending_directory_epoch().is_some() {
+            session.lab.retry_pending_directory_publication().await?;
+        }
         let Some(pds) = &self.pds else {
             return Ok(());
         };
-        let latest = s.lab.latest_public().map_err(map_error)?;
-        let published = PdsDirectory::new(pds.clone())
-            .latest(&self.did)
-            .await
-            .map_err(map_error)?;
-        if published.is_none_or(|p| p.seq < latest.seq) {
-            let ds_latest = self
-                .ds_directory()
-                .latest(&self.did)
-                .await
-                .map_err(map_error)?;
-            if ds_latest.as_ref().is_none_or(|d| d.seq <= latest.seq) {
-                let out = s.lab.publish_latest_keys().await;
-                s.finish(out)?;
-            }
+        let local = session.lab.latest_public()?;
+        let pds_latest = PdsDirectory::new(pds.clone()).latest(&self.did).await?;
+        let ds_latest = self.ds_directory().latest(&self.did).await?;
+        let agrees = |head: &Option<labyrinth::mailbox::EpochPublic>| {
+            head.as_ref()
+                .is_some_and(|head| head.seq == local.seq && head.head == local.head)
+        };
+        if !agrees(&pds_latest) || !agrees(&ds_latest) {
+            session.lab.publish_latest_keys().await?;
         }
         Ok(())
     }
@@ -406,6 +462,9 @@ impl SessionDeps {
             vault: self.vault,
             placements: self.placements,
             persisted,
+            recovery_method_stale: false,
+            directory_publish_attempted: false,
+            directory_publish_error: None,
         }
     }
 
@@ -430,10 +489,14 @@ impl SessionDeps {
         surface(&fault)?;
         let lab = lab.map_err(map_error)?;
         let mut s = self.clone().session(lab, fault, Some(saved));
-        self.backfill_pds(&mut s).await?;
-        let sync_res = s.sync_epochs_healing_squats().await;
-        s.finish(sync_res)?;
-        self.backfill_pds(&mut s).await?;
+        let publication = self.reconcile_directory_publication(&mut s).await;
+        s.note_directory_publication(&publication);
+        if publication.is_ok() {
+            let sync_res = s.sync_epochs_healing_squats().await;
+            s.finish(sync_res)?;
+        } else {
+            s.save()?;
+        }
         Ok(Some(s))
     }
 
@@ -444,16 +507,20 @@ impl SessionDeps {
         }
         let placement = self.probe_placement().await?;
         let fault = SignerFault::default();
-        let lab = Labyrinth::initialize(
+        let initialized = Labyrinth::initialize_with_report(
             &self.did,
             self.transport_signer(&fault),
             self.backends(placement)?,
         )
         .await;
         surface(&fault)?;
-        let lab = lab.map_err(map_error)?;
+        let (lab, unfinished) = initialized.map_err(map_error)?;
         self.save_placement(placement)?;
         let mut s = self.session(lab, fault, None);
+        if let Some(error) = unfinished {
+            let failed: labyrinth::Result<()> = Err(error);
+            s.note_directory_publication(&failed);
+        }
         s.save()?;
         Ok(s)
     }
@@ -470,13 +537,14 @@ impl SessionDeps {
         )
         .await;
         surface(&fault)?;
-        let (lab, _enrollment) = restored.map_err(map_error)?;
+        let (lab, enrollment) = restored.map_err(map_error)?;
         self.save_placement(placement)?;
         let existing = self
             .vault
             .load_zeroizing(&self.did)
             .map_err(OrchestratorError::Mls)?;
         let mut s = self.session(lab, fault, existing);
+        s.recovery_method_stale = enrollment.stale_recovery_method;
         s.save()?;
         Ok(s)
     }
@@ -521,6 +589,9 @@ pub struct LabyrinthSession {
     vault: Arc<dyn StateVault>,
     placements: Arc<dyn StateVault>,
     persisted: Arc<std::sync::Mutex<Option<Zeroizing<Vec<u8>>>>>,
+    recovery_method_stale: bool,
+    directory_publish_attempted: bool,
+    directory_publish_error: Option<String>,
 }
 
 impl LabyrinthSession {
@@ -530,6 +601,27 @@ impl LabyrinthSession {
 
     pub fn latest_epoch(&self) -> u64 {
         self.lab.latest_epoch()
+    }
+
+    pub fn recovery_method_stale(&self) -> bool {
+        self.recovery_method_stale
+    }
+
+    pub fn pending_directory_epoch(&self) -> Option<u64> {
+        self.lab.pending_directory_epoch()
+    }
+
+    pub fn directory_publish_attempted(&self) -> bool {
+        self.directory_publish_attempted
+    }
+
+    pub fn directory_publish_error(&self) -> Option<&str> {
+        self.directory_publish_error.as_deref()
+    }
+
+    fn note_directory_publication(&mut self, result: &labyrinth::Result<()>) {
+        self.directory_publish_attempted = true;
+        self.directory_publish_error = result.as_ref().err().map(ToString::to_string);
     }
 
     pub fn is_for(&self, did: &str, transport_key: &[u8; 32]) -> bool {
@@ -566,6 +658,15 @@ impl LabyrinthSession {
     }
 
     async fn sync_epochs_healing_squats(&mut self) -> labyrinth::Result<()> {
+        if self.lab.pending_directory_epoch().is_some() {
+            let retry = self
+                .lab
+                .retry_pending_directory_publication()
+                .await
+                .map(|_| ());
+            self.note_directory_publication(&retry);
+            retry?;
+        }
         for _ in 0..8 {
             match self.lab.sync_epochs().await {
                 Ok(_) => return Ok(()),
@@ -630,7 +731,11 @@ impl LabyrinthSession {
         self.finish(out)
     }
 
-    pub async fn revoke_chat_device(&mut self, chat_key: [u8; 32]) -> Result<Vec<u64>> {
+    pub async fn revoke_chat_device(
+        &mut self,
+        chat_key: [u8; 32],
+    ) -> Result<Vec<SessionRotationReport>> {
+        let recovery_methods = self.lab.list_recovery_methods().await.unwrap_or_default();
         let out = match self.lab.revoke_chat_device(&chat_key).await {
             Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
                 if self.try_heal_squat(seq).await {
@@ -641,7 +746,12 @@ impl LabyrinthSession {
             }
             other => other,
         }
-        .map(|v| v.into_iter().map(|r| r.new_epoch).collect());
+        .map(|reports| {
+            reports
+                .into_iter()
+                .map(|report| rotation_report(report, &recovery_methods))
+                .collect()
+        });
         self.finish(out)
     }
 
@@ -653,7 +763,19 @@ impl LabyrinthSession {
         self.lab.device_public().device_key_pub.0
     }
 
+    fn capture_directory_failure<R>(&mut self, out: &labyrinth::Result<R>) {
+        if self.lab.pending_directory_epoch().is_some() {
+            if let Err(error) = out {
+                self.directory_publish_attempted = true;
+                self.directory_publish_error = Some(error.to_string());
+            }
+        } else if out.is_ok() {
+            self.directory_publish_error = None;
+        }
+    }
+
     fn try_finish<R>(&mut self, out: labyrinth::Result<R>) -> Result<labyrinth::Result<R>> {
+        self.capture_directory_failure(&out);
         let save_res = self.save();
         surface(&self.fault)?;
         save_res?;
@@ -661,6 +783,7 @@ impl LabyrinthSession {
     }
 
     fn finish<R>(&mut self, out: labyrinth::Result<R>) -> Result<R> {
+        self.capture_directory_failure(&out);
         let save_res = self.save();
         surface(&self.fault)?;
         match out {
@@ -706,6 +829,31 @@ impl LabyrinthSession {
             other => other,
         }
         .map(|setup| setup.code.to_string());
+        self.finish(out)
+    }
+
+    pub async fn create_passkey_recovery(
+        &mut self,
+        prf_output: &[u8],
+        credential_id: &[u8],
+    ) -> Result<()> {
+        let out = match self
+            .lab
+            .create_passkey_recovery(prf_output, credential_id)
+            .await
+        {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab
+                        .create_passkey_recovery(prf_output, credential_id)
+                        .await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        }
+        .map(|_| ());
         self.finish(out)
     }
 
@@ -833,6 +981,22 @@ impl LabyrinthSession {
         self.lab.discard_pending(conversation_id);
     }
 
+    /// Publish the author's immutable message-scoped redaction through the
+    /// same Conversation Space used by native send/archive.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn unsend_native_message(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<labyrinth::Result<usize>> {
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            self.lab.unsend(conversation_id, message_id).await
+        }
+        .await;
+        self.try_finish(raw)
+    }
+
     /// Native queue entries keep the verified receipt and blinded frame nonce;
     /// delegate MEK verification/distribution and sender sealing to Labyrinth.
     ///
@@ -868,6 +1032,20 @@ impl LabyrinthSession {
                         let receipt: crate::client::chat_wire::StoredArchivedReceipt =
                             serde_json::from_str(receipt)
                                 .map_err(|_| labyrinth::Error::Malformed("archive receipt"))?;
+                        let attestation: crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope =
+                            serde_json::from_str(
+                                item.original_sender_attestation_json
+                                    .as_ref()
+                                    .ok_or(labyrinth::Error::ReceiptCommitmentMismatch)?,
+                            )
+                            .map_err(|_| {
+                                labyrinth::Error::Malformed(
+                                    "archive original sender attestation",
+                                )
+                            })?;
+                        if receipt.original_sender_attestation.as_ref() != Some(&attestation) {
+                            return Err(labyrinth::Error::ReceiptCommitmentMismatch);
+                        }
                         let archived = receipt
                             .to_labyrinth_archived()
                             .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
@@ -932,6 +1110,18 @@ impl LabyrinthSession {
                             .ok_or(labyrinth::Error::ReceiptCommitmentMismatch)?,
                     )
                     .map_err(|_| labyrinth::Error::Malformed("archive receipt"))?;
+                let attestation: crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope =
+                    serde_json::from_str(
+                        item.original_sender_attestation_json
+                            .as_ref()
+                            .ok_or(labyrinth::Error::ReceiptCommitmentMismatch)?,
+                    )
+                    .map_err(|_| {
+                        labyrinth::Error::Malformed("archive original sender attestation")
+                    })?;
+                if receipt.original_sender_attestation.as_ref() != Some(&attestation) {
+                    return Err(labyrinth::Error::ReceiptCommitmentMismatch);
+                }
                 let archived = receipt
                     .to_labyrinth_archived()
                     .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
@@ -1058,7 +1248,8 @@ impl LabyrinthSession {
         self.finish(out)
     }
 
-    pub async fn revoke_device(&mut self, device_key: [u8; 32]) -> Result<u64> {
+    pub async fn revoke_device(&mut self, device_key: [u8; 32]) -> Result<SessionRotationReport> {
+        let recovery_methods = self.lab.list_recovery_methods().await.unwrap_or_default();
         let out = match self.lab.revoke_device(&XVerifyingKey(device_key)).await {
             Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
                 if self.try_heal_squat(seq).await {
@@ -1069,7 +1260,7 @@ impl LabyrinthSession {
             }
             other => other,
         }
-        .map(|r| r.new_epoch);
+        .map(|report| rotation_report(report, &recovery_methods));
         self.finish(out)
     }
 
@@ -1107,5 +1298,42 @@ mod history_error_tests {
             },
         ];
         assert_eq!(history_error_counts(&items), (1, 1));
+    }
+
+    #[test]
+    fn rotation_exclusions_keep_recovery_method_identity() {
+        let key = labyrinth::sign::XVerifyingKey([7; 32]);
+        let report = labyrinth::client::RotationReport {
+            new_epoch: 9,
+            revoked: labyrinth::sign::XVerifyingKey([8; 32]),
+            excluded: vec![
+                labyrinth::client::ExcludedMember {
+                    device_key: Some(key),
+                    reason: labyrinth::client::ExclusionReason::InvalidMac,
+                },
+                labyrinth::client::ExcludedMember {
+                    device_key: None,
+                    reason: labyrinth::client::ExclusionReason::MalformedMember,
+                },
+            ],
+        };
+        let methods = [labyrinth::client::RecoveryMethod {
+            vdevice_id: [4; 16],
+            mechanism: labyrinth::virtual_device::Mechanism::Passkey,
+            device_key: key,
+            created_at_ms: 1,
+            last_used_at_ms: None,
+            stale_at_ms: Some(2),
+            revoked: false,
+        }];
+
+        let mapped = super::rotation_report(report, &methods);
+        assert_eq!(mapped.new_epoch, 9);
+        assert_eq!(
+            mapped.exclusions[0].recovery_method,
+            Some(labyrinth::virtual_device::Mechanism::Passkey)
+        );
+        assert_eq!(mapped.exclusions[0].reason, "invalid-membership");
+        assert_eq!(mapped.exclusions[1].device_key, None);
     }
 }

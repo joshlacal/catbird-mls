@@ -28,7 +28,7 @@ use crate::messaging::receive::{
 };
 use crate::metadata::derive_metadata_key_from_group;
 use crate::orchestrator::canonical_transport::{
-    canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
+    canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
 };
 use crate::orchestrator::direct_request_bootstrap::{
     DirectRequestBootstrap, DirectRequestIntroductionResult, DirectRequestWelcomeInput,
@@ -75,28 +75,6 @@ fn verify_own_commit_body(signed_request: &Value, public_key: &[u8]) -> Result<V
     verify_signed_mutation_body(signed_request, kind, public_key)
 }
 
-/// An account deletion also ends this member's archive duty for that account: witness copies
-/// still queued for the conversation Space, and the retained evidence that a kick rescue or
-/// re-archive would publish, go with the local messages, so the history is never re-published.
-fn drop_archive_duty_of(tx: &crate::storage::SqlTx<'_>, deleted_did: &str) -> Result<(), MLSError> {
-    tx.conn()
-        .execute(
-            "DELETE FROM labyrinth_queue WHERE item_id IN \
-             (SELECT message_id FROM messages WHERE sender_did = ?1)",
-            [deleted_did],
-        )
-        .map_err(|e| map_rusqlite_err("drop deleted account witness queue", &e))?;
-    tx.conn()
-        .execute(
-            "DELETE FROM labyrinth_state WHERE state_key IN \
-             (SELECT 'native.message:' || conversation_id || ':' || message_id \
-              FROM messages WHERE sender_did = ?1)",
-            [deleted_did],
-        )
-        .map_err(|e| map_rusqlite_err("drop deleted account archive evidence", &e))?;
-    Ok(())
-}
-
 /// `labyrinth_state` key: `cid` sequenced `did`'s account deletion; the value is its seq.
 pub(super) fn account_deletion_key(cid: &str, did: &str) -> String {
     format!("native.account_deleted:{cid}:{did}")
@@ -135,9 +113,9 @@ fn account_deletion_signing_bytes(fields: &[&str]) -> Vec<u8> {
 impl CatbirdMlsClient {
     /// Verifies an `accountDeletedEntry`'s `sequencerAuthority` (`I13`) before any effect: it
     /// must bind `cid` and the conversation's pinned `sequencer_did`, and carry a low-S ES256
-    /// signature under that sequencer's `#mls-receipt-1` key. Returns the deleted DID and seq, or
-    /// `None` (logged) for an entry that does not verify; such an entry never hides anything.
-    /// `Err` only when the sequencer key cannot be resolved (retryable).
+    /// signature under the exact versioned method named by `keyId`. Returns the deleted DID and
+    /// seq, or `None` (logged) for an entry that does not verify; such an entry never hides
+    /// anything. `Err` only when that historical method cannot be resolved (retryable).
     pub(super) fn verify_account_deleted_entry(
         &self,
         cid: &str,
@@ -149,9 +127,10 @@ impl CatbirdMlsClient {
             value.as_str().filter(|s| !s.is_empty())
         }
         let authority = &entry["sequencerAuthority"];
-        let key_id = format!("{sequencer}#mls-receipt-1");
         let bound = (|| {
             let seq = entry["seq"].as_i64().filter(|seq| *seq > 0)?;
+            let key_id = text(&authority["keyId"])?;
+            labyrinth::protocol::receipt_key_generation(sequencer, key_id).ok()?;
             let fields = (
                 text(&entry["deletedDid"])?,
                 text(&entry["entryId"])?,
@@ -162,11 +141,10 @@ impl CatbirdMlsClient {
                 .is_none_or(|t| t == crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND)
                 && text(&entry["conversationId"]) == Some(cid)
                 && text(&entry["sequencerDid"]) == Some(sequencer)
-                && text(&authority["sequencerDid"]) == Some(sequencer)
-                && text(&authority["keyId"]) == Some(key_id.as_str()))
-            .then_some((seq, fields))
+                && text(&authority["sequencerDid"]) == Some(sequencer))
+            .then_some((seq, key_id, fields))
         })();
-        let Some((seq, (deleted_did, entry_id, received_at))) = bound else {
+        let Some((seq, key_id, (deleted_did, entry_id, received_at))) = bound else {
             tracing::warn!(
                 cid,
                 "ignoring account deletion not bound to this conversation's sequencer"
@@ -174,7 +152,7 @@ impl CatbirdMlsClient {
             return Ok(None);
         };
         let key = self
-            .resolve_sequencer_receipt_key(sequencer, "#mls-receipt-1")?
+            .resolve_sequencer_receipt_key(sequencer, key_id)?
             .ok_or_else(|| {
                 MLSError::Cryptography("I13: account deletion authority key unavailable".into())
             })?;
@@ -215,10 +193,8 @@ impl CatbirdMlsClient {
         seq: i64,
     ) -> Result<(), MLSError> {
         let now_ms = self.hooks.now_ms();
-        self.db.write_tx(|tx| {
-            drop_archive_duty_of(tx, deleted_did)?;
-            record_account_deletion(tx, cid, deleted_did, seq, now_ms)
-        })?;
+        self.db
+            .write_tx(|tx| record_account_deletion(tx, cid, deleted_did, seq, now_ms))?;
         handle_account_deleted_event(&self.db, deleted_did)?;
         self.clear_cached_groups();
         Ok(())
@@ -364,6 +340,29 @@ impl CatbirdMlsClient {
                     MLSError::Cryptography("cached message archive epoch missing".into())
                 })?,
             };
+            let original_sender_attestation:
+                crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope =
+                serde_json::from_str(
+                    evidence["original_sender_attestation_json"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "cached message missing original sender attestation".into(),
+                            )
+                        })?,
+                )
+                .map_err(|error| {
+                    MLSError::Cryptography(format!(
+                        "cached original sender attestation: {error}"
+                    ))
+                })?;
+            if original_sender_attestation.sender_did != message.sender_did
+                || original_sender_attestation.sender_device_id != message.sender_device_id
+            {
+                return Err(MLSError::Cryptography(
+                    "cached original sender attestation attribution mismatch".into(),
+                ));
+            }
             let (seq, generation, stored_receipt) =
                 chat_wire::parse_and_verify_i13_sequencer_receipt(
                     receipt,
@@ -373,7 +372,9 @@ impl CatbirdMlsClient {
                     &message.group_id,
                     bound_epoch,
                     entry_id,
+                    message_id,
                     &commitment,
+                    Some(&original_sender_attestation),
                 )?;
             if evidence["message_id"].as_str() != Some(message_id)
                 || evidence["conversation_id"].as_str() != Some(cid)
@@ -802,6 +803,30 @@ impl CatbirdMlsClient {
         .timestamp()
         .max(0) as u64;
 
+        let opening_commitment: [u8; 32] = chat_wire::json_bytes(&vp["archiveCommitment"])?
+            .try_into()
+            .map_err(|_| MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into()))?;
+        let original_sender_attestation =
+            crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+                vp.get("originalSenderAttestation").ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "C33 publication missing original sender attestation".into(),
+                    )
+                })?,
+            )?;
+        if original_sender_attestation.sender_did != sender_did
+            || original_sender_attestation.sender_device_id != sender_device_id
+        {
+            return Err(MLSError::Cryptography(
+                "C33 original sender attestation attribution mismatch".into(),
+            ));
+        }
+        original_sender_attestation.verify(
+            ctx_val["conversationId"].as_str().unwrap_or_default(),
+            ctx_val["firstMessageId"].as_str().unwrap_or_default(),
+            &opening_commitment,
+        )?;
+
         let bootstrap = DirectRequestBootstrap {
             context_json,
             context_hash,
@@ -817,11 +842,8 @@ impl CatbirdMlsClient {
                 &artifact["metadataSnapshot"]["ciphertext"],
             )?,
             initial_ciphertext: chat_wire::json_bytes(&artifact["initialCiphertext"])?,
-            archive_commitment: chat_wire::json_bytes(&vp["archiveCommitment"])?
-                .try_into()
-                .map_err(|_| {
-                    MLSError::Cryptography("C33 archiveCommitment must be 32 bytes".into())
-                })?,
+            archive_commitment: opening_commitment,
+            original_sender_attestation,
             opening: None,
         };
 
@@ -1072,6 +1094,15 @@ impl CatbirdMlsClient {
                     mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
                     frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
                     sequencer_receipt_json: Some(dr_rcpt_json),
+                    original_sender_attestation_json: Some(
+                        serde_json::to_string(&bootstrap.original_sender_attestation).map_err(
+                            |error| {
+                                MLSError::Internal(format!(
+                                    "serialize C33 original sender attestation: {error}"
+                                ))
+                            },
+                        )?,
+                    ),
                     created_at_ms: now_ms,
                 };
                 tx.put_labyrinth_state(
@@ -2643,6 +2674,56 @@ impl CatbirdMlsClient {
                     continue;
                 }
 
+                let verified_application_body =
+                    if entry.get("payloadPruned").and_then(Value::as_bool) == Some(true) {
+                        None
+                    } else {
+                        let actor_did =
+                            body.get("actorDid")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    MLSError::Cryptography(
+                                        "applicationSendBody missing actorDid".into(),
+                                    )
+                                })?;
+                        let actor_device_id = body
+                            .get("actorDeviceId")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                MLSError::Cryptography(
+                                    "applicationSendBody missing actorDeviceId".into(),
+                                )
+                            })?;
+                        let outer_key = flat_auth_keys
+                            .iter()
+                            .find(|key| key.did == actor_did && key.device_id == actor_device_id)
+                            .ok_or_else(|| {
+                                MLSError::Cryptography(
+                                    "application outer sender key is not authorized".into(),
+                                )
+                            })?;
+                        let verified = verify_signed_mutation_body(
+                            signed_req,
+                            SignedMutationKind::ApplicationSend,
+                            &outer_key.signature_public_key,
+                        )?;
+                        if verified["actorDid"].as_str() != Some(actor_did)
+                            || verified["actorDeviceId"].as_str() != Some(actor_device_id)
+                            || verified["messageId"].as_str() != Some(msg_id)
+                            || verified["prior"]["conversationId"].as_str() != Some(cid)
+                            || entry
+                                .get("conversationId")
+                                .and_then(Value::as_str)
+                                .is_some_and(|conversation| conversation != cid)
+                        {
+                            return Err(MLSError::Cryptography(
+                                "signed application coordinates or sender mismatch".into(),
+                            ));
+                        }
+                        Some(verified)
+                    };
+                let body = verified_application_body.as_ref().unwrap_or(body);
+
                 let already_have = self.db.read_tx(|tx| tx.get_message(msg_id))?.is_some();
                 #[cfg(feature = "sim")]
                 let already_have = already_have
@@ -2804,6 +2885,20 @@ impl CatbirdMlsClient {
                         .map_err(|e| MLSError::Cryptography(format!("decrypt app msg: {e:?}")))?;
                     let sender_cred = processed.credential().clone();
                     let aad_bytes = processed.aad().to_vec();
+                    let signed_aad =
+                        canonical_application_aad_bytes(body.get("aad").ok_or_else(|| {
+                            MLSError::Cryptography("signed application body missing MLS AAD".into())
+                        })?)
+                        .map_err(|error| {
+                            MLSError::Cryptography(format!(
+                                "invalid signed application AAD: {error}"
+                            ))
+                        })?;
+                    if signed_aad != aad_bytes {
+                        return Err(MLSError::Cryptography(
+                            "decrypted MLS AAD differs from signed outer application AAD".into(),
+                        ));
+                    }
 
                     // Verify sender leaf binding against PDS `blue.catbird.chat.device` (`I4`)!
                     let sender_id_str = std::str::from_utf8(sender_cred.serialized_content())
@@ -2811,6 +2906,13 @@ impl CatbirdMlsClient {
                     let (sender_did, sender_dev_id) = sender_id_str
                         .split_once('#')
                         .ok_or_else(|| MLSError::Cryptography("unscoped credential".to_string()))?;
+                    if body["actorDid"].as_str() != Some(sender_did)
+                        || body["actorDeviceId"].as_str() != Some(sender_dev_id)
+                    {
+                        return Err(MLSError::Cryptography(
+                            "verified outer sender differs from decrypted MLS sender".into(),
+                        ));
+                    }
                     let member = group
                         .members()
                         .find(|m| {
@@ -2836,8 +2938,12 @@ impl CatbirdMlsClient {
                         ));
                     };
                     let plaintext = app_msg.into_bytes();
-                    let (display_body, json_str, verified_commitment_opt) =
-                        extract_plaintext_body_and_verify_aad(&plaintext, &aad_bytes)?;
+                    let (
+                        display_body,
+                        json_str,
+                        verified_commitment_opt,
+                        original_sender_attestation,
+                    ) = extract_plaintext_body_and_verify_aad(&plaintext, &aad_bytes)?;
                     let _ = display_body;
                     let verified_commitment = verified_commitment_opt.ok_or_else(|| {
                         MLSError::Cryptography(
@@ -2845,6 +2951,25 @@ impl CatbirdMlsClient {
                                 .to_string(),
                         )
                     })?;
+                    let original_sender_attestation =
+                        original_sender_attestation.ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "application message missing original sender archive attestation"
+                                    .into(),
+                            )
+                        })?;
+                    if original_sender_attestation.sender_did != sender_did
+                        || original_sender_attestation.sender_device_id != sender_dev_id
+                        || original_sender_attestation
+                            .sender_transport_public_key
+                            .as_slice()
+                            != member.signature_key.as_slice()
+                    {
+                        return Err(MLSError::Cryptography(
+                            "original sender attestation differs from decrypted MLS sender leaf"
+                                .into(),
+                        ));
+                    }
 
                     let (rcpt_seq, _, archived_receipt_json) =
                         chat_wire::parse_and_verify_i13_sequencer_receipt(
@@ -2855,7 +2980,9 @@ impl CatbirdMlsClient {
                             &c.group_id,
                             msg_epoch.max(0) as u64,
                             expected_rcpt_entry_id,
+                            msg_id,
                             &verified_commitment,
+                            Some(&original_sender_attestation),
                         )?;
                     if rcpt_seq as i64 != entry_seq {
                         return Err(MLSError::Cryptography(format!(
@@ -2901,6 +3028,15 @@ impl CatbirdMlsClient {
                         mls_ciphertext_b64: STANDARD.encode(&ct_bytes),
                         frame_nonce_b64: Some(STANDARD.encode(inner.frame_nonce)),
                         sequencer_receipt_json: Some(archived_receipt_json),
+                        original_sender_attestation_json: Some(
+                            serde_json::to_string(&original_sender_attestation).map_err(
+                                |error| {
+                                    MLSError::Internal(format!(
+                                        "serialize original sender archive attestation: {error}"
+                                    ))
+                                },
+                            )?,
+                        ),
                         created_at_ms: now_ms,
                     };
                     tx.put_labyrinth_state(
@@ -3196,11 +3332,11 @@ impl CatbirdMlsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::drop_archive_duty_of;
+    use super::record_account_deletion;
     use crate::storage::{LabyrinthQueueRow, MessageRow, MlsAccountDb, OpenMode};
 
     #[test]
-    fn a_deleted_accounts_queued_witness_copies_and_evidence_are_dropped() {
+    fn account_deletion_retains_queued_witness_copies_and_evidence() {
         const CID: &str = "conversation";
         let dir = tempfile::tempdir().unwrap();
         let db = MlsAccountDb::open_native(dir.path().join("witness.db"), &[7; 32], OpenMode::App)
@@ -3232,7 +3368,7 @@ mod tests {
                 })?;
                 tx.put_labyrinth_state(&format!("native.message:{CID}:{id}"), b"{}", 1)?;
             }
-            drop_archive_duty_of(tx, "did:plc:alice")
+            record_account_deletion(tx, CID, "did:plc:alice", 9, 1)
         })
         .unwrap();
         db.read_tx(|tx| {
@@ -3241,10 +3377,10 @@ mod tests {
                 .into_iter()
                 .map(|row| row.item_id)
                 .collect();
-            assert_eq!(queued, ["m-bob"]);
+            assert_eq!(queued, ["m-alice", "m-bob"]);
             assert!(tx
                 .get_labyrinth_state(&format!("native.message:{CID}:m-alice"))?
-                .is_none());
+                .is_some());
             assert!(tx
                 .get_labyrinth_state(&format!("native.message:{CID}:m-bob"))?
                 .is_some());

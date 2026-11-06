@@ -693,6 +693,14 @@ where
         body["preparationRequestDigest"] = json!(STANDARD.encode(prepared.request_digest()));
         body["contextHash"] = json!(STANDARD.encode(b.context_hash));
         body["archiveCommitment"] = json!(STANDARD.encode(b.archive_commitment));
+        body["originalSenderAttestation"] = json!({
+            "senderDid": b.original_sender_attestation.sender_did,
+            "senderDeviceId": b.original_sender_attestation.sender_device_id,
+            "senderTransportPubkey": STANDARD.encode(
+                &b.original_sender_attestation.sender_transport_public_key
+            ),
+            "signature": STANDARD.encode(&b.original_sender_attestation.signature),
+        });
         body["next"] = b.coordinates.clone();
         body["importUntil"] = json!(import_until);
         let artifact = |data: &[u8], content_type: &str| json!({"framing":"mlsMessage","contentType":content_type,"bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))});

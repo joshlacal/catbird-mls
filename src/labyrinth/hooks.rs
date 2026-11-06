@@ -14,7 +14,7 @@ use super::queue::{
 };
 use super::session::{
     HistoryPage, ImportReport, LabyrinthSession, LocalConversationAuthority, LocalGroupSnapshot,
-    SessionDeps,
+    SessionDeps, SessionRotationReport,
 };
 use super::signer::ChatKeySigner;
 use super::space::{thread_placement_key, MlsPlacementVault, Placement, SpaceXrpcTransport};
@@ -450,7 +450,10 @@ where
         Ok(report)
     }
 
-    pub async fn labyrinth_revoke_device(&self, device_key_hex: &str) -> Result<u64> {
+    pub async fn labyrinth_revoke_device(
+        &self,
+        device_key_hex: &str,
+    ) -> Result<SessionRotationReport> {
         let key: [u8; 32] = hex::decode(device_key_hex)
             .ok()
             .and_then(|k| k.try_into().ok())
@@ -465,7 +468,10 @@ where
         session.revoke_device(key).await
     }
 
-    pub async fn labyrinth_revoke_chat_device(&self, chat_key: [u8; 32]) -> Result<Vec<u64>> {
+    pub async fn labyrinth_revoke_chat_device(
+        &self,
+        chat_key: [u8; 32],
+    ) -> Result<Vec<SessionRotationReport>> {
         let deps = self.labyrinth_deps().await?;
         let mut guard = self.labyrinth_slot().lock().await;
         match Self::ensure_opened_in_slot(&mut guard, deps).await? {

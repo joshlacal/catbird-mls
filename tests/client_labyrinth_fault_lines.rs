@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use catbird_mls::client::{
     personal_mailbox_space_uri, CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpRequest,
-    PlatformHttpResponse, PlatformKeyStore, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+    PlatformHttpResponse, PlatformKeyStore, PlatformTransport, QueuedLabyrinthArchivePayload,
+    REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
-use catbird_mls::storage::{ConversationRow, MessageRow};
+use catbird_mls::storage::{ConversationRow, LabyrinthQueueRow, MessageRow};
 use catbird_mls::MLSError;
 use tempfile::TempDir;
 
@@ -595,22 +596,23 @@ fn catbird_mls_client_outbox_crash_durability_kick_fallback_and_attributed_histo
         )
         .expect("import bob message");
 
+    let writes_before_rescue = transport.write_requests.lock().unwrap().len();
     let rescued = client
         .rescue_conversation_on_kick(conv_id)
         .expect("rescue_conversation_on_kick");
     assert_eq!(rescued, 2);
 
-    let rescue_req = transport
-        .write_requests
-        .lock()
-        .unwrap()
-        .last()
-        .cloned()
-        .unwrap();
-    let rescue_bytes = serde_json::to_vec(&rescue_req["writes"][0]["value"]).unwrap();
-    let opened_rescue = client
-        .open_rescued_owner_batch(&rescue_bytes)
-        .expect("decrypt rescued OwnerBatch");
+    let rescue_requests = transport.write_requests.lock().unwrap()[writes_before_rescue..].to_vec();
+    let mut opened_rescue = Vec::new();
+    for request in rescue_requests {
+        let bytes = serde_json::to_vec(&request["writes"][0]["value"]).unwrap();
+        opened_rescue.extend(
+            client
+                .open_rescued_owner_batch(&bytes)
+                .expect("decrypt rescued OwnerBatch"),
+        );
+    }
+    opened_rescue.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(opened_rescue.len(), 2);
     assert_eq!(opened_rescue[0].0, "msg-bob-peer-0");
     assert_eq!(
@@ -739,12 +741,101 @@ impl PlatformTransport for MemorySpacePlatformTransport {
 }
 
 #[test]
+fn passkey_registration_reports_success_only_after_verified_bundle_persistence() {
+    let failing_tmp = TempDir::new().unwrap();
+    let failing = CatbirdMlsClient::open_offline_archive_for_test(
+        CatbirdMlsClientConfig {
+            storage_root: failing_tmp.path().display().to_string(),
+            account_did: "did:plc:passkeyfail00000000000".to_string(),
+            device_id: "passkey-failure".to_string(),
+            home_ds_did: "did:web:chat.catbird.blue".to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        Arc::new(RecordingSpaceTransport::new()),
+        None,
+    )
+    .unwrap();
+    assert!(failing
+        .register_passkey_prf(b"credential".to_vec(), vec![0x5a; 32])
+        .is_err());
+    assert!(!failing.labyrinth_status().unwrap().has_passkey_prf);
+    assert!(failing
+        .db()
+        .read_tx(|tx| tx.get_labyrinth_state("passkey_credential_id"))
+        .unwrap()
+        .is_none());
+
+    let host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:passkeyok000000000000";
+    let success_tmp = TempDir::new().unwrap();
+    let success = CatbirdMlsClient::open_offline_archive_for_test(
+        CatbirdMlsClientConfig {
+            storage_root: success_tmp.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "passkey-success".to_string(),
+            home_ds_did: "did:web:chat.catbird.blue".to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        Arc::new(MemorySpacePlatformTransport::new(&host, alice)),
+        None,
+    )
+    .unwrap();
+    let status = success
+        .register_passkey_prf(b"credential".to_vec(), vec![0xa5; 32])
+        .unwrap();
+    assert!(status.has_passkey_prf);
+
+    use labyrinth::store::space::SpaceRpc as _;
+    let inspector = MemorySpacePlatformTransport::new(&host, alice);
+    let body = inspector
+        .rt
+        .block_on(inspector.space_client.query(
+            "com.atproto.space.listRecords",
+            &[
+                ("space", personal_mailbox_space_uri(alice)),
+                ("repo", alice.to_string()),
+                (
+                    "collection",
+                    labyrinth::records::nsid::VIRTUAL_DEVICE.to_string(),
+                ),
+                ("limit", "100".to_string()),
+            ],
+        ))
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let records = listed["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    let value = &records[0]["value"];
+    assert_eq!(value["formatVersion"], 2);
+    assert!(value["passkeyWrappedCode"]["$bytes"].as_str().is_some());
+    assert!(value["passkeyCredentialId"]["$bytes"].as_str().is_some());
+    assert!(value.get(concat!("encryptedMailbox", "RootSalt")).is_none());
+}
+
+#[test]
 fn offline_committed_owner_frames_authenticate_before_open_or_restore() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use labyrinth::message::{ArchivedReceipt, OwnerMessage};
+    use labyrinth::message::{ArchivedReceipt, OriginalSenderArchiveAttestation, OwnerMessage};
+    use labyrinth::sign::TransportSigner;
     use labyrinth_protocol::receipt::{
         compute_archive_commitment, sign_sequencer_receipt, SequencerReceiptPayload,
     };
+
+    struct SenderTransport(ed25519_dalek::SigningKey);
+    impl TransportSigner for SenderTransport {
+        fn transport_public_key(&self) -> [u8; 32] {
+            self.0.verifying_key().to_bytes()
+        }
+
+        fn sign_transport(&self, message: &[u8]) -> [u8; 64] {
+            use ed25519_dalek::Signer as _;
+            self.0.sign(message).to_bytes()
+        }
+    }
 
     let tmp = TempDir::new().unwrap();
     let host = labyrinth::store::space::host::MemorySpaceHost::new();
@@ -771,6 +862,7 @@ fn offline_committed_owner_frames_authenticate_before_open_or_restore() {
     let frame = br#"{"text":"receipt-authenticated archive"}"#;
     let timestamp_ms = 1_700_300_000_000;
     let signing_key = p256::ecdsa::SigningKey::from_bytes((&[0x73; 32]).into()).unwrap();
+    let sender_transport = SenderTransport(ed25519_dalek::SigningKey::from_bytes(&[0x74; 32]));
     let point = signing_key.verifying_key().to_encoded_point(false);
     let did_doc = serde_json::json!({
         "id": ds_did,
@@ -853,8 +945,18 @@ fn offline_committed_owner_frames_authenticate_before_open_or_restore() {
             payload.entry_id = "a-different-message".to_string();
         }
         let key_id = format!("{}#mls-receipt-1", payload.sequencer_did);
-        let mut receipt =
-            ArchivedReceipt::new(sign_sequencer_receipt(&signing_key, &key_id, &payload).unwrap());
+        let original_sender_attestation = OriginalSenderArchiveAttestation::sign(
+            bob.to_owned(),
+            "11111111-1111-4111-8111-111111111111".to_owned(),
+            &payload.conversation_id,
+            &payload.entry_id,
+            &payload.archive_commitment,
+            &sender_transport,
+        );
+        let mut receipt = ArchivedReceipt::new(
+            sign_sequencer_receipt(&signing_key, &key_id, &payload).unwrap(),
+            original_sender_attestation,
+        );
         if case == "bad-signature" {
             receipt.signed.signature[0] ^= 1;
         }
@@ -992,6 +1094,81 @@ fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagina
         let code = client1
             .setup_recovery_code()
             .expect("setup_recovery_code on device 1");
+
+        // G13: one malformed item in an exact 100-item kick rescue cannot
+        // poison the other 99 independently sealed owner records.
+        let partial_rescue_conversation = "convo-100-partial-rescue";
+        client1
+            .db()
+            .write_tx(|tx| {
+                for index in 0..100 {
+                    let message_id = format!("rescue-msg-{index:04}");
+                    let payload_bytes = if index == 50 {
+                        b"{malformed".to_vec()
+                    } else {
+                        serde_json::to_vec(&QueuedLabyrinthArchivePayload {
+                            version: 1,
+                            message_id: message_id.clone(),
+                            conversation_id: partial_rescue_conversation.to_string(),
+                            group_id_hex: "00".repeat(32),
+                            epoch: 0,
+                            expected_member_dids: vec![alice.to_string()],
+                            seq: index,
+                            sender_did: alice.to_string(),
+                            sender_device_id: "dev-phone-1".to_string(),
+                            sequencer_did: ds_did.to_string(),
+                            space_uri: None,
+                            plaintext_json: serde_json::json!({
+                                "text": format!("partial rescue #{index}")
+                            })
+                            .to_string(),
+                            labyrinth_frame_json: serde_json::json!({
+                                "text": format!("partial rescue #{index}")
+                            })
+                            .to_string(),
+                            mls_ciphertext_b64: String::new(),
+                            frame_nonce_b64: None,
+                            sequencer_receipt_json: None,
+                            original_sender_attestation_json: None,
+                            created_at_ms: 1_700_099_000_000 + index,
+                        })
+                        .unwrap()
+                    };
+                    tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
+                        item_id: message_id,
+                        conversation_id: partial_rescue_conversation.to_string(),
+                        group_id_hex: "00".repeat(32),
+                        seq: index,
+                        payload_bytes,
+                        created_at_ms: 1_700_099_000_000 + index,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            client1
+                .rescue_conversation_on_kick(partial_rescue_conversation)
+                .expect("99 valid rescue items survive one malformed item"),
+            99
+        );
+        client1
+            .db()
+            .write_tx(|tx| {
+                let remaining = tx.list_labyrinth_queue(Some(partial_rescue_conversation), 100)?;
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].item_id, "rescue-msg-0050");
+                let report = tx
+                    .get_labyrinth_state(&format!(
+                        "native.rescue-report:{partial_rescue_conversation}"
+                    ))?
+                    .expect("durable partial-rescue report");
+                let report: serde_json::Value = serde_json::from_slice(&report).unwrap();
+                assert_eq!(report["rescuedCount"], 99);
+                assert_eq!(report["skippedEvidenceIds"][0], "rescue-msg-0050");
+                tx.dequeue_labyrinth_item("rescue-msg-0050")
+            })
+            .unwrap();
 
         let convo = client1
             .create_group(

@@ -9,6 +9,7 @@ use base64::Engine as _;
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer as _;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,7 +24,9 @@ use crate::client::QueuedLabyrinthArchivePayload;
 use crate::error::MLSError;
 use crate::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
 use crate::groups::metadata_v1::{validate_metadata_snapshot_size, SpaceAvatarPointer};
-use crate::messaging::receive::PrivateMessagePlaintextEnvelope;
+use crate::messaging::receive::{
+    OriginalSenderArchiveAttestationEnvelope, PrivateMessagePlaintextEnvelope,
+};
 use crate::metadata::{
     derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
 };
@@ -1524,6 +1527,16 @@ impl CatbirdMlsClient {
         publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
         publish_body["next"] = bootstrap.coordinates.clone();
         publish_body["archiveCommitment"] = json!(STANDARD.encode(bootstrap.archive_commitment));
+        publish_body["originalSenderAttestation"] = json!({
+            "senderDid": bootstrap.original_sender_attestation.sender_did,
+            "senderDeviceId": bootstrap.original_sender_attestation.sender_device_id,
+            "senderTransportPubkey": STANDARD.encode(
+                &bootstrap
+                    .original_sender_attestation
+                    .sender_transport_public_key
+            ),
+            "signature": STANDARD.encode(&bootstrap.original_sender_attestation.signature),
+        });
         publish_body["importUntil"] = json!(import_until_str);
         publish_body["artifacts"] = json!({
             "genesisGroupInfo": artifact(&bootstrap.genesis_group_info, "groupInfo"),
@@ -1790,6 +1803,15 @@ impl CatbirdMlsClient {
                 mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
                 frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
                 sequencer_receipt_json: Some(opening_receipt_json),
+                original_sender_attestation_json: Some(
+                    serde_json::to_string(&bootstrap.original_sender_attestation).map_err(
+                        |error| {
+                            MLSError::Internal(format!(
+                                "serialize C33 original sender attestation: {error}"
+                            ))
+                        },
+                    )?,
+                ),
                 created_at_ms: now_ms,
             };
             tx.put_labyrinth_state(
@@ -2406,13 +2428,6 @@ impl CatbirdMlsClient {
 
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
         let canonical_msg_id = msg_uuid.hyphenated().to_string();
-        let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
-            frame_nonce,
-            canonical_payload_bytes: frame_json.as_bytes().to_vec(),
-        })
-        .map_err(|e| {
-            MLSError::Internal(format!("serialize PrivateMessagePlaintextEnvelope: {e}"))
-        })?;
 
         let prior_coords = self.load_or_build_conversation_coords(&canonical_convo_id)?;
         let generation = prior_coords
@@ -2467,6 +2482,44 @@ impl CatbirdMlsClient {
                 return Ok((signer, auth_gen, pending, true));
             }
 
+            let attestation_transcript =
+                labyrinth_protocol::transcripts::original_sender_archive_transcript(
+                    &canonical_convo_id,
+                    &canonical_msg_id,
+                    &archive_commitment,
+                );
+            let original_sender_attestation = OriginalSenderArchiveAttestationEnvelope {
+                sender_did: self.normalized_did.clone(),
+                sender_device_id: canonical_dev_id.clone(),
+                sender_transport_public_key: signer.public().to_vec(),
+                signature: signer.sign(&attestation_transcript).map_err(|error| {
+                    MLSError::Cryptography(format!(
+                        "sign original sender archive attestation: {error:?}"
+                    ))
+                })?,
+            };
+            original_sender_attestation.verify(
+                &canonical_convo_id,
+                &canonical_msg_id,
+                &archive_commitment,
+            )?;
+            let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
+                frame_nonce,
+                canonical_payload_bytes: frame_json.as_bytes().to_vec(),
+                original_sender_attestation: Some(original_sender_attestation.clone()),
+            })
+            .map_err(|error| {
+                MLSError::Internal(format!(
+                    "serialize PrivateMessagePlaintextEnvelope: {error}"
+                ))
+            })?;
+            let original_sender_attestation_json =
+                serde_json::to_string(&original_sender_attestation).map_err(|error| {
+                    MLSError::Internal(format!(
+                        "serialize original sender archive attestation: {error}"
+                    ))
+                })?;
+
             let aad_prior = chat_wire::build_aad_prior_coordinate(
                 &convo_uuid,
                 &convo.group_id,
@@ -2483,6 +2536,7 @@ impl CatbirdMlsClient {
                 "messageId": STANDARD.encode(msg_uuid.as_bytes()),
                 "prior": aad_prior,
                 "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
+                "originalSenderAttestation": original_sender_attestation.to_aad_json(),
             });
             let aad_bytes = canonical_application_aad_bytes(&aad_val).map_err(|e| {
                 MLSError::Cryptography(format!("canonical_application_aad_bytes: {e}"))
@@ -2573,6 +2627,7 @@ impl CatbirdMlsClient {
                     mls_ciphertext_b64: STANDARD.encode(&ciphertext.0),
                     frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
                     sequencer_receipt_json: None,
+                    original_sender_attestation_json: Some(original_sender_attestation_json),
                     created_at_ms: now_ms,
                 },
             };
@@ -2665,6 +2720,22 @@ impl CatbirdMlsClient {
                     queued.sequencer_did
                 ))
             })?;
+        let original_sender_attestation: OriginalSenderArchiveAttestationEnvelope =
+            serde_json::from_str(
+                queued
+                    .original_sender_attestation_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        MLSError::Cryptography(
+                            "pending send missing original sender archive attestation".into(),
+                        )
+                    })?,
+            )
+            .map_err(|error| {
+                MLSError::Cryptography(format!(
+                    "invalid original sender archive attestation: {error}"
+                ))
+            })?;
         let (seq, generation, archived_json) = chat_wire::parse_and_verify_i13_sequencer_receipt(
             receipt,
             &sec1_key,
@@ -2673,7 +2744,9 @@ impl CatbirdMlsClient {
             &group_id,
             queued.epoch.max(0) as u64,
             entry_id,
+            &queued.message_id,
             &commitment,
+            Some(&original_sender_attestation),
         )?;
         let seq = i64::try_from(seq)
             .map_err(|_| MLSError::Cryptography("I13: receipt seq exceeds i64".into()))?;
@@ -4058,8 +4131,9 @@ impl CatbirdMlsClient {
         })
     }
 
-    /// Erase terminal conversation secrets and every associated plaintext mutation journal
-    /// in the same transaction as the terminal marker. Both local and received closes use it.
+    /// Erase terminal conversation secrets and plaintext mutation journals in the
+    /// same transaction as the terminal marker. Receipt-bound archive evidence remains
+    /// available for post-leave rescue and durable unsend reconciliation.
     pub(crate) fn apply_terminal_close(
         &self,
         cid: &str,
@@ -4112,12 +4186,6 @@ impl CatbirdMlsClient {
                     [cid],
                 )
                 .map_err(|e| map_rusqlite_err("erase closed archive queue", &e))?;
-            tx.conn()
-                .execute(
-                    "DELETE FROM labyrinth_state WHERE substr(state_key, 1, length(?1)) = ?1",
-                    [format!("native.message:{cid}:")],
-                )
-                .map_err(|e| map_rusqlite_err("erase closed archive evidence", &e))?;
             if let Some(retired) = retired {
                 tx.put_account_meta(
                     &format!("conversation_coords:{cid}"),

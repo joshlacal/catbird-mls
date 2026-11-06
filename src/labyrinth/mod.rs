@@ -34,7 +34,10 @@ use crate::orchestrator::error::OrchestratorError;
 pub use flush::FlushReport;
 pub use hooks_status::ArchiveStatusReport;
 pub use queue::{ArchiveQueueStore, ArchiveWorker, MlsArchiveQueue, PendingArchive, QueueConfig};
-pub use session::{ArchiveBatch, HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
+pub use session::{
+    ArchiveBatch, HistoryPage, ImportReport, LabyrinthSession, RotationExclusion, SessionDeps,
+    SessionRotationReport,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use signer::OrchestratorChatSigner;
 pub use signer::{ChatKeySigner, ContextIdentitySigner, SignerFault};

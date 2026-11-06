@@ -56,27 +56,14 @@ fn decode_stored_device_secrets(raw_dev: &[u8]) -> Option<labyrinth::device::Dev
 }
 
 #[cfg(feature = "labyrinth")]
-fn ensure_device_secrets_and_salt(
+fn ensure_device_secrets(
     tx: &crate::storage::SqlTx<'_>,
     now_ms: i64,
     hooks: &crate::sim_hooks::SimClientHooks,
-) -> Result<(labyrinth::device::DeviceSecrets, [u8; 32]), MLSError> {
-    let salt = match tx
-        .get_labyrinth_state("mailbox_root_salt")?
-        .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
-    {
-        Some(arr) => arr,
-        None => {
-            let mut fresh_salt = [0u8; 32];
-            hooks.fill_bytes(&mut fresh_salt);
-            tx.put_labyrinth_state("mailbox_root_salt", &fresh_salt, now_ms)?;
-            fresh_salt
-        }
-    };
-
+) -> Result<labyrinth::device::DeviceSecrets, MLSError> {
     if let Some(raw_dev) = tx.get_labyrinth_state("physical_device_secrets_json")? {
         if let Some(rebuilt) = decode_stored_device_secrets(&raw_dev) {
-            return Ok((rebuilt, salt));
+            return Ok(rebuilt);
         }
     }
 
@@ -105,7 +92,7 @@ fn ensure_device_secrets_and_salt(
         MLSError::Internal(format!("serialize StoredLabyrinthDeviceSecrets: {e}"))
     })?;
     tx.put_labyrinth_state("physical_device_secrets_json", &bytes, now_ms)?;
-    Ok((fresh, salt))
+    Ok(fresh)
 }
 
 #[cfg(feature = "labyrinth")]
@@ -251,6 +238,8 @@ struct RemoteMailboxEpochState {
     physical_devices: std::collections::HashMap<[u8; 32], (labyrinth::device::DevicePublic, bool)>,
     virtual_devices: std::collections::HashMap<[u8; 32], labyrinth::device::DevicePublic>,
     vdev_bundles: std::collections::HashMap<[u8; 16], labyrinth::virtual_device::VirtualDeviceRecord>,
+    vdev_passkey_wraps:
+        std::collections::HashMap<[u8; 16], Option<labyrinth::records::mailbox::PasskeyWrap>>,
 }
 
 #[cfg(feature = "labyrinth")]
@@ -321,10 +310,12 @@ impl CatbirdMlsClient {
 
         let mut virtual_devices = std::collections::HashMap::new();
         let mut vdev_bundles = std::collections::HashMap::new();
+        let mut vdev_passkey_wraps = std::collections::HashMap::new();
         for val in vdev_vals {
             if let Ok(doc) = serde_json::from_value::<labyrinth::records::VirtualDevice>(val) {
-                if let Ok((bundle, _)) = doc.to_bundle() {
+                if let Ok((bundle, wrap)) = doc.to_bundle() {
                     virtual_devices.insert(bundle.public.device_key_pub.0, bundle.public.clone());
+                    vdev_passkey_wraps.insert(bundle.vdevice_id, wrap);
                     vdev_bundles.insert(bundle.vdevice_id, bundle);
                 }
             }
@@ -336,6 +327,7 @@ impl CatbirdMlsClient {
             physical_devices,
             virtual_devices,
             vdev_bundles,
+            vdev_passkey_wraps,
         }))
     }
 
@@ -723,7 +715,7 @@ impl CatbirdMlsClient {
             let st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
             let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms, &self.hooks)?;
-            let (me, _) = ensure_device_secrets_and_salt(tx, now_ms, &self.hooks)?;
+            let me = ensure_device_secrets(tx, now_ms, &self.hooks)?;
             Ok((st, me))
         })?;
 
@@ -842,6 +834,22 @@ impl CatbirdMlsClient {
     }
 
     pub(super) fn offline_setup_recovery_code(&self) -> Result<String, MLSError> {
+        self.offline_create_recovery_bundle(None)
+    }
+
+    pub(super) fn offline_register_passkey_recovery(
+        &self,
+        credential_id: &[u8],
+        prf_output: &[u8],
+    ) -> Result<(), MLSError> {
+        self.offline_create_recovery_bundle(Some((prf_output, credential_id)))
+            .map(|_| ())
+    }
+
+    fn offline_create_recovery_bundle(
+        &self,
+        passkey: Option<(&[u8], &[u8])>,
+    ) -> Result<String, MLSError> {
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
         }
@@ -852,8 +860,14 @@ impl CatbirdMlsClient {
         let grouped = code.format_grouped();
         let now_ms = self.hooks.now_ms();
         let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
+        let is_passkey = passkey.is_some();
+        let mechanism = if is_passkey {
+            labyrinth::virtual_device::Mechanism::Passkey
+        } else {
+            labyrinth::virtual_device::Mechanism::Code
+        };
 
-        let (st_snapshot, mut active_seq, mut owner_root, me_secrets, salt) =
+        let (st_snapshot, mut active_seq, mut owner_root, me_secrets) =
             self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
@@ -862,8 +876,8 @@ impl CatbirdMlsClient {
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 let seq = st.epoch_seq;
                 let root = ensure_owner_epoch_root(tx, seq, now_ms, &self.hooks)?;
-                let (me, salt) = ensure_device_secrets_and_salt(tx, now_ms, &self.hooks)?;
-                Ok((st, seq, root, me, salt))
+                let me = ensure_device_secrets(tx, now_ms, &self.hooks)?;
+                Ok((st, seq, root, me))
             })?;
 
         if let Some(mut remote) =
@@ -942,14 +956,26 @@ impl CatbirdMlsClient {
                     &code,
                     &me_secrets,
                     &current_epoch,
-                    &salt,
-                    labyrinth::virtual_device::Mechanism::Code,
+                    mechanism,
                 )
             })
             .map_err(|e| MLSError::Cryptography(format!("virtual_device::create: {e}")))?;
 
-        let vdev_doc =
-            labyrinth::records::VirtualDevice::from_bundle(&vdev_bundle, None, created_at.clone());
+        let passkey_wrap = passkey
+            .map(|(prf, credential_id)| {
+                labyrinth::virtual_device::passkey::wrap_code(prf, &code)
+                    .map(|wrapped_code| labyrinth::records::mailbox::PasskeyWrap {
+                        wrapped_code,
+                        credential_id: credential_id.to_vec(),
+                    })
+            })
+            .transpose()
+            .map_err(|e| MLSError::Cryptography(format!("wrap passkey recovery code: {e}")))?;
+        let vdev_doc = labyrinth::records::VirtualDevice::from_bundle(
+            &vdev_bundle,
+            passkey_wrap.as_ref(),
+            created_at.clone(),
+        );
         let vdev_rkey = vdev_doc.rkey();
         let vdev_doc_bytes = serde_json::to_vec(&vdev_doc)
             .map_err(|e| MLSError::Internal(format!("serialize VirtualDevice: {e}")))?;
@@ -986,6 +1012,60 @@ impl CatbirdMlsClient {
             )));
         }
 
+        if is_passkey {
+            let persisted = self
+                .fetch_remote_mailbox_epoch_state(&st_snapshot.mailbox_space_uri)?
+                .ok_or_else(|| {
+                    MLSError::Internal(
+                        "recovery registration cannot verify the persisted bundle".to_string(),
+                    )
+                })?;
+            let persisted_bundle = persisted
+                .vdev_bundles
+                .get(&vdev_bundle.vdevice_id)
+                .ok_or_else(|| {
+                    MLSError::Internal(
+                        "recovery registration bundle missing after applyWrites".to_string(),
+                    )
+                })?;
+            if persisted_bundle != &vdev_bundle
+                || persisted
+                    .vdev_passkey_wraps
+                    .get(&vdev_bundle.vdevice_id)
+                    != Some(&passkey_wrap)
+            {
+                return Err(MLSError::Internal(
+                    "recovery registration bundle changed after applyWrites".to_string(),
+                ));
+            }
+            labyrinth::virtual_device::open(persisted_bundle, &code, &self.normalized_did)
+                .map_err(|e| {
+                    MLSError::Cryptography(format!(
+                        "verify persisted recovery virtual device: {e}"
+                    ))
+                })?;
+            let persisted_member = persisted
+                .members_by_epoch
+                .get(&active_seq)
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find(|member| member.device_key_pub == member_rec.device_key_pub)
+                })
+                .ok_or_else(|| {
+                    MLSError::Internal(
+                        "recovery registration epoch member missing after applyWrites".to_string(),
+                    )
+                })?;
+            labyrinth::epoch::verify_member(&current_epoch, persisted_member, true).map_err(
+                |e| {
+                    MLSError::Cryptography(format!(
+                        "verify persisted recovery epoch member: {e}"
+                    ))
+                },
+            )?;
+        }
+
         let status = self.db.write_tx(|tx| {
             let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                 MLSError::InvalidState("Labyrinth status not initialized".to_string())
@@ -993,9 +1073,24 @@ impl CatbirdMlsClient {
             let mut st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
             st.epoch_seq = st.epoch_seq.max(active_seq);
-            st.has_recovery_code = true;
-            tx.put_labyrinth_state("recovery_vdevice_id", &vdev_bundle.vdevice_id, now_ms)?;
-            tx.put_labyrinth_state("recovery_vdev_doc_json", &vdev_doc_bytes, now_ms)?;
+            if is_passkey {
+                tx.put_labyrinth_state(
+                    "passkey_vdevice_id",
+                    &vdev_bundle.vdevice_id,
+                    now_ms,
+                )?;
+                tx.put_labyrinth_state("passkey_vdev_doc_json", &vdev_doc_bytes, now_ms)?;
+            } else {
+                st.has_recovery_code = true;
+                st.rotation_exclusions
+                    .retain(|exclusion| exclusion.recovery_method.as_deref() != Some("code"));
+                tx.put_labyrinth_state(
+                    "recovery_vdevice_id",
+                    &vdev_bundle.vdevice_id,
+                    now_ms,
+                )?;
+                tx.put_labyrinth_state("recovery_vdev_doc_json", &vdev_doc_bytes, now_ms)?;
+            }
             tx.put_labyrinth_state(
                 "status_json",
                 &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
@@ -1004,9 +1099,11 @@ impl CatbirdMlsClient {
             Ok(st)
         })?;
 
-        self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
-            epoch_seq: status.epoch_seq,
-        });
+        if !is_passkey {
+            self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
+                epoch_seq: status.epoch_seq,
+            });
+        }
         Ok(grouped)
     }
 
@@ -1033,7 +1130,7 @@ impl CatbirdMlsClient {
             let st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
             let local_doc = tx.get_labyrinth_state("recovery_vdev_doc_json")?;
-            let (me, _) = ensure_device_secrets_and_salt(tx, now_ms, &self.hooks)?;
+            let me = ensure_device_secrets(tx, now_ms, &self.hooks)?;
             Ok((st, local_doc, me))
         })?;
 
@@ -1087,7 +1184,6 @@ impl CatbirdMlsClient {
             )?;
         let recovered_seq = restored.epoch.seq();
         let recovered_root = Zeroizing::new(*restored.epoch.root());
-        let recovered_salt = restored.mailbox_root_salt;
 
         let mut recovered_roots: std::collections::BTreeMap<u64, Zeroizing<[u8; 32]>> =
             std::collections::BTreeMap::new();
@@ -1290,7 +1386,6 @@ impl CatbirdMlsClient {
 
         let status = self.db.write_tx(|tx| {
             tx.put_labyrinth_state("recovery_vdevice_id", &matched_vdev_id, now_ms)?;
-            tx.put_labyrinth_state("mailbox_root_salt", &recovered_salt, now_ms)?;
             for (seq, root) in &recovered_roots {
                 tx.put_labyrinth_state(&owner_epoch_root_key(*seq), root.as_slice(), now_ms)?;
             }
@@ -1903,6 +1998,8 @@ impl CatbirdMlsClient {
         }
 
         let mut seen_ids = std::collections::HashSet::new();
+        let mut skipped_evidence_ids = std::collections::BTreeSet::new();
+        let mut queued_message_ids = Vec::new();
         let mut sealed_items = Vec::new();
         for msg in &cached_msgs {
             if !seen_ids.insert(msg.message_id.clone()) {
@@ -1927,7 +2024,20 @@ impl CatbirdMlsClient {
         }
 
         for row in &queued_rows {
-            let payload = self.decode_queue_row(row)?;
+            let payload = match self.decode_queue_row(row) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(
+                        conversation_id,
+                        evidence_id = %row.item_id,
+                        %error,
+                        "Labyrinth kick rescue skipped invalid queued evidence"
+                    );
+                    skipped_evidence_ids.insert(row.item_id.clone());
+                    continue;
+                }
+            };
+            queued_message_ids.push((row.item_id.clone(), payload.message_id.clone()));
             if !seen_ids.insert(payload.message_id.clone()) {
                 continue;
             }
@@ -1948,31 +2058,53 @@ impl CatbirdMlsClient {
             sealed_items.push(owner_msg);
         }
 
-        if sealed_items.is_empty() {
-            return Ok(0);
-        }
 
         let now_ms = self.hooks.now_ms();
         let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
-        for (chunk_idx, chunk) in sealed_items
-            .chunks(labyrinth::records::MAX_BATCH_ITEMS)
-            .enumerate()
-        {
+        let mut rescued = 0u32;
+        let mut completed_message_ids = std::collections::BTreeSet::new();
+        for (item_idx, item) in sealed_items.iter().enumerate() {
             if self.is_handle_closed() {
                 return Err(MLSError::ContextClosed);
             }
-            let first_ts = chunk.first().map(|m| m.timestamp as i64).unwrap_or(now_ms);
-            let first_id = chunk.first().map(|m| m.message_id.as_str()).unwrap_or("0");
             let rkey = deterministic_tid(
-                first_ts,
-                chunk_idx as u64,
-                &format!("rescue:{conversation_id}:{chunk_idx}:{first_id}"),
+                item.timestamp as i64,
+                item_idx as u64,
+                &format!(
+                    "rescue:{conversation_id}:{item_idx}:{}",
+                    item.message_id
+                ),
             );
-            let batch = labyrinth::records::OwnerBatch::from_messages(chunk, created_at.clone())
-                .map_err(|e| MLSError::Internal(format!("OwnerBatch::from_messages: {e}")))?;
-            let batch_val = serde_json::to_value(&batch)
-                .map_err(|e| MLSError::Internal(format!("serialize OwnerBatch: {e}")))?;
-            let resp = self.apply_space_writes(
+            let batch = match labyrinth::records::OwnerBatch::from_messages(
+                std::slice::from_ref(item),
+                created_at.clone(),
+            ) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::warn!(
+                        conversation_id,
+                        message_id = %item.message_id,
+                        %error,
+                        "Labyrinth kick rescue skipped invalid sealed evidence"
+                    );
+                    skipped_evidence_ids.insert(item.message_id.clone());
+                    continue;
+                }
+            };
+            let batch_val = match serde_json::to_value(&batch) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        conversation_id,
+                        message_id = %item.message_id,
+                        %error,
+                        "Labyrinth kick rescue skipped unserializable evidence"
+                    );
+                    skipped_evidence_ids.insert(item.message_id.clone());
+                    continue;
+                }
+            };
+            let committed = match self.apply_space_writes(
                 &status.mailbox_space_uri,
                 &[serde_json::json!({
                     "$type": "com.atproto.space.applyWrites#create",
@@ -1980,29 +2112,62 @@ impl CatbirdMlsClient {
                     "rkey": rkey,
                     "value": batch_val,
                 })],
-            )?;
-            if !is_space_write_committed(&resp) {
-                return Err(MLSError::Internal(format!(
-                    "rescue_conversation_on_kick applyWrites returned HTTP {}",
-                    resp.status
-                )));
+            ) {
+                Ok(response) if is_space_write_committed(&response) => true,
+                Ok(response) => {
+                    tracing::warn!(
+                        conversation_id,
+                        message_id = %item.message_id,
+                        status = response.status,
+                        "Labyrinth kick rescue skipped rejected evidence"
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        conversation_id,
+                        message_id = %item.message_id,
+                        %error,
+                        "Labyrinth kick rescue skipped evidence after Space failure"
+                    );
+                    false
+                }
+            };
+            if committed {
+                rescued = rescued.saturating_add(1);
+                completed_message_ids.insert(item.message_id.clone());
+            } else {
+                skipped_evidence_ids.insert(item.message_id.clone());
             }
         }
 
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
         }
+        let skipped_evidence_ids = skipped_evidence_ids.into_iter().collect::<Vec<_>>();
         self.db.write_tx(|tx| {
-            for row in &queued_rows {
-                tx.dequeue_labyrinth_item(&row.item_id)?;
+            for (item_id, message_id) in &queued_message_ids {
+                if completed_message_ids.contains(message_id) {
+                    tx.dequeue_labyrinth_item(item_id)?;
+                }
             }
+            tx.put_labyrinth_state(
+                &format!("native.rescue-report:{conversation_id}"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "rescuedCount": rescued,
+                    "skippedEvidenceIds": &skipped_evidence_ids,
+                }))
+                .map_err(|error| MLSError::Internal(error.to_string()))?,
+                now_ms,
+            )?;
             tx.upsert_mutation_journal(&MutationJournalRow {
                 journal_id: format!("kick-rescue-{conversation_id}-{}", status.epoch_seq),
                 op_type: "kick_rescue".to_string(),
                 epoch_seq: status.epoch_seq,
                 state_json: serde_json::json!({
                     "conversationId": conversation_id,
-                    "rescuedCount": sealed_items.len(),
+                    "rescuedCount": rescued,
+                    "skippedEvidenceIds": &skipped_evidence_ids,
                 })
                 .to_string(),
                 status: "completed".to_string(),
@@ -2012,7 +2177,7 @@ impl CatbirdMlsClient {
             Ok(())
         })?;
 
-        Ok(sealed_items.len() as u32)
+        Ok(rescued)
     }
 
     fn offline_verify_committed_frame<'r>(

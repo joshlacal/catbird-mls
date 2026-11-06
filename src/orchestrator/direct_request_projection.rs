@@ -127,10 +127,15 @@ impl DirectRequestProjection {
             .map_err(|_| invalid())?
             .try_into()
             .map_err(|_| invalid())?;
+        let original_sender_attestation =
+            crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+                body.get("originalSenderAttestation").ok_or_else(invalid)?,
+            )?;
         super::super::direct_request_bootstrap::verify_opening_receipt_binding(
             body,
             &body["next"],
             &commitment,
+            Some(&original_sender_attestation),
             &receipt["sequencerReceipt"],
             &auth_did,
             &i13_key,

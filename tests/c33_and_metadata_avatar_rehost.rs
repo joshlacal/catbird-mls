@@ -55,11 +55,12 @@ fn c33_generic_receive_preserves_the_authenticated_opening_frame_and_rejects_leg
         &opening.archive_commitment,
     )
     .unwrap();
-    let (text, frame, commitment) =
+    let (text, frame, commitment, attestation) =
         extract_plaintext_body_and_verify_aad(&plaintext, &aad).unwrap();
     assert_eq!(text, "C33 exact archive frame");
     assert_eq!(frame.as_bytes(), opening.canonical_payload_bytes);
     assert_eq!(commitment, Some(opening.archive_commitment));
+    assert!(attestation.is_none());
     let wrong_aad =
         direct_request_application_aad(&[9; 32], &coordinates, message_id, &[0; 32]).unwrap();
     assert!(extract_plaintext_body_and_verify_aad(&plaintext, &wrong_aad).is_err());

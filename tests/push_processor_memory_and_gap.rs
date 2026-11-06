@@ -13,11 +13,13 @@ use base64::Engine as _;
 use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_traits::OpenMlsProvider;
+use openmls_traits::{signatures::Signer as _, OpenMlsProvider};
 use tempfile::TempDir;
 
 use catbird_mls::client::config::account_did_hash_hex;
-use catbird_mls::messaging::receive::PrivateMessagePlaintextEnvelope;
+use catbird_mls::messaging::receive::{
+    OriginalSenderArchiveAttestationEnvelope, PrivateMessagePlaintextEnvelope,
+};
 use catbird_mls::metadata::{
     derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
 };
@@ -33,6 +35,10 @@ use catbird_mls::storage::{
 use catbird_mls::MLSError;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+const BOB_DEVICE_ID: &str = "b0b00000-0000-4000-8000-000000000001";
+const INLINE_MESSAGE_ID: &str = "b0b00000-0000-4000-8000-000000000002";
+const UNVERIFIED_MESSAGE_ID: &str = "b0b00000-0000-4000-8000-000000000003";
+const PRUNED_LIVE_MESSAGE_ID: &str = "b0b00000-0000-4000-8000-000000000004";
 
 fn push_coordinates<P: OpenMlsProvider>(
     group: &MlsGroup,
@@ -204,8 +210,8 @@ struct TwoPeerGroupFixture {
 
 fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFixture {
     let temp_dir = TempDir::new().expect("tempdir");
-    let alice_did = "did:plc:alicepush000000000000000";
-    let bob_did = "did:plc:bobpush00000000000000000";
+    let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
     let alice_hash = account_did_hash_hex(alice_did).expect("alice hash");
     let alice_db_key = [0x41u8; 32];
     let bob_db_key = [0x42u8; 32];
@@ -234,7 +240,7 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
             bob_signer
                 .store(provider.storage())
                 .map_err(|e| MLSError::Internal(format!("store bob signer: {e:?}")))?;
-            let cred = BasicCredential::new(format!("{bob_did}#dev-bob").into_bytes());
+            let cred = BasicCredential::new(format!("{bob_did}#{BOB_DEVICE_ID}").into_bytes());
             let cred_with_key = CredentialWithKey {
                 credential: cred.into(),
                 signature_key: bob_signer.public().into(),
@@ -313,7 +319,7 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
                 if authorize_bob_in_alice_db {
                     let bob_keys = vec![AuthorizedPeerDeviceKey {
                         did: bob_did.to_string(),
-                        device_id: "dev-bob".to_string(),
+                        device_id: BOB_DEVICE_ID.to_string(),
                         signature_public_key: bob_pub_key.clone(),
                     }];
                     tx.put_account_meta(
@@ -396,7 +402,7 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
         alice_db_path,
         alice_db_key,
         bob_did: bob_did.to_string(),
-        bob_device_id: "dev-bob".to_string(),
+        bob_device_id: BOB_DEVICE_ID.to_string(),
         bob_signer,
         bob_db,
         conversation_id,
@@ -404,12 +410,63 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
     }
 }
 
-fn bob_encrypt_app_message(fixture: &TwoPeerGroupFixture, text: &str) -> Vec<u8> {
+fn seal_bob_application_message<P: OpenMlsProvider>(
+    fixture: &TwoPeerGroupFixture,
+    group: &MlsGroup,
+    provider: &P,
+    frame_nonce: [u8; 32],
+    payload_json: &[u8],
+    message_id: &str,
+    state_version: i64,
+) -> Result<(Vec<u8>, Vec<u8>), MLSError> {
+    let archive_commitment =
+        labyrinth_protocol::receipt::compute_archive_commitment(&frame_nonce, payload_json);
+    let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+        &fixture.conversation_id,
+        message_id,
+        &archive_commitment,
+    );
+    let attestation = OriginalSenderArchiveAttestationEnvelope {
+        sender_did: fixture.bob_did.clone(),
+        sender_device_id: fixture.bob_device_id.clone(),
+        sender_transport_public_key: fixture.bob_signer.public().to_vec(),
+        signature: fixture.bob_signer.sign(&transcript).map_err(|error| {
+            MLSError::Cryptography(format!("sign sender attestation: {error:?}"))
+        })?,
+    };
+    attestation.verify(&fixture.conversation_id, message_id, &archive_commitment)?;
+    let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
+        frame_nonce,
+        canonical_payload_bytes: payload_json.to_vec(),
+        original_sender_attestation: Some(attestation.clone()),
+    })
+    .map_err(|error| MLSError::Internal(format!("serialize push plaintext: {error}")))?;
+
+    let conversation_id = uuid::Uuid::parse_str(&fixture.conversation_id)
+        .map_err(|error| MLSError::invalid_input(format!("conversation UUID: {error}")))?;
+    let message_id = uuid::Uuid::parse_str(message_id)
+        .map_err(|error| MLSError::invalid_input(format!("message UUID: {error}")))?;
+    let conversation_id_bytes = STANDARD.encode(conversation_id.as_bytes());
+    let mut prior = push_coordinates(group, provider, &fixture.conversation_id, state_version);
+    prior["conversationId"] = serde_json::json!(conversation_id_bytes);
+    let aad = catbird_mls::orchestrator::canonical_transport::canonical_application_aad_bytes(
+        &serde_json::json!({
+            "protocolVersion": "1",
+            "conversationId": conversation_id_bytes,
+            "generation": 0,
+            "messageId": STANDARD.encode(message_id.as_bytes()),
+            "prior": prior,
+            "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
+            "originalSenderAttestation": attestation.to_aad_json(),
+        }),
+    )
+    .map_err(|error| MLSError::Cryptography(format!("canonical application AAD: {error}")))?;
+    Ok((inner_plaintext, aad))
+}
+
+fn bob_encrypt_app_message(fixture: &TwoPeerGroupFixture, text: &str, message_id: &str) -> Vec<u8> {
     let payload_json =
         serde_json::to_string(&catbird_mls::orchestrator::MLSMessagePayload::text(text)).unwrap();
-    let (inner_plaintext, aad) =
-        PrivateMessagePlaintextEnvelope::seal_with_aad([0x5Au8; 32], payload_json.into_bytes())
-            .expect("seal_with_aad");
 
     fixture
         .bob_db
@@ -420,6 +477,15 @@ fn bob_encrypt_app_message(fixture: &TwoPeerGroupFixture, text: &str) -> Vec<u8>
                 MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
                     .map_err(|e| MLSError::Internal(format!("load bob group: {e:?}")))?
                     .expect("bob group present");
+            let (inner_plaintext, aad) = seal_bob_application_message(
+                fixture,
+                &group,
+                &provider,
+                [0x5Au8; 32],
+                payload_json.as_bytes(),
+                message_id,
+                7,
+            )?;
             group.set_aad(aad);
             let msg_out = group
                 .create_message(&provider, &fixture.bob_signer, &inner_plaintext)
@@ -439,7 +505,8 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
         return;
     }
     let fixture = setup_alice_and_bob_group(true);
-    let ciphertext = bob_encrypt_app_message(&fixture, "Offline hello from Bob!");
+    let ciphertext =
+        bob_encrypt_app_message(&fixture, "Offline hello from Bob!", INLINE_MESSAGE_ID);
     assert!(
         ciphertext.len() <= INLINE_CIPHERTEXT_MAX_BYTES,
         "expected inline ciphertext <= 2200 B, got {}",
@@ -463,7 +530,7 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
         conversation_id: fixture.conversation_id.clone(),
         generation: 0,
         entry_seq: 2,
-        message_id: "msg-inline-002".to_string(),
+        message_id: INLINE_MESSAGE_ID.to_string(),
         recipient_account_hash: fixture.alice_hash.clone(),
         fetch_required: false,
         sender_did: Some(fixture.bob_did.clone()),
@@ -491,7 +558,7 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
         "G1: process_push_notification must spawn zero background worker threads"
     );
 
-    assert_eq!(preview.message_id, "msg-inline-002");
+    assert_eq!(preview.message_id, INLINE_MESSAGE_ID);
     assert_eq!(preview.sender_did, fixture.bob_did);
     assert_eq!(preview.group_title.as_deref(), Some("Initial Nest"));
     assert_eq!(preview.body, "Offline hello from Bob!");
@@ -639,23 +706,17 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
 
             let payload_json = serde_json::to_string(
                 &catbird_mls::orchestrator::MLSMessagePayload::text("Caught up 2 epochs in NSE!"),
-            ).unwrap();
-            let commitment = labyrinth_protocol::receipt::compute_archive_commitment(
-                &[0x77u8; 32], payload_json.as_bytes(),
-            );
-            let (inner_plaintext, _) = PrivateMessagePlaintextEnvelope::seal_with_aad(
-                [0x77u8; 32], payload_json.into_bytes(),
-            ).expect("seal_with_aad");
-            let mut prior = push_coordinates(&group, &provider, &fixture.conversation_id, 9);
-            let cid_bytes = STANDARD.encode(uuid::Uuid::parse_str(&fixture.conversation_id).unwrap().as_bytes());
-            prior["conversationId"] = serde_json::json!(cid_bytes);
-            let aad = catbird_mls::orchestrator::canonical_transport::canonical_application_aad_bytes(
-                &serde_json::json!({
-                    "protocolVersion": "1", "conversationId": cid_bytes, "generation": 0,
-                    "messageId": STANDARD.encode(uuid::Uuid::parse_str(gap_message_id).unwrap().as_bytes()),
-                    "prior": prior, "archiveCommitment": { "$bytes": STANDARD.encode(commitment) },
-                }),
-            ).unwrap();
+            )
+            .unwrap();
+            let (inner_plaintext, aad) = seal_bob_application_message(
+                &fixture,
+                &group,
+                &provider,
+                [0x77u8; 32],
+                payload_json.as_bytes(),
+                gap_message_id,
+                9,
+            )?;
             group.set_aad(aad);
             let msg_out = group
                 .create_message(&provider, &fixture.bob_signer, &inner_plaintext)
@@ -927,7 +988,11 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
 fn unverified_sender_leaf_key_fails_i4_and_never_persists_message() {
     // Initialize Alice's DB WITHOUT Bob's device signature key in authorized_device_keys!
     let fixture = setup_alice_and_bob_group(false);
-    let ciphertext = bob_encrypt_app_message(&fixture, "Forged/unverified device wake");
+    let ciphertext = bob_encrypt_app_message(
+        &fixture,
+        "Forged/unverified device wake",
+        UNVERIFIED_MESSAGE_ID,
+    );
 
     let keystore = Arc::new(MemoryPushKeystore::new(
         &fixture.alice_hash,
@@ -940,7 +1005,7 @@ fn unverified_sender_leaf_key_fails_i4_and_never_persists_message() {
         conversation_id: fixture.conversation_id.clone(),
         generation: 0,
         entry_seq: 2,
-        message_id: "msg-unverified-002".to_string(),
+        message_id: UNVERIFIED_MESSAGE_ID.to_string(),
         recipient_account_hash: fixture.alice_hash.clone(),
         fetch_required: false,
         sender_did: Some(fixture.bob_did.clone()),
@@ -1216,11 +1281,15 @@ fn push_catchup_skips_i14_pruned_entry_and_decrypts_live_message() {
                 &catbird_mls::orchestrator::MLSMessagePayload::text("Message after pruned seq 2!"),
             )
             .unwrap();
-            let (inner_plaintext, aad) = PrivateMessagePlaintextEnvelope::seal_with_aad(
+            let (inner_plaintext, aad) = seal_bob_application_message(
+                &fixture,
+                &group,
+                &provider,
                 [0x88u8; 32],
-                payload_json.into_bytes(),
-            )
-            .expect("seal_with_aad");
+                payload_json.as_bytes(),
+                PRUNED_LIVE_MESSAGE_ID,
+                7,
+            )?;
             group.set_aad(aad);
             let msg_out = group
                 .create_message(&provider, &fixture.bob_signer, &inner_plaintext)
@@ -1278,7 +1347,7 @@ fn push_catchup_skips_i14_pruned_entry_and_decrypts_live_message() {
                     mls_bytes: Vec::new(), // I14 pruned ciphertext!
                 },
                 FetchedPushEntry {
-                    entry_id: "entry-live-seq-3".to_string(),
+                    entry_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
                     seq: 3,
                     epoch: 1,
                     entry_kind: "application_message".to_string(),
@@ -1292,7 +1361,7 @@ fn push_catchup_skips_i14_pruned_entry_and_decrypts_live_message() {
     });
 
     let wake = PushWakePayload {
-        message_id: "entry-live-seq-3".to_string(),
+        message_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
         conversation_id: fixture.conversation_id.clone(),
         generation: 1,
         entry_seq: 3,

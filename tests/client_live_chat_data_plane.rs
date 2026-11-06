@@ -3271,9 +3271,11 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
                 .get_account_meta(&format!("c33_pending_opening:{cid}"))?
                 .is_none());
             assert!(tx.list_labyrinth_queue(Some(&cid), 100)?.is_empty());
-            assert!(tx
-                .get_labyrinth_state(&format!("native.message:{cid}:{msg_id}"))?
-                .is_none());
+            assert!(
+                tx.get_labyrinth_state(&format!("native.message:{cid}:{msg_id}"))?
+                    .is_some(),
+                "receipt-bound archive evidence survives terminal close for rescue/unsend"
+            );
             Ok(())
         })
         .unwrap();

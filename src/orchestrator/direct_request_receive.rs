@@ -55,6 +55,27 @@ fn bootstrap(publication: &Value) -> Result<DirectRequestBootstrap> {
             .timestamp(),
     )
     .map_err(|_| invalid())?;
+    let archive_commitment: [u8; 32] = bytes(&p["archiveCommitment"])?
+        .try_into()
+        .map_err(|_| invalid())?;
+    let original_sender_attestation =
+        crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope::from_aad_json(
+            p.get("originalSenderAttestation").ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+    if original_sender_attestation.sender_did != p["actorDid"].as_str().unwrap_or_default()
+        || original_sender_attestation.sender_device_id
+            != p["actorDeviceId"].as_str().unwrap_or_default()
+    {
+        return Err(invalid());
+    }
+    original_sender_attestation
+        .verify(
+            p["conversationId"].as_str().unwrap_or_default(),
+            p["firstMessageId"].as_str().unwrap_or_default(),
+            &archive_commitment,
+        )
+        .map_err(|_| invalid())?;
     Ok(DirectRequestBootstrap {
         context_json,
         context_hash,
@@ -68,9 +89,8 @@ fn bootstrap(publication: &Value) -> Result<DirectRequestBootstrap> {
         metadata_nonce: bytes(&artifact["metadataSnapshot"]["nonce"])?,
         metadata_ciphertext: bytes(&artifact["metadataSnapshot"]["ciphertext"])?,
         initial_ciphertext: bytes(&artifact["initialCiphertext"])?,
-        archive_commitment: bytes(&p["archiveCommitment"])?
-            .try_into()
-            .map_err(|_| invalid())?,
+        archive_commitment,
+        original_sender_attestation,
         opening: None,
     })
 }

@@ -225,7 +225,15 @@ pub(crate) fn root_did_from_credential_bytes(
 pub(crate) fn extract_plaintext_body_and_verify_aad(
     decrypted_bytes: &[u8],
     aad_bytes: &[u8],
-) -> Result<(String, String, Option<[u8; 32]>), MLSError> {
+) -> Result<
+    (
+        String,
+        String,
+        Option<[u8; 32]>,
+        Option<crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope>,
+    ),
+    MLSError,
+> {
     crate::messaging::receive::extract_plaintext_body_and_verify_aad(decrypted_bytes, aad_bytes)
 }
 
@@ -255,6 +263,7 @@ pub(crate) fn verify_signed_mutation_body(
         SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
         SignedMutationKind::PolicyTransition => "signedPolicyTransition",
         SignedMutationKind::ConversationClose => "signedConversationClose",
+        SignedMutationKind::ApplicationSend => "signedApplicationSend",
         _ => {
             return Err(MLSError::Cryptography(
                 "unexpected signed transition kind".into(),
@@ -1000,7 +1009,7 @@ pub fn process_push_notification_with_hooks(
                     }
 
                     let decrypted_bytes = app_msg.into_bytes();
-                    let (body, plaintext_json, commitment_opt) =
+                    let (body, plaintext_json, commitment_opt, original_sender_attestation) =
                         extract_plaintext_body_and_verify_aad(&decrypted_bytes, &aad_bytes)?;
                     let message_id = authenticated_application_message_id(
                         &aad_bytes, &wake.conversation_id, &entry.entry_id,
@@ -1022,6 +1031,21 @@ pub fn process_push_notification_with_hooks(
                         .map_err(|e| MLSError::Cryptography(format!("push archive payload: {e}")))?;
                     if commitment_opt.is_none() {
                         return Err(MLSError::Cryptography("push message has no authenticated archive commitment".into()));
+                    }
+                    let original_sender_attestation =
+                        original_sender_attestation.ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "push message has no original sender archive attestation".into(),
+                            )
+                        })?;
+                    if original_sender_attestation.sender_did != verified_sender_did
+                        || original_sender_attestation.sender_device_id != verified_device_id
+                        || original_sender_attestation.sender_transport_public_key.as_slice()
+                            != sender_member.signature_key.as_slice()
+                    {
+                        return Err(MLSError::Cryptography(
+                            "push original sender attestation differs from MLS sender leaf".into(),
+                        ));
                     }
                     // The full archive payload with the authenticated receive-time roster; the
                     // app enqueues it once the entry's I13 receipt verifies.
@@ -1050,6 +1074,15 @@ pub fn process_push_notification_with_hooks(
                         mls_ciphertext_b64: STANDARD.encode(&entry.mls_bytes),
                         frame_nonce_b64: Some(STANDARD.encode(inner.frame_nonce)),
                         sequencer_receipt_json: None,
+                        original_sender_attestation_json: Some(
+                            serde_json::to_string(&original_sender_attestation).map_err(
+                                |error| {
+                                    MLSError::Internal(format!(
+                                        "serialize push original sender attestation: {error}"
+                                    ))
+                                },
+                            )?,
+                        ),
                         created_at_ms: now_ms,
                     };
                     tx.put_labyrinth_state(

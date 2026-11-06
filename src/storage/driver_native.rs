@@ -1875,6 +1875,17 @@ impl<'a> SqlTx<'a> {
             .map_err(|e| map_rusqlite_err("dequeue_labyrinth_item", &e))?;
         Ok(())
     }
+
+    pub fn purge_labyrinth_queue_from_sender(&self, sender_did: &str) -> Result<usize, MLSError> {
+        self.read
+            .conn
+            .execute(
+                "DELETE FROM labyrinth_queue \
+                 WHERE json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?1",
+                [sender_did],
+            )
+            .map_err(|e| map_rusqlite_err("purge_labyrinth_queue_from_sender", &e))
+    }
 }
 
 /// Rust-internal [`EpochSecretStorage`] backed directly by the `epoch_secrets` table in [`MlsAccountDb`].

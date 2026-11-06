@@ -63,6 +63,15 @@ pub struct SignedPushGatewayRegistration {
     pub request_json: String,
 }
 
+/// A member unexpectedly dropped during a mailbox epoch rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct LabyrinthRotationExclusion {
+    pub device_key_hex: Option<String>,
+    pub reason: String,
+    pub recovery_method: Option<String>,
+}
+
 /// Labyrinth 1.1 backup & recovery status (`D4`, `Spec §6.7`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
@@ -73,6 +82,25 @@ pub struct LabyrinthBackupStatus {
     pub has_passkey_prf: bool,
     pub epoch_seq: u64,
     pub active_device_ids: Vec<String>,
+    /// Advisory only: this restored keychain/passkey method passed its
+    /// client-clock freshness window but remains valid until rotation.
+    #[serde(default)]
+    pub recovery_method_stale: bool,
+    /// Recovery/device members unexpectedly excluded by the latest rotation.
+    #[serde(default)]
+    pub rotation_exclusions: Vec<LabyrinthRotationExclusion>,
+    /// Epoch head durably queued for PDS + directory publication.
+    #[serde(default)]
+    pub pending_directory_epoch: Option<u64>,
+    /// True after a publication retry failed; archive items remain queued.
+    #[serde(default)]
+    pub directory_publication_stalled: bool,
+    /// Number of app-start/sync publication attempts observed by this device.
+    #[serde(default)]
+    pub directory_publication_retry_count: u64,
+    /// Last retry failure, cleared once both directory publications succeed.
+    #[serde(default)]
+    pub directory_publication_error: Option<String>,
 }
 
 /// Enrolled-device offer for 6-digit hybrid PQ `CPace + ML-KEM-768` device pairing (`I16`).
@@ -117,6 +145,8 @@ pub struct QueuedLabyrinthArchivePayload {
     pub frame_nonce_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequencer_receipt_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_sender_attestation_json: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -248,11 +278,11 @@ pub(crate) mod native_client {
     use super::{
         account_db_path, account_did_hash_hex, normalize_account_did, personal_mailbox_space_uri,
         probe_and_check_spaces_eligibility, wipe_pre_cutover_local_artifacts,
-        CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus, OtcPairingCompletion,
-        OtcPairingOffer, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
-        PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
-        PreCutoverWipeReport, QueuedLabyrinthArchivePayload, SignedPushGatewayRegistration,
-        SpacesEligibilityStatus,
+        CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus,
+        LabyrinthRotationExclusion, OtcPairingCompletion, OtcPairingOffer, PlatformChangeEvent,
+        PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest, PlatformHttpResponse,
+        PlatformKeyStore, PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload,
+        SignedPushGatewayRegistration, SpacesEligibilityStatus,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
@@ -481,6 +511,12 @@ pub(crate) mod native_client {
                         has_passkey_prf: false,
                         epoch_seq: 1,
                         active_device_ids: vec![config.device_id.clone()],
+                        recovery_method_stale: false,
+                        rotation_exclusions: Vec::new(),
+                        pending_directory_epoch: None,
+                        directory_publication_stalled: false,
+                        directory_publication_retry_count: 0,
+                        directory_publication_error: None,
                     };
                     let bytes = serde_json::to_vec(&initial).map_err(|e| {
                         MLSError::Internal(format!("serialize initial LabyrinthBackupStatus: {e}"))
@@ -1130,6 +1166,7 @@ pub(crate) mod native_client {
                     mls_ciphertext_b64: BASE64_STANDARD.encode(&ciphertext_bytes),
                     frame_nonce_b64: Some(BASE64_STANDARD.encode(frame_nonce)),
                     sequencer_receipt_json: None,
+                    original_sender_attestation_json: None,
                     created_at_ms: now_ms,
                 };
                 let queued_bytes = serde_json::to_vec(&queued_payload).map_err(|e| {
@@ -1539,6 +1576,13 @@ pub(crate) mod native_client {
                     "passkey PRF requires non-empty credential_id and 32-byte PRF output",
                 ));
             }
+            let prf_output_32 = Zeroizing::new(prf_output_32);
+            #[cfg(feature = "labyrinth")]
+            self.persist_native_passkey_recovery(&credential_id, &prf_output_32)?;
+            #[cfg(not(feature = "labyrinth"))]
+            return Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ));
             let now_ms = self.hooks.now_ms();
             let status = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
@@ -1547,6 +1591,9 @@ pub(crate) mod native_client {
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 st.has_passkey_prf = true;
+                st.recovery_method_stale = false;
+                st.rotation_exclusions
+                    .retain(|exclusion| exclusion.recovery_method.as_deref() != Some("passkey"));
                 tx.put_labyrinth_state("passkey_credential_id", &credential_id, now_ms)?;
                 tx.put_labyrinth_state(
                     "status_json",
@@ -1638,7 +1685,7 @@ pub(crate) mod native_client {
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 #[cfg(feature = "labyrinth")]
                 {
-                    st.epoch_seq = rotated_remote;
+                    st.epoch_seq = rotated_remote.new_epoch;
                 }
                 #[cfg(not(feature = "labyrinth"))]
                 {
@@ -1700,7 +1747,8 @@ pub(crate) mod native_client {
                 st.active_device_ids.retain(|d| d != target_device_id);
                 #[cfg(feature = "labyrinth")]
                 {
-                    st.epoch_seq = rotated_remote;
+                    st.epoch_seq = rotated_remote.new_epoch;
+                    st.rotation_exclusions = rotated_remote.exclusions.clone();
                 }
                 #[cfg(not(feature = "labyrinth"))]
                 {

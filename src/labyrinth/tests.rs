@@ -135,6 +135,7 @@ struct MockDsState {
     chat_keys: HashMap<String, Vec<[u8; 32]>>,
     conversations: HashMap<String, (String, Vec<String>)>,
     did_docs: HashMap<String, Vec<u8>>,
+    publish_epoch_failures: usize,
 }
 
 struct MockSixEndpointGateway {
@@ -159,6 +160,10 @@ impl LabyrinthGateway for MockSixEndpointGateway {
         let mut st = self.state.lock().unwrap();
         match request.nsid.as_str() {
             "blue.catbird.labyrinth.publishEpochHead" => {
+                if st.publish_epoch_failures > 0 {
+                    st.publish_epoch_failures -= 1;
+                    return Err("injected publishEpochHead failure".into());
+                }
                 let parsed: serde_json::Value =
                     serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
                         .map_err(|e| e.to_string())?;
@@ -557,6 +562,49 @@ async fn fault_line_1_session_persists_mek_pin_and_revocation_before_flush_or_pu
 }
 
 #[tokio::test]
+async fn partial_directory_publish_is_durable_visible_and_retried_on_reopen() {
+    let alice = "did:plc:alicepublishretry000000000";
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState::default()));
+    let deps = build_deps(
+        alice,
+        "dev-a1",
+        41,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let mut session = deps.clone().enable().await.expect("enable");
+
+    ds_state.lock().unwrap().publish_epoch_failures = 1;
+    assert!(session.rotate_epoch().await.is_err());
+    assert_eq!(session.pending_directory_epoch(), Some(1));
+    assert!(session.directory_publish_attempted());
+    assert!(session.directory_publish_error().is_some());
+    drop(session);
+
+    let reopened = deps
+        .open()
+        .await
+        .expect("reopen after partial publication")
+        .expect("saved session");
+    assert_eq!(reopened.pending_directory_epoch(), None);
+    assert!(reopened.directory_publish_attempted());
+    assert_eq!(reopened.directory_publish_error(), None);
+    let state = ds_state.lock().unwrap();
+    assert_eq!(
+        state
+            .heads
+            .get(alice)
+            .and_then(|heads| heads.last())
+            .map(|head| head.epoch_number),
+        Some(1)
+    );
+}
+
+#[tokio::test]
 async fn fault_line_2_kick_outbox_fallback_and_cached_history_rescue_import_with_sender_attribution(
 ) {
     let alice = "did:plc:alicefl20000000000000000";
@@ -764,7 +812,7 @@ async fn fault_line_3_session_heals_unanchored_squatted_epoch_and_preserves_anch
                 &mailbox_space,
                 alice,
                 labyrinth::records::nsid::EPOCH,
-                &format!("{new_ep:012}"),
+                &format!("{:012}", new_ep.new_epoch),
             )
             .is_some(),
         "directory-anchored revocation epoch must remain intact in Space"

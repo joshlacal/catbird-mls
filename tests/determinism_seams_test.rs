@@ -450,12 +450,12 @@ impl DeterministicMockTransport {
                     .as_str()
                     .unwrap_or("did:plc:aliceaaaaaaaaaaaaaaaaaaa")
                     .to_string();
-                self.labyrinth_epochs
-                    .lock()
-                    .unwrap()
-                    .entry(did)
-                    .or_default()
-                    .push(body_json["epoch"].clone());
+                let epoch = body_json["epoch"].clone();
+                let mut epochs = self.labyrinth_epochs.lock().unwrap();
+                let chain = epochs.entry(did).or_default();
+                chain.retain(|known| known["seq"] != epoch["seq"]);
+                chain.push(epoch);
+                chain.sort_by_key(|known| known["seq"].as_u64().unwrap_or_default());
                 return Ok(json_ok(serde_json::json!({})));
             }
             if url.contains("/xrpc/blue.catbird.labyrinth.getEpochHead") {
@@ -710,7 +710,7 @@ fn two_seeded_clients_produce_byte_identical_enrollment_and_ciphertexts() {
     hasher.update(out_a.3.as_bytes());
     let digest_hex = hasher.finalize().to_hex().to_string();
     assert_eq!(
-        digest_hex, "eaf7e7c3a94e2c471e35a5ba0a8f5ef5cc21b66b774e16558a8eb188e139fc8c",
+        digest_hex, "2eede06b61413adc5cc7bda913feb93f2d5313d1c0f101621efca6f87747c99b",
         "cross-process enrollment + X-Wing ciphertext blake3 digest drifted"
     );
 }
@@ -783,7 +783,7 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // against the account-bound native Space host, and a solo-group flush makes no Space reads.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "e165fd614c5ea0633807b768462b11725ea4c5cfa639f4fda7c4fd596535eb77",
+        "a93168fb55a79dad48cbe496aa8d1c7bb6f2dd98ff42074360c3f5c497ed4ebc",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -849,7 +849,7 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
     // device/epoch/virtualDevice records.
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "31b6c6f54e85df43826bb6e913f1948e8904b8f04eca7f5cbf456b0a46a30903",
+        "49abb8fe1314e29aa22f5dc13a755267d14bcabd262fe62ee93349f82e9020fc",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }

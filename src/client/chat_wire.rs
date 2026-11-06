@@ -515,7 +515,11 @@ pub fn parse_and_verify_i13_sequencer_receipt(
     expected_group_id: &[u8],
     expected_epoch: u64,
     expected_entry_id: &str,
+    expected_message_id: &str,
     expected_commitment: &[u8; 32],
+    original_sender_attestation: Option<
+        &crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope,
+    >,
 ) -> Result<(u64, u64, String), MLSError> {
     let conversation_id = receipt_val
         .get("conversationId")
@@ -591,6 +595,20 @@ pub fn parse_and_verify_i13_sequencer_receipt(
             "I13 sequencerReceipt coordinates or archiveCommitment mismatch".to_string(),
         ));
     }
+    if let Some(original_sender_attestation) = original_sender_attestation {
+        if original_sender_attestation.sender_did != sender_did
+            || original_sender_attestation.sender_device_id != sender_device_id
+        {
+            return Err(MLSError::Cryptography(
+                "sequencer receipt sender differs from original sender attestation".into(),
+            ));
+        }
+        original_sender_attestation.verify(
+            expected_convo_id,
+            expected_message_id,
+            expected_commitment,
+        )?;
+    }
 
     let signed = labyrinth_protocol::receipt::SignedSequencerReceipt {
         payload: labyrinth_protocol::receipt::SequencerReceiptPayload {
@@ -628,6 +646,7 @@ pub fn parse_and_verify_i13_sequencer_receipt(
         key_id: signed.key_id,
         signature: signed.signature.to_vec(),
         generation,
+        original_sender_attestation: original_sender_attestation.cloned(),
     };
     let archived_json = serde_json::to_string(&stored)
         .map_err(|e| MLSError::Internal(format!("serialize StoredArchivedReceipt JSON: {e}")))?;
@@ -650,6 +669,8 @@ pub struct StoredArchivedReceipt {
     pub key_id: String,
     pub signature: Vec<u8>,
     pub generation: u64,
+    pub original_sender_attestation:
+        Option<crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope>,
 }
 
 impl StoredArchivedReceipt {
@@ -681,6 +702,15 @@ impl StoredArchivedReceipt {
                 signature,
             },
             generation: self.generation,
+            original_sender_attestation: self
+                .original_sender_attestation
+                .as_ref()
+                .ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "stored archive receipt lacks original sender attestation".into(),
+                    )
+                })?
+                .to_labyrinth()?,
         })
     }
 }

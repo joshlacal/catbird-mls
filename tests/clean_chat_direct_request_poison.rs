@@ -195,6 +195,15 @@ async fn proof(world: &TestWorld) -> Proof {
     let artifact = |bytes: &Vec<u8>, kind: &str| json!({"framing":"mlsMessage","contentType":kind,"bytes":STANDARD.encode(bytes),"sha256":STANDARD.encode(Sha256::digest(bytes))});
     let metadata = json!({"coordinate":metadata_coordinate(&b.coordinates).unwrap(),"originTransitionId":ctx["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(&b.metadata_nonce),"ciphertext":STANDARD.encode(&b.metadata_ciphertext),"ciphertextSha256":STANDARD.encode(Sha256::digest(&b.metadata_ciphertext)),"ciphertextSize":b.metadata_ciphertext.len(),"authorProof":{"authorDid":alice.did,"authorDeviceId":device,"authorKeyId":ctx["actorKeyId"],"signaturePublicKey":STANDARD.encode(&public),"authGenerationAtOrigin":1,"originTransitionId":ctx["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
     let body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\0","protocolVersion":"2","actorDid":alice.did,"actorDeviceId":device,"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":bob.did,"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode(input.preparation_request_digest),"contextHash":STANDARD.encode(b.context_hash),"archiveCommitment":STANDARD.encode(b.archive_commitment),"next":b.coordinates,"importUntil":utc(b.import_until),"artifacts":{"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":[{"recipientDid":bob.did,"recipientDeviceId":bob_device,"provenance":{"requestId":ctx["requestId"],"preparationDigest":ctx["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":uuid::Uuid::new_v4().to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(package.hash_ref),"importUntil":utc(b.import_until)}}]},"metadataSnapshot":metadata,"initialCiphertext":STANDARD.encode(&b.initial_ciphertext)},"idempotencyKey":uuid::Uuid::new_v4().to_string(),"signedAt":utc(now)});
+    let mut body = body;
+    body["originalSenderAttestation"] = json!({
+        "senderDid": b.original_sender_attestation.sender_did,
+        "senderDeviceId": b.original_sender_attestation.sender_device_id,
+        "senderTransportPubkey": STANDARD.encode(
+            &b.original_sender_attestation.sender_transport_public_key
+        ),
+        "signature": STANDARD.encode(&b.original_sender_attestation.signature),
+    });
     let welcome = DirectRequestWelcomeInput {
         // The receiver derives its bootstrap from the publication; only the sender's
         // journal captures the opening before encryption.
