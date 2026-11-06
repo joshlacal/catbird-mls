@@ -385,12 +385,14 @@ fn device_signed_claim(
 }
 
 /// `read_auth::verify`: the claim names the session account, this route, and this exact
-/// canonical query (every decoded pair, sorted, RFC 3986 re-encoded), signed by `actorDeviceId`.
+/// canonical query (every decoded pair, sorted, RFC 3986 re-encoded). Ordinary
+/// directory reads bind the claim device to `actorDeviceId`; fixed-shape reads do not.
 fn verify_read(
     g: &MockDsState,
     account: &str,
     req: &PlatformHttpRequest,
     nsid: &str,
+    actor_device_param: bool,
 ) -> Result<(), &'static str> {
     use catbird_mls::labyrinth::write_auth::{canonical_query_params, READ_DOMAIN, READ_HEADER};
     let (claim, _) = device_signed_claim(g, account, req, READ_HEADER, "deviceId", READ_DOMAIN)?;
@@ -403,15 +405,17 @@ fn verify_read(
         .map(|(k, v)| (pct_decode(k), pct_decode(v)))
         .collect();
     let params: Vec<(&str, String)> = pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-    let device = pairs
+    let devices = pairs
         .iter()
         .filter(|(k, _)| k == "actorDeviceId")
         .map(|(_, v)| v.as_str())
         .collect::<Vec<_>>();
+    let expected_devices = [claim["deviceId"].as_str().unwrap_or_default()];
     if claim["did"] != account
         || claim["nsid"] != nsid
         || claim["query"] != canonical_query_params(&params)
-        || device != [claim["deviceId"].as_str().unwrap_or_default()]
+        || (actor_device_param && devices != expected_devices)
+        || (!actor_device_param && !devices.is_empty())
     {
         return Err("read claim does not bind this account, route, and query");
     }
@@ -509,6 +513,15 @@ impl SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getMailboxKeysRecord") {
+            if let Err(message) = verify_read(
+                &g,
+                account,
+                &req,
+                "blue.catbird.labyrinth.getMailboxKeysRecord",
+                false,
+            ) {
+                return xrpc_error(401, "InvalidSignature", message);
+            }
             let repo = q.get("did").cloned().unwrap_or_default();
             let rkey = q.get("rkey").cloned().unwrap_or_default();
             let collection = labyrinth::records::nsid::MAILBOX_KEYS.to_string();
@@ -609,9 +622,13 @@ impl SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getEpochHead") {
-            if let Err(message) =
-                verify_read(&g, account, &req, "blue.catbird.labyrinth.getEpochHead")
-            {
+            if let Err(message) = verify_read(
+                &g,
+                account,
+                &req,
+                "blue.catbird.labyrinth.getEpochHead",
+                true,
+            ) {
                 return xrpc_error(401, "InvalidSignature", message);
             }
             let chain = g
@@ -638,7 +655,7 @@ impl SharedMockDs {
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getChatDeviceKeys") {
             let nsid = "blue.catbird.labyrinth.getChatDeviceKeys";
-            if let Err(message) = verify_read(&g, account, &req, nsid) {
+            if let Err(message) = verify_read(&g, account, &req, nsid, true) {
                 return xrpc_error(401, "InvalidSignature", message);
             }
             let did = q.get("did").cloned().unwrap_or_default();

@@ -183,7 +183,7 @@ impl NativeArchiveGateway {
             super::chat_wire::urlencode_form_component(did),
             super::chat_wire::urlencode_form_component(rkey),
         );
-        let headers = super::chat_wire::build_chat_read_headers(
+        let mut headers = super::chat_wire::build_chat_read_headers(
             NSID,
             &query,
             &self.config.account_did,
@@ -194,7 +194,24 @@ impl NativeArchiveGateway {
         .map_err(|e| labyrinth::Error::Backend(e.to_string()))?
         .into_iter()
         .map(|header| (header.name, header.value))
-        .collect();
+        .collect::<Vec<_>>();
+        let claim = crate::labyrinth::write_auth::ReadClaim::new(
+            NSID,
+            &[("did", did.to_owned()), ("rkey", rkey.to_owned())],
+            &self.config.account_did,
+            &self.config.device_id,
+            self.hooks.now_ms().max(0) as u64,
+        );
+        let claim_json = claim.to_json();
+        let signature = crate::labyrinth::ChatKeySigner::sign(
+            self.signer.as_ref(),
+            &crate::labyrinth::write_auth::ReadClaim::signing_input(&claim_json),
+        )
+        .map_err(labyrinth::Error::Backend)?;
+        headers.extend(crate::labyrinth::write_auth::read_headers(
+            &claim_json,
+            &signature,
+        ));
         let response = crate::labyrinth::transport::decode_response_bounded(
             self.execute(
                 &self.config.home_ds_endpoint,
