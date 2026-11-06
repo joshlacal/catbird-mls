@@ -429,7 +429,9 @@ impl SessionDeps {
             head.as_ref()
                 .is_some_and(|head| head.seq == local.seq && head.head == local.head)
         };
-        if !agrees(&pds_latest) || !agrees(&ds_latest) {
+        if (!agrees(&pds_latest) || !agrees(&ds_latest))
+            && local.attestation.transport_public_key == self.signer.public_key()
+        {
             session.lab.publish_latest_keys().await?;
         }
         Ok(())
