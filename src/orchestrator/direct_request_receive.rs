@@ -151,28 +151,15 @@ where
             .iter()
             .any(|p| p["userDid"] == owner && p["status"] != "active"))
     }
-    /// A device outside the publication's addressed set (for example one
-    /// enrolled after publication) is refused the request entry and holds no
-    /// request keys. Its truthful view is the account's consent from the
-    /// validated conversation state with crypto unavailable. Nothing is
-    /// retained, so later leaf recovery never inherits a fabricated preview.
-    /// `code` names why: the device was not addressed, or its opening was
-    /// pruned before import (`sender` then binds the verified receipt actor).
-    async fn unaddressed_direct_request_view(
+    fn unavailable_request_view_from_state(
         &self,
         cid: &str,
         owner: &str,
-        device: &str,
         code: &str,
         sender: Option<&str>,
+        state_json: &Value,
     ) -> Result<DirectRequestView> {
-        let result = self
-            .request_query(
-                CanonicalOperation::GetConversationState,
-                format!("actorDeviceId={device}&conversationId={cid}"),
-            )
-            .await?;
-        let view = super::super::admission::conversation_view_from_state_json(&result["state"])
+        let view = super::super::admission::conversation_view_from_state_json(state_json)
             .ok_or_else(invalid)?;
         super::super::admission::validate_conversation_view(&view)?;
         let state = view.canonical_state.as_ref().ok_or_else(invalid)?;
@@ -205,12 +192,83 @@ where
             generation: u64::try_from(state.coordinates.generation).map_err(|_| invalid())?,
         })
     }
+
+    /// A device outside the publication's addressed set (for example one enrolled after
+    /// publication) gets only the account's authenticated policy view.
+    async fn unaddressed_direct_request_view(
+        &self,
+        cid: &str,
+        owner: &str,
+        device: &str,
+        code: &str,
+        sender: Option<&str>,
+    ) -> Result<DirectRequestView> {
+        let result = self
+            .request_query(
+                CanonicalOperation::GetConversationState,
+                format!("actorDeviceId={device}&conversationId={cid}"),
+            )
+            .await?;
+        self.unavailable_request_view_from_state(cid, owner, code, sender, &result["state"])
+    }
+
+    /// Authenticate the exact pruned row before its shared page cursor is accepted. The signed
+    /// conversation state supplies both independent participants; a row-controlled actor can
+    /// never select its own receipt authority.
+    pub(super) async fn verified_pruned_request_view(
+        &self,
+        cid: &str,
+        owner: &str,
+        device: &str,
+        entry: &Value,
+    ) -> Result<DirectRequestView> {
+        let result = self
+            .request_query(
+                CanonicalOperation::GetConversationState,
+                format!("actorDeviceId={device}&conversationId={cid}"),
+            )
+            .await?;
+        let view = super::super::admission::conversation_view_from_state_json(&result["state"])
+            .ok_or_else(invalid)?;
+        super::super::admission::validate_conversation_view(&view)?;
+        let state = view.canonical_state.as_ref().ok_or_else(invalid)?;
+        super::super::admission::validate_conversation_policy(state)?;
+        let request = state.direct_request.as_ref().ok_or_else(invalid)?;
+        if state.coordinates.conversation_id.as_str() != cid
+            || request.sender_did == request.recipient_did
+            || (owner != request.sender_did.as_str() && owner != request.recipient_did.as_str())
+        {
+            return Err(invalid());
+        }
+        let document = self
+            .request_receipt_authority(&request.sender_did, &request.recipient_did, true)
+            .await?;
+        let authority: Value = serde_json::from_slice(&document).map_err(|_| invalid())?;
+        let receipt = crate::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
+            entry,
+            cid,
+            authority["id"].as_str().ok_or_else(invalid)?,
+            &document,
+        )
+        .map_err(|_| invalid())?;
+        if receipt["actorDid"].as_str() != Some(request.sender_did.as_str()) {
+            return Err(invalid());
+        }
+        self.unavailable_request_view_from_state(
+            cid,
+            owner,
+            "OpeningPruned",
+            Some(&request.sender_did),
+            &result["state"],
+        )
+    }
     /// The authenticated receipt-authority document for a request between
     /// `actor_did` and `recipient_did`.
     async fn request_receipt_authority(
         &self,
         actor_did: &str,
         recipient_did: &str,
+        require_both_declarations: bool,
     ) -> Result<Vec<u8>> {
         let actor_auth = self
             .credentials()
@@ -224,11 +282,19 @@ where
             (Some(a), Some(b)) => {
                 transcript::derive_deterministic_coordinator(&a, &b).map_err(|_| invalid())?
             }
-            (None, None) => super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
-            (Some(auth), None) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+            (None, None) if !require_both_declarations => {
                 super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
             }
-            (None, Some(auth)) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+            (Some(auth), None)
+                if !require_both_declarations
+                    && auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY =>
+            {
+                super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+            }
+            (None, Some(auth))
+                if !require_both_declarations
+                    && auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY =>
+            {
                 super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
             }
             _ => {
@@ -342,29 +408,14 @@ where
                 return Err(OrchestratorError::ConversationNotFound(cid.into()));
             }
             if crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(requests[0]) {
-                // The opening ciphertext was pruned before this device imported
-                // it. Only its immutable receipts remain: verify them, then
-                // surface the declared terminal view. Nothing is persisted and
-                // no Welcome import, preview or acceptance can follow from it.
-                let actor = requests[0]["publicationReceipt"]["body"]["receipt"]["actorDid"]
-                    .as_str()
-                    .ok_or_else(invalid)?;
-                let document = Box::pin(self.request_receipt_authority(actor, &owner)).await?;
-                let did: Value = serde_json::from_slice(&document).map_err(|_| invalid())?;
-                crate::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
-                    requests[0],
-                    cid,
-                    did["id"].as_str().ok_or_else(invalid)?,
-                    &document,
-                )
-                .map_err(|_| invalid())?;
+                // Authenticate the exact immutable row against the signed two-party state before
+                // surfacing a terminal view. Nothing is persisted.
                 crate::info_log!("[request] convo={} opening pruned before import: terminal view, nothing persisted", cid);
-                return Box::pin(self.unaddressed_direct_request_view(
+                return Box::pin(self.verified_pruned_request_view(
                     cid,
                     &owner,
                     &device,
-                    "OpeningPruned",
-                    Some(actor),
+                    requests[0],
                 ))
                 .await;
             }
@@ -410,7 +461,8 @@ where
             )
             .map_err(|_| invalid())?;
             let actor_did = verified.body()["actorDid"].as_str().ok_or_else(invalid)?;
-            let document = Box::pin(self.request_receipt_authority(actor_did, &owner)).await?;
+            let document =
+                Box::pin(self.request_receipt_authority(actor_did, &owner, false)).await?;
             let projection = DirectRequestProjection {
                 authorization_version: super::projection::REQUEST_AUTHORIZATION_VERSION,
                 owner_did: owner.clone(),

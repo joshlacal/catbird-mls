@@ -479,7 +479,7 @@ impl MLSStorageBackend for BotStorage {
         let msgs = s.messages.get(conversation_id).cloned().unwrap_or_default();
         let filtered: Vec<Message> = msgs
             .into_iter()
-            .filter(|m| before_sequence.map_or(true, |seq| m.sequence_number < seq))
+            .filter(|m| before_sequence.is_none_or(|seq| m.sequence_number < seq))
             .collect();
         Ok(filtered.into_iter().rev().take(limit as usize).collect())
     }
@@ -581,162 +581,6 @@ impl MLSStorageBackend for BotStorage {
             "clear_recovery_backoff",
             "set_last_global_rejoin_attempt_at",
         ]
-    }
-}
-
-#[cfg(test)]
-mod bot_storage_tests {
-    use super::*;
-
-    fn test_mls_context(path: &std::path::Path, label: &str) -> Arc<MLSContext> {
-        MLSContext::new(
-            path.to_string_lossy().to_string(),
-            format!("echo-bot-storage-test-{label}"),
-            Box::new(InMemoryKeychain::new()),
-        )
-        .expect("create test MLS context")
-    }
-
-    #[tokio::test]
-    async fn bot_storage_definitively_reads_conversation_state_for_normal_resolution() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let storage = BotStorage::with_recovery_path(directory.path().join("recovery-state.json"))
-            .expect("create bot storage");
-        assert_eq!(
-            storage
-                .get_conversation_state("ordinary-conversation")
-                .await
-                .expect("ordinary resolution requires a definitive absence"),
-            None
-        );
-
-        storage
-            .set_conversation_state("tracked-conversation", ConversationState::NeedsRejoin)
-            .await
-            .expect("store tracked state");
-        assert_eq!(
-            storage
-                .get_conversation_state("tracked-conversation")
-                .await
-                .expect("read tracked state"),
-            Some(ConversationState::NeedsRejoin)
-        );
-    }
-
-    #[tokio::test]
-    async fn bot_storage_recovery_state_survives_restart_and_allows_initialization() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let recovery_path = directory.path().join("recovery-state.json");
-        let did = "did:plc:echo-storage-test";
-        let conversation_id = "durable-recovery-conversation";
-
-        let storage = BotStorage::with_recovery_path(recovery_path.clone())
-            .expect("create durable bot storage");
-        storage
-            .set_recovery_backoff(&PersistedRecoveryBackoff {
-                conversation_id: conversation_id.to_string(),
-                failed_rejoin_count: 2,
-                last_attempt_at_ms: Utc::now().timestamp_millis(),
-                quarantined_until_ms: None,
-            })
-            .await
-            .expect("persist recovery backoff");
-        drop(storage);
-
-        let restarted =
-            BotStorage::with_recovery_path(recovery_path).expect("reopen durable bot storage");
-        let orchestrator = MLSOrchestrator::new(
-            test_mls_context(&directory.path().join("restart.db"), "restart"),
-            Arc::new(restarted),
-            Arc::new(HttpDSClient::new("http://127.0.0.1:9", did, "test-token")),
-            Arc::new(BotCredentials::new()),
-            OrchestratorConfig::default(),
-        );
-
-        orchestrator
-            .initialize(did)
-            .await
-            .expect("echo-bot storage must satisfy mandatory recovery persistence");
-        let tracker = orchestrator.recovery_tracker().lock().await;
-        assert_eq!(tracker.failed_attempts(conversation_id), 2);
-        assert!(tracker.cooldown_remaining(conversation_id).is_some());
-    }
-
-    #[tokio::test]
-    async fn post_rename_sync_failure_cannot_be_erased_by_later_write() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let recovery_path = directory.path().join("recovery-state.json");
-        let storage = BotStorage::with_recovery_path(recovery_path.clone())
-            .expect("create durable bot storage");
-        let entry = |conversation_id: &str| PersistedRecoveryBackoff {
-            conversation_id: conversation_id.to_string(),
-            failed_rejoin_count: 1,
-            last_attempt_at_ms: Utc::now().timestamp_millis(),
-            quarantined_until_ms: None,
-        };
-
-        storage.fail_next_directory_sync();
-        storage
-            .set_recovery_backoff(&entry("conversation-a"))
-            .await
-            .expect_err("post-rename directory sync failure must propagate");
-        storage
-            .set_recovery_backoff(&entry("conversation-b"))
-            .await
-            .expect("later write must preserve the renamed snapshot");
-        drop(storage);
-
-        let restarted =
-            BotStorage::with_recovery_path(recovery_path).expect("reopen durable bot storage");
-        let persisted = restarted
-            .get_recovery_state()
-            .await
-            .expect("read recovery state");
-        let ids: HashSet<_> = persisted
-            .entries
-            .iter()
-            .map(|entry| entry.conversation_id.as_str())
-            .collect();
-        assert_eq!(ids, HashSet::from(["conversation-a", "conversation-b"]));
-    }
-
-    #[tokio::test]
-    async fn list_conversations_orders_by_updated_at_then_conversation_id() {
-        use chrono::TimeZone as _;
-        let directory = tempfile::tempdir().expect("tempdir");
-        let storage = BotStorage::with_recovery_path(directory.path().join("recovery-state.json"))
-            .expect("create bot storage");
-        let at = |ms| Utc.timestamp_millis_opt(ms).single();
-        for (cid, ms) in [
-            ("c3", 100),
-            ("c0", 100),
-            ("c4", 200),
-            ("c2", 100),
-            ("c1", 200),
-        ] {
-            storage.inner.lock().unwrap().conversations.insert(
-                cid.to_string(),
-                ConversationView {
-                    group_id: format!("group-{cid}"),
-                    conversation_id: cid.to_string(),
-                    epoch: 0,
-                    members: vec![],
-                    metadata: None,
-                    created_at: at(ms),
-                    updated_at: at(ms),
-                    sequencer_did: None,
-                    canonical_state: None,
-                },
-            );
-        }
-        let ids: Vec<String> = storage
-            .list_conversations("did:plc:bot")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|c| c.conversation_id)
-            .collect();
-        assert_eq!(ids, ["c1", "c4", "c0", "c2", "c3"]);
     }
 }
 
@@ -850,7 +694,7 @@ impl MLSAPIClient for HttpDSClient {
             .as_array()
             .unwrap_or(&vec![])
             .iter()
-            .filter_map(|c| parse_convo_view(c))
+            .filter_map(parse_convo_view)
             .collect();
         let cursor = body["cursor"].as_str().map(|s| s.to_string());
 
@@ -942,10 +786,6 @@ impl MLSAPIClient for HttpDSClient {
                 let kp_data = p["keyPackage"]
                     .as_str()
                     .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())?;
-                let hash_ref = p["hashRef"]
-                    .as_str()
-                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-                    .unwrap_or_default();
                 Some(KeyPackageRef {
                     did,
                     key_package_data: kp_data,
@@ -1303,4 +1143,159 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     info!("Echo bot stopped");
     Ok(())
+}
+#[cfg(test)]
+mod bot_storage_tests {
+    use super::*;
+
+    fn test_mls_context(path: &std::path::Path, label: &str) -> Arc<MLSContext> {
+        MLSContext::new(
+            path.to_string_lossy().to_string(),
+            format!("echo-bot-storage-test-{label}"),
+            Box::new(InMemoryKeychain::new()),
+        )
+        .expect("create test MLS context")
+    }
+
+    #[tokio::test]
+    async fn bot_storage_definitively_reads_conversation_state_for_normal_resolution() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = BotStorage::with_recovery_path(directory.path().join("recovery-state.json"))
+            .expect("create bot storage");
+        assert_eq!(
+            storage
+                .get_conversation_state("ordinary-conversation")
+                .await
+                .expect("ordinary resolution requires a definitive absence"),
+            None
+        );
+
+        storage
+            .set_conversation_state("tracked-conversation", ConversationState::NeedsRejoin)
+            .await
+            .expect("store tracked state");
+        assert_eq!(
+            storage
+                .get_conversation_state("tracked-conversation")
+                .await
+                .expect("read tracked state"),
+            Some(ConversationState::NeedsRejoin)
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_storage_recovery_state_survives_restart_and_allows_initialization() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let recovery_path = directory.path().join("recovery-state.json");
+        let did = "did:plc:echo-storage-test";
+        let conversation_id = "durable-recovery-conversation";
+
+        let storage = BotStorage::with_recovery_path(recovery_path.clone())
+            .expect("create durable bot storage");
+        storage
+            .set_recovery_backoff(&PersistedRecoveryBackoff {
+                conversation_id: conversation_id.to_string(),
+                failed_rejoin_count: 2,
+                last_attempt_at_ms: Utc::now().timestamp_millis(),
+                quarantined_until_ms: None,
+            })
+            .await
+            .expect("persist recovery backoff");
+        drop(storage);
+
+        let restarted =
+            BotStorage::with_recovery_path(recovery_path).expect("reopen durable bot storage");
+        let orchestrator = MLSOrchestrator::new(
+            test_mls_context(&directory.path().join("restart.db"), "restart"),
+            Arc::new(restarted),
+            Arc::new(HttpDSClient::new("http://127.0.0.1:9", did, "test-token")),
+            Arc::new(BotCredentials::new()),
+            OrchestratorConfig::default(),
+        );
+
+        orchestrator
+            .initialize(did)
+            .await
+            .expect("echo-bot storage must satisfy mandatory recovery persistence");
+        let tracker = orchestrator.recovery_tracker().lock().await;
+        assert_eq!(tracker.failed_attempts(conversation_id), 2);
+        assert!(tracker.cooldown_remaining(conversation_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn post_rename_sync_failure_cannot_be_erased_by_later_write() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let recovery_path = directory.path().join("recovery-state.json");
+        let storage = BotStorage::with_recovery_path(recovery_path.clone())
+            .expect("create durable bot storage");
+        let entry = |conversation_id: &str| PersistedRecoveryBackoff {
+            conversation_id: conversation_id.to_string(),
+            failed_rejoin_count: 1,
+            last_attempt_at_ms: Utc::now().timestamp_millis(),
+            quarantined_until_ms: None,
+        };
+
+        storage.fail_next_directory_sync();
+        storage
+            .set_recovery_backoff(&entry("conversation-a"))
+            .await
+            .expect_err("post-rename directory sync failure must propagate");
+        storage
+            .set_recovery_backoff(&entry("conversation-b"))
+            .await
+            .expect("later write must preserve the renamed snapshot");
+        drop(storage);
+
+        let restarted =
+            BotStorage::with_recovery_path(recovery_path).expect("reopen durable bot storage");
+        let persisted = restarted
+            .get_recovery_state()
+            .await
+            .expect("read recovery state");
+        let ids: HashSet<_> = persisted
+            .entries
+            .iter()
+            .map(|entry| entry.conversation_id.as_str())
+            .collect();
+        assert_eq!(ids, HashSet::from(["conversation-a", "conversation-b"]));
+    }
+
+    #[tokio::test]
+    async fn list_conversations_orders_by_updated_at_then_conversation_id() {
+        use chrono::TimeZone as _;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = BotStorage::with_recovery_path(directory.path().join("recovery-state.json"))
+            .expect("create bot storage");
+        let at = |ms| Utc.timestamp_millis_opt(ms).single();
+        for (cid, ms) in [
+            ("c3", 100),
+            ("c0", 100),
+            ("c4", 200),
+            ("c2", 100),
+            ("c1", 200),
+        ] {
+            storage.inner.lock().unwrap().conversations.insert(
+                cid.to_string(),
+                ConversationView {
+                    group_id: format!("group-{cid}"),
+                    conversation_id: cid.to_string(),
+                    epoch: 0,
+                    members: vec![],
+                    metadata: None,
+                    created_at: at(ms),
+                    updated_at: at(ms),
+                    sequencer_did: None,
+                    canonical_state: None,
+                },
+            );
+        }
+        let ids: Vec<String> = storage
+            .list_conversations("did:plc:bot")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.conversation_id)
+            .collect();
+        assert_eq!(ids, ["c1", "c4", "c0", "c2", "c3"]);
+    }
 }

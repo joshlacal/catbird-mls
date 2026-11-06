@@ -377,9 +377,9 @@ async fn test_c15_edited_local_draft_cannot_mutate_unresolved_operation() {
     );
 }
 
-/// A refusal without a signed receipt never mutates the intent unless it defers the retry. A
-/// transient one without a deferral (`429`, `503`, `500`) stays `OutcomeUnknown` and every resume
-/// replays the identical signed prepare; a semantic `400` is terminal for those bytes.
+/// A refusal without a signed receipt never resolves or mutates the intent. Transient refusals
+/// (`429`, `503`, `500`) stay `OutcomeUnknown`; permanent unsigned refusals surface their raw
+/// status while every resume still replays the identical signed prepare.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prepare_refusals_split_transient_from_semantic_without_mutating_the_intent() {
     let mut world = TestWorld::new();
@@ -440,22 +440,18 @@ async fn test_prepare_refusals_split_transient_from_semantic_without_mutating_th
         400,
         json!({ "error": "RequestPolicyDenied", "message": "recipient refuses requests" }),
     );
-    let outcome = alice
+    let refusal = alice
         .orchestrator
         .start_direct_request(input.clone())
         .await
-        .unwrap();
-    let signed: Value = serde_json::from_slice(&sent[0]).unwrap();
-    assert_eq!(
-        outcome,
-        DirectRequestOutcome::TerminalNotPublished {
-            request_id: signed["signedRequest"]["body"]["requestId"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-            code: "RequestPolicyDenied".into(),
-        }
-    );
+        .expect_err("an unsigned semantic refusal cannot prove nonpublication");
+    assert!(matches!(
+        refusal,
+        OrchestratorError::ServerError {
+            status: 400,
+            ref body
+        } if body.contains("RequestPolicyDenied")
+    ));
     assert_eq!(prepares().last(), Some(&sent[0]));
     assert_eq!(
         intent(),
@@ -572,15 +568,18 @@ async fn test_capacity_unavailable_defers_resume_by_a_persisted_retry_instant() 
         400,
         json!({ "error": "RequestPolicyDenied", "message": "recipient refuses requests" }),
     );
-    let outcome = world
+    let refusal = world
         .client("Alice")
         .orchestrator
         .resume_direct_request(draft)
         .await
-        .unwrap();
+        .expect_err("an unsigned refusal leaves the attempt unresolved");
     assert!(matches!(
-        outcome,
-        DirectRequestOutcome::TerminalNotPublished { ref code, .. } if code == "RequestPolicyDenied"
+        refusal,
+        OrchestratorError::ServerError {
+            status: 400,
+            ref body
+        } if body.contains("RequestPolicyDenied")
     ));
     let sent = sent_prepares(&world);
     assert_eq!(sent.len(), 2);

@@ -309,9 +309,9 @@ where
         *old = next;
         Ok(())
     }
-    /// A refusal carries no signed receipt. A transient one keeps the attempt for an identical
-    /// resume (`CapacityUnavailable` is deferred by the delivery service's 5-second contract,
-    /// persisted on the intent); a semantic one is terminal for those bytes.
+    /// A refusal carries no signed receipt, so it never proves nonpublication. Transient failures
+    /// keep the attempt for an identical resume (`CapacityUnavailable` is deferred by the delivery
+    /// service's 5-second contract); permanent HTTP refusals remain explicit unresolved errors.
     fn direct_request_refused(
         &self,
         intent: &mut DirectRequestIntent,
@@ -332,7 +332,10 @@ where
         let request_id = intent.request_id()?;
         if !retryable {
             self.clear_direct_request_retry(intent, raw)?;
-            return Ok(DirectRequestOutcome::TerminalNotPublished { request_id, code });
+            return Err(OrchestratorError::ServerError {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            });
         }
         if code == "CapacityUnavailable" {
             intent.retry_not_before_ms = Some(now_ms() + CAPACITY_UNAVAILABLE_RETRY_MS);

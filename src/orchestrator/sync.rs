@@ -547,6 +547,7 @@ where
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let any_needs_recovery = {
             let mut needed = false;
             for c in &all_convos {

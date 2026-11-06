@@ -786,12 +786,14 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
         threads_during_fetch: AtomicUsize::new(0),
     });
 
+    // Nest/APNs omit messageId and platform adapters preserve the legacy seq sentinel. The
+    // processor must derive the notification identity from authenticated MLS AAD.
     let wake = PushWakePayload {
         kind: "application_message".to_string(),
         conversation_id: fixture.conversation_id.clone(),
         generation: 0,
         entry_seq: 4,
-        message_id: gap_message_id.to_string(),
+        message_id: "msg-4".to_string(),
         recipient_account_hash: fixture.alice_hash.clone(),
         fetch_required: true,
         sender_did: Some(fixture.bob_did.clone()),
@@ -853,6 +855,28 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
     assert_eq!(preview.seq, 4);
     assert!(!preview.fallback_generic);
     assert_eq!(preview.message_id, gap_message_id);
+    let mismatched_wake = PushWakePayload {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        ..wake.clone()
+    };
+    let mismatch = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        Arc::new(MemoryPushKeystore::new(
+            &fixture.alice_hash,
+            fixture.alice_db_key,
+            Some("cached-chat-dpop-jwt".to_string()),
+        )),
+        Some(transport.clone()),
+        &mismatched_wake,
+    )
+    .expect_err("supplied wake identity is only a comparator");
+    assert!(
+        mismatch
+            .to_string()
+            .contains("messageId differs from authenticated MLS AAD"),
+        "{mismatch}"
+    );
 
     let app_db =
         MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)

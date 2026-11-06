@@ -1771,37 +1771,41 @@ where
             scanned = report.scanned,
             "Starting Rust-owned deferred recovery sweep"
         );
-        let mut any_needs_recovery = false;
-        for convo in &conversations {
-            let convo_id = &convo.conversation_id;
-            let persisted_state = self
-                .storage()
-                .get_conversation_state(convo_id)
-                .await
-                .ok()
-                .flatten();
-            let needs_rejoin = self.storage().needs_rejoin(convo_id).await.unwrap_or(false);
-            let in_memory_state = if persisted_state.is_none() {
-                self.conversation_states()
-                    .lock()
+        #[cfg(not(target_arch = "wasm32"))]
+        let any_needs_recovery = {
+            let mut needed = false;
+            for convo in &conversations {
+                let convo_id = &convo.conversation_id;
+                let persisted_state = self
+                    .storage()
+                    .get_conversation_state(convo_id)
                     .await
-                    .get(convo_id)
-                    .cloned()
-            } else {
-                None
-            };
-            if needs_rejoin
-                || persisted_state
-                    .as_ref()
-                    .is_some_and(Self::state_requires_deferred_recovery)
-                || in_memory_state
-                    .as_ref()
-                    .is_some_and(Self::state_requires_deferred_recovery)
-            {
-                any_needs_recovery = true;
-                break;
+                    .ok()
+                    .flatten();
+                let needs_rejoin = self.storage().needs_rejoin(convo_id).await.unwrap_or(false);
+                let in_memory_state = if persisted_state.is_none() {
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .get(convo_id)
+                        .cloned()
+                } else {
+                    None
+                };
+                if needs_rejoin
+                    || persisted_state
+                        .as_ref()
+                        .is_some_and(Self::state_requires_deferred_recovery)
+                    || in_memory_state
+                        .as_ref()
+                        .is_some_and(Self::state_requires_deferred_recovery)
+                {
+                    needed = true;
+                    break;
+                }
             }
-        }
+            needed
+        };
 
         #[cfg(not(target_arch = "wasm32"))]
         if any_needs_recovery {
@@ -6427,6 +6431,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fork-resolution")]
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn welcome_reissue_root_matching_preserves_method_specific_case() {

@@ -98,6 +98,8 @@ impl PlatformKeyStore for MemKeyStore {
 
 struct MockDsState {
     receipt_sk: P256SigningKey,
+    rotated_outcome_sk: Option<P256SigningKey>,
+    rotate_outcome_key_on_next_publish: bool,
     tamper_next_receipt: bool,
     omit_next_receipt: bool,
     empty_stub_next_send: bool,
@@ -157,6 +159,8 @@ impl SharedMockDs {
         Arc::new(Self {
             inner: Mutex::new(MockDsState {
                 receipt_sk: P256SigningKey::random(&mut rand::rngs::OsRng),
+                rotated_outcome_sk: None,
+                rotate_outcome_key_on_next_publish: false,
                 tamper_next_receipt: false,
                 omit_next_receipt: false,
                 empty_stub_next_send: false,
@@ -204,12 +208,28 @@ impl SharedMockDs {
                 .as_bytes(),
         )
         .unwrap();
-        serde_json::from_slice(&direct_request_i13::authority_document(
+        let mut document: Value = serde_json::from_slice(&direct_request_i13::authority_document(
             &g.receipt_sk,
             &method,
             DS_DID,
         ))
-        .unwrap()
+        .unwrap();
+        if let Some(rotated) = &g.rotated_outcome_sk {
+            let rotated_method = dr_transcript::direct_request_receipt_key_id_for_authority(
+                DS_DID,
+                rotated.verifying_key().to_encoded_point(true).as_bytes(),
+            )
+            .unwrap();
+            let rotated_document: Value = serde_json::from_slice(
+                &direct_request_i13::authority_document(rotated, &rotated_method, DS_DID),
+            )
+            .unwrap();
+            document["verificationMethod"]
+                .as_array_mut()
+                .unwrap()
+                .push(rotated_document["verificationMethod"][0].clone());
+        }
+        document
     }
 
     fn for_account(self: &Arc<Self>, account_did: &str) -> Arc<dyn PlatformTransport> {
@@ -486,6 +506,24 @@ impl SharedMockDs {
                 })
                 .collect();
             return ok_json(json!({ "records": records }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.getMailboxKeysRecord") {
+            let repo = q.get("did").cloned().unwrap_or_default();
+            let rkey = q.get("rkey").cloned().unwrap_or_default();
+            let collection = labyrinth::records::nsid::MAILBOX_KEYS.to_string();
+            let Some((value, cid)) = self.archive_auth.mailbox_keys_record(&repo, &rkey) else {
+                return Ok(PlatformHttpResponse {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: br#"{"error":"RecordNotFound"}"#.to_vec(),
+                });
+            };
+            return ok_json(json!({
+                "uri": format!("at://{repo}/{collection}/{rkey}"),
+                "cid": cid,
+                "value": value
+            }));
         }
 
         if url.contains("/xrpc/com.atproto.repo.getRecord") {
@@ -772,12 +810,16 @@ impl SharedMockDs {
                 .ok_or_else(|| MLSError::Internal(format!("no DR keys for {recipient_did}")))?;
             let (dev_id, kp, grant) = avail.pop().expect("at least 1 DR key");
             let prep_digest = STANDARD.encode(Sha256::digest(cid.as_bytes()));
+            let preparation_outcome_key = g
+                .rotated_outcome_sk
+                .clone()
+                .unwrap_or_else(|| g.receipt_sk.clone());
             return ok_json(json!({
                 "outcome": {
                     "conversationId": cid,
                     "authorityDid": DS_DID,
                     "receiptKeyId": dr_transcript::direct_request_receipt_key_id_for_authority(
-                        DS_DID, g.receipt_sk.verifying_key().to_encoded_point(true).as_bytes(),
+                        DS_DID, preparation_outcome_key.verifying_key().to_encoded_point(true).as_bytes(),
                     ).unwrap(),
                     "preparationDigest": { "$bytes": prep_digest },
                     "selectedDevices": [{
@@ -796,6 +838,13 @@ impl SharedMockDs {
             let cid = b["conversationId"].as_str().unwrap().to_string();
             let coords = b["next"].clone();
             let opening_receipt = direct_request_i13::receipt(&g.receipt_sk, b, 1, DS_DID);
+            if std::mem::take(&mut g.rotate_outcome_key_on_next_publish) {
+                g.rotated_outcome_sk = Some(P256SigningKey::random(&mut rand::rngs::OsRng));
+            }
+            let outcome_key = g
+                .rotated_outcome_sk
+                .clone()
+                .unwrap_or_else(|| g.receipt_sk.clone());
             let publication_transcript = dr_transcript::direct_request_signing_bytes(
                 DirectRequestKind::Publish,
                 &serde_json::to_vec(b).unwrap(),
@@ -806,7 +855,7 @@ impl SharedMockDs {
                 "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
                 "protocolVersion": "2", "authorityDid": DS_DID,
                 "keyId": dr_transcript::direct_request_receipt_key_id_for_authority(
-                    DS_DID, g.receipt_sk.verifying_key().to_encoded_point(true).as_bytes(),
+                    DS_DID, outcome_key.verifying_key().to_encoded_point(true).as_bytes(),
                 ).unwrap(),
                 "receipt": {
                     "$type": "blue.catbird.chat.defs#directRequestPublishedReceipt",
@@ -825,7 +874,7 @@ impl SharedMockDs {
                 &serde_json::to_vec(&outcome_body).unwrap(),
             )
             .unwrap();
-            let signature: p256::ecdsa::Signature = g.receipt_sk.sign(&transcript);
+            let signature: p256::ecdsa::Signature = outcome_key.sign(&transcript);
             let signature = signature.normalize_s().unwrap_or(signature);
             let outcome = json!({
                 "$type": "blue.catbird.chat.defs#signedDirectRequestReceipt",
@@ -840,7 +889,17 @@ impl SharedMockDs {
                     "participants": [
                         { "userDid": b["actorDid"], "status": "active", "role": "admin", "leafCount": 1 },
                         { "userDid": b["recipientDid"], "status": "pending", "role": "member", "leafCount": 0 }
-                    ]
+                    ],
+                    "directRequest": {
+                        "requestId": b["requestId"],
+                        "firstMessageId": b["firstMessageId"],
+                        "senderDid": b["actorDid"],
+                        "recipientDid": b["recipientDid"],
+                        "consent": "incomingPending",
+                        "importUntil": b["importUntil"],
+                        "contextHash": b["contextHash"],
+                        "preparationDigest": b["preparationDigest"]
+                    }
                 }),
             );
             g.entries.entry(cid.clone()).or_default().push(json!({
@@ -1566,6 +1625,19 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
     );
 
     // 3. Positive `C33` 1:1 Direct Request: Alice -> Bob (`prepareDirectRequest` + `publishDirectRequest`)
+    let preparation_receipt_method = {
+        let mut state = ds.inner.lock().unwrap();
+        state.rotate_outcome_key_on_next_publish = true;
+        dr_transcript::direct_request_receipt_key_id_for_authority(
+            DS_DID,
+            state
+                .receipt_sk
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        )
+        .unwrap()
+    };
     let dm_cid = uuid::Uuid::new_v4().to_string();
     let alice_dm = alice
         .create_group(
@@ -1577,6 +1649,22 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
         )
         .expect("alice create C33 DM");
     assert_eq!(alice_dm.epoch, 1);
+    let publication_receipt_method = {
+        let state = ds.inner.lock().unwrap();
+        let rotated = state
+            .rotated_outcome_sk
+            .as_ref()
+            .expect("publish rotated the retained outcome key");
+        dr_transcript::direct_request_receipt_key_id_for_authority(
+            DS_DID,
+            rotated.verifying_key().to_encoded_point(true).as_bytes(),
+        )
+        .unwrap()
+    };
+    assert_ne!(
+        preparation_receipt_method, publication_receipt_method,
+        "publication outcome verification resolves its own retained keyId"
+    );
 
     // Before acceptance, Alice's opening message MUST NOT be in the Labyrinth outbox (`C33` pending exclusion)!
     assert_eq!(
@@ -1971,6 +2059,80 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
     eve.sync().expect("eve join welcome");
     bob.sync().expect("bob sync eve addition");
 
+    // A history import carries plaintext rows, not live publication evidence. Seeing the same
+    // message ID on the live page must still authenticate its receipt and ciphertext before the
+    // cursor advances.
+    let imported_mid = uuid::Uuid::new_v4().to_string();
+    alice
+        .send_message(
+            &clean_cid,
+            &imported_mid,
+            "imported before live verification",
+        )
+        .expect("publish row later imported as history");
+    let imported = alice
+        .list_messages(&clean_cid, None, 100)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.message_id == imported_mid)
+        .expect("published row");
+    bob.import_conversation_history(&clean_cid, vec![imported])
+        .expect("import evidence-less history row");
+    assert!(bob
+        .db()
+        .read_tx(|tx| tx.get_labyrinth_state(&format!("native.message:{clean_cid}:{imported_mid}")))
+        .unwrap()
+        .is_none());
+    let cursor_before_import_reconciliation = bob
+        .db()
+        .read_tx(|tx| tx.get_conversation(&clean_cid))
+        .unwrap()
+        .unwrap()
+        .last_seq;
+    let published_import = {
+        let mut state = ds.inner.lock().unwrap();
+        let entry = state
+            .entries
+            .get_mut(&clean_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == imported_mid)
+            .unwrap();
+        let original = entry.clone();
+        entry["signedRequest"]["body"]["applicationMessage"]["bytes"] =
+            json!({ "$bytes": STANDARD.encode([0_u8]) });
+        original
+    };
+    assert!(
+        bob.sync().is_err(),
+        "an imported row without retained evidence must not bypass live authentication"
+    );
+    assert_eq!(
+        bob.db()
+            .read_tx(|tx| tx.get_conversation(&clean_cid))
+            .unwrap()
+            .unwrap()
+            .last_seq,
+        cursor_before_import_reconciliation
+    );
+    {
+        let mut state = ds.inner.lock().unwrap();
+        *state
+            .entries
+            .get_mut(&clean_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == imported_mid)
+            .unwrap() = published_import;
+    }
+    bob.sync()
+        .expect("authenticate the live row behind imported history");
+    assert!(bob
+        .db()
+        .read_tx(|tx| tx.get_labyrinth_state(&format!("native.message:{clean_cid}:{imported_mid}")))
+        .unwrap()
+        .is_some());
+
     // 2. Empty stub response (`{"ok":true}`) and omitted `sequencerReceipt` on sendMessage MUST fail closed (`I13`)
     // AND leave zero phantom `MessageRow`/`LabyrinthQueueRow` rows while reserving sender generations.
     ds.inner.lock().unwrap().empty_stub_next_send = true;
@@ -1993,11 +2155,11 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             .is_err(),
         "live sendMessage must reject missing sequencerReceipt (I13)"
     );
+    let alice_rows = alice.list_messages(&clean_cid, None, 20).unwrap();
     assert!(
-        alice
-            .list_messages(&clean_cid, None, 20)
-            .unwrap()
-            .is_empty(),
+        alice_rows
+            .iter()
+            .all(|row| row.message_id != bad_stub_mid && row.message_id != missing_rcpt_mid),
         "failed sends must commit zero phantom MessageRows"
     );
     assert!(
@@ -2006,7 +2168,7 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             .read_tx(|tx| tx.list_labyrinth_queue(None, 20))
             .unwrap()
             .iter()
-            .all(|q| q.conversation_id != clean_cid),
+            .all(|row| row.item_id != bad_stub_mid && row.item_id != missing_rcpt_mid),
         "failed sends must commit zero LabyrinthQueueRows"
     );
 
@@ -3194,11 +3356,11 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
 }
 
 /// `C33` peer on the transport-only home: its home serves the coordinator-sequenced
-/// `#accountDeletedEntry(D)` in the direct conversation's `getEntries`. The peer's ordinary sync
-/// records the deletion, drops its queued witness duty for D, and a fresh restore from the
-/// Conversation Space hides D's sender and witness copies while the peer's own messages restore.
+/// `#accountDeletedEntry(D)`. Ordinary sync applies it, while cross-writer restore
+/// accepts only a cursor-complete, MAC-committed writer snapshot whose STAR and
+/// oplog heads all reconcile.
 #[test]
-fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy() {
+fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
     let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
@@ -3274,6 +3436,58 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
         .unwrap()
         .iter()
         .any(|item| item.message_id == a2));
+    // A peer public-repo auth failure is a directory prerequisite failure,
+    // not proof that the established Conversation Space denied this member.
+    // It must retain the durable queue and must never fall back to OwnerBatch.
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.http_log.clear();
+        state.xrpc_failures.push((
+            "/xrpc/blue.catbird.labyrinth.getMailboxKeysRecord",
+            403,
+            "Forbidden",
+            None,
+        ));
+    }
+    let writes_before_directory_failure = ds.archive_auth.committed_space_write_count();
+    assert!(
+        bob.flush_labyrinth_queue().is_err(),
+        "foreign mailboxKeys 403 must remain a retryable archive prerequisite failure"
+    );
+    assert_eq!(
+        ds.archive_auth.committed_space_write_count(),
+        writes_before_directory_failure,
+        "directory failure must not publish an owner fallback"
+    );
+    assert!(
+        bob.list_pending_labyrinth_queue(Some(&cid), 100)
+            .unwrap()
+            .iter()
+            .any(|item| item.message_id == a2),
+        "directory failure must retain the exact queued frame"
+    );
+    let urls: Vec<String> = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .map(|(_, url, _)| url.clone())
+        .collect();
+    assert!(
+        urls.iter().any(|url| {
+            url.starts_with(DS_URL)
+                && url.contains("/xrpc/blue.catbird.labyrinth.getMailboxKeysRecord")
+        }),
+        "peer mailboxKeys must route through the account's home"
+    );
+    assert!(
+        !urls.iter().any(|url| {
+            url.contains("/xrpc/com.atproto.repo.getRecord")
+                && query_map(url).get("repo").map(String::as_str) == Some(ALICE_DID)
+        }),
+        "native archive must never connect directly to a peer PDS record endpoint"
+    );
     let d_messages: Vec<String> = bob
         .list_messages(&cid, None, 100)
         .unwrap()
@@ -3332,7 +3546,11 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
         let mut g = ds.inner.lock().unwrap();
         let seq = next_seq(&g);
         let entry = signed_account_deletion(&sequencer_sk, DS_DID, &cid, ALICE_DID, seq);
-        g.entries.get_mut(&cid).unwrap().push(entry);
+        g.entries.get_mut(&cid).unwrap().push(entry.clone());
+        g.account_deletions
+            .entry(cid.clone())
+            .or_default()
+            .push(entry);
         seq
     };
     bob.sync()
@@ -3358,7 +3576,9 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
         .unwrap()
         .is_empty());
 
-    // Fresh restore: the peer's own copy must come back from the Space too.
+    // Restore consumes every snapshot-bound listRepos page, verifies its
+    // inventory commitment, and reconciles each writer's STAR/oplog head
+    // before importing any message.
     bob.db()
         .write_tx(|tx| {
             tx.conn()
@@ -3370,67 +3590,46 @@ fn c33_peer_applies_its_homes_account_deleted_entry_and_restore_hides_every_copy
             Ok(())
         })
         .unwrap();
-    bob.restore_conversation_from_owner_mailbox(&cid)
-        .expect("fresh restore from the Conversation Space");
+    ds.archive_auth.set_inventory_fault(Some("truncate"));
+    let error = bob
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("a terminal page that omits a committed writer must fail closed");
+    assert!(error.to_string().contains("ArchiveInventoryIncomplete"));
+    let unchanged = bob.list_messages(&cid, None, 100).unwrap();
+    assert!(unchanged
+        .iter()
+        .all(|message| message.message_id != b1 && message.message_id != b2));
+    ds.archive_auth.set_inventory_fault(None);
+    assert_eq!(
+        bob.restore_conversation_from_owner_mailbox(&cid)
+            .expect("committed writer inventory restores the complete Space"),
+        2
+    );
     let restored = bob.list_messages(&cid, None, 100).unwrap();
-    assert!(
-        restored.iter().all(|m| m.sender_did != ALICE_DID),
-        "restore must hide every pre-deletion copy of D's messages: {:?}",
-        restored.iter().map(|m| &m.message_id).collect::<Vec<_>>()
-    );
-    assert!(
-        restored.iter().any(|m| m.message_id == b1),
-        "peer's own message stays"
-    );
-    assert!(
-        restored.iter().any(|m| m.message_id == b2),
-        "the survivor's post-deletion message is archived"
-    );
+    assert!(restored.iter().any(|message| message.message_id == b1));
+    assert!(restored.iter().any(|message| message.message_id == b2));
+    assert!(restored
+        .iter()
+        .all(|message| !d_messages.contains(&message.message_id)));
 
-    // A fresh recovery-code device never sees `getEntries`: only the signed state list.
+    // A recovered device accepts the same authenticated complete snapshot;
+    // account-deleted author copies remain suppressed.
     let code = bob.setup_recovery_code().expect("bob recovery code");
     let bob2 = open("bob2", BOB_DID);
     bob2.enroll_device(&scopes).expect("enroll bob2");
     bob2.restore_with_recovery_code(&code)
         .expect("bob2 recovers the archive");
-    ds.inner
-        .lock()
-        .unwrap()
-        .account_deletions
-        .insert(cid.clone(), rogue(deletion_seq).to_vec());
-    bob2.restore_conversation_from_owner_mailbox(&cid)
-        .expect("fresh-device restore");
-    assert_eq!(marker(&bob2), None);
-    assert!(
-        bob2.list_messages(&cid, None, 100)
-            .unwrap()
-            .iter()
-            .any(|m| m.message_id == a1),
-        "unverified deletions must hide nothing on a fresh device"
+    assert_eq!(
+        bob2.restore_conversation_from_owner_mailbox(&cid)
+            .expect("fresh-device restore verifies the paged inventory"),
+        2
     );
-    ds.inner
-        .lock()
-        .unwrap()
-        .account_deletions
-        .get_mut(&cid)
-        .unwrap()
-        .push(signed_account_deletion(
-            &sequencer_sk,
-            DS_DID,
-            &cid,
-            ALICE_DID,
-            deletion_seq,
-        ));
-    bob2.restore_conversation_from_owner_mailbox(&cid)
-        .expect("fresh-device restore with the signed deletion");
-    assert_eq!(marker(&bob2), Some(deletion_seq.to_string().into_bytes()));
-    let restored2 = bob2.list_messages(&cid, None, 100).unwrap();
-    assert!(
-        restored2.iter().all(|m| m.sender_did != ALICE_DID),
-        "fresh device must hide every pre-deletion copy of D's messages"
-    );
-    assert!(restored2.iter().any(|m| m.message_id == b1));
-    assert!(restored2.iter().any(|m| m.message_id == b2));
+    let recovered = bob2.list_messages(&cid, None, 100).unwrap();
+    assert!(recovered.iter().any(|message| message.message_id == b1));
+    assert!(recovered.iter().any(|message| message.message_id == b2));
+    assert!(recovered
+        .iter()
+        .all(|message| !d_messages.contains(&message.message_id)));
 }
 
 /// Cold start: the DS authenticates `ConversationNotFound` and this device holds no local state
@@ -3593,6 +3792,36 @@ fn reenrolling_after_cold_relaunch_keeps_the_signer_so_archive_and_peers_stay_bo
         ds.inner.lock().unwrap().device_keys[&(ALICE_DID.to_string(), alice_dev.clone())]
             .as_slice(),
         enrolled.as_slice()
+    );
+
+    let enroll_posts = || {
+        ds.inner
+            .lock()
+            .unwrap()
+            .http_log
+            .iter()
+            .filter(|(account, url, _)| {
+                account == ALICE_DID && url.ends_with("/xrpc/blue.catbird.chat.enrollDevice")
+            })
+            .count()
+    };
+    let before_mismatch = enroll_posts();
+    let mismatched = live_client(
+        tmp.path(),
+        &ds,
+        "alice",
+        ALICE_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &alice_keys,
+    );
+    assert!(matches!(
+        mismatched.enroll_device(&scopes),
+        Err(MLSError::InvalidState(code)) if code == "EnrollmentDeviceIdentityMismatch"
+    ));
+    assert_eq!(
+        enroll_posts(),
+        before_mismatch,
+        "a completed signer may not be rebound to a different device ID"
     );
 
     let after = uuid::Uuid::new_v4().to_string();
@@ -3984,12 +4213,13 @@ fn c33_opening_publication_receipt_requires_exact_union_tag() {
     assert_eq!(bob.list_requests(Some("incomingPending")).unwrap().len(), 1);
 }
 
-/// A transient `C33` refusal (`400 CapacityUnavailable`, `Retry-After: 5`) keeps the peer-keyed
+/// A transient `C33` refusal (`503 CapacityUnavailable`, `Retry-After: 5`) keeps the peer-keyed
 /// creation journal. A retry inside the delay sends nothing; after it, and across a restart, the
 /// exact signed publication is replayed over the journaled bootstrap (no second prepare, no
 /// second recipient key package) and the journaled conversation and text win over the caller's.
-/// A transient `acceptConversation` refusal keeps the acceptance journal the same way, and a
-/// semantic refusal drops the creation journal so the next attempt is a fresh request.
+/// A transient `acceptConversation` refusal keeps the acceptance journal the same way. Unsigned
+/// semantic and authentication refusals after publication also retain the exact publication until
+/// a signed outcome resolves it.
 #[test]
 fn c33_transient_refusal_replays_the_journaled_publication_after_retry_after() {
     use catbird_mls::sim_hooks::{FixedStepClock, OsSimEntropy, SimClientHooks, SimClock as _};
@@ -4066,11 +4296,16 @@ fn c33_transient_refusal_replays_the_journaled_publication_after_retry_after() {
             .unwrap()
     };
     let refuse = |route: &'static str, code: &'static str, retry_after: Option<&'static str>| {
+        let status = if code == "CapacityUnavailable" {
+            503
+        } else {
+            400
+        };
         ds.inner
             .lock()
             .unwrap()
             .xrpc_failures
-            .push((route, 400, code, retry_after));
+            .push((route, status, code, retry_after));
     };
     let create = |client: &CatbirdMlsClient, cid: &str, text: &str| {
         client.create_group(
@@ -4162,23 +4397,39 @@ fn c33_transient_refusal_replays_the_journaled_publication_after_retry_after() {
     assert_eq!(accepts.len(), 2);
     assert_eq!(accepts[0], accepts[1]);
 
-    // A semantic refusal drops the attempt; the next tap is a fresh request.
+    // An unsigned semantic refusal, followed by an authentication refusal, cannot prove that the
+    // publication was not accepted. Both retain and replay the exact immutable publication.
+    let prepares_before_unknown = posts(ALICE_DID, PREPARE).len();
     refuse(PUBLISH, "RequestPolicyDenied", None);
-    let refused = create(&alice, &uuid::Uuid::new_v4().to_string(), "denied");
+    let denied_caller_cid = uuid::Uuid::new_v4().to_string();
+    let refused = create(&alice, &denied_caller_cid, "denied");
     assert_eq!(refusal(refused), "RequestPolicyDenied");
+    let retained: Value =
+        serde_json::from_str(&journal(&alice).expect("unsigned refusal retains the publication"))
+            .unwrap();
+    let retained_conversation_id = retained["conversation_id"].as_str().unwrap().to_string();
+    let retained_publish = retained["publish"]["publish_wrapper"].clone();
+    ds.inner
+        .lock()
+        .unwrap()
+        .xrpc_failures
+        .push((PUBLISH, 401, "AuthRequired", None));
+    assert!(create(&alice, &uuid::Uuid::new_v4().to_string(), "auth retry").is_err());
+    let after_auth: Value =
+        serde_json::from_str(&journal(&alice).expect("auth refusal retains the publication"))
+            .unwrap();
+    assert_eq!(after_auth["publish"]["publish_wrapper"], retained_publish);
+    assert_eq!(posts(ALICE_DID, PREPARE).len(), prepares_before_unknown + 1);
+
+    let later_caller_cid = uuid::Uuid::new_v4().to_string();
+    let resumed = create(&alice, &later_caller_cid, "later tap")
+        .expect("a signed published outcome resolves the retained attempt");
+    assert_eq!(resumed.conversation_id, retained_conversation_id);
+    assert_ne!(resumed.conversation_id, later_caller_cid);
+    let publications = posts(ALICE_DID, PUBLISH);
+    let replayed = &publications[publications.len() - 3..];
+    assert!(replayed.windows(2).all(|pair| pair[0] == pair[1]));
     assert!(journal(&alice).is_none());
-    let fresh_cid = uuid::Uuid::new_v4().to_string();
-    let fresh = create(&alice, &fresh_cid, "fresh").expect("a fresh request");
-    assert_eq!(fresh.conversation_id, fresh_cid);
-    let request_id_of = |body: &[u8]| {
-        let body: Value = serde_json::from_slice(body).unwrap();
-        body["signedRequest"]["body"]["requestId"].clone()
-    };
-    let prepared = posts(ALICE_DID, PREPARE);
-    let [.., denied, fresh_prepare] = prepared.as_slice() else {
-        panic!("two more prepares");
-    };
-    assert_ne!(request_id_of(denied), request_id_of(fresh_prepare));
 }
 
 /// A signed terminal receipt answering a replayed prepare drops the C33 creation journal only once

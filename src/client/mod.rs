@@ -640,6 +640,14 @@ pub(crate) mod native_client {
 
             let (signer, signer_bytes, direct_kp_bytes, recovery_kp_bytes) =
                 self.db.write_tx(|tx| {
+                    if tx
+                        .get_account_meta("scoped_identity")?
+                        .is_some_and(|identity| identity != scoped_identity)
+                    {
+                        return Err(MLSError::InvalidState(
+                            "EnrollmentDeviceIdentityMismatch".into(),
+                        ));
+                    }
                     let signer = match tx.get_account_meta("enrolled_signer_json")? {
                         Some(raw) => serde_json::from_str::<SignatureKeyPair>(&raw)
                             .map_err(|e| MLSError::Internal(format!("deserialize signer: {e}")))?,

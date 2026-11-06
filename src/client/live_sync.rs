@@ -1097,8 +1097,8 @@ impl CatbirdMlsClient {
     }
 
     /// An opening pruned before this device imported it keeps only its receipts: no Welcome,
-    /// preview or acceptance can follow. Verify them under the coordinator, then record the
-    /// declared terminal request state once; the history is reachable only via Spaces.
+    /// preview or acceptance can follow. Authenticate both state participants and their independent
+    /// homes before the receipt authority, then record the terminal request state once.
     fn record_pruned_c33_opening(
         &self,
         cid: &str,
@@ -1106,38 +1106,56 @@ impl CatbirdMlsClient {
         entry: &Value,
     ) -> Result<bool, MLSError> {
         let missing = |what: &str| MLSError::Cryptography(format!("C33 pruned opening: {what}"));
-        let sender_did = entry
-            .pointer("/publicationReceipt/body/receipt/actorDid")
-            .and_then(Value::as_str)
-            .ok_or_else(|| missing("actorDid"))?;
-        let peer_did = if sender_did == self.normalized_did {
-            state["participants"]
-                .as_array()
-                .and_then(|participants| {
-                    participants.iter().find_map(|p| {
-                        p["userDid"]
-                            .as_str()
-                            .filter(|did| *did != self.normalized_did)
-                    })
-                })
-                .ok_or_else(|| missing("recipient"))?
+        let participants = state["participants"]
+            .as_array()
+            .filter(|participants| participants.len() == 2)
+            .ok_or_else(|| missing("two participants"))?;
+        let first = participants[0]["userDid"]
+            .as_str()
+            .ok_or_else(|| missing("participant DID"))?;
+        let second = participants[1]["userDid"]
+            .as_str()
+            .ok_or_else(|| missing("participant DID"))?;
+        let sender_did = state["directRequest"]["senderDid"]
+            .as_str()
+            .ok_or_else(|| missing("state senderDid"))?;
+        let recipient_did = state["directRequest"]["recipientDid"]
+            .as_str()
+            .ok_or_else(|| missing("state recipientDid"))?;
+        if state["conversationKind"] != "direct"
+            || state["coordinates"]["conversationId"].as_str() != Some(cid)
+            || first == second
+            || sender_did == recipient_did
+            || !(first == sender_did && second == recipient_did
+                || first == recipient_did && second == sender_did)
+            || (self.normalized_did != sender_did && self.normalized_did != recipient_did)
+        {
+            return Err(missing("state participant binding"));
+        }
+        let sender_home = if sender_did == self.normalized_did {
+            self.config.home_ds_did.clone()
         } else {
-            sender_did
+            self.resolve_peer_home_ds_did(sender_did)
+                .ok_or_else(|| missing("sender home DS authority"))?
         };
-        let peer_ds = self
-            .resolve_peer_home_ds_did(peer_did)
-            .ok_or_else(|| missing("peer home DS authority"))?;
-        let authority = dr_transcript::derive_deterministic_coordinator(
-            self.config.home_ds_did.trim(),
-            &peer_ds,
-        )
-        .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
+        let recipient_home = if recipient_did == self.normalized_did {
+            self.config.home_ds_did.clone()
+        } else {
+            self.resolve_peer_home_ds_did(recipient_did)
+                .ok_or_else(|| missing("recipient home DS authority"))?
+        };
+        let authority =
+            dr_transcript::derive_deterministic_coordinator(&sender_home, &recipient_home)
+                .map_err(|e| MLSError::Cryptography(format!("C33 coordinator: {e}")))?;
         let document = self
             .resolve_did_document(&authority)?
             .ok_or_else(|| missing("receipt authority document"))?;
         let receipt = crate::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
             entry, cid, &authority, &document,
         )?;
+        if receipt["actorDid"].as_str() != Some(sender_did) {
+            return Err(missing("receipt sender binding"));
+        }
         let row = RequestRow {
             request_id: receipt["requestId"]
                 .as_str()
@@ -1145,11 +1163,7 @@ impl CatbirdMlsClient {
                 .to_string(),
             conversation_id: cid.to_string(),
             sender_did: sender_did.to_string(),
-            recipient_did: if sender_did == self.normalized_did {
-                peer_did.to_string()
-            } else {
-                self.normalized_did.clone()
-            },
+            recipient_did: recipient_did.to_string(),
             consent: C33_OPENING_UNAVAILABLE.to_string(),
             first_message_id: receipt["firstMessageId"].as_str().map(str::to_owned),
             first_message_archived: false,
@@ -2636,7 +2650,12 @@ impl CatbirdMlsClient {
                         && crate::planted::is_planted_bug_active(
                             crate::planted::PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart,
                         ));
-                if already_have {
+                let has_archive_evidence = self.db.read_tx(|tx| {
+                    Ok(tx
+                        .get_labyrinth_state(&format!("native.message:{cid}:{msg_id}"))?
+                        .is_some())
+                })?;
+                if already_have && has_archive_evidence {
                     let receipt = entry
                         .get("sequencerReceipt")
                         .filter(|value| value.is_object())

@@ -55,12 +55,29 @@ impl crate::labyrinth::StateVault for NativeArchiveVault {
 }
 
 #[cfg(feature = "labyrinth")]
+#[derive(Clone)]
+struct VerifiedArchiveRecord {
+    collection: String,
+    rkey: String,
+    cid: String,
+    value: serde_json::Value,
+}
+
+#[cfg(feature = "labyrinth")]
+#[derive(Clone, Default)]
+struct VerifiedArchiveInventory {
+    writers: std::collections::BTreeMap<String, Vec<VerifiedArchiveRecord>>,
+}
+
+#[cfg(feature = "labyrinth")]
 struct NativeArchiveGateway {
     config: CatbirdMlsClientConfig,
     db: Arc<MlsAccountDb>,
     transport: Arc<dyn PlatformTransport>,
     signer: Arc<NativeArchiveSigner>,
     hooks: crate::sim_hooks::SimClientHooks,
+    verified_inventories:
+        Mutex<std::collections::BTreeMap<String, VerifiedArchiveInventory>>,
 }
 
 #[cfg(feature = "labyrinth")]
@@ -150,12 +167,82 @@ impl NativeArchiveGateway {
         serde_json::from_slice(&bytes).map_err(|_| labyrinth::Error::Malformed("PDS repository response"))
     }
 
-    async fn account_pds(&self, did: &str) -> labyrinth::Result<String> {
-        if did == self.config.account_did { return Ok(self.config.pds_endpoint.clone()); }
-        let doc = crate::labyrinth::LabyrinthGateway::resolve_did_document(self, did).await
-            .map_err(labyrinth::Error::Backend)?.ok_or(labyrinth::Error::Unattested)?;
-        super::chat_wire::extract_pds_endpoint_from_did_doc(&doc).ok_or(labyrinth::Error::Unattested)
+    fn peer_mailbox_keys_json(
+        &self,
+        did: &str,
+        rkey: &str,
+    ) -> labyrinth::Result<serde_json::Value> {
+        const NSID: &str = "blue.catbird.labyrinth.getMailboxKeysRecord";
+        let query = format!(
+            "did={}&rkey={}",
+            super::chat_wire::urlencode_form_component(did),
+            super::chat_wire::urlencode_form_component(rkey),
+        );
+        let headers = super::chat_wire::build_chat_read_headers(
+            NSID,
+            &query,
+            &self.config.account_did,
+            &self.config.device_id,
+            &self.signer.0,
+            self.hooks.now_ms(),
+        )
+        .map_err(|e| labyrinth::Error::Backend(e.to_string()))?
+        .into_iter()
+        .map(|header| (header.name, header.value))
+        .collect();
+        let response = crate::labyrinth::transport::decode_response_bounded(
+            self.execute(
+                &self.config.home_ds_endpoint,
+                "GET".into(),
+                format!("/xrpc/{NSID}?{query}"),
+                headers,
+                None,
+            )
+            .map(Self::response),
+            crate::labyrinth::transport::MAX_LABYRINTH_XRPC_RESPONSE_BYTES,
+        )
+        .map_err(|error| {
+            if matches!(error.status, 400 | 404)
+                && error.error.as_deref() == Some("RecordNotFound")
+            {
+                labyrinth::Error::NotFound("record")
+            } else {
+                crate::labyrinth::transport::map_xrpc_error(error)
+            }
+        })?;
+        serde_json::from_slice(&response)
+            .map_err(|_| labyrinth::Error::Malformed("mailboxKeys relay response"))
     }
+}
+
+#[cfg(feature = "labyrinth")]
+fn parse_mailbox_keys_record(
+    response: &serde_json::Value,
+    did: &str,
+    rkey: &str,
+) -> labyrinth::Result<(Vec<u8>, String)> {
+    let expected_uri = format!(
+        "at://{did}/{}/{rkey}",
+        labyrinth::records::nsid::MAILBOX_KEYS
+    );
+    if response["uri"].as_str() != Some(expected_uri.as_str()) {
+        return Err(labyrinth::Error::Malformed(
+            "mailboxKeys relay URI binding",
+        ));
+    }
+    let cid = response["cid"]
+        .as_str()
+        .filter(|cid| !cid.is_empty())
+        .ok_or(labyrinth::Error::Malformed("getRecord missing CID"))?
+        .to_owned();
+    let value = response
+        .get("value")
+        .ok_or(labyrinth::Error::Malformed("getRecord missing value"))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+    crate::labyrinth::transport::enforce_pds_record_cap(&bytes)
+        .map_err(labyrinth::Error::Backend)?;
+    Ok((bytes, cid))
 }
 
 #[cfg(feature = "labyrinth")]
@@ -176,21 +263,23 @@ impl labyrinth::store::pds::PublicRepoBackend for NativeArchiveGateway {
     }
 
     async fn get_mailbox_keys(&self, did: &str, rkey: &str) -> labyrinth::Result<Option<(Vec<u8>, String)>> {
-        let base = self.account_pds(did).await?;
-        let path = format!("/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
-            super::chat_wire::urlencode_form_component(did), labyrinth::records::nsid::MAILBOX_KEYS,
-            super::chat_wire::urlencode_form_component(rkey));
-        let response = match self.pds_json(&base, "GET", path, None) {
-            Ok(value) => value,
-            Err(labyrinth::Error::NotFound("record")) => return Ok(None),
-            Err(error) => return Err(error),
+        let response = if did == self.config.account_did {
+            let path = format!("/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+                super::chat_wire::urlencode_form_component(did), labyrinth::records::nsid::MAILBOX_KEYS,
+                super::chat_wire::urlencode_form_component(rkey));
+            match self.pds_json(&self.config.pds_endpoint, "GET", path, None) {
+                Ok(value) => value,
+                Err(labyrinth::Error::NotFound("record")) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        } else {
+            match self.peer_mailbox_keys_json(did, rkey) {
+                Ok(value) => value,
+                Err(labyrinth::Error::NotFound("record")) => return Ok(None),
+                Err(error) => return Err(error),
+            }
         };
-        let cid = response["cid"].as_str().filter(|cid| !cid.is_empty())
-            .ok_or(labyrinth::Error::Malformed("getRecord missing CID"))?.to_owned();
-        let value = response.get("value").ok_or(labyrinth::Error::Malformed("getRecord missing value"))?;
-        let bytes = serde_json::to_vec(value).map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
-        crate::labyrinth::transport::enforce_pds_record_cap(&bytes).map_err(labyrinth::Error::Backend)?;
-        Ok(Some((bytes, cid)))
+        parse_mailbox_keys_record(&response, did, rkey).map(Some)
     }
 
     async fn delete_all_mailbox_keys(&self, did: &str) -> labyrinth::Result<()> {
@@ -362,7 +451,14 @@ impl CatbirdMlsClient {
         let mut config = self.config.clone();
         config.account_did = self.normalized_did.clone();
         config.device_id = self.canonical_uuid_v4_device_id().ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
-        let gateway = Arc::new(NativeArchiveGateway { config: config.clone(), db: self.db.clone(), transport: self.transport.clone(), signer: signer.clone(), hooks: self.hooks.clone() });
+        let gateway = Arc::new(NativeArchiveGateway {
+            config: config.clone(),
+            db: self.db.clone(),
+            transport: self.transport.clone(),
+            signer: signer.clone(),
+            hooks: self.hooks.clone(),
+            verified_inventories: Mutex::new(std::collections::BTreeMap::new()),
+        });
         let transport = Arc::new(crate::labyrinth::GatewayXrpcTransport::new(gateway.clone(), signer.clone(), self.normalized_did.clone(), config.device_id)
             .with_clock(Arc::new(NativeArchiveClock(self.hooks.clone()))));
         Ok(crate::labyrinth::SessionDeps {
@@ -445,6 +541,7 @@ impl CatbirdMlsClient {
             tx.put_labyrinth_state(&key, &serde_json::to_vec(&placements).map_err(|e| MLSError::Internal(e.to_string()))?, self.hooks.now_ms())
         })
     }
+
 
     async fn native_backup_owner_items(&self, session: &mut crate::labyrinth::LabyrinthSession, conversation_id: &str, items: &[NativeArchiveEvidence]) -> Result<u32, MLSError> {
         // P11 drops the kicked member's OwnerBatch fallback on every path (flush denial and kick rescue).
@@ -532,11 +629,20 @@ impl CatbirdMlsClient {
                                 }
                                 Ok(kept)
                             })?;
-                            let denied = if owner_only { true } else {
-                                match session.archive_native_sender(&cid, &roster, chunk).await.map_err(native_archive_error)? {
-                                    Ok(()) => false,
-                                    Err(labyrinth::Error::Forbidden) => true,
-                                    Err(error) => return Err(MLSError::Cryptography(format!("sender archive: {error}"))),
+                            let denied = if owner_only {
+                                true
+                            } else {
+                                match session
+                                    .archive_native_sender(&cid, &roster, chunk)
+                                    .await
+                                    .map_err(native_archive_error)?
+                                {
+                                    Ok(denied) => denied,
+                                    Err(error) => {
+                                        return Err(MLSError::Cryptography(format!(
+                                            "sender archive prerequisite: {error}"
+                                        )));
+                                    }
                                 }
                             };
                             if denied {
@@ -696,20 +802,38 @@ impl CatbirdMlsClient {
             // account's owner records (as in flush); it never unlocks Conversation Space reads.
             let owner_only = match local_has_self {
                 Some(has_self) => !has_self,
-                None => matches!(
-                    deps.transport.query("blue.catbird.chat.getConversationState", &[("conversationId", conversation_id.to_owned())]).await
-                        .map_err(crate::labyrinth::transport::map_xrpc_error),
-                    Err(labyrinth::Error::NotFound("conversation"))
-                ),
+                None => match deps
+                    .transport
+                    .query(
+                        "blue.catbird.chat.getConversationState",
+                        &[("conversationId", conversation_id.to_owned())],
+                    )
+                    .await
+                    .map_err(crate::labyrinth::transport::map_xrpc_error)
+                {
+                    Ok(_) => false,
+                    Err(labyrinth::Error::NotFound("conversation")) => true,
+                    Err(error) => {
+                        return Err(native_archive_error(crate::labyrinth::map_error(error)))
+                    }
+                },
             };
             let mut session = deps.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
             if owner_only { return session.load_owner_history(conversation_id).await.map(|m| (m, 0)).map_err(native_archive_error); }
             let history = session.load_history(conversation_id, labyrinth::store::TimeRange::ALL).await.map_err(native_archive_error)?;
-            if history.undecryptable != 0 { return Err(MLSError::Cryptography("conversation archive contains undecryptable or unverified frames".into())); }
-            let space_readable = history.space_readable;
-            // Active members trust Conversation Space (sender and witness copies); owner records
-            // are only a Forbidden fallback.
-            Ok((history.messages.into_iter().filter(|message| !space_readable || message.source != labyrinth::client::MessageSource::Owner).collect(), history.rejected))
+            if !history.space_readable {
+                return Err(MLSError::InvalidState(
+                    "ArchiveInventoryIncomplete".into(),
+                ));
+            }
+            if history.undecryptable != 0 {
+                return Err(MLSError::Cryptography("conversation archive contains corrupt or unverified frames".into()));
+            }
+            if history.not_recipient != 0 {
+                tracing::debug!(conversation_id, skipped = history.not_recipient,
+                    "labyrinth restore: skipped authenticated records outside this account's recipient interval");
+            }
+            Ok((history.messages, history.rejected))
         })?;
         if rejected > 0 {
             tracing::warn!(conversation_id, rejected, "labyrinth restore: ignored witness copies that contradict accepted archive copies");
@@ -953,6 +1077,7 @@ impl CatbirdMlsClient {
                 transport: self.transport.clone(),
                 signer: rogue_arc_signer.clone(),
                 hooks: self.hooks.clone(),
+                verified_inventories: Mutex::new(std::collections::BTreeMap::new()),
             });
             let rogue_xrpc = Arc::new(
                 crate::labyrinth::GatewayXrpcTransport::new(
@@ -1035,7 +1160,10 @@ impl CatbirdMlsClient {
 /// copy colliding with another member's message id, never fail or alter restore.
 #[cfg(all(test, feature = "labyrinth"))]
 mod native_restore_tests {
-    use super::{block_on_sync, native_restore_copies, select_restore_copy, MessageRow};
+    use super::{
+        block_on_sync, native_restore_copies, parse_mailbox_keys_record, select_restore_copy,
+        MessageRow,
+    };
     use labyrinth::client::{Backends, Clock, Labyrinth};
     use labyrinth::message::ArchivedReceipt;
     use labyrinth::protocol::receipt::{
@@ -1051,6 +1179,24 @@ mod native_restore_tests {
     const ALICE: &str = "did:plc:alice";
     const BOB: &str = "did:plc:bob";
     const CAROL: &str = "did:plc:carol";
+
+    #[test]
+    fn mailbox_keys_relay_cannot_substitute_a_peer_record() {
+        let response = serde_json::json!({
+            "uri": format!(
+                "at://{CAROL}/{}/epoch-7",
+                labyrinth::records::nsid::MAILBOX_KEYS
+            ),
+            "cid": "bafy-substituted",
+            "value": {"epoch": 7}
+        });
+        assert!(matches!(
+            parse_mailbox_keys_record(&response, ALICE, "epoch-7"),
+            Err(labyrinth::Error::Malformed(
+                "mailboxKeys relay URI binding"
+            ))
+        ));
+    }
 
     struct FixedClock;
     impl Clock for FixedClock {

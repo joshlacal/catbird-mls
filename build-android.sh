@@ -147,14 +147,14 @@ ANDROID_TARGETS=(
 # finish-android re-captures and refuses to stamp outputs if any changed.
 BUILD_INPUTS="$OUTPUT_ROOT/build-inputs.json"
 PIPELINE_INPUT_ARGS=(
-  --extra-input "$ANDROID_NDK_DIR/source.properties"
-  --extra-input "$TOOLCHAIN_DIR/bin/clang"
-  --extra-input "$TOOLCHAIN_DIR/bin/llvm-ar"
-  --extra-input "$TOOLCHAIN_DIR/bin/llvm-strip"
+  --extra-input "android-ndk/source-properties=$ANDROID_NDK_DIR/source.properties"
+  --extra-input "android-ndk/clang=$TOOLCHAIN_DIR/bin/clang"
+  --extra-input "android-ndk/llvm-ar=$TOOLCHAIN_DIR/bin/llvm-ar"
+  --extra-input "android-ndk/llvm-strip=$TOOLCHAIN_DIR/bin/llvm-strip"
 )
 if [[ -n "$ANDROID_MODULE_DIR" ]]; then
   for pipeline_file in regenerate.sh emit-contract-version.sh patch_clean_chat_bindings.py; do
-    PIPELINE_INPUT_ARGS+=(--extra-input "$ANDROID_MODULE_DIR/$pipeline_file")
+    PIPELINE_INPUT_ARGS+=(--extra-input "android-module/$pipeline_file=$ANDROID_MODULE_DIR/$pipeline_file")
   done
 fi
 python3 scripts/native-artifact-manifest.py capture --features "$CATBIRD_MLS_FEATURES" \
@@ -319,7 +319,7 @@ log_info "✓ Kotlin bindings generated under $KOTLIN_DIR"
 log_info "✓ Patched OrchestratorBridgeException.message field names for Kotlin compatibility"
 python3 scripts/native-artifact-manifest.py finish-android \
   --inputs "$BUILD_INPUTS" --root "$STAGING_DIR" --abis arm64-v8a armeabi-v7a x86 x86_64 \
-  --output "$STAGING_DIR/native-build-manifest.json"
+  "${PIPELINE_INPUT_ARGS[@]}" --output "$STAGING_DIR/native-build-manifest.json"
 
 if [[ "$SYNC_TO_ANDROID_MODULE" == "yes" || ( "$SYNC_TO_ANDROID_MODULE" == "auto" && -n "$ANDROID_MODULE_DIR" ) ]]; then
   if [[ -z "$ANDROID_MODULE_DIR" ]]; then

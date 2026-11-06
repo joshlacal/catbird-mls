@@ -20,9 +20,22 @@ class ReceiptIntegrityTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.inputs = {"features": "labyrinth", "native_source_revision": "a" * 40, "extra_pipeline_inputs": {"wrapper.sh": "fixture-hash"}}
-        self.receipt = {"schema": 1, "build_id": "test-only", "inputs": self.inputs,
-                        "inputs_sha256": manifest.digest_json(self.inputs), "kind": "android"}
+        self.wrapper = self.root / "wrapper.sh"
+        self.wrapper.write_bytes(b"Disposable pipeline wrapper")
+        self.inputs = {
+            "features": "labyrinth",
+            "native_source_revision": "a" * 40,
+            "native_source_tree": "b" * 40,
+            "extra_pipeline_inputs": {"wrapper.sh": manifest.digest_file(self.wrapper)},
+        }
+        self.receipt = {
+            "schema": 2,
+            "build_id": "test-only",
+            "inputs": self.inputs,
+            "inputs_sha256": manifest.digest_json(self.inputs),
+            "kind": "android",
+            "diagnostics": {"extra_pipeline_inputs": {"wrapper.sh": str(self.wrapper)}},
+        }
         self.path = self.root / "receipt.json"
         self.make_files(sorted(manifest.ANDROID_ABIS))
 
@@ -67,10 +80,40 @@ class ReceiptIntegrityTests(unittest.TestCase):
 
     def test_source_or_pipeline_drift_rejected(self):
         changed = copy.deepcopy(self.inputs)
-        changed["extra_pipeline_inputs"]["wrapper.sh"] = "changed-fixture-hash"
+        changed["native_source_tree"] = "c" * 40
         with patch.object(manifest, "capture_inputs", return_value=changed):
             with self.assertRaisesRegex(ValueError, "inputs changed"):
                 manifest.verify_inputs(self.receipt)
+
+    def test_extra_pipeline_input_drift_rejected(self):
+        self.wrapper.write_bytes(b"Changed pipeline wrapper")
+        changed = copy.deepcopy(self.inputs)
+        changed["extra_pipeline_inputs"]["wrapper.sh"] = manifest.digest_file(self.wrapper)
+        with patch.object(manifest, "capture_inputs", return_value=changed) as capture:
+            with self.assertRaisesRegex(ValueError, "inputs changed"):
+                manifest.verify_inputs(self.receipt)
+        self.assertEqual(
+            capture.call_args.args[1], [f"wrapper.sh={self.wrapper.resolve()}"]
+        )
+
+    def test_android_module_input_uses_relocated_root(self):
+        relocated = self.root / "relocated"
+        relocated.mkdir()
+        current = relocated / "regenerate.sh"
+        current.write_bytes(b"Current wrapper")
+        self.inputs["extra_pipeline_inputs"] = {
+            "android-module/regenerate.sh": manifest.digest_file(current)
+        }
+        self.receipt["inputs_sha256"] = manifest.digest_json(self.inputs)
+        self.receipt["diagnostics"]["extra_pipeline_inputs"] = {
+            "android-module/regenerate.sh": "/old/checkout/regenerate.sh"
+        }
+        with patch.object(manifest, "capture_inputs", return_value=self.inputs) as capture:
+            manifest.verify_inputs(self.receipt, root=relocated)
+        self.assertEqual(
+            capture.call_args.args[1],
+            [f"android-module/regenerate.sh={current.resolve()}"],
+        )
 
     def test_tampered_input_record_rejected(self):
         changed = copy.deepcopy(self.receipt)
@@ -81,7 +124,7 @@ class ReceiptIntegrityTests(unittest.TestCase):
     def test_unknown_source_revision_rejected(self):
         self.receipt["inputs"]["native_source_revision"] = "unknown"
         self.receipt["inputs_sha256"] = manifest.digest_json(self.inputs)
-        with self.assertRaisesRegex(ValueError, "exact source revision"):
+        with self.assertRaisesRegex(ValueError, "exact source"):
             manifest.verify_inputs(self.receipt)
 
     def test_duplicate_or_unknown_abi_rejected(self):
@@ -90,17 +133,118 @@ class ReceiptIntegrityTests(unittest.TestCase):
                 manifest.android_files(self.root, abis)
 
     def test_postprocessing_retains_parent_and_tool_identity(self):
-        parent_hash = manifest.digest_file(self.path)
+        parent_hash = manifest.digest_json({
+            key: value for key, value in self.receipt.items()
+            if key not in {"diagnostics", "postprocessing"}
+        })
         tool = self.root / "strip-fixture"
         tool.write_bytes(b"Disposable tool fixture")
         output = self.root / "packaged.json"
-        args = ["manifest", "record-android-postprocess", "--manifest", str(self.path), "--root", str(self.root), "--tool", str(tool), "--output", str(output)]
-        with patch.object(sys, "argv", args), patch.object(manifest, "capture_inputs", return_value=self.inputs):
+        args = ["manifest", "record-android-postprocess", "--manifest", str(self.path),
+                "--root", str(self.root), "--tool", str(tool), "--output", str(output)]
+        with patch.object(sys, "argv", args), \
+                patch.object(manifest, "capture_inputs", return_value=self.inputs):
             manifest.main()
         receipt = json.loads(output.read_text())
-        self.assertEqual(receipt["postprocessing"]["parent_manifest_sha256"], parent_hash)
+        self.assertEqual(receipt["postprocessing"]["parent_content_sha256"], parent_hash)
         self.assertEqual(receipt["postprocessing"]["tool_sha256"], manifest.digest_file(tool))
+        self.assertNotIn("tool", receipt["postprocessing"])
+        self.assertEqual(receipt["diagnostics"]["postprocess_tool"], str(tool.resolve()))
         self.assertEqual(receipt["inputs_sha256"], self.receipt["inputs_sha256"])
+
+    def test_content_identity_survives_checkout_relocation(self):
+        def checkout(name):
+            root = self.root / name
+            crate = root / "crate"
+            (crate / "src").mkdir(parents=True)
+            (root / "scripts").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["crate"]\nresolver = "2"\n'
+            )
+            (root / "Cargo.lock").write_text(
+                'version = 3\n\n[[package]]\nname = "uniffi"\nversion = "0.29.4"\n'
+            )
+            (root / "uniffi.toml").write_text("[bindings.kotlin]\n")
+            (root / "build-android.sh").write_text("fixture build\n")
+            (root / "create-xcframework.sh").write_text("fixture xcframework\n")
+            (root / "scripts/native-artifact-manifest.py").write_text("fixture receipt\n")
+            (root / "wrapper").write_text("fixture wrapper\n")
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "fixture"\nversion = "0.1.0"\n'
+            )
+            (crate / "src/lib.rs").write_text("pub fn fixture() {}\n")
+            package_id = f"path+file://{crate}#fixture@0.1.0"
+            metadata = {
+                "packages": [{
+                    "id": package_id,
+                    "name": "fixture",
+                    "version": "0.1.0",
+                    "source": None,
+                    "manifest_path": str(crate / "Cargo.toml"),
+                }],
+                "resolve": {"nodes": [{"id": package_id, "features": ["default"]}]},
+            }
+            return root, metadata
+
+        def capture(root, metadata):
+            def fake_run(*args, **_kwargs):
+                if args[:2] == ("cargo", "metadata"):
+                    return json.dumps(metadata)
+                if args[:2] == ("jj", "log"):
+                    return "a" * 40
+                if args[:2] == ("git", "rev-parse"):
+                    return "a" * 40 if args[-1].endswith("^{commit}") else "b" * 40
+                if args[0].endswith("rustc"):
+                    return "rustc fixture"
+                if args[:2] == ("cargo", "--version"):
+                    return "cargo fixture"
+                raise AssertionError(args)
+
+            diagnostics = {}
+            with patch.object(manifest, "ROOT", root), \
+                    patch.object(manifest, "run", side_effect=fake_run), \
+                    patch.object(manifest.shutil, "which", return_value="/fixture/jj"):
+                inputs = manifest.capture_inputs(
+                    "labyrinth", [f"wrapper={root / 'wrapper'}"], diagnostics
+                )
+            return inputs, diagnostics
+
+        left_root, left_metadata = checkout("left")
+        right_root, right_metadata = checkout("right")
+        left, left_diagnostics = capture(left_root, left_metadata)
+        right, right_diagnostics = capture(right_root, right_metadata)
+
+        self.assertEqual(left, right)
+        self.assertEqual(manifest.digest_json(left), manifest.digest_json(right))
+        self.assertNotIn(str(left_root), json.dumps(left))
+        self.assertNotIn(str(right_root), json.dumps(right))
+        self.assertNotEqual(
+            left_diagnostics["native_source_root"], right_diagnostics["native_source_root"]
+        )
+        self.assertNotEqual(
+            left_diagnostics["extra_pipeline_inputs"]["wrapper"],
+            right_diagnostics["extra_pipeline_inputs"]["wrapper"],
+        )
+        self.assertNotEqual(
+            left_diagnostics["path_package_manifests"]["path#fixture@0.1.0"],
+            right_diagnostics["path_package_manifests"]["path#fixture@0.1.0"],
+        )
+
+    def test_clean_git_only_checkout_has_exact_commit_and_tree(self):
+        def fake_run(*args, **_kwargs):
+            if args[:2] == ("git", "status"):
+                return ""
+            if args[:2] == ("git", "rev-parse"):
+                return "c" * 40 if args[-1] == "HEAD^{commit}" else "d" * 40
+            raise AssertionError(args)
+
+        diagnostics = {}
+        with patch.object(manifest.shutil, "which", return_value=None), \
+                patch.object(manifest, "run", side_effect=fake_run):
+            revision, tree = manifest.exact_source_identity(diagnostics)
+        self.assertEqual(revision, "c" * 40)
+        self.assertEqual(tree, "d" * 40)
+        self.assertEqual(diagnostics["vcs"], "git")
 
 
 if __name__ == "__main__":

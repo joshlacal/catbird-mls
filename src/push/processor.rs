@@ -588,6 +588,13 @@ pub fn process_push_notification_with_hooks(
             )));
         }
     }
+    let supplied_message_id = wake.message_id.trim();
+    let legacy_missing_id = supplied_message_id
+        .strip_prefix("msg-")
+        .and_then(|seq| seq.parse::<i64>().ok())
+        == Some(wake.entry_seq);
+    let supplied_message_id =
+        (!supplied_message_id.is_empty() && !legacy_missing_id).then_some(supplied_message_id);
 
     let db_path = resolve_push_db_path(storage_root, account_did_hash)?;
     if !db_path.exists() {
@@ -628,17 +635,36 @@ pub fn process_push_notification_with_hooks(
             .and_then(|m| m.title.clone())
             .or_else(|| convo.as_ref().and_then(|c| c.title.clone()));
 
-        let existing_msg: Option<(String, String, i64, i64)> = tx
+        let existing_msg: Option<(String, String, String, i64, i64)> = tx
             .conn()
             .query_row(
-                "SELECT sender_did, plaintext_json, epoch, seq FROM messages WHERE message_id = ?1;",
-                [&wake.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT message_id, sender_did, plaintext_json, epoch, seq \
+                 FROM messages WHERE conversation_id = ?1 AND seq = ?2;",
+                rusqlite::params![wake.conversation_id, wake.entry_seq],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| MLSError::Internal(format!("query cached push message: {e}")))?;
 
-        if let Some((sender_did, plaintext_json, epoch, seq)) = existing_msg {
+        if let (Some(supplied), Some((canonical, ..))) =
+            (supplied_message_id, existing_msg.as_ref())
+        {
+            if supplied != canonical.as_str() {
+                return Err(MLSError::Cryptography(
+                    "push wake messageId differs from authenticated MLS AAD".into(),
+                ));
+            }
+        }
+
+        if let Some((message_id, sender_did, plaintext_json, epoch, seq)) = existing_msg {
             let (body, _) = parse_canonical_message_body(plaintext_json.as_bytes())?;
             let display_name: Option<String> = tx
                 .conn()
@@ -653,7 +679,7 @@ pub fn process_push_notification_with_hooks(
 
             return Ok(PreflightState {
                 cached_preview: Some(NotificationPreview {
-                    message_id: wake.message_id.clone(),
+                    message_id,
                     conversation_id: wake.conversation_id.clone(),
                     sender_did,
                     sender_display_name: display_name,
@@ -891,7 +917,7 @@ pub fn process_push_notification_with_hooks(
             }]
         };
 
-        let mut target_decrypted: Option<(String, String, i64, i64)> = None;
+        let mut target_decrypted: Option<(String, String, String, i64, i64)> = None;
 
         for entry in entries_to_apply {
             if entry.seq <= current_convo.last_seq && entry.seq != wake.entry_seq {
@@ -979,8 +1005,12 @@ pub fn process_push_notification_with_hooks(
                     let message_id = authenticated_application_message_id(
                         &aad_bytes, &wake.conversation_id, &entry.entry_id,
                     )?;
-                    if entry.seq == wake.entry_seq && message_id != wake.message_id {
-                        return Err(MLSError::Cryptography("push wake messageId differs from authenticated MLS AAD".into()));
+                    if entry.seq == wake.entry_seq
+                        && supplied_message_id.is_some_and(|supplied| supplied != message_id)
+                    {
+                        return Err(MLSError::Cryptography(
+                            "push wake messageId differs from authenticated MLS AAD".into(),
+                        ));
                     }
                     let inner: crate::messaging::receive::PrivateMessagePlaintextEnvelope =
                         serde_json::from_slice(&decrypted_bytes).map_err(|e| {
@@ -1069,8 +1099,17 @@ pub fn process_push_notification_with_hooks(
                         current_convo.unread_count = current_convo.unread_count.saturating_add(1);
                     }
 
-                    if message_id == wake.message_id || target_decrypted.is_none() {
-                        target_decrypted = Some((verified_sender_did, body, msg_epoch, entry.seq));
+                    if entry.seq == wake.entry_seq
+                        || supplied_message_id.is_some_and(|supplied| supplied == message_id)
+                        || target_decrypted.is_none()
+                    {
+                        target_decrypted = Some((
+                            message_id,
+                            verified_sender_did,
+                            body,
+                            msg_epoch,
+                            entry.seq,
+                        ));
                     }
                 }
                 ProcessedMessageContent::ProposalMessage(queued_prop) => {
@@ -1204,12 +1243,12 @@ pub fn process_push_notification_with_hooks(
         current_convo.updated_at_ms = now_ms;
         tx.upsert_conversation(&current_convo)?;
 
-        let Some((sender_did, body, msg_epoch, msg_seq)) = target_decrypted else {
+        let Some((message_id, sender_did, body, msg_epoch, msg_seq)) = target_decrypted else {
             return Ok(build_generic_fallback_preview(wake, resolved_title));
         };
 
         Ok(NotificationPreview {
-            message_id: wake.message_id.clone(),
+            message_id,
             conversation_id: wake.conversation_id.clone(),
             sender_did,
             sender_display_name: preflight.sender_display_name.clone(),

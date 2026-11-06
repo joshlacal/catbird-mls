@@ -45,6 +45,7 @@ struct World {
     spent_delegations: BTreeSet<String>,
     sequence: u64,
     committed_space_writes: usize,
+    inventory_fault: Option<&'static str>,
 }
 
 impl World {
@@ -88,6 +89,20 @@ impl NativeArchiveAuthFixture {
 
     pub fn committed_space_write_count(&self) -> usize {
         self.world.lock().unwrap().committed_space_writes
+    }
+
+    #[allow(dead_code)]
+    pub fn set_inventory_fault(&self, fault: Option<&'static str>) {
+        self.world.lock().unwrap().inventory_fault = fault;
+    }
+
+    pub fn mailbox_keys_record(&self, did: &str, rkey: &str) -> Option<(Value, String)> {
+        self.world
+            .lock()
+            .unwrap()
+            .mailbox_keys
+            .get(&(did.to_owned(), rkey.to_owned()))
+            .map(|record| (record.value.clone(), record.cid.clone()))
     }
 
     pub fn execute(
@@ -700,24 +715,78 @@ impl NativeArchiveAuthFixture {
                 let dids: BTreeSet<_> = world
                     .records
                     .keys()
-                    .filter(|(s, _, _, _)| s == &space.raw)
+                    .filter(|(stored_space, _, _, _)| stored_space == &space.raw)
                     .map(|(_, did, _, _)| did)
                     .collect();
+                let mut inventory = LtHash::empty();
                 let mut repos = Vec::new();
                 for did in dids {
                     let records: Vec<_> = world
                         .records
                         .iter()
-                        .filter(|((s, repo, _, _), _)| s == &space.raw && repo == did)
+                        .filter(|((stored_space, repo, _, _), _)| {
+                            stored_space == &space.raw && repo == did
+                        })
                         .collect();
                     let repo_rev = world
                         .repo_revisions
                         .get(&(space.raw.clone(), did.clone()))
                         .cloned()
                         .unwrap_or_else(|| tid(0));
-                    repos.push(json!({"did": did, "repoRev": repo_rev, "spaceRev": repo_rev, "data": {"$bytes": STANDARD.encode(commitment(&records)?)}}));
+                    let data = commitment(&records)?;
+                    inventory
+                        .add_inventory_entry(did, &repo_rev, &repo_rev, &data)
+                        .map_err(failure)?;
+                    repos.push((did.clone(), repo_rev, data));
                 }
-                Ok(reply(200, json!({"repos": repos})))
+                let inventory_data = inventory.commitment();
+                let snapshot_rev = tid(world.sequence);
+                let offset = params
+                    .get("cursor")
+                    .map(|cursor| cursor.parse::<usize>().map_err(failure))
+                    .transpose()?
+                    .unwrap_or(0);
+                if offset > repos.len() {
+                    return Ok(reply(400, json!({"error": "InvalidCursor"})));
+                }
+                let page_limit = limit(params, 100)?;
+                let end = offset.saturating_add(page_limit).min(repos.len());
+                let complete = end == repos.len();
+                let mut page: Vec<_> = repos[offset..end]
+                    .iter()
+                    .map(|(did, repo_rev, data)| {
+                        json!({
+                            "did": did,
+                            "repoRev": repo_rev,
+                            "spaceRev": repo_rev,
+                            "data": {"$bytes": STANDARD.encode(data)}
+                        })
+                    })
+                    .collect();
+                if world.inventory_fault == Some("truncate") && complete {
+                    page.pop();
+                }
+                let commit = json!({
+                    "space": space.raw,
+                    "repo": space.authority,
+                    "rev": snapshot_rev,
+                    "ver": 1,
+                    "data": {"$bytes": STANDARD.encode(inventory_data)}
+                });
+                let mut body = json!({"repos": page, "complete": complete, "commit": commit});
+                if !complete {
+                    body["cursor"] = end.to_string().into();
+                }
+                let secret = shared_secret(&space.authority, want_mac, COMMIT_MAC_TYPE)?;
+                let mac = compute_commit_mac(
+                    &secret,
+                    &space.raw,
+                    &space.authority,
+                    &snapshot_rev,
+                    &inventory_data,
+                )
+                .map_err(failure)?;
+                Ok(with_mac(reply(200, body), format_commit_mac_header(&mac)))
             }
             "com.atproto.space.getSpace" => Ok(reply(
                 200,

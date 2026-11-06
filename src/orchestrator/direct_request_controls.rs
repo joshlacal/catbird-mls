@@ -81,21 +81,25 @@ where
             return Ok(None);
         }
         self.require_direct_request_support()?;
-        // This fetch independently verifies the publication receipt and any
-        // policy-only acceptance commit receipt before considering row identity.
-        Box::pin(self.refresh_request_preview(cid)).await?;
         let owner = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
+        if entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
+            && crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(&entry)
+            && self
+                .mls_context()
+                .read_direct_request_projection(cid)?
+                .is_none()
+        {
+            // Authenticate this consumed row itself before the caller commits its page cursor.
+            Box::pin(self.verified_pruned_request_view(cid, &owner, &device, &entry)).await?;
+            return Ok(None);
+        }
+        // This fetch independently verifies the publication receipt and any policy-only acceptance
+        // commit receipt. A pruned row without a retained projection was handled exactly above.
+        Box::pin(self.refresh_request_preview(cid)).await?;
         let lock = self.direct_request_operation_lock(cid).await;
         let guard = lock.lock().await;
         let Some(mut raw) = self.mls_context().read_direct_request_projection(cid)? else {
-            // A pruned opening this device never imported already reached its
-            // verified terminal view in the refresh above; nothing to retain.
-            if entry["$type"] == "blue.catbird.chat.defs#directRequestEntry"
-                && crate::orchestrator::direct_request_bootstrap::is_pruned_opening_entry(&entry)
-            {
-                return Ok(None);
-            }
             return Err(invalid());
         };
         let mut projection = self

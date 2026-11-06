@@ -1,13 +1,19 @@
 // Included beside native_archive.rs in native_client. Authentication stays request-scoped.
 #[cfg(feature = "labyrinth")]
 mod native_archive_space_auth {
-    use super::{block_on_sync, NativeArchiveGateway, PlatformHttpResponse};
+    use super::{
+        block_on_sync, NativeArchiveGateway, PlatformHttpResponse, VerifiedArchiveInventory,
+        VerifiedArchiveRecord,
+    };
     use atproto_spaces::{
         did_resolver::DidDocument,
         http_signature::sign_credential_request_minimal,
         kem::{encapsulate_p256_deterministic, encode_p256_did_key, P256SecretKey},
         lthash::{compute_dagcbor_cid, LtHash},
-        mac::{format_want_mac_header, verify_commit_mac, verify_record_mac, COMMIT_MAC_TYPE, RECORD_MAC_TYPE},
+        mac::{
+            format_want_mac_header, verify_commit_mac, verify_record_mac, COMMIT_MAC_TYPE,
+            RECORD_MAC_TYPE,
+        },
         star::{read_star_metadata, read_star_repo, validate_canonical_dagcbor_record},
         sync_engine::WriterSyncState,
         tokens::{verify_space_token, SpaceKeyResolver, SpaceTokenKind, SpaceVerifyingKey},
@@ -18,14 +24,19 @@ mod native_archive_space_auth {
         list_repo_ops::ListRepoOpsOutput,
     };
     use crate::labyrinth::{LabyrinthSpaceRequest, LabyrinthSpaceResponse};
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
     use zeroize::Zeroizing;
 
     const GET_RECORD: &str = "com.atproto.space.getRecord";
+    const GET_REPO: &str = "com.atproto.space.getRepo";
     const LIST_RECORDS: &str = "com.atproto.space.listRecords";
+    const LIST_REPOS: &str = "com.atproto.space.listRepos";
     const LIST_OPS: &str = "com.atproto.space.listRepoOps";
     const MAX_BODY: usize = crate::labyrinth::space::MAX_SPACE_XRPC_RESPONSE_BYTES;
+    const MAX_INVENTORY_PAGES: usize = 1_000;
+    const MAX_INVENTORY_WRITERS: usize = 100_000;
+    const MAX_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
 
     struct Credential {
         jwt: Zeroizing<String>,
@@ -78,7 +89,7 @@ mod native_archive_space_auth {
     }
     #[derive(Deserialize)]
     struct ListedPage { records: Vec<ListedRecord>, cursor: Option<String> }
-    #[derive(Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     struct Commit {
         space: String,
         repo: String,
@@ -86,6 +97,24 @@ mod native_archive_space_auth {
         ver: u64,
         #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
         data: catbird_atproto::jacquard_common::deps::bytes::Bytes,
+    }
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct InventoryRepo {
+        did: String,
+        repo_rev: String,
+        space_rev: String,
+        #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
+        data: catbird_atproto::jacquard_common::deps::bytes::Bytes,
+    }
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct InventoryPage {
+        #[serde(default)]
+        repos: Vec<InventoryRepo>,
+        complete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        commit: Commit,
     }
     #[derive(Deserialize)]
     struct CommitEnvelope { commit: Option<Commit>, cursor: Option<String> }
@@ -153,22 +182,81 @@ mod native_archive_space_auth {
                 Ok(credential) => credential,
                 Err(denied) => return Ok(into_response(denied)),
             };
-            let context = ReadContext { space, writer, personal, kem_key, credential };
+            let mut context = ReadContext { space, writer, personal, kem_key, credential };
+            if context.space.space_type == "blue.catbird.labyrinth.conversation"
+                && matches!(request.nsid.as_str(), GET_RECORD | LIST_RECORDS)
+                && self
+                    .verified_inventories
+                    .lock()
+                    .map_err(|_| "native_space_inventory_cache_poisoned")?
+                    .contains_key(&context.space.raw)
+            {
+                let mut cached = PlatformHttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: vec![],
+                };
+                if request.nsid == GET_RECORD {
+                    self.release_verified_inventory_record(&context, &params, &mut cached)?;
+                } else {
+                    self.release_verified_inventory_records(&context, &params, &mut cached)?;
+                }
+                self.space_credential_live(&context)?;
+                return bounded(cached).map(into_response);
+            }
             let mac_type = match request.nsid.as_str() {
                 GET_RECORD | LIST_RECORDS | "com.atproto.space.getBlob" => Some(RECORD_MAC_TYPE),
-                LIST_OPS | "com.atproto.space.getRepo" | "com.atproto.space.getLatestCommit" => Some(COMMIT_MAC_TYPE),
+                LIST_REPOS | LIST_OPS | GET_REPO | "com.atproto.space.getLatestCommit" => {
+                    Some(COMMIT_MAC_TYPE)
+                }
                 _ => None,
             };
             let (mut response, secret) = self.space_read(&context, &request.nsid, &request.path, request.headers, mac_type)?;
             if !(200..300).contains(&response.status) { return Ok(into_response(response)); }
             match request.nsid.as_str() {
                 GET_RECORD => {
-                    let (full, value) = verify_record(&context, &params, &response, secret.as_deref().ok_or("native_space_missing_request_secret")?)?;
-                    response.body = serde_json::to_vec(&serde_json::json!({"uri": full.uri, "cid": full.cid, "value": value})).map_err(|e| format!("native_space_encode_record: {e}"))?;
+                    let (full, value) = verify_record(
+                        &context,
+                        &params,
+                        &response,
+                        secret
+                            .as_deref()
+                            .ok_or("native_space_missing_request_secret")?,
+                    )?;
+                    response.body = serde_json::to_vec(&serde_json::json!({
+                        "uri": full.uri,
+                        "cid": full.cid,
+                        "value": value
+                    }))
+                    .map_err(|e| format!("native_space_encode_record: {e}"))?;
                 }
                 LIST_RECORDS => self.verify_listed_records(&context, &params, &mut response)?,
-                "com.atproto.space.getRepo" => verify_star(&context, &response, secret.as_deref().ok_or("native_space_missing_request_secret")?)?,
-                LIST_OPS => self.verify_repo_ops(&context, &mut response, secret.as_deref().ok_or("native_space_missing_request_secret")?)?,
+                LIST_REPOS => self
+                    .verify_inventory(
+                        &mut context,
+                        &params,
+                        &mut response,
+                        secret
+                            .as_deref()
+                            .ok_or("native_space_missing_request_secret")?,
+                    )
+                    .map_err(|error| format!("ArchiveInventoryIncomplete: {error}"))?,
+                GET_REPO => verify_star(
+                    &context,
+                    &response,
+                    secret
+                        .as_deref()
+                        .ok_or("native_space_missing_request_secret")?,
+                )?,
+                LIST_OPS => {
+                    self.verify_repo_ops(
+                        &context,
+                        &mut response,
+                        secret
+                            .as_deref()
+                            .ok_or("native_space_missing_request_secret")?,
+                    )?;
+                }
                 "com.atproto.space.getLatestCommit" => {
                     let envelope: CommitEnvelope = decode(&response.body, "commit envelope")?;
                     let commit = envelope.commit.ok_or("native_space_missing_commit")?;
@@ -287,7 +375,464 @@ mod native_archive_space_auth {
             Ok((bounded(response)?, negotiated.map(|(_, secret)| secret)))
         }
 
+        fn verify_inventory(
+            &self,
+            context: &mut ReadContext,
+            params: &BTreeMap<String, String>,
+            response: &mut PlatformHttpResponse,
+            secret: &[u8; 32],
+        ) -> Result<(), String> {
+            if params
+                .keys()
+                .any(|key| !matches!(key.as_str(), "space" | "cursor" | "limit"))
+                || params.contains_key("cursor")
+            {
+                return Err("native_space_inventory_must_start_at_snapshot_head".into());
+            }
+            let limit = params
+                .get("limit")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| "native_space_invalid_inventory_limit")?
+                .unwrap_or(100);
+            if limit == 0 || limit > 1_000 {
+                return Err("native_space_invalid_inventory_limit".into());
+            }
+            if context.writer != context.space.authority {
+                return Err("native_space_inventory_authority_mismatch".into());
+            }
+
+            let authority = context.space.authority.clone();
+            let authority_kem = context.kem_key.clone();
+            self.verified_inventories
+                .lock()
+                .map_err(|_| "native_space_inventory_cache_poisoned")?
+                .remove(&context.space.raw);
+            let mut current = PlatformHttpResponse {
+                status: response.status,
+                headers: std::mem::take(&mut response.headers),
+                body: std::mem::take(&mut response.body),
+            };
+            let mut current_secret = Zeroizing::new(*secret);
+            let mut expected_commit: Option<Commit> = None;
+            let mut repos = Vec::new();
+            let mut cursors = BTreeSet::new();
+            let mut previous_did: Option<String> = None;
+            let mut total_bytes = 0usize;
+            let mut terminal = false;
+
+            for _ in 0..MAX_INVENTORY_PAGES {
+                total_bytes = total_bytes
+                    .checked_add(current.body.len())
+                    .ok_or("native_space_inventory_bytes_overflow")?;
+                if total_bytes > MAX_INVENTORY_BYTES {
+                    return Err("native_space_inventory_bytes_exceeded".into());
+                }
+                let page: InventoryPage = decode(&current.body, "writer inventory")?;
+                if page.repos.len() > limit {
+                    return Err("native_space_inventory_limit_exceeded".into());
+                }
+                if page.commit.rev.is_empty() {
+                    return Err("native_space_inventory_commit_revision_missing".into());
+                }
+                verify_commit(context, &current, &current_secret, &page.commit)?;
+                let _: [u8; 32] = page
+                    .commit
+                    .data
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| "native_space_invalid_inventory_commitment")?;
+                if expected_commit.is_none() {
+                    expected_commit = Some(page.commit.clone());
+                } else if expected_commit.as_ref() != Some(&page.commit) {
+                    return Err("native_space_inventory_commit_changed".into());
+                }
+
+                if page.complete != page.cursor.is_none() {
+                    return Err("native_space_inventory_terminal_cursor_mismatch".into());
+                }
+                if !page.complete && page.repos.is_empty() {
+                    return Err("native_space_inventory_empty_nonterminal_page".into());
+                }
+                for row in page.repos {
+                    if !atproto_spaces::is_valid_did(&row.did)
+                        || row.repo_rev.is_empty()
+                        || row.space_rev.is_empty()
+                    {
+                        return Err("native_space_invalid_inventory_row".into());
+                    }
+                    if previous_did
+                        .as_deref()
+                        .is_some_and(|previous| previous >= row.did.as_str())
+                    {
+                        return Err("native_space_inventory_not_strictly_ordered".into());
+                    }
+                    let _: [u8; 32] = row
+                        .data
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| "native_space_invalid_inventory_repo_commitment")?;
+                    previous_did = Some(row.did.clone());
+                    repos.push(row);
+                    if repos.len() > MAX_INVENTORY_WRITERS {
+                        return Err("native_space_inventory_writer_limit_exceeded".into());
+                    }
+                }
+
+                let Some(cursor) = page.cursor else {
+                    terminal = true;
+                    break;
+                };
+                check_cursor(Some(&cursor))?;
+                if !cursors.insert(cursor.clone()) {
+                    return Err("native_space_inventory_cursor_cycle".into());
+                }
+                let mut next_params = params.clone();
+                next_params.insert("cursor".into(), cursor);
+                let (next, next_secret) = self.space_read(
+                    context,
+                    LIST_REPOS,
+                    &query_path(LIST_REPOS, &next_params),
+                    vec![],
+                    Some(COMMIT_MAC_TYPE),
+                )?;
+                require_success(&next, "listRepos inventory")?;
+                current = next;
+                current_secret =
+                    next_secret.ok_or("native_space_missing_request_secret")?;
+            }
+            if !terminal {
+                return Err("native_space_inventory_page_limit_exceeded".into());
+            }
+
+            let commit = expected_commit.ok_or("native_space_inventory_commit_missing")?;
+            let expected_data: [u8; 32] = commit
+                .data
+                .as_ref()
+                .try_into()
+                .map_err(|_| "native_space_invalid_inventory_commitment")?;
+            let mut inventory_hash = LtHash::empty();
+            for row in &repos {
+                let data: [u8; 32] = row
+                    .data
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| "native_space_invalid_inventory_repo_commitment")?;
+                inventory_hash
+                    .add_inventory_entry(&row.did, &row.repo_rev, &row.space_rev, &data)
+                    .map_err(|error| format!("native_space_inventory_hash: {error}"))?;
+            }
+            if inventory_hash.commitment() != expected_data {
+                return Err("native_space_inventory_commitment_mismatch".into());
+            }
+
+            let mut verified = VerifiedArchiveInventory::default();
+            let mut verified_bytes = 0usize;
+            for row in &repos {
+                context.writer = row.did.clone();
+                context.kem_key = if row.did == authority {
+                    authority_kem.clone()
+                } else {
+                    self.space_document(&row.did)?.atproto_kem_did_key
+                };
+                let (records, writer_bytes) = self.verify_inventory_writer(context, row)?;
+                verified_bytes = verified_bytes
+                    .checked_add(writer_bytes)
+                    .ok_or("native_space_inventory_cache_bytes_overflow")?;
+                if verified_bytes > MAX_INVENTORY_BYTES {
+                    return Err("native_space_inventory_cache_bytes_exceeded".into());
+                }
+                if verified.writers.insert(row.did.clone(), records).is_some() {
+                    return Err("native_space_inventory_duplicate_writer".into());
+                }
+            }
+            self.verified_inventories
+                .lock()
+                .map_err(|_| "native_space_inventory_cache_poisoned")?
+                .insert(context.space.raw.clone(), verified);
+            context.writer = authority;
+            context.kem_key = authority_kem;
+
+            response.status = current.status;
+            response.headers = std::mem::take(&mut current.headers);
+            response.body = serde_json::to_vec(&InventoryPage {
+                repos,
+                complete: true,
+                cursor: None,
+                commit,
+            })
+            .map_err(|error| format!("native_space_encode_inventory: {error}"))?;
+            Ok(())
+        }
+
+        fn verify_inventory_writer(
+            &self,
+            context: &mut ReadContext,
+            row: &InventoryRepo,
+        ) -> Result<(Vec<VerifiedArchiveRecord>, usize), String> {
+            let expected_data: [u8; 32] = row
+                .data
+                .as_ref()
+                .try_into()
+                .map_err(|_| "native_space_invalid_inventory_repo_commitment")?;
+            let params = BTreeMap::from([
+                ("space".into(), context.space.raw.clone()),
+                ("repo".into(), row.did.clone()),
+            ]);
+
+            let (star_response, star_secret) = self.space_read(
+                context,
+                GET_REPO,
+                &query_path(GET_REPO, &params),
+                vec![],
+                Some(COMMIT_MAC_TYPE),
+            )?;
+            require_success(&star_response, "inventory getRepo")?;
+            let metadata =
+                read_star_metadata(&star_response.body, &context.space.raw, &row.did)
+                    .map_err(|error| {
+                        format!("native_space_inventory_star_metadata: {error}")
+                    })?;
+            verify_star(
+                context,
+                &star_response,
+                star_secret
+                    .as_deref()
+                    .ok_or("native_space_missing_request_secret")?,
+            )?;
+            if metadata.rev != row.repo_rev || metadata.data != expected_data {
+                return Err("native_space_inventory_star_head_mismatch".into());
+            }
+
+            let mut ops_params = params;
+            ops_params.insert("excludeValues".into(), "true".into());
+            ops_params.insert("limit".into(), "1000".into());
+            let (mut ops_response, ops_secret) = self.space_read(
+                context,
+                LIST_OPS,
+                &query_path(LIST_OPS, &ops_params),
+                vec![],
+                Some(COMMIT_MAC_TYPE),
+            )?;
+            require_success(&ops_response, "inventory listRepoOps")?;
+            let head = self.verify_repo_ops(
+                context,
+                &mut ops_response,
+                ops_secret
+                    .as_deref()
+                    .ok_or("native_space_missing_request_secret")?,
+            )?;
+            if head.rev != row.repo_rev || head.data.as_ref() != expected_data.as_slice() {
+                return Err("native_space_inventory_oplog_head_mismatch".into());
+            }
+            let repo = read_star_repo(&star_response.body, &context.space.raw, &row.did)
+                .map_err(|error| format!("native_space_inventory_star_records: {error}"))?;
+            let mut records = Vec::with_capacity(repo.records.len());
+            let mut coordinates = BTreeSet::new();
+            let mut cached_bytes = 0usize;
+            for record in repo.records {
+                if !coordinates.insert((record.collection.clone(), record.rkey.clone())) {
+                    return Err("native_space_inventory_duplicate_record".into());
+                }
+                let get_params = BTreeMap::from([
+                    ("space".into(), context.space.raw.clone()),
+                    ("repo".into(), row.did.clone()),
+                    ("collection".into(), record.collection.clone()),
+                    ("rkey".into(), record.rkey.clone()),
+                ]);
+                let (record_response, record_secret) = self.space_read(
+                    context,
+                    GET_RECORD,
+                    &query_path(GET_RECORD, &get_params),
+                    vec![],
+                    Some(RECORD_MAC_TYPE),
+                )?;
+                require_success(&record_response, "inventory getRecord")?;
+                let (full, value) = verify_record(
+                    context,
+                    &get_params,
+                    &record_response,
+                    record_secret
+                        .as_deref()
+                        .ok_or("native_space_missing_request_secret")?,
+                )?;
+                let cid = record.cid.to_string();
+                if full.cid.as_str() != cid {
+                    return Err("native_space_inventory_record_cid_mismatch".into());
+                }
+                cached_bytes = cached_bytes
+                    .checked_add(record_response.body.len())
+                    .and_then(|size| size.checked_add(record.collection.len()))
+                    .and_then(|size| size.checked_add(record.rkey.len()))
+                    .and_then(|size| size.checked_add(cid.len()))
+                    .ok_or("native_space_inventory_cache_bytes_overflow")?;
+                records.push(VerifiedArchiveRecord {
+                    collection: record.collection,
+                    rkey: record.rkey,
+                    cid,
+                    value,
+                });
+            }
+            records.sort_by(|left, right| {
+                (&left.collection, &left.rkey).cmp(&(&right.collection, &right.rkey))
+            });
+            Ok((records, cached_bytes))
+        }
+        fn release_verified_inventory_record(
+            &self,
+            context: &ReadContext,
+            params: &BTreeMap<String, String>,
+            response: &mut PlatformHttpResponse,
+        ) -> Result<(), String> {
+            if params.keys().any(|key| {
+                !matches!(key.as_str(), "space" | "repo" | "collection" | "rkey")
+            }) {
+                return Err("native_space_inventory_record_parameter_mismatch".into());
+            }
+            let inventories = self
+                .verified_inventories
+                .lock()
+                .map_err(|_| "native_space_inventory_cache_poisoned")?;
+            let collection = required(params, "collection")?;
+            let rkey = required(params, "rkey")?;
+            let inventory = inventories
+                .get(&context.space.raw)
+                .ok_or("native_space_inventory_snapshot_missing")?;
+            let record = inventory
+                .writers
+                .get(&context.writer)
+                .and_then(|records| {
+                    records.iter().find(|record| {
+                        record.collection == collection && record.rkey == rkey
+                    })
+                });
+            let Some(record) = record else {
+                response.status = 404;
+                response.body = serde_json::to_vec(&serde_json::json!({
+                    "error": "RecordNotFound",
+                }))
+                .map_err(|error| format!("native_space_encode_record_absence: {error}"))?;
+                return Ok(());
+            };
+            let uri = context
+                .space
+                .record_uri(&context.writer, collection, rkey)
+                .map_err(|error| format!("native_space_record_coordinates: {error}"))?;
+            response.body = serde_json::to_vec(&serde_json::json!({
+                "uri": uri,
+                "cid": record.cid,
+                "value": record.value,
+            }))
+            .map_err(|error| format!("native_space_encode_inventory_record: {error}"))?;
+            Ok(())
+        }
+
+
+        fn release_verified_inventory_records(
+            &self,
+            context: &ReadContext,
+            params: &BTreeMap<String, String>,
+            response: &mut PlatformHttpResponse,
+        ) -> Result<(), String> {
+            if params.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "space"
+                        | "repo"
+                        | "collection"
+                        | "cursor"
+                        | "limit"
+                        | "reverse"
+                        | "excludeValues"
+                )
+            }) {
+                return Err("native_space_inventory_list_parameter_mismatch".into());
+            }
+            let inventories = self
+                .verified_inventories
+                .lock()
+                .map_err(|_| "native_space_inventory_cache_poisoned")?;
+            let records = inventories
+                .get(&context.space.raw)
+                .and_then(|inventory| inventory.writers.get(&context.writer))
+                .ok_or("native_space_inventory_snapshot_missing")?;
+            let limit = params
+                .get("limit")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| "native_space_invalid_list_limit")?
+                .unwrap_or(50);
+            if limit == 0 || limit > 1_000 {
+                return Err("native_space_invalid_list_limit".into());
+            }
+            let reverse = match params.get("reverse").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err("native_space_invalid_list_reverse".into()),
+            };
+            let exclude = match params.get("excludeValues").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err("native_space_invalid_exclude_values".into()),
+            };
+            let cursor = params.get("cursor");
+            check_cursor(cursor.map(String::as_str))?;
+            let collection = params.get("collection");
+            let mut selected: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    collection.is_none_or(|wanted| wanted == &record.collection)
+                        && cursor.is_none_or(|cursor| {
+                            let path = format!("{}/{}", record.collection, record.rkey);
+                            if reverse {
+                                path.as_str() < cursor.as_str()
+                            } else {
+                                path.as_str() > cursor.as_str()
+                            }
+                        })
+                })
+                .collect();
+            if reverse {
+                selected.reverse();
+            }
+            let more = selected.len() > limit;
+            selected.truncate(limit);
+            let next = more.then(|| {
+                let record = selected
+                    .last()
+                    .expect("more records implies a nonempty selected page");
+                format!("{}/{}", record.collection, record.rkey)
+            });
+            let records: Vec<_> = selected
+                .into_iter()
+                .map(|record| {
+                    let mut value = serde_json::json!({
+                        "collection": record.collection,
+                        "rkey": record.rkey,
+                        "cid": record.cid,
+                    });
+                    if !exclude {
+                        value["value"] = record.value.clone();
+                    }
+                    value
+                })
+                .collect();
+            let mut body = serde_json::json!({"records": records});
+            if let Some(next) = next {
+                body["cursor"] = next.into();
+            }
+            response.headers.clear();
+            response.body = serde_json::to_vec(&body)
+                .map_err(|error| format!("native_space_encode_inventory_records: {error}"))?;
+            Ok(())
+        }
+
+
+
         fn verify_listed_records(&self, context: &ReadContext, params: &BTreeMap<String, String>, response: &mut PlatformHttpResponse) -> Result<(), String> {
+            if context.space.space_type == "blue.catbird.labyrinth.conversation" {
+                return self.release_verified_inventory_records(context, params, response);
+            }
             // Parse only coordinates first. Values are skipped by serde until every
             // corresponding getRecord has passed MAC and content-CID verification.
             let page: ListedPage = decode(&response.body, "listRecords envelope")?;
@@ -338,7 +883,7 @@ mod native_archive_space_auth {
             Ok(())
         }
 
-        fn verify_repo_ops(&self, context: &ReadContext, response: &mut PlatformHttpResponse, secret: &[u8; 32]) -> Result<(), String> {
+        fn verify_repo_ops(&self, context: &ReadContext, response: &mut PlatformHttpResponse, secret: &[u8; 32]) -> Result<Commit, String> {
             let requested_head: CommitEnvelope = decode(&response.body, "listRepoOps commit envelope")?;
             check_cursor(requested_head.cursor.as_deref())?;
             if requested_head.commit.is_some() && requested_head.cursor.is_some() { return Err("native_space_commit_before_oplog_head".into()); }
@@ -430,7 +975,7 @@ mod native_archive_space_auth {
                     if let Some(value) = served.value { op["value"] = value; }
                 }
                 response.body = serde_json::to_vec(&body).map_err(|e| format!("native_space_encode_ops: {e}"))?;
-                return Ok(());
+                return Ok(head);
             }
             Err("native_space_oplog_page_limit_exceeded".into())
         }
@@ -702,31 +1247,211 @@ mod native_archive_space_auth {
                     assert_eq!(header(&request, "x-oauth-transport-test"), "preserved");
                     return Ok(response(json!({"results": []})));
                 }
-                let (read_nsid, read_query, want_mac) = if nsid == "blue.catbird.chat.relaySpaceRead" {
-                    assert!(request.url.starts_with("https://home.example/"));
-                    let body: Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
-                    assert_eq!(body["targetDid"], WRITER);
-                    assert_eq!(body["spaceAudience"], WRITER);
-                    assert!(body["signatureInput"].as_str().unwrap().contains("atproto-space-credential"));
-                    assert!(body["signature"].as_str().unwrap().starts_with("atproto-space-credential=:"));
-                    (body["nsid"].as_str().unwrap().to_owned(), body["query"].as_str().unwrap().to_owned(), body["wantMac"].as_str().unwrap().to_owned())
-                } else {
-                    assert!(request.url.starts_with("https://account-pds.example/"));
-                    assert!(header(&request, "authorization").starts_with("Atproto-Space-Credential "));
-                    assert_eq!(header(&request, "atproto-space-audience"), ACCOUNT);
-                    assert!(header(&request, "signature").starts_with("atproto-space-credential=:"));
-                    (nsid.into(), query.into(), header(&request, "atproto-space-want-mac").into())
-                };
-                let params = parse_query(&LabyrinthSpaceRequest::get(&read_nsid, format!("/xrpc/{read_nsid}?{read_query}"))).unwrap();
+                let (read_nsid, read_query, want_mac, relay_target) =
+                    if nsid == "blue.catbird.chat.relaySpaceRead" {
+                        assert!(request.url.starts_with("https://home.example/"));
+                        let body: Value =
+                            serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+                        assert_eq!(body["spaceAudience"], body["targetDid"]);
+                        assert!(body["signatureInput"]
+                            .as_str()
+                            .unwrap()
+                            .contains("atproto-space-credential"));
+                        assert!(body["signature"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("atproto-space-credential=:"));
+                        (
+                            body["nsid"].as_str().unwrap().to_owned(),
+                            body["query"].as_str().unwrap().to_owned(),
+                            body["wantMac"].as_str().unwrap().to_owned(),
+                            Some(body["targetDid"].as_str().unwrap().to_owned()),
+                        )
+                    } else {
+                        assert!(request.url.starts_with("https://account-pds.example/"));
+                        assert!(header(&request, "authorization")
+                            .starts_with("Atproto-Space-Credential "));
+                        assert_eq!(header(&request, "atproto-space-audience"), ACCOUNT);
+                        assert!(header(&request, "signature")
+                            .starts_with("atproto-space-credential=:"));
+                        (
+                            nsid.into(),
+                            query.into(),
+                            header(&request, "atproto-space-want-mac").into(),
+                            None,
+                        )
+                    };
+                let params = parse_query(&LabyrinthSpaceRequest::get(
+                    &read_nsid,
+                    format!("/xrpc/{read_nsid}?{read_query}"),
+                ))
+                .unwrap();
                 let space = SpaceUri::parse(required(&params, "space").unwrap()).unwrap();
-                let writer = required(&params, "repo").unwrap();
+                let writer = params
+                    .get("repo")
+                    .map(String::as_str)
+                    .unwrap_or(space.authority.as_str());
+                if let Some(target) = relay_target {
+                    assert_eq!(target, writer);
+                }
                 if read_nsid == "com.atproto.space.getBlob" {
                     return Ok(PlatformHttpResponse { status: 200, headers: vec![], body: BLOB.to_vec() });
                 }
-                let value = serde_json::to_value(served_record()).unwrap();
+                let mut value = serde_json::to_value(served_record()).unwrap();
+                if fault == "record_changed_after_inventory" {
+                    value["createdAt"] = "2026-11-04T00:00:00.000Z".into();
+                }
                 let bytes = value_bytes(&value);
                 let cid = compute_dagcbor_cid(&bytes);
+                if read_nsid == LIST_REPOS {
+                    if fault == "inventory_snapshot_changed" && params.contains_key("cursor") {
+                        return Ok(PlatformHttpResponse {
+                            status: 409,
+                            headers: vec![],
+                            body: br#"{"error":"SnapshotChanged"}"#.to_vec(),
+                        });
+                    }
+                    let share = parse_want_mac_header(&want_mac, COMMIT_MAC_TYPE).unwrap();
+                    let secret = decapsulate_p256(&self.kem, &share).unwrap();
+                    let mut repo_hash = LtHash::empty();
+                    repo_hash.add_record(COLLECTION, "batch-1", &cid);
+                    let repo_data = repo_hash.commitment();
+                    let many = matches!(
+                        fault,
+                        "inventory_101"
+                            | "inventory_changed_commit"
+                            | "inventory_snapshot_changed"
+                    );
+                    let cycle = fault == "inventory_cursor_cycle";
+                    let logical_dids: Vec<String> = if many || cycle {
+                        let count = if cycle { 102 } else { 101 };
+                        (0..count)
+                            .map(|index| format!("did:web:writer-{index:03}.example"))
+                            .collect()
+                    } else if matches!(
+                        fault,
+                        "inventory_truncated"
+                            | "inventory_omitted"
+                            | "inventory_reordered"
+                            | "inventory_duplicate"
+                    ) {
+                        vec![
+                            WRITER.to_owned(),
+                            "did:plc:cccccccccccccccccccccccc".to_owned(),
+                        ]
+                    } else {
+                        vec![WRITER.to_owned()]
+                    };
+                    let logical_rows: Vec<(String, String, String, [u8; 32])> = logical_dids
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, did)| {
+                            let data = if fault == "inventory_star_head" {
+                                [9; 32]
+                            } else {
+                                repo_data
+                            };
+                            (
+                                did,
+                                REV.to_owned(),
+                                format!("3jzfcijpj{index:04}a"),
+                                data,
+                            )
+                        })
+                        .collect();
+                    let mut inventory_hash = LtHash::empty();
+                    for (did, repo_rev, space_rev, data) in &logical_rows {
+                        inventory_hash
+                            .add_inventory_entry(did, repo_rev, space_rev, data)
+                            .unwrap();
+                    }
+                    let inventory_data = inventory_hash.commitment();
+                    let second_page = params.contains_key("cursor");
+                    let mut served_rows: Vec<_> = if many || cycle {
+                        if second_page {
+                            if cycle {
+                                logical_rows[100..101].to_vec()
+                            } else {
+                                logical_rows[100..].to_vec()
+                            }
+                        } else {
+                            logical_rows[..100].to_vec()
+                        }
+                    } else {
+                        logical_rows.clone()
+                    };
+                    if matches!(fault, "inventory_truncated" | "inventory_omitted") {
+                        served_rows.truncate(1);
+                    } else if fault == "inventory_reordered" {
+                        served_rows.reverse();
+                    } else if fault == "inventory_duplicate" {
+                        served_rows[1] = served_rows[0].clone();
+                    }
+                    let nonterminal = (many || cycle) && (!second_page || cycle);
+                    let cursor = nonterminal.then_some("inventory-page-100");
+                    let mut commit_data = inventory_data;
+                    if fault == "inventory_changed_commit" && second_page {
+                        commit_data[0] ^= 1;
+                    }
+                    let commit_repo = if fault == "inventory_wrong_authority" {
+                        "did:web:wrong-authority.example"
+                    } else {
+                        AUTHORITY
+                    };
+                    let commit = json!({
+                        "space": space.raw,
+                        "repo": commit_repo,
+                        "rev": REV,
+                        "ver": 1,
+                        "data": {"$bytes": STANDARD.encode(commit_data)}
+                    });
+                    let repos: Vec<Value> = served_rows
+                        .into_iter()
+                        .map(|(did, repo_rev, space_rev, data)| {
+                            json!({
+                                "did": did,
+                                "repoRev": repo_rev,
+                                "spaceRev": space_rev,
+                                "data": {"$bytes": STANDARD.encode(data)}
+                            })
+                        })
+                        .collect();
+                    let mut body = json!({
+                        "repos": repos,
+                        "complete": !nonterminal,
+                        "commit": commit
+                    });
+                    if let Some(cursor) = cursor {
+                        body["cursor"] = cursor.into();
+                    }
+                    if fault == "inventory_truncated" {
+                        body["complete"] = false.into();
+                        body.as_object_mut().unwrap().remove("cursor");
+                    }
+                    let mac = compute_commit_mac(
+                        &secret,
+                        &space.raw,
+                        commit_repo,
+                        REV,
+                        &commit_data,
+                    )
+                    .unwrap();
+                    let mut output = response(body);
+                    output.headers.push(PlatformHttpHeader {
+                        name: "Atproto-Space-Mac".into(),
+                        value: format_commit_mac_header(&mac),
+                    });
+                    if fault == "inventory_bad_mac" {
+                        output.headers[0].value = format_commit_mac_header(&[0; 32]);
+                    } else if fault == "inventory_missing_mac" {
+                        output.headers.clear();
+                    }
+                    return Ok(output);
+                }
                 if read_nsid == LIST_RECORDS {
+                    if fault == "listed_omitted_after_inventory" {
+                        return Ok(response(json!({"records": []})));
+                    }
                     let listed_value = if fault == "listed_value" { json!({"ciphertext": "forged"}) } else { value };
                     return Ok(response(json!({"records": [{
                         "collection": if fault == "listed_collection" { "blue.catbird.labyrinth.other" } else { COLLECTION },
@@ -797,7 +1522,11 @@ mod native_archive_space_auth {
                     home_ds_did: "did:web:home.example".into(), home_ds_endpoint: "https://home.example".into(),
                     pds_endpoint: "https://account-pds.example".into(),
                 },
-                db, transport: host.clone(), signer: Arc::new(NativeArchiveSigner(signer)), hooks,
+                db,
+                transport: host.clone(),
+                signer: Arc::new(NativeArchiveSigner(signer)),
+                hooks,
+                verified_inventories: Mutex::new(BTreeMap::new()),
             };
             (directory, gateway, host)
         }
@@ -809,9 +1538,13 @@ mod native_archive_space_auth {
 
         fn request(nsid: &str, personal: bool) -> LabyrinthSpaceRequest {
             let space = space(personal);
-            let mut params = BTreeMap::from([
-                ("space".into(), space.raw), ("repo".into(), if personal { ACCOUNT.into() } else { WRITER.into() }),
-            ]);
+            let mut params = BTreeMap::from([("space".into(), space.raw)]);
+            if nsid != LIST_REPOS {
+                params.insert(
+                    "repo".into(),
+                    if personal { ACCOUNT.into() } else { WRITER.into() },
+                );
+            }
             if matches!(nsid, GET_RECORD | LIST_RECORDS) { params.insert("collection".into(), COLLECTION.into()); }
             if nsid == GET_RECORD { params.insert("rkey".into(), "batch-1".into()); }
             LabyrinthSpaceRequest::get(nsid, query_path(nsid, &params))
@@ -852,6 +1585,12 @@ mod native_archive_space_auth {
                 for personal in [true, false] {
                     let response = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, personal))).unwrap();
                     assert_eq!(response.status, 200);
+                    if !personal {
+                        block_on_sync(
+                            gateway.execute_authenticated_space(request(LIST_REPOS, false)),
+                        )
+                        .unwrap();
+                    }
                     let response = block_on_sync(gateway.execute_authenticated_space(request(LIST_RECORDS, personal))).unwrap();
                     let listed: Value = serde_json::from_slice(&response.body).unwrap();
                     assert_eq!(listed["records"][0]["rkey"], "batch-1");
@@ -873,6 +1612,125 @@ mod native_archive_space_auth {
         }
 
         #[test]
+        fn writer_inventory_pages_past_one_hundred_only_release_after_head_reconciliation() {
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "inventory_101";
+            let response =
+                block_on_sync(gateway.execute_authenticated_space(request(LIST_REPOS, false)))
+                    .unwrap();
+            let inventory: InventoryPage = serde_json::from_slice(&response.body).unwrap();
+            assert!(inventory.complete);
+            assert!(inventory.cursor.is_none());
+            assert_eq!(inventory.repos.len(), 101);
+            assert!(inventory
+                .repos
+                .windows(2)
+                .all(|pair| pair[0].did < pair[1].did));
+
+            let requests = host.requests.lock().unwrap();
+            let relay_bodies: Vec<Value> = requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .url
+                        .ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")
+                })
+                .map(|request| {
+                    serde_json::from_slice(request.body.as_deref().unwrap()).unwrap()
+                })
+                .collect();
+            assert!(relay_bodies.iter().any(|body| {
+                body["nsid"] == LIST_REPOS
+                    && body["query"]
+                        .as_str()
+                        .is_some_and(|query| query.contains("cursor=inventory-page-100"))
+            }));
+            let last = &inventory.repos[100].did;
+            assert!(relay_bodies.iter().any(|body| {
+                body["nsid"] == GET_REPO && body["targetDid"].as_str() == Some(last)
+            }));
+            assert!(relay_bodies.iter().any(|body| {
+                body["nsid"] == LIST_OPS && body["targetDid"].as_str() == Some(last)
+            }));
+        }
+
+        #[test]
+        fn conversation_records_are_released_from_the_authenticated_star_snapshot() {
+            let (_directory, gateway, host) = gateway();
+            block_on_sync(
+                gateway.execute_authenticated_space(request(LIST_REPOS, false)),
+            )
+            .unwrap();
+
+            for fault in [
+                "listed_omitted_after_inventory",
+                "listed_value",
+                "listed_cid",
+                "listed_collection",
+            ] {
+                *host.fault.lock().unwrap() = fault;
+                let listed = block_on_sync(
+                    gateway.execute_authenticated_space(request(LIST_RECORDS, false)),
+                )
+                .unwrap();
+                let listed: Value = serde_json::from_slice(&listed.body).unwrap();
+                assert_eq!(listed["records"].as_array().unwrap().len(), 1);
+                assert_eq!(listed["records"][0]["rkey"], "batch-1");
+            }
+
+            *host.fault.lock().unwrap() = "record_changed_after_inventory";
+            let record = block_on_sync(
+                gateway.execute_authenticated_space(request(GET_RECORD, false)),
+            )
+            .unwrap();
+            let record: Value = serde_json::from_slice(&record.body).unwrap();
+            assert_eq!(
+                record["value"]["createdAt"],
+                "2026-11-03T00:00:00.000Z"
+            );
+
+            let mut absent = request(GET_RECORD, false);
+            absent.path = absent.path.replace("rkey=batch-1", "rkey=missing");
+            let absent =
+                block_on_sync(gateway.execute_authenticated_space(absent)).unwrap();
+            assert_eq!(absent.status, 404);
+            let absent: Value = serde_json::from_slice(&absent.body).unwrap();
+            assert_eq!(absent["error"], "RecordNotFound");
+        }
+
+        #[test]
+        fn writer_inventory_rejects_every_incomplete_or_inconsistent_snapshot_shape() {
+            for (fault, expected) in [
+                ("inventory_truncated", "inventory_terminal_cursor_mismatch"),
+                ("inventory_omitted", "inventory_commitment_mismatch"),
+                ("inventory_reordered", "inventory_not_strictly_ordered"),
+                ("inventory_duplicate", "inventory_not_strictly_ordered"),
+                ("inventory_changed_commit", "inventory_commit_changed"),
+                ("inventory_bad_mac", "native_space_commit_mac"),
+                ("inventory_missing_mac", "native_space_missing_response_mac"),
+                ("inventory_wrong_authority", "native_space_commit_binding_mismatch"),
+                ("inventory_cursor_cycle", "inventory_cursor_cycle"),
+                (
+                    "inventory_snapshot_changed",
+                    "listRepos inventory: HTTP 409 SnapshotChanged",
+                ),
+                ("inventory_star_head", "inventory_star_head_mismatch"),
+            ] {
+                let (_directory, gateway, host) = gateway();
+                *host.fault.lock().unwrap() = fault;
+                let error = block_on_sync(
+                    gateway.execute_authenticated_space(request(LIST_REPOS, false)),
+                )
+                .unwrap_err();
+                assert!(
+                    error.starts_with("ArchiveInventoryIncomplete:")
+                        && error.contains(expected),
+                    "{fault}: {error}"
+                );
+            }
+        }
+
+        #[test]
         fn native_space_auth_rejects_unbound_credentials_and_unsigned_or_mismatched_records() {
             for (fault, expected, nsid) in [
                 ("wrong_key", "native_space_credential_binding_mismatch", GET_RECORD),
@@ -883,9 +1741,6 @@ mod native_archive_space_auth {
                 ("bad_mac", "native_space_record_mac", GET_RECORD),
                 ("wrong_uri", "native_space_record_uri_mismatch", GET_RECORD),
                 ("record_value", "native_space_record_value_cid_mismatch", GET_RECORD),
-                ("listed_value", "native_space_list_value_mismatch", LIST_RECORDS),
-                ("listed_cid", "native_space_list_cid_mismatch", LIST_RECORDS),
-                ("listed_collection", "native_space_list_coordinate_mismatch", LIST_RECORDS),
             ] {
                 let (_directory, gateway, host) = gateway();
                 *host.fault.lock().unwrap() = fault;
@@ -929,6 +1784,12 @@ mod native_archive_space_auth {
             let served = serde_json::to_value(served_record()).unwrap();
             let (_directory, gateway, _host) = gateway();
             let released = |nsid: &str, personal: bool, pointer: &str| {
+                if nsid == LIST_RECORDS && !personal {
+                    block_on_sync(
+                        gateway.execute_authenticated_space(request(LIST_REPOS, false)),
+                    )
+                    .unwrap();
+                }
                 let response = block_on_sync(gateway.execute_authenticated_space(request(nsid, personal))).unwrap();
                 let body: Value = serde_json::from_slice(&response.body).unwrap();
                 body.pointer(pointer).unwrap().clone()

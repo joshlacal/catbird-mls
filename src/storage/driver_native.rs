@@ -1729,6 +1729,47 @@ impl<'a> SqlTx<'a> {
         Ok(())
     }
 
+    pub fn compare_exchange_pending_op(
+        &self,
+        op_kind: &str,
+        op_key: &str,
+        expected_payload: Option<&str>,
+        payload_json: &str,
+        created_at_ms: i64,
+    ) -> Result<bool, MLSError> {
+        let changed = match expected_payload {
+            Some(expected) => self.read.conn.execute(
+                "UPDATE pending_ops SET payload_json = ?1, created_at_ms = ?2 \
+                 WHERE op_kind = ?3 AND op_key = ?4 AND payload_json = ?5",
+                rusqlite::params![payload_json, created_at_ms, op_kind, op_key, expected],
+            ),
+            None => self.read.conn.execute(
+                "INSERT INTO pending_ops (op_kind, op_key, payload_json, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(op_kind, op_key) DO NOTHING",
+                rusqlite::params![op_kind, op_key, payload_json, created_at_ms],
+            ),
+        }
+        .map_err(|e| map_rusqlite_err("compare_exchange_pending_op", &e))?;
+        Ok(changed == 1)
+    }
+
+    pub fn delete_pending_op_if_payload(
+        &self,
+        op_kind: &str,
+        op_key: &str,
+        expected_payload: &str,
+    ) -> Result<bool, MLSError> {
+        self.read
+            .conn
+            .execute(
+                "DELETE FROM pending_ops \
+                 WHERE op_kind = ?1 AND op_key = ?2 AND payload_json = ?3",
+                rusqlite::params![op_kind, op_key, expected_payload],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|e| map_rusqlite_err("delete_pending_op_if_payload", &e))
+    }
+
     pub fn delete_pending_op(&self, op_kind: &str, op_key: &str) -> Result<usize, MLSError> {
         self.read
             .conn

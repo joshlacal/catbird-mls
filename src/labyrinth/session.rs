@@ -74,14 +74,25 @@ pub struct SessionDeps {
 pub struct HistoryPage {
     /// Ordered by `(timestamp, messageId)`.
     pub messages: Vec<LoadedMessage>,
-    /// Messages this device can see but not open (e.g. sent before the account joined).
+    /// Corrupt or unauthenticated records that could not be opened.
     pub undecryptable: usize,
+    /// Authenticated records whose MEK was not addressed to this account,
+    /// as expected for history outside its membership interval.
+    pub not_recipient: usize,
     /// Witness copies Labyrinth rejected because they contradict an accepted copy (ruling 3).
     pub rejected: usize,
     /// False if the Space refused the conversation's sender records; only the owner archive is included.
     pub space_readable: bool,
     /// Redacted messages (`by_author`, `account_deleted`, or `removed_by_server`).
     pub redacted: Vec<RedactedMessage>,
+}
+
+fn history_error_counts(items: &[labyrinth::client::Undecryptable]) -> (usize, usize) {
+    let not_recipient = items
+        .iter()
+        .filter(|item| item.error == labyrinth::Error::NotRecipient)
+        .count();
+    (items.len() - not_recipient, not_recipient)
 }
 
 /// What importing a conversation's history into local storage did.
@@ -824,13 +835,18 @@ impl LabyrinthSession {
 
     /// Native queue entries keep the verified receipt and blinded frame nonce;
     /// delegate MEK verification/distribution and sender sealing to Labyrinth.
+    ///
+    /// `Ok(true)` is narrowly an established Conversation Space write denial:
+    /// roster/directory and mailbox preparation have already succeeded. A
+    /// `Forbidden` from those prerequisite stages remains an error so callers
+    /// retain their durable queue rather than misclassifying it as a kick.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn archive_native_sender(
         &mut self,
         conversation_id: &str,
         members: &[String],
         items: &[crate::client::QueuedLabyrinthArchivePayload],
-    ) -> Result<labyrinth::Result<()>> {
+    ) -> Result<labyrinth::Result<bool>> {
         use base64::Engine as _;
         let raw = async {
             self.sync_epochs_healing_squats().await?;
@@ -842,7 +858,7 @@ impl LabyrinthSession {
             }
             let roster = resolved.roster;
             for item in items {
-                match (&item.frame_nonce_b64, &item.sequencer_receipt_json) {
+                let write = match (&item.frame_nonce_b64, &item.sequencer_receipt_json) {
                     (Some(nonce), Some(receipt)) => {
                         let nonce: [u8; 32] = base64::engine::general_purpose::STANDARD
                             .decode(nonce)
@@ -865,17 +881,25 @@ impl LabyrinthSession {
                                 item.labyrinth_frame_json.as_bytes(),
                                 &archived,
                             )
-                            .await?;
+                            .await
                     }
                     _ => return Err(labyrinth::Error::ReceiptCommitmentMismatch),
+                };
+                match write {
+                    Ok(_) => {}
+                    Err(labyrinth::Error::Forbidden) => return Ok(true),
+                    Err(error) => return Err(error),
                 }
             }
-            self.lab.flush_thread(conversation_id).await?;
-            Ok(())
+            match self.lab.flush_thread(conversation_id).await {
+                Ok(_) => Ok(false),
+                Err(labyrinth::Error::Forbidden) => Ok(true),
+                Err(error) => Err(error),
+            }
         }
         .await;
         let out = self.try_finish(raw);
-        if !matches!(out, Ok(Ok(_))) {
+        if !matches!(out, Ok(Ok(false))) {
             self.lab.discard_pending(conversation_id);
         }
         out
@@ -980,8 +1004,10 @@ impl LabyrinthSession {
         }
         .await;
         let h = self.finish(raw)?;
+        let (undecryptable, not_recipient) = history_error_counts(&h.undecryptable);
         Ok(HistoryPage {
-            undecryptable: h.undecryptable.len(),
+            undecryptable,
+            not_recipient,
             rejected: h.rejected.len(),
             space_readable: h.space_readable,
             messages: h.messages,
@@ -1006,9 +1032,11 @@ impl LabyrinthSession {
         }
         .await;
         let p = self.finish(raw)?;
+        let (undecryptable, not_recipient) = history_error_counts(&p.history.undecryptable);
         Ok((
             HistoryPage {
-                undecryptable: p.history.undecryptable.len(),
+                undecryptable,
+                not_recipient,
                 rejected: p.history.rejected.len(),
                 space_readable: p.history.space_readable,
                 messages: p.history.messages,
@@ -1055,5 +1083,29 @@ impl LabyrinthSession {
             .await
             .map(|r| r.messages_archived);
         self.finish(out)
+    }
+}
+
+#[cfg(test)]
+mod history_error_tests {
+    use super::history_error_counts;
+
+    #[test]
+    fn expected_not_recipient_is_separate_from_corruption() {
+        let items = [
+            labyrinth::client::Undecryptable {
+                message_id: "before-join".into(),
+                timestamp: 1,
+                sender: Some("did:plc:alice".into()),
+                error: labyrinth::Error::NotRecipient,
+            },
+            labyrinth::client::Undecryptable {
+                message_id: "tampered".into(),
+                timestamp: 2,
+                sender: Some("did:plc:alice".into()),
+                error: labyrinth::Error::BadSignature,
+            },
+        ];
+        assert_eq!(history_error_counts(&items), (1, 1));
     }
 }

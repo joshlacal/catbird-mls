@@ -218,9 +218,15 @@ async fn fresh_device_sees_pruned_opening_as_declared_terminal_state() {
     let world = world_for(&owner).await;
     let client = world.client("Late");
     client.credentials.set_request_authority_document(doc);
+    let state = &captured["getConversationState"]["state"]["directRequest"];
+    for party in ["senderDid", "recipientDid"] {
+        client
+            .credentials
+            .set_chat_declaration_authority(state[party].as_str().unwrap(), Some(AUTHORITY));
+    }
     let service = world.delivery_service();
 
-    // Receipts that do not bind this exact row are rejected before any state read.
+    // Receipts that do not bind this exact row are rejected under the two-party state authority.
     let mut forged_seq = entry.clone();
     forged_seq["sequencerReceipt"]["seq"] = json!(2);
     let mut forged_id = entry.clone();
@@ -238,6 +244,11 @@ async fn fresh_device_sees_pruned_opening_as_declared_terminal_state() {
         ("omitted body without payloadPruned", unflagged),
     ] {
         service.queue_request_operation_response(Op::GetEntries, 200, entries(&forged));
+        service.queue_request_operation_response(
+            Op::GetConversationState,
+            200,
+            captured["getConversationState"].clone(),
+        );
         assert!(
             matches!(
                 client.orchestrator.refresh_request_preview(&cid).await,
@@ -286,6 +297,45 @@ async fn fresh_device_sees_pruned_opening_as_declared_terminal_state() {
         envelope.sender_did,
         captured["getConversationState"]["state"]["directRequest"]["senderDid"]
     );
+    // A page may carry a different pruned row than the refresh above. The consumed row itself
+    // must bind its entry identity and signed publication before the shared cursor can advance.
+    let mut forged_consumed = entry.clone();
+    forged_consumed["entryId"] = json!(uuid::Uuid::new_v4().to_string());
+    let forged_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&forged_consumed, &cid)
+            .unwrap()
+            .unwrap();
+    service.queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        captured["getConversationState"].clone(),
+    );
+    service.queue_incoming_page(vec![forged_envelope], Some("1".into()));
+    assert!(
+        client
+            .orchestrator
+            .fetch_messages(&cid, None, 100, None, None, None)
+            .await
+            .is_err(),
+        "a separately refreshed publication must not authenticate a forged consumed row"
+    );
+
+    let exact_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&entry, &cid)
+            .unwrap()
+            .unwrap();
+    service.queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        captured["getConversationState"].clone(),
+    );
+    service.queue_incoming_page(vec![exact_envelope], Some("1".into()));
+    let (messages, _) = client
+        .orchestrator
+        .fetch_messages(&cid, None, 100, None, None, None)
+        .await
+        .expect("the exact authenticated pruned row advances without a message");
+    assert!(messages.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -296,6 +346,12 @@ async fn pruned_opening_must_name_the_states_request_sender() {
     let world = world_for(&owner).await;
     let client = world.client("Late");
     client.credentials.set_request_authority_document(doc);
+    let state = &captured["getConversationState"]["state"]["directRequest"];
+    for party in ["senderDid", "recipientDid"] {
+        client
+            .credentials
+            .set_chat_declaration_authority(state[party].as_str().unwrap(), Some(AUTHORITY));
+    }
     let state = captured["getConversationState"].clone();
     let service = world.delivery_service();
     service.queue_request_operation_response(Op::GetEntries, 200, entries(&entry));

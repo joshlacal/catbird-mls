@@ -20,6 +20,10 @@ use e2e_harness::mock_api_client::MockDeliveryService;
 use e2e_harness::mock_credentials::MockCredentials;
 use e2e_harness::mock_storage::MockStorage;
 use e2e_harness::{TestClient, TestWorld};
+#[cfg(feature = "fork-resolution")]
+use openmls::prelude::{MlsMessageIn, Welcome};
+#[cfg(feature = "fork-resolution")]
+use tls_codec::Deserialize as _;
 
 /// Canonical requests carry their payload as `{"signedRequest": {"body": …}}`, `{"body": …}`,
 /// or as the bare payload itself.
