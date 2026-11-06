@@ -109,16 +109,21 @@ impl crate::labyrinth::LabyrinthGateway for NativeArchiveGateway {
     async fn submit_labyrinth(&self, request: crate::labyrinth::LabyrinthRequest) -> Result<crate::orchestrator::canonical_transport::GatewayResponse, String> {
         self.execute(&self.config.home_ds_endpoint, request.method, request.path, request.headers, request.body).map(Self::response)
     }
-    async fn submit_canonical(&self, request: crate::orchestrator::canonical_transport::PreparedRequest) -> Result<crate::orchestrator::canonical_transport::GatewayResponse, String> {
+    async fn submit_canonical(
+        &self,
+        request: crate::orchestrator::canonical_transport::PreparedRequest,
+        extra_headers: Vec<(String, String)>,
+    ) -> Result<crate::orchestrator::canonical_transport::GatewayResponse, String> {
         // These directory requests contain only canonical DID/UUID coordinates.
         // Sort the already-percent-encoded pairs exactly like chat read signing.
         let mut query: Vec<&str> = request.path.split_once('?').map(|(_, q)| q.split('&').collect()).unwrap_or_default();
         query.sort_unstable();
         let query = query.join("&");
-        let headers = super::chat_wire::build_chat_read_headers(
+        let mut headers = super::chat_wire::build_chat_read_headers(
             request.operation.nsid(), &query, &self.config.account_did,
             &self.config.device_id, &self.signer.0, self.hooks.now_ms(),
-        ).map_err(|e| e.to_string())?.into_iter().map(|h| (h.name, h.value)).collect();
+        ).map_err(|e| e.to_string())?.into_iter().map(|h| (h.name, h.value)).collect::<Vec<_>>();
+        headers.extend(extra_headers);
         self.execute(&self.config.home_ds_endpoint, request.method, request.path, headers, request.body).map(Self::response)
     }
     async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {

@@ -76,8 +76,13 @@ pub fn map_xrpc_error(e: XrpcTransportError) -> labyrinth::Error {
 pub trait LabyrinthGateway: MaybeSend + MaybeSync {
     /// A `blue.catbird.labyrinth.*` request.
     async fn submit_labyrinth(&self, request: LabyrinthRequest) -> Result<GatewayResponse, String>;
-    /// A clean-chat query through the existing prepared-request route.
-    async fn submit_canonical(&self, request: PreparedRequest) -> Result<GatewayResponse, String>;
+    /// A clean-chat query through the canonical route, carrying the signed
+    /// Labyrinth read headers unchanged.
+    async fn submit_canonical(
+        &self,
+        request: PreparedRequest,
+        headers: Vec<(String, String)>,
+    ) -> Result<GatewayResponse, String>;
     /// Per-conversation `[CB-38]` Ed25519 redaction verifying key for `sequencer_did`.
     async fn resolve_sequencer_key_for(
         &self,
@@ -121,9 +126,19 @@ impl<A: MLSAPIClient + 'static> LabyrinthGateway for ApiGateway<A> {
             .map_err(|e| e.to_string())
     }
 
-    async fn submit_canonical(&self, request: PreparedRequest) -> Result<GatewayResponse, String> {
+    async fn submit_canonical(
+        &self,
+        request: PreparedRequest,
+        headers: Vec<(String, String)>,
+    ) -> Result<GatewayResponse, String> {
         self.api
-            .submit_prepared_request(request)
+            .submit_labyrinth_request(LabyrinthRequest {
+                nsid: request.operation.nsid().to_owned(),
+                method: request.method,
+                path: request.path,
+                body: request.body,
+                headers,
+            })
             .await
             .map_err(|e| e.to_string())
     }
@@ -356,20 +371,23 @@ impl GatewayXrpcTransport {
         }
         let params = self.wire_params(params);
         let path = Self::query_path(nsid, &params);
+        let mut all = headers.to_vec();
+        all.extend(self.read_headers(nsid, &params)?);
         let response = match canonical {
             Some(operation) => {
                 self.gateway
-                    .submit_canonical(PreparedRequest {
-                        operation,
-                        method: "GET".into(),
-                        path,
-                        body: None,
-                    })
+                    .submit_canonical(
+                        PreparedRequest {
+                            operation,
+                            method: "GET".into(),
+                            path,
+                            body: None,
+                        },
+                        all,
+                    )
                     .await
             }
             None => {
-                let mut all = headers.to_vec();
-                all.extend(self.read_headers(nsid, &params)?);
                 self.gateway
                     .submit_labyrinth(LabyrinthRequest {
                         nsid: nsid.to_owned(),
@@ -1361,6 +1379,7 @@ mod tests {
             async fn submit_canonical(
                 &self,
                 _request: PreparedRequest,
+                _headers: Vec<(String, String)>,
             ) -> Result<GatewayResponse, String> {
                 self.state_queries.fetch_add(1, Ordering::SeqCst);
                 Ok(GatewayResponse {
@@ -1382,7 +1401,7 @@ mod tests {
                 [0; 32]
             }
             fn sign(&self, _message: &[u8]) -> Result<[u8; 64], String> {
-                panic!("canonical state query must not sign a mutation")
+                Ok([0; 64])
             }
         }
         impl StateVault for Fixture {
@@ -1556,6 +1575,89 @@ mod tests {
         assert_eq!(fixture.state_queries.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn canonical_query_carries_exact_labyrinth_read_headers() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Capture(Mutex<Option<(PreparedRequest, Vec<(String, String)>)>>);
+        #[async_trait::async_trait]
+        impl LabyrinthGateway for Capture {
+            async fn submit_labyrinth(
+                &self,
+                _request: LabyrinthRequest,
+            ) -> Result<GatewayResponse, String> {
+                panic!("canonical query must use the canonical route")
+            }
+
+            async fn submit_canonical(
+                &self,
+                request: PreparedRequest,
+                headers: Vec<(String, String)>,
+            ) -> Result<GatewayResponse, String> {
+                *self.0.lock().unwrap() = Some((request, headers));
+                Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+
+        struct Signer;
+        impl ChatKeySigner for Signer {
+            fn public_key(&self) -> [u8; 32] {
+                [7; 32]
+            }
+
+            fn sign(&self, _message: &[u8]) -> Result<[u8; 64], String> {
+                Ok([9; 64])
+            }
+        }
+
+        struct Clock;
+        impl labyrinth::client::Clock for Clock {
+            fn now_ms(&self) -> u64 {
+                123_456
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let did = "did:plc:alice";
+        let device = "11111111-1111-4111-8111-111111111111";
+        let nsid = CanonicalOperation::GetConversationState.nsid();
+        let params = [("conversationId", "22222222-2222-4222-8222-222222222222".into())];
+        let supplied = vec![("x-test".into(), "kept".into())];
+        GatewayXrpcTransport::new(
+            capture.clone(),
+            Arc::new(Signer),
+            did.into(),
+            device.into(),
+        )
+        .with_clock(Arc::new(Clock))
+        .query_with_headers(nsid, &params, &supplied)
+        .await
+        .unwrap();
+
+        let (request, actual) = capture.0.lock().unwrap().take().unwrap();
+        let wire_params = [
+            ("actorDeviceId", device.into()),
+            ("conversationId", params[0].1.clone()),
+        ];
+        let claim = ReadClaim::new(nsid, &wire_params, did, device, 123_456);
+        let mut expected = supplied;
+        expected.extend(read_headers(&claim.to_json(), &[9; 64]));
+        assert_eq!(actual, expected);
+        assert_eq!(request.operation, CanonicalOperation::GetConversationState);
+        assert_eq!(
+            request.path,
+            format!(
+                "/xrpc/{nsid}?actorDeviceId={device}&conversationId={}",
+                params[0].1
+            )
+        );
+    }
+
     #[test]
     fn destructive_directory_operation_ids_follow_scoped_entropy() {
         use std::sync::atomic::{AtomicU8, Ordering};
@@ -1579,6 +1681,7 @@ mod tests {
             async fn submit_canonical(
                 &self,
                 _request: PreparedRequest,
+                _headers: Vec<(String, String)>,
             ) -> Result<GatewayResponse, String> {
                 panic!("directory mutations must use the Labyrinth route")
             }
@@ -1705,6 +1808,7 @@ mod tests {
             async fn submit_canonical(
                 &self,
                 _req: PreparedRequest,
+                _headers: Vec<(String, String)>,
             ) -> Result<GatewayResponse, String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(GatewayResponse {

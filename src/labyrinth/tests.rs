@@ -257,7 +257,11 @@ impl LabyrinthGateway for MockSixEndpointGateway {
         }
     }
 
-    async fn submit_canonical(&self, request: PreparedRequest) -> Result<GatewayResponse, String> {
+    async fn submit_canonical(
+        &self,
+        request: PreparedRequest,
+        _headers: Vec<(String, String)>,
+    ) -> Result<GatewayResponse, String> {
         let st = self.state.lock().unwrap();
         let conv_id = query_param(&request.path, "conversationId").unwrap_or_default();
         match st.conversations.get(&conv_id) {
@@ -974,6 +978,7 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         async fn submit_canonical(
             &self,
             _request: PreparedRequest,
+            _headers: Vec<(String, String)>,
         ) -> Result<GatewayResponse, String> {
             let body = if self.status == 403 {
                 br#"{"error":"Forbidden","message":"removed from conversation"}"#.to_vec()
