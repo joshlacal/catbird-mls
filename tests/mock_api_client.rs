@@ -167,6 +167,8 @@ struct StoredDevice {
 
 #[derive(Debug, Default)]
 struct FailureFlags {
+    /// Refuse this many next first-seen sends `StaleSend`, writing nothing.
+    stale_sends: u32,
     fail_next_send: bool,
     fail_next_create: bool,
     fail_next_get_messages: bool,
@@ -943,6 +945,10 @@ impl MockDeliveryService {
 
     pub fn fail_next_send(&self) {
         self.state.lock().unwrap().failures.fail_next_send = true;
+    }
+
+    pub fn refuse_next_sends_stale(&self, count: u32) {
+        self.state.lock().unwrap().failures.stale_sends = count;
     }
 
     pub fn fail_next_create(&self) {
@@ -2695,6 +2701,17 @@ impl MLSAPIClient for MockDeliveryService {
                 let response = {
                 let mut guard = self.state.lock().unwrap();
                 check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
+                if guard.failures.stale_sends > 0 {
+                    guard.failures.stale_sends -= 1;
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 400,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(
+                            &serde_json::json!({"error": "StaleSend", "message": "injected"}),
+                        )
+                        .unwrap(),
+                    });
+                }
                 let did = self
                     .effective_did_from_guard(&guard)
                     .unwrap_or_else(|| "did:plc:mock".to_string());

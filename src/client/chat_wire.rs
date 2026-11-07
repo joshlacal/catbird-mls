@@ -10,13 +10,17 @@ use base64::{
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::{signatures::Signer as _, storage::StorageProvider as _, OpenMlsProvider};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 use tls_codec::Serialize as _;
 
 use crate::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
+use crate::chat_v2::transcript::{
+    normalize_read_presentation, project_signed_body, SignedMutationKind, SignedWrapper,
+    VerifiedMutation,
+};
 use crate::client::traits::PlatformHttpHeader;
 use crate::error::MLSError;
 use crate::metadata::{
@@ -58,6 +62,144 @@ pub fn own_active_device<'a>(
             && json_bytes(&device["signaturePublicKey"])
                 .is_ok_and(|key| key == signature_public_key)
     })
+}
+
+/// `mls-ds` error for a send whose `(prior.generation, prior.epoch, sendCounter)` does not exceed
+/// this device's last accepted send in the conversation. Nothing was sequenced or retired: the
+/// sender re-sends the same message id as a freshly encrypted frame, never the refused bytes.
+pub const STALE_SEND: &str = "StaleSend";
+
+pub fn is_stale_send(error: &MLSError) -> bool {
+    matches!(error, MLSError::InvalidState(code) if code == STALE_SEND)
+}
+
+/// `account_meta` key of the last `sendCounter` this device signed in `conversation_id`.
+pub fn send_counter_key(conversation_id: &str) -> String {
+    format!("send_counter:{conversation_id}")
+}
+
+/// The `sendCounter` after `last`, the persisted value (absent before the first send). Callers
+/// persist the result in the same write transaction that encrypts the frame, before any HTTP.
+pub fn next_send_counter(last: Option<&str>) -> Result<u64, MLSError> {
+    let last = match last {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| MLSError::Internal(format!("corrupt send counter {raw:?}")))?,
+        None => 0,
+    };
+    last.checked_add(1)
+        .filter(|next| *next <= 9_007_199_254_740_991)
+        .ok_or_else(|| MLSError::Internal("send counter exhausted".into()))
+}
+
+/// Why a current-epoch application message can never be decrypted by this device: its
+/// generation left the sender-ratchet window or was consumed, or its key or framing cannot open
+/// it. Re-fetching the same signed entry cannot change any of these. A library, storage or
+/// non-decryption failure returns `None` and stays fatal for the sync pass.
+pub fn permanent_decrypt_failure<E>(error: &ProcessMessageError<E>) -> Option<&'static str> {
+    use openmls::framing::errors::{MessageDecryptionError as D, SecretTreeError as S};
+    let ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(error)) = error
+    else {
+        return None;
+    };
+    Some(match error {
+        D::SecretTreeError(S::TooDistantInThePast) => "TooDistantInThePast",
+        D::SecretTreeError(S::TooDistantInTheFuture) => "TooDistantInTheFuture",
+        D::SecretTreeError(S::SecretReuseError) => "SecretReuse",
+        D::SecretTreeError(S::IndexOutOfBounds | S::RatchetTooLong) => "SenderRatchetUnavailable",
+        D::GenerationOutOfBound => "GenerationOutOfBound",
+        D::AeadError => "AeadFailure",
+        D::MalformedContent | D::WrongWireFormat => "MalformedContent",
+        _ => return None,
+    })
+}
+
+/// System notice content key of the row that stands in for an undecryptable message.
+pub const UNDECRYPTABLE_MESSAGE_NOTICE: &str = "message.undecryptable";
+
+/// `labyrinth_state` key of the evidence that this device can never decrypt `message_id`. It
+/// holds no plaintext, frame nonce or receipt, so no witness or archive copy exists for it: kick
+/// rescue records the message as evidence-less and restore may replace the gap row with a
+/// verified archive copy.
+pub fn undecryptable_evidence_key(conversation_id: &str, message_id: &str) -> String {
+    format!("native.undecryptable:{conversation_id}:{message_id}")
+}
+
+/// One sequenced application entry, its outer signed request verified, that this device can
+/// never decrypt (`permanent_decrypt_failure`). The sender fields come from that signed request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndecryptableEntryEvidence {
+    pub version: u32,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub entry_id: String,
+    pub seq: i64,
+    pub epoch: i64,
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub reason: String,
+    pub recorded_at_ms: i64,
+}
+
+impl UndecryptableEntryEvidence {
+    /// The timeline row marking the gap: a system notice at the entry's seq.
+    pub fn gap_row(
+        &self,
+        group_id: &[u8],
+        is_own: bool,
+    ) -> Result<crate::storage::MessageRow, MLSError> {
+        Ok(crate::storage::MessageRow {
+            message_id: self.message_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            group_id: group_id.to_vec(),
+            epoch: self.epoch,
+            seq: self.seq,
+            sender_did: self.sender_did.clone(),
+            sender_device_id: self.sender_device_id.clone(),
+            plaintext_json: serde_json::to_string(
+                &crate::orchestrator::MLSMessagePayload::system(UNDECRYPTABLE_MESSAGE_NOTICE),
+            )?,
+            created_at_ms: self.recorded_at_ms,
+            is_own,
+        })
+    }
+}
+
+/// Verify an outer signed transition or application send under `public_key` and return its
+/// strictly projected body (native sync, NSE and `wasm32` sync share this one check).
+pub fn verify_signed_mutation_body(
+    signed_request: &serde_json::Value,
+    kind: SignedMutationKind,
+    public_key: &[u8],
+) -> Result<serde_json::Value, MLSError> {
+    let wrapper_name = match kind {
+        SignedMutationKind::CommitTransition => "signedCommitTransition",
+        SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
+        SignedMutationKind::PolicyTransition => "signedPolicyTransition",
+        SignedMutationKind::ConversationClose => "signedConversationClose",
+        SignedMutationKind::ApplicationSend => "signedApplicationSend",
+        _ => {
+            return Err(MLSError::Cryptography(
+                "unexpected signed transition kind".into(),
+            ))
+        }
+    };
+    let mut normalized =
+        normalize_read_presentation(&serde_json::to_vec(signed_request)?, wrapper_name, false)
+            .map_err(|e| MLSError::Cryptography(format!("normalize signed transition: {e}")))?;
+    let wrapper = SignedWrapper::decode(&serde_json::to_vec(&normalized)?)
+        .map_err(|e| MLSError::Cryptography(format!("decode signed transition: {e}")))?;
+    if wrapper.kind() != Some(kind) {
+        return Err(MLSError::Cryptography(
+            "signed transition has the wrong kind".into(),
+        ));
+    }
+    let projected = project_signed_body(kind, &wrapper.body)
+        .map_err(|e| MLSError::Cryptography(format!("project signed transition: {e}")))?;
+    VerifiedMutation::verify(projected, wrapper.signature, public_key)
+        .map_err(|e| MLSError::Cryptography(format!("verify signed transition: {e}")))?;
+    Ok(normalized["body"].take())
 }
 
 /// Format current UTC wall-clock time as canonical RFC 3339 milliseconds (`YYYY-MM-DDTHH:MM:SS.sssZ`).

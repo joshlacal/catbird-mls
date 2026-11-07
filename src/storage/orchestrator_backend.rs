@@ -1237,6 +1237,17 @@ impl MLSStorageBackend for MlsAccountDb {
             .map_err(mls_to_orch_err)
     }
 
+    async fn reserve_send_counter(&self, conversation_id: &str) -> OrchResult<u64> {
+        let key = crate::client::chat_wire::send_counter_key(conversation_id);
+        self.write_tx(|tx| {
+            let next =
+                crate::client::chat_wire::next_send_counter(tx.get_account_meta(&key)?.as_deref())?;
+            tx.put_account_meta(&key, &next.to_string(), now_ms())?;
+            Ok(next)
+        })
+        .map_err(mls_to_orch_err)
+    }
+
     async fn store_sequencer_receipt(&self, receipt: &SequencerReceipt) -> OrchResult<()> {
         let entry_id = hex::encode(&receipt.commit_hash);
         let json = serde_json::to_string(receipt)

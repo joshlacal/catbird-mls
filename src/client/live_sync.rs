@@ -20,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 use crate::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
 use crate::chat_v2::transcript::SignedMutationKind;
 use crate::client::chat_wire;
+use crate::client::chat_wire::verify_signed_mutation_body;
 use crate::client::traits::PlatformChangeEvent;
 use crate::client::QueuedLabyrinthArchivePayload;
 use crate::error::MLSError;
@@ -35,7 +36,7 @@ use crate::orchestrator::direct_request_bootstrap::{
     C33_OPENING_UNAVAILABLE,
 };
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
-use crate::push::processor::{verify_signed_mutation_body, NATIVE_ARCHIVE_RECEIPT_OP};
+use crate::push::processor::NATIVE_ARCHIVE_RECEIPT_OP;
 use crate::push::{root_did_from_credential_bytes, AuthorizedPeerDeviceKey};
 use crate::storage::driver_native::map_rusqlite_err;
 use crate::storage::{
@@ -50,6 +51,9 @@ fn build_join_config() -> MlsGroupJoinConfig {
         .use_ratchet_tree_extension(true)
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(5)
+        .sender_ratchet_configuration(
+            crate::types::GroupConfig::default().sender_ratchet_configuration(),
+        )
         .build()
 }
 
@@ -100,8 +104,7 @@ pub(super) fn record_account_deletion(
 /// Inner deletion record transcript retained by the server's v2 authority signature.
 const ACCOUNT_DELETION_DOMAIN: &[u8] = b"catbird-mls-account-deletion-v1\0";
 /// Signature domain that binds the exact retained receipt verification method to the deletion.
-const ACCOUNT_DELETION_AUTHORITY_DOMAIN: &[u8] =
-    b"catbird-mls-account-deletion-authority-v2\0";
+const ACCOUNT_DELETION_AUTHORITY_DOMAIN: &[u8] = b"catbird-mls-account-deletion-authority-v2\0";
 
 fn append_account_deletion_text(bytes: &mut Vec<u8>, text: &str) -> Option<()> {
     bytes.extend_from_slice(&u32::try_from(text.len()).ok()?.to_be_bytes());
@@ -452,6 +455,36 @@ impl CatbirdMlsClient {
                 .map_err(|e| map_rusqlite_err("update authenticated cached message seq", &e))?;
             convo.last_seq = convo.last_seq.max(entry_seq);
             convo.updated_at_ms = now_ms;
+            tx.upsert_conversation(&convo)
+        })
+    }
+
+    /// Record a sequenced application entry this device can never decrypt: durable evidence and a
+    /// system gap row at its seq, so the timeline shows the gap and sync moves on to later
+    /// Commits. An already stored message keeps its row. No archive or witness copy exists.
+    fn record_undecryptable_entry(
+        &self,
+        evidence: &chat_wire::UndecryptableEntryEvidence,
+    ) -> Result<(), MLSError> {
+        let cid = evidence.conversation_id.as_str();
+        self.db.write_tx(|tx| {
+            let Some(mut convo) = tx.get_conversation(cid)? else {
+                return Ok(());
+            };
+            if tx.get_message(&evidence.message_id)?.is_none() {
+                let is_own = evidence.sender_did == self.normalized_did;
+                tx.insert_message(&evidence.gap_row(&convo.group_id, is_own)?)?;
+                tx.put_labyrinth_state(
+                    &chat_wire::undecryptable_evidence_key(cid, &evidence.message_id),
+                    &serde_json::to_vec(evidence)?,
+                    evidence.recorded_at_ms,
+                )?;
+                if !is_own {
+                    convo.unread_count = convo.unread_count.saturating_add(1);
+                }
+            }
+            convo.last_seq = convo.last_seq.max(evidence.seq);
+            convo.updated_at_ms = evidence.recorded_at_ms;
             tx.upsert_conversation(&convo)
         })
     }
@@ -2896,6 +2929,8 @@ impl CatbirdMlsClient {
                             convo.sequencer_did
                         ))
                     })?;
+                // Set only when OpenMLS can never open this current-epoch entry for this device.
+                let mut undecryptable = None;
                 let decrypt_result = self.db.write_tx(|tx| {
                     self.clear_cached_groups();
                     let Some(mut c) = tx.get_conversation(cid)? else {
@@ -2916,9 +2951,14 @@ impl CatbirdMlsClient {
                         .try_into_protocol_message()
                         .map_err(|e| MLSError::Cryptography(format!("app protocol msg: {e:?}")))?;
                     let msg_epoch = proto.epoch().as_u64() as i64;
-                    let processed = group
-                        .process_message(&provider, proto)
-                        .map_err(|e| MLSError::Cryptography(format!("decrypt app msg: {e:?}")))?;
+                    let current_epoch = proto.epoch() == group.epoch();
+                    let processed = group.process_message(&provider, proto).map_err(|e| {
+                        if current_epoch {
+                            undecryptable = chat_wire::permanent_decrypt_failure(&e)
+                                .map(|reason| (reason, msg_epoch));
+                        }
+                        MLSError::Cryptography(format!("decrypt app msg: {e:?}"))
+                    })?;
                     let sender_cred = processed.credential().clone();
                     let aad_bytes = processed.aad().to_vec();
                     let signed_aad =
@@ -3112,6 +3152,38 @@ impl CatbirdMlsClient {
                     )
                 {
                     self.plant_p9_automated_forced_rejoin(cid, canonical_dev_id, signer)?;
+                }
+                if let (Err(error), Some((reason, epoch))) = (&decrypt_result, undecryptable) {
+                    // Never fail-stop or force a rejoin here: later entries, Commits above all,
+                    // must still apply. The failed attempt rolled back; record the gap instead.
+                    tracing::warn!(
+                        conversation_id = cid,
+                        seq = entry_seq,
+                        reason,
+                        %error,
+                        "recording permanently undecryptable application entry"
+                    );
+                    self.record_undecryptable_entry(&chat_wire::UndecryptableEntryEvidence {
+                        version: 1,
+                        conversation_id: cid.to_owned(),
+                        message_id: msg_id.to_owned(),
+                        entry_id: expected_rcpt_entry_id.to_owned(),
+                        seq: entry_seq,
+                        epoch,
+                        sender_did: body["actorDid"].as_str().unwrap_or_default().to_owned(),
+                        sender_device_id: body["actorDeviceId"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        reason: reason.to_owned(),
+                        recorded_at_ms: now_ms,
+                    })?;
+                    self.notify_change(PlatformChangeEvent::MessagesUpdated {
+                        conversation_id: cid.to_string(),
+                    });
+                    max_seq = max_seq.max(entry_seq);
+                    applied_count = applied_count.saturating_add(1);
+                    continue;
                 }
                 decrypt_result?;
 
@@ -3405,7 +3477,11 @@ mod tests {
         let key = SigningKey::from_slice(&[7; 32]).unwrap();
         let sign = |message: &[u8]| {
             let signature: Signature = key.sign(message);
-            signature.normalize_s().unwrap_or(signature).to_bytes().to_vec()
+            signature
+                .normalize_s()
+                .unwrap_or(signature)
+                .to_bytes()
+                .to_vec()
         };
         let signature = sign(&transcript);
         let public_key = key.verifying_key().to_encoded_point(true);
@@ -3427,12 +3503,47 @@ mod tests {
         ));
 
         for changed in [
-            ["did:web:other.example.com", CONVERSATION, DELETED, "12", ENTRY, RECEIVED_AT],
-            [SEQUENCER, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", DELETED, "12", ENTRY, RECEIVED_AT],
-            [SEQUENCER, CONVERSATION, "did:web:other.example.com", "12", ENTRY, RECEIVED_AT],
+            [
+                "did:web:other.example.com",
+                CONVERSATION,
+                DELETED,
+                "12",
+                ENTRY,
+                RECEIVED_AT,
+            ],
+            [
+                SEQUENCER,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                DELETED,
+                "12",
+                ENTRY,
+                RECEIVED_AT,
+            ],
+            [
+                SEQUENCER,
+                CONVERSATION,
+                "did:web:other.example.com",
+                "12",
+                ENTRY,
+                RECEIVED_AT,
+            ],
             [SEQUENCER, CONVERSATION, DELETED, "13", ENTRY, RECEIVED_AT],
-            [SEQUENCER, CONVERSATION, DELETED, "12", "44444444-4444-4444-8444-444444444444", RECEIVED_AT],
-            [SEQUENCER, CONVERSATION, DELETED, "12", ENTRY, "2026-11-03T12:00:00.124Z"],
+            [
+                SEQUENCER,
+                CONVERSATION,
+                DELETED,
+                "12",
+                "44444444-4444-4444-8444-444444444444",
+                RECEIVED_AT,
+            ],
+            [
+                SEQUENCER,
+                CONVERSATION,
+                DELETED,
+                "12",
+                ENTRY,
+                "2026-11-03T12:00:00.124Z",
+            ],
         ] {
             assert!(!account_deletion_signature_valid(
                 public_key.as_bytes(),
@@ -3457,7 +3568,10 @@ mod tests {
         let wrong_signature: Signature = wrong_key.sign(&transcript);
         assert!(!account_deletion_signature_valid(
             public_key.as_bytes(),
-            &wrong_signature.normalize_s().unwrap_or(wrong_signature).to_bytes(),
+            &wrong_signature
+                .normalize_s()
+                .unwrap_or(wrong_signature)
+                .to_bytes(),
             KEY_ID,
             &fields,
         ));

@@ -112,7 +112,6 @@ impl NativeArchiveAuthFixture {
         }
     }
 
-
     #[allow(dead_code)]
     pub fn mailbox_keys_record(&self, did: &str, rkey: &str) -> Option<(Value, String)> {
         self.world

@@ -203,6 +203,10 @@ struct BotStorageInner {
     pending_messages: HashSet<String>,
     recovery_backoff: HashMap<String, PersistedRecoveryBackoff>,
     last_global_rejoin_attempt_at_ms: Option<i64>,
+    /// Last reserved `sendCounter` per conversation. In memory, like the device
+    /// identity (`BotCredentials`): each process enrolls a new device, whose send
+    /// order at the DS starts empty.
+    send_counters: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +549,15 @@ impl MLSStorageBackend for BotStorage {
             .pending_messages
             .remove(message_id))
     }
+    async fn reserve_send_counter(&self, conversation_id: &str) -> OrcResult<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let counter = inner
+            .send_counters
+            .entry(conversation_id.to_string())
+            .or_default();
+        *counter += 1;
+        Ok(*counter)
+    }
     async fn get_recovery_state(&self) -> OrcResult<PersistedRecoveryState> {
         Ok(Self::recovery_state(&self.inner.lock().unwrap()))
     }
@@ -580,6 +593,7 @@ impl MLSStorageBackend for BotStorage {
             "set_recovery_backoff",
             "clear_recovery_backoff",
             "set_last_global_rejoin_attempt_at",
+            "reserve_send_counter",
         ]
     }
 }

@@ -781,9 +781,10 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // Moved in Task 4 R1 (two separate processes agree; seed 99_102 gives 96be9104…): the flush
     // is the native LabyrinthSession sealing the I13 `ArchivedReceipt { signed, generation }`
     // against the account-bound native Space host, and a solo-group flush makes no Space reads.
+    // Moved again for seed 2323: every `sendMessage` body now signs its `sendCounter`.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "a93168fb55a79dad48cbe496aa8d1c7bb6f2dd98ff42074360c3f5c497ed4ebc",
+        "47f3e88362957e2e5ae0c7fb31e7b381ef88e5fd0410b5bd27c8956da4c1e47d",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }

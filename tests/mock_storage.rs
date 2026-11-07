@@ -124,6 +124,8 @@ struct Inner {
     /// Platform epoch-retention calls, recorded as `(conversation_id, cutoff)`.
     epoch_cleanup_calls: Vec<(String, u64)>,
     startup_probe_counts: StartupProbeCounts,
+    /// conversation_id -> last reserved `sendCounter` (survives simulated restart).
+    send_counters: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1908,6 +1910,16 @@ impl MLSStorageBackend for MockStorage {
         Ok(inner.pending_messages.remove(message_id))
     }
 
+    async fn reserve_send_counter(&self, conversation_id: &str) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let counter = inner
+            .send_counters
+            .entry(conversation_id.to_string())
+            .or_default();
+        *counter += 1;
+        Ok(*counter)
+    }
+
     // ── Sequencer Receipts (WS-3 equivocation detection) ─────────────────
 
     async fn store_sequencer_receipt(&self, receipt: &SequencerReceipt) -> Result<()> {
@@ -2120,6 +2132,7 @@ impl MLSStorageBackend for MockStorage {
             "set_recovery_backoff",
             "clear_recovery_backoff",
             "set_last_global_rejoin_attempt_at",
+            "reserve_send_counter",
         ];
         const ALL: &[&str] = &[
             "get_conversation_state",
@@ -2145,6 +2158,7 @@ impl MLSStorageBackend for MockStorage {
             "mark_pending_local_delete",
             "clear_pending_local_delete",
             "list_pending_local_deletes",
+            "reserve_send_counter",
         ];
         if self
             .declare_pending_delete_capabilities

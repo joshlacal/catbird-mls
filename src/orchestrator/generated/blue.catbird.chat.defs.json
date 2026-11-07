@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "0f4f58a27d161c35cf7dcc1072a570660a7fbb0f",
-    "sourceSha256": "eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad",
-    "sourceTree": "5173d7d9679b13d8e40316e050fb2394c8f0d956"
+    "sourceRevision": "e4227af68226a61a4cae7478496d1a7b930f28f6",
+    "sourceSha256": "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075",
+    "sourceTree": "2ce27d72e2a84fd363cba629d2847a3f32921743"
   },
   "defs": {
     "accessEndedEvent": {
@@ -212,35 +212,6 @@
           "ref": "#artifactHash",
           "type": "ref"
         },
-        "originalSenderAttestation": {
-          "type": "object",
-          "required": [
-            "senderDid",
-            "senderDeviceId",
-            "senderTransportPubkey",
-            "signature"
-          ],
-          "properties": {
-            "senderDid": {
-              "type": "ref",
-              "ref": "#bareDid"
-            },
-            "senderDeviceId": {
-              "type": "ref",
-              "ref": "#deviceId"
-            },
-            "senderTransportPubkey": {
-              "type": "bytes",
-              "minLength": 32,
-              "maxLength": 32
-            },
-            "signature": {
-              "type": "bytes",
-              "minLength": 64,
-              "maxLength": 64
-            }
-          }
-        },
         "conversationId": {
           "ref": "#identifierBytes",
           "type": "ref"
@@ -253,6 +224,35 @@
         "messageId": {
           "ref": "#identifierBytes",
           "type": "ref"
+        },
+        "originalSenderAttestation": {
+          "properties": {
+            "senderDeviceId": {
+              "ref": "#deviceId",
+              "type": "ref"
+            },
+            "senderDid": {
+              "ref": "#bareDid",
+              "type": "ref"
+            },
+            "senderTransportPubkey": {
+              "maxLength": 32,
+              "minLength": 32,
+              "type": "bytes"
+            },
+            "signature": {
+              "maxLength": 64,
+              "minLength": 64,
+              "type": "bytes"
+            }
+          },
+          "required": [
+            "senderDid",
+            "senderDeviceId",
+            "senderTransportPubkey",
+            "signature"
+          ],
+          "type": "object"
         },
         "prior": {
           "ref": "#mlsAadPriorContext",
@@ -450,7 +450,7 @@
       "type": "object"
     },
     "applicationSendBody": {
-      "description": "messageId is the sole idempotency identity, unique within conversationId. Its canonical request digest is raw SHA-256 of the exact domain-prefixed canonical Ed25519 transcript and its 64-byte signature is stored separately. Exact completed replay requires both digest and signature byte-equal; either mismatch conflicts. Raw JSON or generated DTO bytes are never hashed. blobBindings contains zero or one exact applicationAttachmentBinding with purpose attachment; metadataAvatarBinding and generic uploadedBlobBinding are forbidden. A stale-coordinate attempt retires that messageId under the same digest/signature rule, so retry requires a newly encrypted frame and new messageId.",
+      "description": "messageId is the sole idempotency identity, unique within conversationId. Its canonical request digest is raw SHA-256 of the exact domain-prefixed canonical Ed25519 transcript and its 64-byte signature is stored separately. Exact completed replay requires both digest and signature byte-equal; either mismatch conflicts. Raw JSON or generated DTO bytes are never hashed. blobBindings contains zero or one exact applicationAttachmentBinding with purpose attachment; metadataAvatarBinding and generic uploadedBlobBinding are forbidden. A stale-coordinate attempt retires that messageId under the same digest/signature rule, so retry requires a newly encrypted frame and new messageId. sendCounter orders one device's sends: a StaleSend refusal retires neither the messageId nor that order, and the sender re-sends the same message as a newly encrypted frame with a new sendCounter under the same messageId; it never resubmits the refused bytes.",
       "properties": {
         "aad": {
           "ref": "#applicationAad",
@@ -494,6 +494,12 @@
           "ref": "#conversationCoordinates",
           "type": "ref"
         },
+        "sendCounter": {
+          "description": "Per-device send order within conversationId: strictly greater than every sendCounter this device has signed for the conversation, assigned in the same durable step that encrypts the frame and never reused. A sequencer resolving a messageId for the first time accepts it only if (prior.generation, prior.epoch, sendCounter) is lexicographically greater than this device's last accepted send in the conversation, so one device's sequenced order is its MLS generation order; otherwise it refuses StaleSend. An exact replay of an accepted send returns its stored outcome, never StaleSend.",
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
         "signatureDomain": {
           "const": "CATBIRD-CHAT-MESSAGE\u0000",
           "type": "string"
@@ -510,6 +516,7 @@
         "actorDeviceId",
         "keyId",
         "authGeneration",
+        "sendCounter",
         "prior",
         "aad",
         "applicationMessage",
@@ -3186,35 +3193,6 @@
           "ref": "#artifactHash",
           "type": "ref"
         },
-        "originalSenderAttestation": {
-          "type": "object",
-          "required": [
-            "senderDid",
-            "senderDeviceId",
-            "senderTransportPubkey",
-            "signature"
-          ],
-          "properties": {
-            "senderDid": {
-              "type": "ref",
-              "ref": "#bareDid"
-            },
-            "senderDeviceId": {
-              "type": "ref",
-              "ref": "#deviceId"
-            },
-            "senderTransportPubkey": {
-              "type": "bytes",
-              "minLength": 32,
-              "maxLength": 32
-            },
-            "signature": {
-              "type": "bytes",
-              "minLength": 64,
-              "maxLength": 64
-            }
-          }
-        },
         "artifacts": {
           "ref": "#directRequestBootstrapArtifacts",
           "type": "ref"
@@ -3256,6 +3234,35 @@
         "origin": {
           "ref": "#directRequestOrigin",
           "type": "ref"
+        },
+        "originalSenderAttestation": {
+          "properties": {
+            "senderDeviceId": {
+              "ref": "#deviceId",
+              "type": "ref"
+            },
+            "senderDid": {
+              "ref": "#bareDid",
+              "type": "ref"
+            },
+            "senderTransportPubkey": {
+              "maxLength": 32,
+              "minLength": 32,
+              "type": "bytes"
+            },
+            "signature": {
+              "maxLength": 64,
+              "minLength": 64,
+              "type": "bytes"
+            }
+          },
+          "required": [
+            "senderDid",
+            "senderDeviceId",
+            "senderTransportPubkey",
+            "signature"
+          ],
+          "type": "object"
         },
         "preparationDigest": {
           "ref": "#artifactHash",

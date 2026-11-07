@@ -145,3 +145,60 @@ async fn same_account_restart_after_server_acceptance_withholds_local_confirmati
         "old ACK must not project a sent message into the new lifecycle"
     );
 }
+
+/// The orchestrator signs a durably reserved, strictly increasing `sendCounter` into every send.
+/// A `StaleSend` refusal re-encrypts the same message id once, as a fresh frame under the next
+/// counter; a second refusal is returned to the caller without another attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_counters_increase_and_stale_send_reencrypts_once() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let cid = alice
+        .orchestrator
+        .create_group("send order", None, None)
+        .await
+        .unwrap()
+        .conversation_id;
+    let sends = || {
+        world
+            .api_service
+            .submitted_prepared_requests()
+            .into_iter()
+            .filter(|r| r.operation == CanonicalOperation::SendMessage)
+            .map(|r| {
+                let request: serde_json::Value =
+                    serde_json::from_slice(r.body.as_deref().unwrap()).unwrap();
+                let body = &request["signedRequest"]["body"];
+                (
+                    body["messageId"].as_str().unwrap().to_owned(),
+                    body["sendCounter"].as_u64().unwrap(),
+                    body["applicationMessage"]["bytes"].to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = sends().len();
+    alice.orchestrator.send_message(&cid, "one").await.unwrap();
+    world.api_service.refuse_next_sends_stale(1);
+    alice.orchestrator.send_message(&cid, "two").await.unwrap();
+    world.api_service.refuse_next_sends_stale(2);
+    let error = alice
+        .orchestrator
+        .send_message(&cid, "three")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("StaleSend"), "{error}");
+
+    let sends = sends().split_off(before);
+    let first = sends[0].1;
+    assert_eq!(
+        sends.iter().map(|send| send.1).collect::<Vec<_>>(),
+        (first..first + 5).collect::<Vec<_>>(),
+        "every attempt signs a new counter"
+    );
+    assert_eq!(sends[1].0, sends[2].0, "the refused message id is re-sent");
+    assert_ne!(sends[1].2, sends[2].2, "as a freshly encrypted frame");
+    assert_eq!(sends[3].0, sends[4].0, "exactly one re-encryption");
+}

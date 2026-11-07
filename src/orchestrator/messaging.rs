@@ -28,9 +28,11 @@ struct SendActor {
     lifecycle_generation: u64,
 }
 
-/// Only this explicit refusal is known to precede durable message publication.
-/// A conflict or unknown transport outcome cannot authorize new ciphertext.
-fn is_stale_send_coordinates(error: &OrchestratorError) -> bool {
+/// Only these explicit refusals are known to precede durable message publication:
+/// `StaleCoordinates`, and `StaleSend` (a newer send from this device was already
+/// sequenced, so these bytes never will be). A conflict or unknown transport outcome
+/// cannot authorize new ciphertext.
+fn is_refusal(error: &OrchestratorError, code: &str) -> bool {
     let OrchestratorError::ServerError {
         status: 400 | 409,
         body,
@@ -40,7 +42,7 @@ fn is_stale_send_coordinates(error: &OrchestratorError) -> bool {
     };
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .is_some_and(|value| value["error"].as_str() == Some("StaleCoordinates"))
+        .is_some_and(|value| value["error"].as_str() == Some(code))
 }
 
 /// Bound duplicate-proof reads so an attacker-controlled server ID cannot
@@ -859,7 +861,7 @@ where
                 }
                 return Err(send_result.unwrap_err());
             }
-            Err(ref error) if is_stale_send_coordinates(error) => {
+            Err(ref error) if is_refusal(error, "StaleCoordinates") => {
                 self.validate_send_actor(&actor).await?;
                 let OrchestratorError::ServerError { body, .. } = error else {
                     unreachable!()
@@ -945,7 +947,7 @@ where
                         );
                         Some(resp)
                     }
-                    Err(ref error) if is_stale_send_coordinates(error) => {
+                    Err(ref error) if is_refusal(error, "StaleCoordinates") => {
                         tracing::error!(
                             conversation_id,
                             "Send coordinates remain stale after bounded sync"
@@ -960,6 +962,40 @@ where
                         return Err(e);
                     }
                 }
+            }
+            // A newer send from this device was sequenced first and these bytes are
+            // refused for good, with nothing written. Send the same message ID once more
+            // as a fresh frame under a new counter; a second refusal goes to the caller.
+            Err(ref error) if is_refusal(error, "StaleSend") => {
+                tracing::warn!(conversation_id, "StaleSend; re-encrypting once");
+                let retry_transition_lock = self.rejoin_lock(conversation_id).await;
+                let retry_transition_guard = retry_transition_lock.lock().await;
+                self.reject_send_if_reset_pending(conversation_id).await?;
+                self.validate_send_actor(&actor).await?;
+                let retry_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+                #[cfg(feature = "labyrinth")]
+                {
+                    labyrinth_mls_snapshot = self
+                        .snapshot_group_root_member_dids(&group_id_bytes)
+                        .ok()
+                        .map(|dids| (resolved.group_id.clone(), retry_epoch, dids));
+                }
+                let retry_send_result = self
+                    .encrypt_and_send_message_prepared(
+                        &resolved.conversation_id,
+                        &payload_bytes,
+                        retry_epoch,
+                        &message_id,
+                        &actor,
+                    )
+                    .await;
+                drop(retry_transition_guard);
+                let resp = retry_send_result?;
+                self.failover_tracker()
+                    .lock()
+                    .await
+                    .record_success(conversation_id);
+                Some(resp)
             }
             Err(_) => {
                 // Other errors — don't track as sequencer failure
@@ -2506,6 +2542,13 @@ where
         let aad_bytes = super::canonical_transport::canonical_application_aad_bytes(&body["aad"])
             .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
         self.validate_send_actor(actor).await?;
+        // Reserved durably before the frame it orders exists: a crash in between only
+        // skips a counter, while a reused one would be refused as `StaleSend`.
+        body["sendCounter"] = serde_json::json!(
+            self.storage()
+                .reserve_send_counter(&convo_uuid.hyphenated().to_string())
+                .await?
+        );
         // The signed body below carries this exact AAD. No state fetch or
         // coordinate regeneration may occur between encryption and submission.
         let encrypted = self.mls_context().encrypt_message_with_aad(

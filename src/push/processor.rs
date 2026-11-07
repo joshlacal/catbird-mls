@@ -27,10 +27,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::chat_v2::transcript::{
-    normalize_read_presentation, project_signed_body, SignedMutationKind, SignedWrapper,
-    VerifiedMutation,
-};
 use crate::client::chat_wire;
 use crate::error::MLSError;
 use crate::keychain::KeychainAccess;
@@ -251,40 +247,6 @@ fn extract_message_epoch_hint(mls_bytes: &[u8]) -> Option<u64> {
         MlsMessageBodyIn::PublicMessage(pm) => Some(pm.epoch().as_u64()),
         _ => None,
     }
-}
-
-pub(crate) fn verify_signed_mutation_body(
-    signed_request: &serde_json::Value,
-    kind: SignedMutationKind,
-    public_key: &[u8],
-) -> Result<serde_json::Value, MLSError> {
-    let wrapper_name = match kind {
-        SignedMutationKind::CommitTransition => "signedCommitTransition",
-        SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
-        SignedMutationKind::PolicyTransition => "signedPolicyTransition",
-        SignedMutationKind::ConversationClose => "signedConversationClose",
-        SignedMutationKind::ApplicationSend => "signedApplicationSend",
-        _ => {
-            return Err(MLSError::Cryptography(
-                "unexpected signed transition kind".into(),
-            ))
-        }
-    };
-    let mut normalized =
-        normalize_read_presentation(&serde_json::to_vec(signed_request)?, wrapper_name, false)
-            .map_err(|e| MLSError::Cryptography(format!("normalize signed transition: {e}")))?;
-    let wrapper = SignedWrapper::decode(&serde_json::to_vec(&normalized)?)
-        .map_err(|e| MLSError::Cryptography(format!("decode signed transition: {e}")))?;
-    if wrapper.kind() != Some(kind) {
-        return Err(MLSError::Cryptography(
-            "signed transition has the wrong kind".into(),
-        ));
-    }
-    let projected = project_signed_body(kind, &wrapper.body)
-        .map_err(|e| MLSError::Cryptography(format!("project signed transition: {e}")))?;
-    VerifiedMutation::verify(projected, wrapper.signature, public_key)
-        .map_err(|e| MLSError::Cryptography(format!("verify signed transition: {e}")))?;
-    Ok(normalized["body"].take())
 }
 
 fn deserialize_cbor_bytes<'de, D: serde::Deserializer<'de>>(

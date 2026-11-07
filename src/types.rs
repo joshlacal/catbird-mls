@@ -314,6 +314,17 @@ pub struct GroupConfig {
     pub group_description: Option<String>,
 }
 
+impl GroupConfig {
+    /// Sender-ratchet window of every group this client creates or joins: how far an
+    /// application message may arrive behind or ahead of its sender's newest generation.
+    pub fn sender_ratchet_configuration(&self) -> openmls::prelude::SenderRatchetConfiguration {
+        openmls::prelude::SenderRatchetConfiguration::new(
+            self.out_of_order_tolerance,
+            self.maximum_forward_distance,
+        )
+    }
+}
+
 impl Default for GroupConfig {
     fn default() -> Self {
         Self {

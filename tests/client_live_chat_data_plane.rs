@@ -151,6 +151,19 @@ struct MockDsState {
     // Answer the next prepare with a signed expiry receipt: "valid", "badSignature" or
     // "wrongRequestId" (`expired_prepare_receipt`).
     next_prepare_receipt: Option<&'static str>,
+    // `mls-ds` send order: (conversation, actor DID, actor device) -> last accepted
+    // (prior.generation, prior.epoch, sendCounter). A first-seen send at or below it is refused
+    // `StaleSend` and writes nothing; `enforce_send_order: false` is a DS without the rule.
+    send_order: BTreeMap<(String, String, String), (u64, u64, u64)>,
+    enforce_send_order: bool,
+    // Refuse every first-seen send `StaleSend`.
+    refuse_sends: bool,
+    // Hold the next `sendMessage` in the network: the client sees a transport error and the
+    // request reaches the DS only on `deliver_held_sends`.
+    hold_next_send: bool,
+    held_sends: Vec<Value>,
+    // Every `sendMessage` the DS saw: (messageId, sendCounter, ciphertext, outcome).
+    send_attempts: Vec<(String, u64, String, &'static str)>,
 }
 
 struct SharedMockDs {
@@ -196,6 +209,12 @@ impl SharedMockDs {
                 http_log: Vec::new(),
                 xrpc_failures: Vec::new(),
                 next_prepare_receipt: None,
+                send_order: BTreeMap::new(),
+                enforce_send_order: true,
+                refuse_sends: false,
+                hold_next_send: false,
+                held_sends: Vec::new(),
+                send_attempts: Vec::new(),
             }),
             archive_auth: NativeArchiveAuthFixture::new(
                 ALICE_DID,
@@ -1233,101 +1252,20 @@ impl SharedMockDs {
                 g.empty_stub_next_send = false;
                 return ok_json(json!({ "ok": true }));
             }
-            let sr = body_json["signedRequest"].clone();
-            let b = &sr["body"];
-            let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
-            let msg_id = b["messageId"].as_str().unwrap().to_string();
+            if std::mem::take(&mut g.hold_next_send) {
+                let attempt = send_attempt(&body_json, "held");
+                g.send_attempts.push(attempt);
+                g.held_sends.push(body_json);
+                return Err(MLSError::Internal("sendMessage held by the network".into()));
+            }
             let lose_response = std::mem::take(&mut g.lose_next_send_response);
-            if let Some(entry) = g.entries.get(&cid).and_then(|entries| {
-                entries.iter().find(|entry| {
-                    entry["signedRequest"]["body"]["messageId"].as_str() == Some(msg_id.as_str())
-                })
-            }) {
-                assert_eq!(
-                    entry["signedRequest"], sr,
-                    "uncertain send retries must replay the exact signed ciphertext"
-                );
-                if lose_response {
-                    return Err(MLSError::Internal(
-                        "send response lost after publication".into(),
-                    ));
-                }
-                // An idempotent replay returns the original accepted outcome.
-                return ok_json(json!({
-                    "entry": entry,
-                    "sequencerReceipt": entry["sequencerReceipt"],
-                }));
-            }
-            let actor_did = b["actorDid"].as_str().unwrap().to_string();
-            let actor_dev = b["actorDeviceId"].as_str().unwrap().to_string();
-            let gen = b["prior"]["generation"].as_u64().unwrap_or(0);
-            let epoch = b["prior"]["epoch"].as_u64().unwrap_or(0);
-            let group_id =
-                catbird_mls::client::chat_wire::json_bytes(&b["prior"]["groupId"]).unwrap();
-            let commit_arr: [u8; 32] =
-                catbird_mls::client::chat_wire::json_bytes(&b["aad"]["archiveCommitment"])
-                    .unwrap()
-                    .try_into()
-                    .unwrap();
-
-            if g.omit_next_receipt {
-                g.omit_next_receipt = false;
-                let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
-                return ok_json(json!({ "seq": seq }));
-            }
-
-            let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
-            // `mls-ds` mints the entry ID and signs the I13 receipt over that sequenced entry.
-            let entry_id = uuid::Uuid::new_v4().to_string();
-            let mut payload = SequencerReceiptPayload {
-                sequencer_did: DS_DID.to_string(),
-                conversation_id: cid.clone(),
-                group_id,
-                epoch,
-                sender_device_did_url: format!("{actor_did}#{actor_dev}"),
-                entry_id: entry_id.clone(),
-                archive_commitment: commit_arr,
-                seq,
-                issued_at_ms: 1_762_000_000_000,
-            };
-            if g.tamper_next_receipt {
-                g.tamper_next_receipt = false;
-                payload.archive_commitment[0] ^= 0xff;
-            }
-            let kid_full = format!("{DS_DID}#mls-receipt-1");
-            let signed = sign_sequencer_receipt(&g.receipt_sk, &kid_full, &payload).unwrap();
-            let rcpt_json = json!({
-                "kid": signed.key_id,
-                "sequencerDid": signed.payload.sequencer_did,
-                "conversationId": signed.payload.conversation_id,
-                "generation": gen,
-                "groupId": { "$bytes": STANDARD.encode(&signed.payload.group_id) },
-                "epoch": signed.payload.epoch,
-                "seq": signed.payload.seq,
-                "entryId": signed.payload.entry_id,
-                "senderDid": actor_did,
-                "senderDeviceId": actor_dev,
-                "archiveCommitment": { "$bytes": STANDARD.encode(signed.payload.archive_commitment) },
-                "issuedAtMs": signed.payload.issued_at_ms,
-                "signature": { "$bytes": STANDARD.encode(signed.signature) },
-            });
-            let received_at = b["signedAt"].clone();
-            let entry = json!({
-                "$type": "blue.catbird.chat.defs#applicationEntry",
-                "entryId": entry_id,
-                "conversationId": cid.clone(),
-                "seq": seq,
-                "signedRequest": sr,
-                "sequencerReceipt": rcpt_json.clone(),
-                "receivedAt": received_at,
-            });
-            g.entries.entry(cid).or_default().push(entry.clone());
-            if lose_response {
+            let response = sequence_send(&mut g, &body_json)?;
+            if lose_response && response.status == 200 {
                 return Err(MLSError::Internal(
                     "send response lost after publication".into(),
                 ));
             }
-            return ok_json(json!({ "entry": entry, "sequencerReceipt": rcpt_json }));
+            return Ok(response);
         }
 
         if url.contains("/xrpc/blue.catbird.chat.getConversations") {
@@ -1513,14 +1451,7 @@ fn signed_account_deletion(
     let entry_id = uuid::Uuid::new_v4().to_string();
     let received_at = "2026-11-03T00:00:00.000Z";
     let seq_text = seq.to_string();
-    let fields = [
-        sequencer,
-        cid,
-        deleted,
-        &seq_text,
-        &entry_id,
-        received_at,
-    ];
+    let fields = [sequencer, cid, deleted, &seq_text, &entry_id, received_at];
     let mut message = b"catbird-mls-account-deletion-authority-v2\0".to_vec();
     message.extend_from_slice(&(key_id.len() as u32).to_be_bytes());
     message.extend_from_slice(key_id.as_bytes());
@@ -3821,7 +3752,9 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         &bob_keys,
     );
     alice.enroll_device(&scopes).expect("enroll admin");
-    source.enroll_device(&scopes).expect("enroll removed member");
+    source
+        .enroll_device(&scopes)
+        .expect("enroll removed member");
     let cid = uuid::Uuid::new_v4().to_string();
     alice
         .create_group(
@@ -3893,7 +3826,10 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
             .expect("authenticated Space denial permits owner restore"),
         1
     );
-    assert_eq!(removed.list_messages(&cid, None, 10).unwrap()[0].message_id, message_id);
+    assert_eq!(
+        removed.list_messages(&cid, None, 10).unwrap()[0].message_id,
+        message_id
+    );
 
     // The same DS response is malicious while the Space still admits the account.
     ds.archive_auth.set_space_denied(BOB_DID, &space, false);
@@ -3912,13 +3848,13 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     let error = active
         .restore_conversation_from_owner_mailbox(&cid)
         .expect_err("NotEntitled contradicted by Space access must fail");
-    assert!(error.to_string().contains("ArchiveRemovalUnverified"), "{error}");
+    assert!(
+        error.to_string().contains("ArchiveRemovalUnverified"),
+        "{error}"
+    );
     assert!(active.list_messages(&cid, None, 10).unwrap().is_empty());
 
-    for (index, status, error_code) in [
-        (0, 400, "InvalidRequest"),
-        (1, 401, "NotAuthorized"),
-    ] {
+    for (index, status, error_code) in [(0, 400, "InvalidRequest"), (1, 401, "NotAuthorized")] {
         ds.inner.lock().unwrap().conversation_state_errors.insert(
             (BOB_DID.to_owned(), cid.clone()),
             (status, error_code.to_owned()),
@@ -3936,7 +3872,9 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
             .restore_with_recovery_code(&code)
             .expect("recover archive keys");
         assert!(
-            client.restore_conversation_from_owner_mailbox(&cid).is_err(),
+            client
+                .restore_conversation_from_owner_mailbox(&cid)
+                .is_err(),
             "HTTP {status} {error_code} must not prove removal"
         );
         assert!(client.list_messages(&cid, None, 10).unwrap().is_empty());
@@ -4730,5 +4668,541 @@ fn c33_prepare_stage_terminal_receipt_must_verify_before_the_journal_is_dropped(
     assert!(
         journal().is_none(),
         "a verified terminal receipt resolves the attempt"
+    );
+}
+
+/// `(messageId, sendCounter, ciphertext, outcome)` of one `sendMessage` the mock DS saw.
+fn send_attempt(body_json: &Value, outcome: &'static str) -> (String, u64, String, &'static str) {
+    let b = &body_json["signedRequest"]["body"];
+    (
+        b["messageId"].as_str().unwrap().to_owned(),
+        b["sendCounter"].as_u64().expect("signed sendCounter"),
+        b["applicationMessage"]["bytes"].to_string(),
+        outcome,
+    )
+}
+
+/// `mls-ds` `resolve_application_send`: an exact replay of a sequenced send returns its stored
+/// outcome; a first-seen send is sequenced only if its signed (`prior.generation`,
+/// `prior.epoch`, `sendCounter`) exceeds the device's last accepted send, otherwise it is
+/// refused `StaleSend` and nothing is written.
+fn sequence_send(g: &mut MockDsState, body_json: &Value) -> Result<PlatformHttpResponse, MLSError> {
+    let sr = body_json["signedRequest"].clone();
+    let b = &sr["body"];
+    let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
+    let msg_id = b["messageId"].as_str().unwrap().to_string();
+    if let Some(entry) = g
+        .entries
+        .get(&cid)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry["signedRequest"]["body"]["messageId"].as_str() == Some(msg_id.as_str())
+            })
+        })
+        .cloned()
+    {
+        assert_eq!(
+            entry["signedRequest"], sr,
+            "uncertain send retries must replay the exact signed ciphertext"
+        );
+        g.send_attempts.push(send_attempt(body_json, "replayed"));
+        // An idempotent replay returns the original accepted outcome.
+        return ok_json(json!({
+            "entry": entry,
+            "sequencerReceipt": entry["sequencerReceipt"],
+        }));
+    }
+    let actor_did = b["actorDid"].as_str().unwrap().to_string();
+    let actor_dev = b["actorDeviceId"].as_str().unwrap().to_string();
+    let gen = b["prior"]["generation"].as_u64().unwrap_or(0);
+    let epoch = b["prior"]["epoch"].as_u64().unwrap_or(0);
+    let group_id = chat_wire::json_bytes(&b["prior"]["groupId"]).unwrap();
+    let commit_arr: [u8; 32] = chat_wire::json_bytes(&b["aad"]["archiveCommitment"])
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    if g.omit_next_receipt {
+        g.omit_next_receipt = false;
+        let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
+        return ok_json(json!({ "seq": seq }));
+    }
+
+    let device = (cid.clone(), actor_did.clone(), actor_dev.clone());
+    let position = (
+        gen,
+        epoch,
+        b["sendCounter"].as_u64().expect("signed sendCounter"),
+    );
+    let last = g.send_order.get(&device).copied();
+    if g.refuse_sends || (g.enforce_send_order && last.is_some_and(|last| position <= last)) {
+        g.send_attempts.push(send_attempt(body_json, "stale"));
+        return xrpc_error(
+            400,
+            "StaleSend",
+            "a newer send from this device was sequenced",
+        );
+    }
+    if last.is_none_or(|last| position > last) {
+        g.send_order.insert(device, position);
+    }
+    g.send_attempts.push(send_attempt(body_json, "accepted"));
+
+    let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
+    // `mls-ds` mints the entry ID and signs the I13 receipt over that sequenced entry.
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let mut payload = SequencerReceiptPayload {
+        sequencer_did: DS_DID.to_string(),
+        conversation_id: cid.clone(),
+        group_id,
+        epoch,
+        sender_device_did_url: format!("{actor_did}#{actor_dev}"),
+        entry_id: entry_id.clone(),
+        archive_commitment: commit_arr,
+        seq,
+        issued_at_ms: 1_762_000_000_000,
+    };
+    if g.tamper_next_receipt {
+        g.tamper_next_receipt = false;
+        payload.archive_commitment[0] ^= 0xff;
+    }
+    let kid_full = format!("{DS_DID}#mls-receipt-1");
+    let signed = sign_sequencer_receipt(&g.receipt_sk, &kid_full, &payload).unwrap();
+    let rcpt_json = json!({
+        "kid": signed.key_id,
+        "sequencerDid": signed.payload.sequencer_did,
+        "conversationId": signed.payload.conversation_id,
+        "generation": gen,
+        "groupId": { "$bytes": STANDARD.encode(&signed.payload.group_id) },
+        "epoch": signed.payload.epoch,
+        "seq": signed.payload.seq,
+        "entryId": signed.payload.entry_id,
+        "senderDid": actor_did,
+        "senderDeviceId": actor_dev,
+        "archiveCommitment": { "$bytes": STANDARD.encode(signed.payload.archive_commitment) },
+        "issuedAtMs": signed.payload.issued_at_ms,
+        "signature": { "$bytes": STANDARD.encode(signed.signature) },
+    });
+    let received_at = b["signedAt"].clone();
+    let entry = json!({
+        "$type": "blue.catbird.chat.defs#applicationEntry",
+        "entryId": entry_id,
+        "conversationId": cid.clone(),
+        "seq": seq,
+        "signedRequest": sr,
+        "sequencerReceipt": rcpt_json.clone(),
+        "receivedAt": received_at,
+    });
+    g.entries.entry(cid).or_default().push(entry.clone());
+    ok_json(json!({ "entry": entry, "sequencerReceipt": rcpt_json }))
+}
+
+impl SharedMockDs {
+    /// The network finally delivers every held `sendMessage`. A held copy of a message the
+    /// sender has since sequenced under other bytes is a conflicting replay and is refused.
+    fn deliver_held_sends(&self) {
+        let mut g = self.inner.lock().unwrap();
+        for body in std::mem::take(&mut g.held_sends) {
+            let sr = &body["signedRequest"];
+            let cid = sr["body"]["prior"]["conversationId"].as_str().unwrap();
+            let conflict = g.entries.get(cid).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["signedRequest"]["body"]["messageId"] == sr["body"]["messageId"]
+                        && entry["signedRequest"] != *sr
+                })
+            });
+            if conflict {
+                g.send_attempts.push(send_attempt(&body, "conflict"));
+            } else {
+                let _ = sequence_send(&mut g, &body);
+            }
+        }
+    }
+
+    /// `(sendCounter, outcome, ciphertext)` of every `sendMessage` for `message_id`, in order.
+    fn send_attempts(&self, message_id: &str) -> Vec<(u64, &'static str, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .send_attempts
+            .iter()
+            .filter(|attempt| attempt.0 == message_id)
+            .map(|attempt| (attempt.1, attempt.3, attempt.2.clone()))
+            .collect()
+    }
+
+    fn entry_count(&self, cid: &str) -> i64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(cid)
+            .map_or(0, Vec::len) as i64
+    }
+}
+
+struct SendOrderFixture {
+    tmp: tempfile::TempDir,
+    ds: Arc<SharedMockDs>,
+    cid: String,
+    alice: Arc<CatbirdMlsClient>,
+    alice_dev: String,
+    bob: Arc<CatbirdMlsClient>,
+    bob_dev: String,
+    bob_keys: Arc<MemKeyStore>,
+    eve: Arc<CatbirdMlsClient>,
+}
+
+/// Alice creates a live group with Bob and both complete the join. With `invite_eve`, Eve is
+/// invited too but accepts only when the test syncs her, so Alice's add Commit comes later.
+fn send_order_fixture(invite_eve: bool) -> SendOrderFixture {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let (alice_dev, bob_dev) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    let bob_keys = Arc::new(MemKeyStore::new());
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "alice",
+        ALICE_DID,
+        &alice_dev,
+        &Arc::new(MemKeyStore::new()),
+    );
+    let bob = live_client(tmp.path(), &ds, "bob", BOB_DID, &bob_dev, &bob_keys);
+    alice.enroll_device(&scopes).expect("enroll alice");
+    bob.enroll_device(&scopes).expect("enroll bob");
+    let eve = live_client(
+        tmp.path(),
+        &ds,
+        "eve",
+        EVE_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &Arc::new(MemKeyStore::new()),
+    );
+    eve.enroll_device(&scopes).expect("enroll eve");
+    let mut members = vec![BOB_DID.to_string()];
+    if invite_eve {
+        members.push(EVE_DID.to_string());
+    }
+    let cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(&cid, DS_DID, members, Some("Send order".into()), None)
+        .expect("create group");
+    bob.sync().expect("bob accepts the invite");
+    alice.sync().expect("alice adds bob");
+    bob.sync().expect("bob joins");
+    SendOrderFixture {
+        tmp,
+        ds,
+        cid,
+        alice,
+        alice_dev,
+        bob,
+        bob_dev,
+        bob_keys,
+        eve,
+    }
+}
+
+/// `(seq, text)` of `client`'s rows after `after_seq`, oldest first; a gap row shows its key.
+fn timeline_after(client: &CatbirdMlsClient, cid: &str, after_seq: i64) -> Vec<(i64, String)> {
+    let mut rows = client.list_messages(cid, None, 200).unwrap();
+    rows.sort_by_key(|row| row.seq);
+    rows.iter()
+        .filter(|row| row.seq > after_seq)
+        .map(|row| {
+            let payload: Value = serde_json::from_str(&row.plaintext_json).unwrap();
+            (
+                row.seq,
+                payload["text"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Seed 2323, shrunk to six actions (red-team R1, P2): Bob's first send is held by the network;
+/// Bob crashes and reopens; both sides send; Bob retries an accepted send whose response was
+/// lost; Bob sends twice more; only then does the held request reach `mls-ds`. The
+/// counter-enforcing DS refuses it `StaleSend` without sequencing it, so no receiver meets a
+/// generation behind its ratchet window and both transcripts stay identical. The same message
+/// id then goes out once more as a fresh frame under a new counter.
+#[test]
+fn seed_2323_shrunk_six_action_repro_never_sequences_a_held_send_behind_newer_sends() {
+    let f = send_order_fixture(false);
+    let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+    let baseline = ds.entry_count(cid);
+
+    // 1. Bob's send is held by the network; the client sees a transport error.
+    let crash = new_id();
+    ds.inner.lock().unwrap().hold_next_send = true;
+    assert!(f.bob.send_message(cid, &crash, "crash-b7f3ca61-0").is_err());
+    // 2. Mid-flush jetsam: a send, then the process dies and reopens from disk.
+    f.bob
+        .send_message(cid, &new_id(), "queued-before-jetsam")
+        .unwrap();
+    drop(f.bob);
+    let bob = live_client(f.tmp.path(), ds, "bob", BOB_DID, &f.bob_dev, &f.bob_keys);
+    // 3. After the crash: the peer and Bob send, and Bob's sync keeps each accepted send once.
+    alice
+        .send_message(cid, &new_id(), "peer-before-own-ahead")
+        .unwrap();
+    bob.send_message(cid, &new_id(), "own-ahead-of-cursor")
+        .unwrap();
+    bob.sync().unwrap();
+    // 4. Bob retries an accepted send whose response was lost: the journal replays its bytes.
+    let retry = new_id();
+    ds.inner.lock().unwrap().lose_next_send_response = true;
+    assert!(bob.send_message(cid, &retry, "retry-b7f3ca61-0").is_err());
+    bob.send_message(cid, &retry, "retry-b7f3ca61-0").unwrap();
+    // 5, 6. Two more sends.
+    bob.send_message(cid, &new_id(), "chat-b7f3ca61-3").unwrap();
+    bob.send_message(cid, &new_id(), "send-b7f3ca61-0").unwrap();
+
+    // The held request reaches `mls-ds` last: refused, and nothing is sequenced.
+    let sequenced = ds.entry_count(cid);
+    ds.deliver_held_sends();
+    assert_eq!(ds.entry_count(cid), sequenced);
+    alice
+        .sync()
+        .expect("no entry is behind alice's ratchet window");
+    bob.sync().unwrap();
+    let expected: Vec<(i64, String)> = [
+        "queued-before-jetsam",
+        "peer-before-own-ahead",
+        "own-ahead-of-cursor",
+        "retry-b7f3ca61-0",
+        "chat-b7f3ca61-3",
+        "send-b7f3ca61-0",
+    ]
+    .iter()
+    .zip(baseline + 1..)
+    .map(|(text, seq)| (seq, text.to_string()))
+    .collect();
+    assert_eq!(timeline_after(alice, cid, baseline), expected);
+    assert_eq!(timeline_after(&bob, cid, baseline), expected);
+
+    // The same message id goes out once more as a fresh frame with the next counter.
+    let row = bob
+        .send_message(cid, &crash, "crash-b7f3ca61-0")
+        .expect("StaleSend re-encrypts the held message once");
+    let attempts = ds.send_attempts(&crash);
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|(counter, outcome, _)| (*counter, *outcome))
+            .collect::<Vec<_>>(),
+        [(1, "held"), (1, "stale"), (1, "stale"), (7, "accepted")],
+        "the refused bytes are resubmitted once from the journal, then replaced"
+    );
+    assert_eq!(attempts[0].2, attempts[2].2);
+    assert_ne!(
+        attempts[3].2, attempts[0].2,
+        "refused bytes are never sequenced"
+    );
+    assert_eq!(row.seq, sequenced + 1);
+    alice.sync().unwrap();
+    let mut expected = expected;
+    expected.push((sequenced + 1, "crash-b7f3ca61-0".into()));
+    assert_eq!(timeline_after(alice, cid, baseline), expected);
+    assert_eq!(timeline_after(&bob, cid, baseline), expected);
+}
+
+/// A send held in the network keeps its journal. After a newer send is sequenced, the caller's
+/// retry resubmits those exact bytes, `mls-ds` refuses them (`StaleSend`), and the same message
+/// id goes out once more as a fresh frame; a second refusal is returned, not retried again.
+#[test]
+fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
+    let f = send_order_fixture(false);
+    let (ds, cid, bob) = (&f.ds, f.cid.as_str(), &f.bob);
+    let baseline = ds.entry_count(cid);
+    let held = new_id();
+    ds.inner.lock().unwrap().hold_next_send = true;
+    assert!(bob.send_message(cid, &held, "held").is_err());
+    bob.send_message(cid, &new_id(), "newer").unwrap();
+    let row = bob.send_message(cid, &held, "held").unwrap();
+    let attempts = ds.send_attempts(&held);
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|(counter, outcome, _)| (*counter, *outcome))
+            .collect::<Vec<_>>(),
+        [(1, "held"), (1, "stale"), (3, "accepted")]
+    );
+    assert_eq!(
+        attempts[0].2, attempts[1].2,
+        "the retry resubmits the journal"
+    );
+    assert_ne!(
+        attempts[2].2, attempts[0].2,
+        "the refused bytes are never sequenced"
+    );
+    assert_eq!(row.seq, baseline + 2);
+    ds.deliver_held_sends();
+    assert_eq!(ds.send_attempts(&held).last().unwrap().1, "conflict");
+    f.alice.sync().unwrap();
+    assert_eq!(
+        timeline_after(&f.alice, cid, baseline),
+        [
+            (baseline + 1, "newer".to_string()),
+            (baseline + 2, "held".to_string())
+        ]
+    );
+
+    ds.inner.lock().unwrap().refuse_sends = true;
+    let refused = new_id();
+    let error = bob.send_message(cid, &refused, "refused").unwrap_err();
+    assert!(chat_wire::is_stale_send(&error), "{error:?}");
+    assert_eq!(
+        ds.send_attempts(&refused)
+            .iter()
+            .map(|(counter, outcome, _)| (*counter, *outcome))
+            .collect::<Vec<_>>(),
+        [(4, "stale"), (5, "stale")],
+        "exactly one fresh re-encryption"
+    );
+}
+
+/// Seed 2323 against a DS without the send-order rule: Alice's held send is sequenced behind
+/// her ten newer sends, outside Bob's sender-ratchet window (10). Bob records a gap row and
+/// evidence for it, advances his cursor, and still applies Alice's later Commit.
+#[test]
+fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_applies() {
+    let f = send_order_fixture(true);
+    let (ds, cid, alice, bob) = (&f.ds, f.cid.as_str(), &f.alice, &f.bob);
+    let baseline = ds.entry_count(cid);
+    ds.inner.lock().unwrap().enforce_send_order = false;
+    let late = new_id();
+    ds.inner.lock().unwrap().hold_next_send = true;
+    assert!(alice.send_message(cid, &late, "late").is_err());
+    for n in 1..=10 {
+        alice
+            .send_message(cid, &new_id(), &format!("newer {n}"))
+            .unwrap();
+    }
+    ds.deliver_held_sends();
+    let late_seq = baseline + 11;
+    let epoch_before = bob
+        .db()
+        .read_tx(|tx| tx.get_conversation(cid))
+        .unwrap()
+        .unwrap()
+        .epoch;
+    // Eve accepts her invitation only now, so Alice's add Commit follows the late entry.
+    f.eve.sync().unwrap();
+    alice.sync().unwrap();
+
+    bob.sync()
+        .expect("an undecryptable entry no longer stops sync");
+    let mut expected: Vec<(i64, String)> = (1..=10)
+        .map(|n| (baseline + n, format!("newer {n}")))
+        .collect();
+    expected.push((late_seq, chat_wire::UNDECRYPTABLE_MESSAGE_NOTICE.into()));
+    assert_eq!(
+        timeline_after(bob, cid, baseline)
+            .into_iter()
+            .filter(|(seq, _)| *seq <= late_seq)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let gap = bob
+        .list_messages(cid, None, 200)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.seq == late_seq)
+        .unwrap();
+    assert_eq!(
+        (gap.message_id.as_str(), gap.sender_did.as_str(), gap.is_own),
+        (late.as_str(), ALICE_DID, false)
+    );
+    assert_eq!(
+        gap.plaintext_json,
+        serde_json::to_string(&catbird_mls::orchestrator::MLSMessagePayload::system(
+            chat_wire::UNDECRYPTABLE_MESSAGE_NOTICE
+        ))
+        .unwrap()
+    );
+    let convo = bob
+        .db()
+        .read_tx(|tx| tx.get_conversation(cid))
+        .unwrap()
+        .unwrap();
+    assert_eq!(convo.last_seq, ds.entry_count(cid), "cursor past the gap");
+    assert!(convo.epoch > epoch_before, "Alice's later Commit applied");
+    let evidence: chat_wire::UndecryptableEntryEvidence = serde_json::from_slice(
+        &bob.db()
+            .write_tx(|tx| {
+                tx.get_labyrinth_state(&chat_wire::undecryptable_evidence_key(cid, &late))
+            })
+            .unwrap()
+            .expect("undecryptable evidence"),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            evidence.seq,
+            evidence.epoch,
+            evidence.reason.as_str(),
+            evidence.sender_device_id.as_str()
+        ),
+        (
+            late_seq,
+            epoch_before,
+            "TooDistantInThePast",
+            f.alice_dev.as_str()
+        )
+    );
+}
+
+/// Live create and join both carry the `GroupConfig` sender-ratchet window (10 / 2000): a frame
+/// sequenced nine generations late still decrypts.
+#[test]
+fn live_create_and_join_apply_the_group_config_sender_ratchet_window() {
+    let f = send_order_fixture(false);
+    let (ds, cid) = (&f.ds, f.cid.as_str());
+    for client in [&f.alice, &f.bob] {
+        let window = client
+            .db()
+            .write_tx(|tx| {
+                let convo = tx.get_conversation(cid)?.unwrap();
+                let provider = tx.openmls_provider();
+                let group =
+                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&convo.group_id))
+                        .map_err(|e| MLSError::Internal(format!("{e:?}")))?
+                        .unwrap();
+                let config = group.configuration().sender_ratchet_configuration();
+                Ok((
+                    config.out_of_order_tolerance(),
+                    config.maximum_forward_distance(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(window, (10, 2000));
+    }
+    let baseline = ds.entry_count(cid);
+    ds.inner.lock().unwrap().enforce_send_order = false;
+    let late = new_id();
+    ds.inner.lock().unwrap().hold_next_send = true;
+    assert!(f.alice.send_message(cid, &late, "late").is_err());
+    for n in 1..=9 {
+        f.alice
+            .send_message(cid, &new_id(), &format!("newer {n}"))
+            .unwrap();
+    }
+    ds.deliver_held_sends();
+    f.bob.sync().unwrap();
+    assert_eq!(
+        timeline_after(&f.bob, cid, baseline).last().unwrap(),
+        &(baseline + 10, "late".to_string())
     );
 }

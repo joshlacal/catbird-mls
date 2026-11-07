@@ -77,6 +77,7 @@ fn send_body(prior_conversation: &str, actor_did: &str, actor_device: &str) -> V
         "actorDeviceId": actor_device,
         "keyId": KeyId::from_public_key(&public_key()).as_str(),
         "authGeneration": 1,
+        "sendCounter": 1,
         "prior": prior(prior_conversation),
         "aad": {
             "protocolVersion": "1",

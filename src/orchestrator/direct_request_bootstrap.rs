@@ -295,6 +295,9 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         .lifetime(Lifetime::init(now.saturating_sub(60), now + 29 * 86400))
         .use_ratchet_tree_extension(true)
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .sender_ratchet_configuration(
+            crate::types::GroupConfig::default().sender_ratchet_configuration(),
+        )
         .build();
     let mut group = MlsGroup::new_with_group_id(
         provider,
@@ -659,6 +662,9 @@ pub fn import_with_provider<P: OpenMlsProvider>(
     let config = MlsGroupJoinConfig::builder()
         .use_ratchet_tree_extension(true)
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .sender_ratchet_configuration(
+            crate::types::GroupConfig::default().sender_ratchet_configuration(),
+        )
         .build();
     let group = crate::sim_hooks::build_staged_welcome_at(provider, &config, welcome, None, now)
         .map_err(crypto_error)?

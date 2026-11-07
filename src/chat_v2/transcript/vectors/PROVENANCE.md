@@ -25,8 +25,8 @@ a different revision:
 |---|---|
 | Source repo | `mls-ds` |
 | Source path | `server/tests/fixtures/mls_chat_signing_domain_vectors.json` |
-| Source revision | `ec5028ce4f424af3819aa3e993c86fca1a85bbde` |
-| Vendored on | 2026-08-20 |
+| Source revision | `ceed1595117ea0945cfd75677decc3d6ba6cb57b` (tree `2f07abd0d3306dae9e822ac2cadfcc6681fa007f`) |
+| Vendored on | 2026-11-07 (first vendored 2026-08-20 from `ec5028ce`) |
 
 That revision is **local to this machine and unpushed** at vendoring time. A
 drift check that cannot resolve it is looking at a checkout the seal has not
@@ -49,18 +49,16 @@ SHA-256 of each source file, read from the tracked object at that revision
 it is the implementation these vectors describe. If the encoder changes, the
 vectors may still hash-match while no longer meaning what they did.
 
-For the 10-case clean-cutover signing-domain vectors, hashed at `ec5028ce`:
+For the 10-case signing-domain vectors, re-vendored verbatim at `ceed1595` when
+`applicationSendBody` gained the signed `sendCounter`:
 
 | File | SHA-256 |
 |---|---|
-| `server/tests/fixtures/mls_chat_signing_domain_vectors.json` | `5533e6457fe4dc1b45fe7ff014940a6aea91657d23bf3d5b1493ac65aeefe984` |
-| `server/tests/chat_protocol_signing_domain_vectors.rs` | `cf32d5107632597d59d7443dd170f5bcc85e6cb8b000bc11e1d3a9cdd91ccac7` |
-| `server/tests/common/signing_domain_bodies.rs` | `2b30ca38f38d068e900cc484dec60517ec442f373fffb0c9158f187436fa9259` |
-| `server/src/chat_protocol/transcript.rs` | `1ede8ace0d97fb6c55519bd73aa72f37ad63a99a51b1fd72988886752b1ee5de` |
+| `server/tests/fixtures/mls_chat_signing_domain_vectors.json` | `471ee7bac032142b79782d434b685900f7755c710b3a9378e3cb3a5a3c4ab1ac` |
 
-The `transcript.rs` hash reflects the clean-cutover transcript implementation
-at `ec5028ce` after removing `deviceAuthenticationRebind` and legacy clean-chat
-DPoP fields.
+The first vendoring (`ec5028ce`, `5533e6457fe4dc1b45fe7ff014940a6aea91657d23bf3d5b1493ac65aeefe984`)
+predates `sendCounter`; its `applicationSendBody` no longer projects through
+the current contract.
 
 Not yet vendored, recorded for the slice that needs it (S7c, control
 fingerprints):
@@ -78,11 +76,11 @@ be **the same bytes the server embeds** — the server reaches it through
 | | |
 |---|---|
 | Source path | `PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json` (canonical); mls-ds mirror `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
-| Source revision | `0f4f58a27d161c35cf7dcc1072a570660a7fbb0f` (PetrelCatbird, tree `5173d7d9679b13d8e40316e050fb2394c8f0d956`) |
-| SHA-256 | `eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad` |
-| Size / defs | 233,296 bytes / 258 definitions |
-| Prior SHA-256 | `125b7462eac11e4a46cfda5c1d6de154567c8903844cf2be93ca2d7c0f301581` @ PetrelCatbird `c517b5db`, 232,961 bytes / 258 definitions |
-| Earlier SHA-256 | `fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39` @ PetrelCatbird `df7653aa`, 231,566 bytes / 257 definitions; `a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d` @ PetrelCatbird `f102084e` (unchanged through `854142ea`), 230,449 bytes / 257 definitions |
+| Source revision | `e4227af68226a61a4cae7478496d1a7b930f28f6` (PetrelCatbird, tree `2ce27d72e2a84fd363cba629d2847a3f32921743`) |
+| SHA-256 | `1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075` |
+| Size / defs | 235,876 bytes / 258 definitions |
+| Prior SHA-256 | `3764fc1be74a50e72ca9201eb2793357aaec3b27a7024a3e97e1d9e33ef7aab6` @ PetrelCatbird `b740c2cc`, 234,853 bytes / 258 definitions |
+| Earlier SHA-256 | `eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad` @ PetrelCatbird `0f4f58a2`, 233,296 bytes; `125b7462eac11e4a46cfda5c1d6de154567c8903844cf2be93ca2d7c0f301581` @ `c517b5db`, 232,961 bytes; `fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39` @ `df7653aa`, 231,566 bytes / 257 definitions; `a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d` @ `f102084e` (unchanged through `854142ea`), 230,449 bytes / 257 definitions |
 
 **The changes from `a2e783d3…` to `fca4178c…`** are the C33 opening-evidence
 extension (see the cutover section below): a required `archiveCommitment` on
@@ -108,15 +106,26 @@ recipient device acknowledged it, the sender's account was deleted, the
 request expired, or it reached the 30-day retention ceiling). Receipts and
 all other entry fields remain verbatim. The definition count is unchanged at 258.
 
+**The changes from `eb3af0eb…` to `3764fc1b…`** are the direct-request sender
+attestation: `originalSenderAttestation` is required on
+`directRequestPublicationBody` and optional on `applicationAad`.
+
+**The changes from `3764fc1b…` to `1c21d1b0…`** are the per-device send order:
+`applicationSendBody` requires a signed `sendCounter` (1 to 2^53−1). A sequencer
+accepts a first-seen `messageId` only if (`prior.generation`, `prior.epoch`,
+`sendCounter`) exceeds the device's last accepted send in the conversation and
+refuses it `StaleSend` otherwise; an exact replay of an accepted send still
+returns its stored outcome. The definition count is unchanged at 258.
+
 **Verified identical across every live copy at sync time** — this vendored copy,
 `PetrelCatbird/lexicons/` (the canonical codegen source), and the mls-ds mirror
-the server embeds all hash to `eb3af0eb…`.
+the server embeds all hash to `1c21d1b0…`.
 
 To re-check:
 
 ```sh
 cd Catbird+Petrel/catbird-mls
-/usr/bin/git -C ../PetrelCatbird show 0f4f58a27d161c35cf7dcc1072a570660a7fbb0f:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
+/usr/bin/git -C ../PetrelCatbird show e4227af68226a61a4cae7478496d1a7b930f28f6:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
 shasum -a 256 src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json ../mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json
 python3 scripts/generate_chat_schema.py --check-mirror
 ```
