@@ -315,7 +315,16 @@ mod native_archive_space_auth {
             // No Authorization header here: the existing transport callback supplies
             // PDS OAuth or endpoint-specific home-DS service auth, never a foreign DS.
             let response = bounded(self.execute(base, "POST".into(), format!("/xrpc/{nsid}"), vec![], Some(body))?)?;
-            if matches!(response.status, 401 | 403) { return Ok(Err(response)); }
+            let denied = response.status == 403
+                && serde_json::from_slice::<Value>(&response.body)
+                    .ok()
+                    .and_then(|body| body["error"].as_str().map(str::to_owned))
+                    .is_some_and(|code| matches!(code.as_str(), "Forbidden" | "NotAuthorized"));
+            if denied {
+                return Ok(Err(response));
+            }
+            // A revoked/invalid delegation (401), an undeclared 403, and every other transport or
+            // directory failure are authentication failures, never proof of Space removal.
             require_success(&response, "getSpaceCredential")?;
             let output: CredentialOutput = decode(&response.body, "Space credential")?;
             let jwt = Zeroizing::new(output.credential);
@@ -1216,6 +1225,9 @@ mod native_archive_space_auth {
                     if fault == "credential_denied" {
                         return Ok(PlatformHttpResponse { status: 403, headers: vec![], body: br#"{"error":"NotAuthorized","message":"not a member"}"#.to_vec() });
                     }
+                    if fault == "credential_auth_failed" {
+                        return Ok(PlatformHttpResponse { status: 401, headers: vec![], body: br#"{"error":"InvalidDelegationToken"}"#.to_vec() });
+                    }
                     let body: Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
                     let space = SpaceUri::parse(body["space"].as_str().unwrap()).unwrap();
                     let kid = if nsid.starts_with("blue.") {
@@ -1748,6 +1760,16 @@ mod native_archive_space_auth {
                 assert!(error.starts_with(expected), "{fault}: {error}");
             }
         }
+        #[test]
+        fn native_space_auth_does_not_treat_an_auth_failure_as_membership_denial() {
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "credential_auth_failed";
+            let error =
+                block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false)))
+                    .unwrap_err();
+            assert!(error.starts_with("native_space_getSpaceCredential: HTTP 401"), "{error}");
+        }
+
 
         #[test]
         fn native_space_auth_returns_a_refused_credential_exchange_as_the_space_denial() {

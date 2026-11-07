@@ -97,17 +97,56 @@ pub(super) fn record_account_deletion(
     )
 }
 
-/// Domain of the sequencer's `#mls-receipt-1` signature over an `accountDeletedEntry`.
+/// Inner deletion record transcript retained by the server's v2 authority signature.
 const ACCOUNT_DELETION_DOMAIN: &[u8] = b"catbird-mls-account-deletion-v1\0";
+/// Signature domain that binds the exact retained receipt verification method to the deletion.
+const ACCOUNT_DELETION_AUTHORITY_DOMAIN: &[u8] =
+    b"catbird-mls-account-deletion-authority-v2\0";
 
-/// `ACCOUNT_DELETION_DOMAIN` followed by each field as a u32-BE length-prefixed UTF-8 string.
-fn account_deletion_signing_bytes(fields: &[&str]) -> Vec<u8> {
-    let mut bytes = ACCOUNT_DELETION_DOMAIN.to_vec();
+fn append_account_deletion_text(bytes: &mut Vec<u8>, text: &str) -> Option<()> {
+    bytes.extend_from_slice(&u32::try_from(text.len()).ok()?.to_be_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+    Some(())
+}
+
+/// Server transcript: v2 domain, key ID, then the complete v1 deletion record transcript.
+fn account_deletion_authority_signing_bytes(key_id: &str, fields: &[&str]) -> Option<Vec<u8>> {
+    let fields_len = fields.iter().try_fold(0usize, |len, field| {
+        len.checked_add(4)?.checked_add(field.len())
+    })?;
+    let capacity = ACCOUNT_DELETION_AUTHORITY_DOMAIN
+        .len()
+        .checked_add(4)?
+        .checked_add(key_id.len())?
+        .checked_add(ACCOUNT_DELETION_DOMAIN.len())?
+        .checked_add(fields_len)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(ACCOUNT_DELETION_AUTHORITY_DOMAIN);
+    append_account_deletion_text(&mut bytes, key_id)?;
+    bytes.extend_from_slice(ACCOUNT_DELETION_DOMAIN);
     for field in fields {
-        bytes.extend_from_slice(&(field.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(field.as_bytes());
+        append_account_deletion_text(&mut bytes, field)?;
     }
-    bytes
+    Some(bytes)
+}
+
+fn account_deletion_signature_valid(
+    public_key: &[u8],
+    signature: &[u8],
+    key_id: &str,
+    fields: &[&str],
+) -> bool {
+    let Some(message) = account_deletion_authority_signing_bytes(key_id, fields) else {
+        return false;
+    };
+    p256::ecdsa::Signature::from_slice(signature)
+        .ok()
+        .filter(|signature| signature.normalize_s().is_none())
+        .zip(p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).ok())
+        .is_some_and(|(signature, key)| {
+            use p256::ecdsa::signature::Verifier as _;
+            key.verify(&message, &signature).is_ok()
+        })
 }
 
 impl CatbirdMlsClient {
@@ -156,22 +195,19 @@ impl CatbirdMlsClient {
             .ok_or_else(|| {
                 MLSError::Cryptography("I13: account deletion authority key unavailable".into())
             })?;
-        let message = account_deletion_signing_bytes(&[
+        let seq_text = seq.to_string();
+        let fields = [
             sequencer,
             cid,
             deleted_did,
-            &seq.to_string(),
+            seq_text.as_str(),
             entry_id,
             received_at,
-        ]);
+        ];
         let verified = chat_wire::json_bytes(&authority["signature"])
             .ok()
-            .and_then(|raw| p256::ecdsa::Signature::from_slice(&raw).ok())
-            .filter(|signature| signature.normalize_s().is_none())
-            .zip(p256::ecdsa::VerifyingKey::from_sec1_bytes(&key).ok())
-            .is_some_and(|(signature, key)| {
-                use p256::ecdsa::signature::Verifier as _;
-                key.verify(&message, &signature).is_ok()
+            .is_some_and(|signature| {
+                account_deletion_signature_valid(&key, &signature, key_id, &fields)
             });
         if !verified {
             tracing::warn!(
@@ -3332,8 +3368,100 @@ impl CatbirdMlsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::record_account_deletion;
+    use super::{
+        account_deletion_authority_signing_bytes, account_deletion_signature_valid,
+        record_account_deletion, ACCOUNT_DELETION_AUTHORITY_DOMAIN,
+    };
     use crate::storage::{LabyrinthQueueRow, MessageRow, MlsAccountDb, OpenMode};
+
+    #[test]
+    fn account_deletion_v2_matches_server_vector_and_rejects_downgrades_and_mutations() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        const SEQUENCER: &str = "did:web:sequencer.example.com";
+        const CONVERSATION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const DELETED: &str = "did:web:deleted.example.com";
+        const ENTRY: &str = "33333333-3333-4333-8333-333333333333";
+        const RECEIVED_AT: &str = "2026-11-03T12:00:00.123Z";
+        const KEY_ID: &str = "did:web:sequencer.example.com#mls-receipt-1";
+        let fields = [SEQUENCER, CONVERSATION, DELETED, "12", ENTRY, RECEIVED_AT];
+        let transcript = account_deletion_authority_signing_bytes(KEY_ID, &fields).unwrap();
+        assert_eq!(
+            hex::encode(&transcript),
+            concat!(
+                "636174626972642d6d6c732d6163636f756e742d64656c6574696f6e2d61757468",
+                "6f726974792d7632000000002b6469643a7765623a73657175656e6365722e6578",
+                "616d706c652e636f6d236d6c732d726563656970742d31636174626972642d6d6c",
+                "732d6163636f756e742d64656c6574696f6e2d7631000000001d6469643a776562",
+                "3a73657175656e6365722e6578616d706c652e636f6d0000002461616161616161",
+                "2d616161612d346161612d386161612d6161616161616161616161610000001b64",
+                "69643a7765623a64656c657465642e6578616d706c652e636f6d00000002313200",
+                "00002433333333333333332d333333332d343333332d383333332d333333333333",
+                "33333333333300000018323032362d31312d30335431323a30303a30302e3132335a"
+            )
+        );
+
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
+        let sign = |message: &[u8]| {
+            let signature: Signature = key.sign(message);
+            signature.normalize_s().unwrap_or(signature).to_bytes().to_vec()
+        };
+        let signature = sign(&transcript);
+        let public_key = key.verifying_key().to_encoded_point(true);
+        assert!(account_deletion_signature_valid(
+            public_key.as_bytes(),
+            &signature,
+            KEY_ID,
+            &fields,
+        ));
+
+        // The server's former v1-only signature is a downgrade, not a v2 authority.
+        let inner_offset = ACCOUNT_DELETION_AUTHORITY_DOMAIN.len() + 4 + KEY_ID.len();
+        let legacy_signature = sign(&transcript[inner_offset..]);
+        assert!(!account_deletion_signature_valid(
+            public_key.as_bytes(),
+            &legacy_signature,
+            KEY_ID,
+            &fields,
+        ));
+
+        for changed in [
+            ["did:web:other.example.com", CONVERSATION, DELETED, "12", ENTRY, RECEIVED_AT],
+            [SEQUENCER, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", DELETED, "12", ENTRY, RECEIVED_AT],
+            [SEQUENCER, CONVERSATION, "did:web:other.example.com", "12", ENTRY, RECEIVED_AT],
+            [SEQUENCER, CONVERSATION, DELETED, "13", ENTRY, RECEIVED_AT],
+            [SEQUENCER, CONVERSATION, DELETED, "12", "44444444-4444-4444-8444-444444444444", RECEIVED_AT],
+            [SEQUENCER, CONVERSATION, DELETED, "12", ENTRY, "2026-11-03T12:00:00.124Z"],
+        ] {
+            assert!(!account_deletion_signature_valid(
+                public_key.as_bytes(),
+                &signature,
+                KEY_ID,
+                &changed,
+            ));
+        }
+        for key_id in [
+            "did:web:sequencer.example.com#atproto",
+            "did:web:sequencer.example.com#mls-receipt-01",
+            "did:web:sequencer.example.com#mls-receipt-2",
+        ] {
+            assert!(!account_deletion_signature_valid(
+                public_key.as_bytes(),
+                &signature,
+                key_id,
+                &fields,
+            ));
+        }
+        let wrong_key = SigningKey::from_slice(&[8; 32]).unwrap();
+        let wrong_signature: Signature = wrong_key.sign(&transcript);
+        assert!(!account_deletion_signature_valid(
+            public_key.as_bytes(),
+            &wrong_signature.normalize_s().unwrap_or(wrong_signature).to_bytes(),
+            KEY_ID,
+            &fields,
+        ));
+    }
 
     #[test]
     fn account_deletion_retains_queued_witness_copies_and_evidence() {

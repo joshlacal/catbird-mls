@@ -606,34 +606,143 @@ impl CatbirdMlsClient {
         })
     }
 
-    fn pin_native_conversation(&self, conversation_id: &str) -> Result<(), MLSError> {
-        self.db.write_tx(|tx| {
-            let Some(conversation) = tx.get_conversation(conversation_id)? else { return Ok(()); };
-            if conversation.sequencer_did.is_empty() { return Ok(()); }
-            let generation = u64::try_from(conversation.generation)
-                .map_err(|_| MLSError::Cryptography("negative conversation generation".into()))?;
-            let space = conversation.space_uri.unwrap_or_else(|| format!(
-                "at://{}/space/blue.catbird.labyrinth.conversation/{}-{}",
-                conversation.sequencer_did, conversation_id, conversation.generation,
+    fn pin_native_conversation_coordinates(
+        &self,
+        conversation_id: &str,
+        sequencer_did: &str,
+        generation: u64,
+        explicit_space: Option<&str>,
+    ) -> Result<(), MLSError> {
+        if !sequencer_did.starts_with("did:") || sequencer_did.contains('#') {
+            return Err(MLSError::Cryptography(
+                "archive receipt has an invalid sequencer DID".into(),
             ));
-            let parsed = labyrinth::store::space::SpaceRef::parse(&space)
-                .map_err(|e| MLSError::Cryptography(e.to_string()))?;
-            if parsed.space_did != conversation.sequencer_did {
-                return Err(MLSError::Cryptography("conversation Space authority differs from pinned sequencer".into()));
+        }
+        let space_ref = match explicit_space {
+            Some(space) => labyrinth::store::space::SpaceRef::parse(space)
+                .map_err(|e| MLSError::Cryptography(e.to_string()))?,
+            None => labyrinth::store::space::SpaceRef::conversation(
+                sequencer_did,
+                &format!("{conversation_id}-{generation}"),
+            ),
+        };
+        if space_ref.space_did != sequencer_did {
+            return Err(MLSError::Cryptography(
+                "conversation Space authority differs from pinned sequencer".into(),
+            ));
+        }
+        let space = space_ref.to_string();
+        self.db.write_tx(|tx| {
+            let key = format!(
+                "native.placements:{}",
+                crate::labyrinth::space::thread_placement_key(&self.normalized_did)
+            );
+            let mut placements: std::collections::BTreeMap<
+                String,
+                crate::labyrinth::space::ThreadPlacement,
+            > = tx
+                .get_labyrinth_state(&key)?
+                .map(|raw| serde_json::from_slice(&raw))
+                .transpose()
+                .map_err(|e| {
+                    MLSError::Cryptography(format!("invalid archive Space pins: {e}"))
+                })?
+                .unwrap_or_default();
+            if let Some(existing) = placements.get(conversation_id) {
+                existing
+                    .validate()
+                    .map_err(|e| MLSError::Cryptography(e.to_string()))?;
+                let existing_space = existing
+                    .space
+                    .as_deref()
+                    .ok_or_else(|| MLSError::Cryptography("archive Space pin is empty".into()))?;
+                let existing_ref = labyrinth::store::space::SpaceRef::parse(existing_space)
+                    .map_err(|e| MLSError::Cryptography(e.to_string()))?;
+                if existing_ref.space_did != sequencer_did {
+                    return Err(MLSError::Cryptography(
+                        "archive receipt cannot replace the pinned sequencer".into(),
+                    ));
+                }
+                if existing.generation > generation {
+                    return Ok(());
+                }
+                if existing.generation == generation {
+                    return if existing_space == space {
+                        Ok(())
+                    } else {
+                        Err(MLSError::Cryptography(
+                            "archive receipt conflicts with the pinned Space".into(),
+                        ))
+                    };
+                }
             }
-            let key = format!("native.placements:{}", crate::labyrinth::space::thread_placement_key(&self.normalized_did));
-            let mut placements: std::collections::BTreeMap<String, crate::labyrinth::space::ThreadPlacement> =
-                tx.get_labyrinth_state(&key)?.map(|raw| serde_json::from_slice(&raw))
-                    .transpose().map_err(|e| MLSError::Cryptography(format!("invalid archive Space pins: {e}")))?
-                    .unwrap_or_default();
-            if placements.get(conversation_id).is_some_and(|pin| pin.space.as_deref() == Some(space.as_str()) && pin.generation == generation) {
-                return Ok(());
-            }
-            placements.insert(conversation_id.to_owned(), crate::labyrinth::space::ThreadPlacement {
-                space: Some(space), generation,
-            });
-            tx.put_labyrinth_state(&key, &serde_json::to_vec(&placements).map_err(|e| MLSError::Internal(e.to_string()))?, self.hooks.now_ms())
+            placements.insert(
+                conversation_id.to_owned(),
+                crate::labyrinth::space::ThreadPlacement {
+                    space: Some(space),
+                    generation,
+                },
+            );
+            tx.put_labyrinth_state(
+                &key,
+                &serde_json::to_vec(&placements)
+                    .map_err(|e| MLSError::Internal(e.to_string()))?,
+                self.hooks.now_ms(),
+            )
         })
+    }
+
+    fn pin_native_conversation(&self, conversation_id: &str) -> Result<(), MLSError> {
+        let conversation = self
+            .db
+            .read_tx(|tx| tx.get_conversation(conversation_id))?;
+        let Some(conversation) = conversation else {
+            return Ok(());
+        };
+        self.pin_native_conversation_coordinates(
+            conversation_id,
+            &conversation.sequencer_did,
+            u64::try_from(conversation.generation).map_err(|_| {
+                MLSError::Cryptography("archive conversation generation is negative".into())
+            })?,
+            conversation.space_uri.as_deref(),
+        )
+    }
+
+    /// Owner records are local proof that this account held authenticated conversation material.
+    /// Their verified I13 receipts can bootstrap a Space pin but never replace its authority.
+    fn pin_native_conversation_from_owner_history(
+        &self,
+        conversation_id: &str,
+        history: &[labyrinth::client::LoadedMessage],
+    ) -> Result<(), MLSError> {
+        let mut authority: Option<&str> = None;
+        let mut newest: Option<(u64, &str, u64)> = None;
+        for message in history {
+            let receipt = message.archived_receipt.as_ref().ok_or_else(|| {
+                MLSError::Cryptography("owner archive frame missing sequencer receipt".into())
+            })?;
+            let payload = &receipt.signed.payload;
+            if message.thread_id != conversation_id
+                || payload.conversation_id != conversation_id
+                || authority.is_some_and(|did| did != payload.sequencer_did.as_str())
+            {
+                return Err(MLSError::Cryptography(
+                    "owner archive receipt conflicts with conversation coordinates".into(),
+                ));
+            }
+            authority = Some(&payload.sequencer_did);
+            let candidate = (payload.seq, payload.sequencer_did.as_str(), receipt.generation);
+            if newest.is_none_or(|current| candidate.0 > current.0) {
+                newest = Some(candidate);
+            }
+        }
+        let Some((_, sequencer_did, generation)) = newest else {
+            return Err(MLSError::InvalidState(
+                "ArchiveRemovalUnproven".into(),
+            ));
+        };
+        self.pin_native_conversation_coordinates(conversation_id, sequencer_did, generation, None)
     }
 
 
@@ -1035,10 +1144,13 @@ impl CatbirdMlsClient {
         };
         let (mut history, rejected) = self.native_archive_run(async {
             let deps = self.native_archive_deps()?;
-            // Without local MLS state, an authenticated `ConversationNotFound` leaves only this
-            // account's owner records (as in flush); it never unlocks Conversation Space reads.
-            let owner_only = match local_has_self {
-                Some(has_self) => !has_self,
+            // A verified local roster that excludes this account is sufficient removal proof.
+            // With no MLS state, only exact authenticated protocol results select a fallback:
+            // ConversationNotFound preserves the existing gone-conversation recovery, while
+            // NotEntitled must additionally be confirmed by authenticated owner evidence and the
+            // conversation Space itself. Generic 400/401/403 and directory errors fail closed.
+            let (owner_only, confirm_space_denial) = match local_has_self {
+                Some(has_self) => (!has_self, false),
                 None => match deps
                     .transport
                     .query(
@@ -1046,21 +1158,46 @@ impl CatbirdMlsClient {
                         &[("conversationId", conversation_id.to_owned())],
                     )
                     .await
-                    .map_err(crate::labyrinth::transport::map_xrpc_error)
                 {
-                    Ok(_) => false,
-                    Err(labyrinth::Error::NotFound("conversation")) => true,
+                    Ok(_) => (false, false),
+                    Err(error)
+                        if matches!(error.status, 400 | 404)
+                            && error.error.as_deref() == Some("ConversationNotFound") =>
+                    {
+                        (true, false)
+                    }
+                    Err(error)
+                        if error.status == 400
+                            && error.error.as_deref() == Some("NotEntitled") =>
+                    {
+                        (false, true)
+                    }
                     Err(error) => {
-                        return Err(native_archive_error(crate::labyrinth::map_error(error)))
+                        return Err(native_archive_error(crate::labyrinth::map_error(
+                            crate::labyrinth::transport::map_xrpc_error(error),
+                        )))
                     }
                 },
             };
             let mut session = deps.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
-            if owner_only { return session.load_owner_history(conversation_id).await.map(|m| (m, 0)).map_err(native_archive_error); }
+            if owner_only {
+                return session
+                    .load_owner_history(conversation_id)
+                    .await
+                    .map(|messages| (messages, 0))
+                    .map_err(native_archive_error);
+            }
+            if confirm_space_denial {
+                let owner = session
+                    .load_owner_history(conversation_id)
+                    .await
+                    .map_err(native_archive_error)?;
+                self.pin_native_conversation_from_owner_history(conversation_id, &owner)?;
+            }
             let history = session.load_history(conversation_id, labyrinth::store::TimeRange::ALL).await.map_err(native_archive_error)?;
-            if !history.space_readable {
+            if confirm_space_denial && history.space_readable {
                 return Err(MLSError::InvalidState(
-                    "ArchiveInventoryIncomplete".into(),
+                    "ArchiveRemovalUnverified".into(),
                 ));
             }
             if history.undecryptable != 0 {

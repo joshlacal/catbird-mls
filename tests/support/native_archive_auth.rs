@@ -46,6 +46,8 @@ struct World {
     sequence: u64,
     committed_space_writes: usize,
     inventory_fault: Option<&'static str>,
+    directory_outage: bool,
+    denied_spaces: BTreeSet<(String, String)>,
 }
 
 impl World {
@@ -95,6 +97,19 @@ impl NativeArchiveAuthFixture {
     pub fn set_inventory_fault(&self, fault: Option<&'static str>) {
         self.world.lock().unwrap().inventory_fault = fault;
     }
+    pub fn set_directory_outage(&self, outage: bool) {
+        self.world.lock().unwrap().directory_outage = outage;
+    }
+    pub fn set_space_denied(&self, account: &str, space: &str, denied: bool) {
+        let key = (account.to_owned(), space.to_owned());
+        let mut world = self.world.lock().unwrap();
+        if denied {
+            world.denied_spaces.insert(key);
+        } else {
+            world.denied_spaces.remove(&key);
+        }
+    }
+
 
     #[allow(dead_code)]
     pub fn mailbox_keys_record(&self, did: &str, rkey: &str) -> Option<(Value, String)> {
@@ -139,6 +154,9 @@ impl NativeArchiveAuthFixture {
         }
         let params = query_params(query)?;
         if nsid == "com.atproto.identity.resolveDid" {
+            if self.world.lock().unwrap().directory_outage {
+                return Ok(reply(503, json!({"error": "DirectoryUnavailable"})));
+            }
             let did = required(&params, "did")?;
             let original = raw(request)?;
             let mut root = if original.status == 200 {
@@ -226,6 +244,15 @@ impl NativeArchiveAuthFixture {
                     return Err(failure("delegation account/Space/expiry mismatch"));
                 }
                 let mut world = self.world.lock().unwrap();
+                if world
+                    .denied_spaces
+                    .contains(&(account.to_owned(), space.raw.clone()))
+                {
+                    return Ok(reply(
+                        403,
+                        json!({"error": "NotAuthorized", "message": "not a Space member"}),
+                    ));
+                }
                 if !world
                     .spent_delegations
                     .insert(format!("{}:{}", delegation.iss, delegation.jti))

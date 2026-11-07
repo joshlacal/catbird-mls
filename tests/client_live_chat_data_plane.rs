@@ -98,6 +98,8 @@ impl PlatformKeyStore for MemKeyStore {
 
 struct MockDsState {
     receipt_sk: P256SigningKey,
+    // Retained receipt generation 2; generation 1 remains `receipt_sk`.
+    historical_receipt_sk: Option<P256SigningKey>,
     rotated_outcome_sk: Option<P256SigningKey>,
     rotate_outcome_key_on_next_publish: bool,
     tamper_next_receipt: bool,
@@ -140,6 +142,8 @@ struct MockDsState {
     lose_next_dr_keys_response: bool,
     // Signed `getConversationState.accountDeletions`: cid -> `#accountDeletedEntry`s.
     account_deletions: BTreeMap<String, Vec<Value>>,
+    // Persistent authenticated state denials: (session DID, conversation) -> (status, code).
+    conversation_state_errors: BTreeMap<(String, String), (u16, String)>,
     // Every request as (session account, URL, body), for exact-replay and no-network checks.
     http_log: Vec<(String, String, Vec<u8>)>,
     // One-shot XRPC refusals: (route suffix, status, error code, `Retry-After`).
@@ -159,6 +163,7 @@ impl SharedMockDs {
         Arc::new(Self {
             inner: Mutex::new(MockDsState {
                 receipt_sk: P256SigningKey::random(&mut rand::rngs::OsRng),
+                historical_receipt_sk: None,
                 rotated_outcome_sk: None,
                 rotate_outcome_key_on_next_publish: false,
                 tamper_next_receipt: false,
@@ -187,6 +192,7 @@ impl SharedMockDs {
                 lose_next_enroll_response: false,
                 lose_next_dr_keys_response: false,
                 account_deletions: BTreeMap::new(),
+                conversation_state_errors: BTreeMap::new(),
                 http_log: Vec::new(),
                 xrpc_failures: Vec::new(),
                 next_prepare_receipt: None,
@@ -228,6 +234,23 @@ impl SharedMockDs {
                 .as_array_mut()
                 .unwrap()
                 .push(rotated_document["verificationMethod"][0].clone());
+        }
+        if let Some(historical) = &g.historical_receipt_sk {
+            let request_method = dr_transcript::direct_request_receipt_key_id_for_authority(
+                DS_DID,
+                historical.verifying_key().to_encoded_point(true).as_bytes(),
+            )
+            .unwrap();
+            let historical_document: Value = serde_json::from_slice(
+                &direct_request_i13::authority_document(historical, &request_method, DS_DID),
+            )
+            .unwrap();
+            let mut receipt_method = historical_document["verificationMethod"][1].clone();
+            receipt_method["id"] = json!(format!("{DS_DID}#mls-receipt-2"));
+            document["verificationMethod"]
+                .as_array_mut()
+                .unwrap()
+                .push(receipt_method);
         }
         document
     }
@@ -1335,6 +1358,13 @@ impl SharedMockDs {
         if url.contains("/xrpc/blue.catbird.chat.getConversationState") {
             let cid = q.get("conversationId").expect("conversation ID");
             let dev = q.get("actorDeviceId").expect("actor device ID");
+            if let Some((status, code)) = g
+                .conversation_state_errors
+                .get(&(account.to_owned(), cid.to_owned()))
+                .cloned()
+            {
+                return xrpc_error(status, &code, "authenticated conversation-state denial");
+            }
             let Some(state) = g.conversations.get(cid).cloned() else {
                 return xrpc_error(400, "ConversationNotFound", "conversation not found");
             };
@@ -1470,10 +1500,11 @@ impl SharedMockDs {
     }
 }
 
-/// `#accountDeletedEntry` whose `sequencerAuthority` is `key`'s low-S ES256 signature over
-/// `catbird-mls-account-deletion-v1\0` and the u32-BE length-prefixed bound fields.
+/// Server-compatible `#accountDeletedEntry`: the v2 authority transcript binds the exact retained
+/// receipt method and then the complete v1 deletion record transcript.
 fn signed_account_deletion(
     key: &P256SigningKey,
+    key_id: &str,
     sequencer: &str,
     cid: &str,
     deleted: &str,
@@ -1481,15 +1512,20 @@ fn signed_account_deletion(
 ) -> Value {
     let entry_id = uuid::Uuid::new_v4().to_string();
     let received_at = "2026-11-03T00:00:00.000Z";
-    let mut message = b"catbird-mls-account-deletion-v1\0".to_vec();
-    for field in [
+    let seq_text = seq.to_string();
+    let fields = [
         sequencer,
         cid,
         deleted,
-        &seq.to_string(),
+        &seq_text,
         &entry_id,
         received_at,
-    ] {
+    ];
+    let mut message = b"catbird-mls-account-deletion-authority-v2\0".to_vec();
+    message.extend_from_slice(&(key_id.len() as u32).to_be_bytes());
+    message.extend_from_slice(key_id.as_bytes());
+    message.extend_from_slice(b"catbird-mls-account-deletion-v1\0");
+    for field in fields {
         message.extend_from_slice(&(field.len() as u32).to_be_bytes());
         message.extend_from_slice(field.as_bytes());
     }
@@ -1505,7 +1541,7 @@ fn signed_account_deletion(
         "receivedAt": received_at,
         "sequencerAuthority": {
             "sequencerDid": sequencer,
-            "keyId": format!("{sequencer}#mls-receipt-1"),
+            "keyId": key_id,
             "signature": { "$bytes": STANDARD.encode(signature.to_bytes()) },
         },
     })
@@ -3382,6 +3418,8 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
 fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
+    let historical_receipt_sk = P256SigningKey::from_slice(&[0x39; 32]).unwrap();
+    ds.inner.lock().unwrap().historical_receipt_sk = Some(historical_receipt_sk.clone());
     let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
         .iter()
         .map(|s| (*s).to_string())
@@ -3516,16 +3554,39 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
         .collect();
     assert!(d_messages.contains(&a1) && d_messages.contains(&a2));
 
-    // Bob's transport-only home serves the coordinator's entries. A tampered authority and a
-    // deletion bound to another sequencer have no effect; the genuine one is applied.
+    // Bob resolves the authority's exact retained method. Field edits, a foreign authority, and a
+    // key-ID substitution all have no effect; the genuine generation-2 server entry is applied.
     let sequencer_sk = ds.inner.lock().unwrap().receipt_sk.clone();
+    let key_id_1 = format!("{DS_DID}#mls-receipt-1");
+    let key_id_2 = format!("{DS_DID}#mls-receipt-2");
+    let service_key_id = format!("{DS_DID}#atproto");
+    let foreign_did = "did:web:other.example";
+    let foreign_key_id = format!("{foreign_did}#mls-receipt-1");
     let foreign_sk = P256SigningKey::random(&mut rand::rngs::OsRng);
     let rogue = |seq: i64| {
-        let mut tampered = signed_account_deletion(&sequencer_sk, DS_DID, &cid, EVE_DID, seq);
+        let mut tampered =
+            signed_account_deletion(&sequencer_sk, &key_id_1, DS_DID, &cid, EVE_DID, seq);
         tampered["deletedDid"] = json!(ALICE_DID);
-        let foreign =
-            signed_account_deletion(&foreign_sk, "did:web:other.example", &cid, ALICE_DID, seq);
-        [tampered, foreign]
+        let foreign = signed_account_deletion(
+            &foreign_sk,
+            &foreign_key_id,
+            foreign_did,
+            &cid,
+            ALICE_DID,
+            seq + 1,
+        );
+        let mut wrong_method =
+            signed_account_deletion(&sequencer_sk, &key_id_1, DS_DID, &cid, ALICE_DID, seq + 2);
+        wrong_method["sequencerAuthority"]["keyId"] = json!(key_id_2.clone());
+        let service_method = signed_account_deletion(
+            &sequencer_sk,
+            &service_key_id,
+            DS_DID,
+            &cid,
+            ALICE_DID,
+            seq + 3,
+        );
+        [tampered, foreign, wrong_method, service_method]
     };
     let next_seq = |g: &MockDsState| {
         g.entries[&cid]
@@ -3546,9 +3607,7 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
     {
         let mut g = ds.inner.lock().unwrap();
         let seq = next_seq(&g);
-        let [tampered, mut foreign] = rogue(seq);
-        foreign["seq"] = json!(seq + 1);
-        g.entries.get_mut(&cid).unwrap().extend([tampered, foreign]);
+        g.entries.get_mut(&cid).unwrap().extend(rogue(seq));
     }
     bob.sync().expect("unverified deletions are ignored");
     assert_eq!(marker(&bob), None);
@@ -3564,7 +3623,14 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
     let deletion_seq = {
         let mut g = ds.inner.lock().unwrap();
         let seq = next_seq(&g);
-        let entry = signed_account_deletion(&sequencer_sk, DS_DID, &cid, ALICE_DID, seq);
+        let entry = signed_account_deletion(
+            &historical_receipt_sk,
+            &key_id_2,
+            DS_DID,
+            &cid,
+            ALICE_DID,
+            seq,
+        );
         g.entries.get_mut(&cid).unwrap().push(entry.clone());
         g.account_deletions
             .entry(cid.clone())
@@ -3722,6 +3788,159 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
     let restored = alice.list_messages(&cid, None, 10).unwrap();
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].message_id, msg_id);
+}
+
+/// A fresh removed device has no MLS group. Exact authenticated NotEntitled is therefore only a
+/// lead: a verified owner receipt must recover the Space pin and that Space must independently
+/// deny the account. A malicious NotEntitled for an active member, generic 400, and auth failure
+/// must not unlock owner-only history.
+#[test]
+fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let bob_keys = Arc::new(MemKeyStore::new());
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "removal-admin",
+        ALICE_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &alice_keys,
+    );
+    let source = live_client(
+        tmp.path(),
+        &ds,
+        "removed-source",
+        BOB_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &bob_keys,
+    );
+    alice.enroll_device(&scopes).expect("enroll admin");
+    source.enroll_device(&scopes).expect("enroll removed member");
+    let cid = uuid::Uuid::new_v4().to_string();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_owned()],
+            Some("Removal proof".into()),
+            Some("verified kick".into()),
+        )
+        .expect("create group");
+    source.sync().expect("accept group invitation");
+    alice.sync().expect("fulfill group invitation");
+    source.sync().expect("join group");
+    let code = source.setup_recovery_code().expect("recovery code");
+    let message_id = uuid::Uuid::new_v4().to_string();
+    source
+        .send_message(&cid, &message_id, "owner rescue survives removal")
+        .expect("send owner-rescued message");
+    alice
+        .remove_group_member(MemberRole::Admin, &cid, BOB_DID)
+        .expect("sequence verified removal");
+    source
+        .sync()
+        .expect("apply verified removal and seal owner rescue");
+
+    let space = {
+        let state = ds.inner.lock().unwrap();
+        let conversation = &state.conversations[&cid];
+        conversation["conversationSpace"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-{}",
+                    conversation["coordinates"]["generation"].as_u64().unwrap()
+                )
+            })
+    };
+    ds.inner.lock().unwrap().conversation_state_errors.insert(
+        (BOB_DID.to_owned(), cid.clone()),
+        (400, "NotEntitled".into()),
+    );
+    ds.archive_auth.set_space_denied(BOB_DID, &space, true);
+
+    let removed_keys = Arc::new(MemKeyStore::new());
+    let removed = live_client(
+        tmp.path(),
+        &ds,
+        "removed-fresh",
+        BOB_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &removed_keys,
+    );
+    removed
+        .restore_with_recovery_code(&code)
+        .expect("recover removed member archive keys");
+    ds.archive_auth.set_directory_outage(true);
+    assert!(
+        removed
+            .restore_conversation_from_owner_mailbox(&cid)
+            .is_err(),
+        "directory outage must remain retryable, not prove removal"
+    );
+    assert!(removed.list_messages(&cid, None, 10).unwrap().is_empty());
+    ds.archive_auth.set_directory_outage(false);
+    assert_eq!(
+        removed
+            .restore_conversation_from_owner_mailbox(&cid)
+            .expect("authenticated Space denial permits owner restore"),
+        1
+    );
+    assert_eq!(removed.list_messages(&cid, None, 10).unwrap()[0].message_id, message_id);
+
+    // The same DS response is malicious while the Space still admits the account.
+    ds.archive_auth.set_space_denied(BOB_DID, &space, false);
+    let active_keys = Arc::new(MemKeyStore::new());
+    let active = live_client(
+        tmp.path(),
+        &ds,
+        "active-fresh",
+        BOB_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &active_keys,
+    );
+    active
+        .restore_with_recovery_code(&code)
+        .expect("recover active member archive keys");
+    let error = active
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("NotEntitled contradicted by Space access must fail");
+    assert!(error.to_string().contains("ArchiveRemovalUnverified"), "{error}");
+    assert!(active.list_messages(&cid, None, 10).unwrap().is_empty());
+
+    for (index, status, error_code) in [
+        (0, 400, "InvalidRequest"),
+        (1, 401, "NotAuthorized"),
+    ] {
+        ds.inner.lock().unwrap().conversation_state_errors.insert(
+            (BOB_DID.to_owned(), cid.clone()),
+            (status, error_code.to_owned()),
+        );
+        let keys = Arc::new(MemKeyStore::new());
+        let client = live_client(
+            tmp.path(),
+            &ds,
+            &format!("malicious-{index}"),
+            BOB_DID,
+            &uuid::Uuid::new_v4().to_string(),
+            &keys,
+        );
+        client
+            .restore_with_recovery_code(&code)
+            .expect("recover archive keys");
+        assert!(
+            client.restore_conversation_from_owner_mailbox(&cid).is_err(),
+            "HTTP {status} {error_code} must not prove removal"
+        );
+        assert!(client.list_messages(&cid, None, 10).unwrap().is_empty());
+    }
 }
 
 fn live_client(
