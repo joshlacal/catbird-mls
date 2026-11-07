@@ -25,6 +25,7 @@ mod native_archive_space_auth {
     };
     use crate::labyrinth::{LabyrinthSpaceRequest, LabyrinthSpaceResponse};
     use serde::{Deserialize, Serialize};
+    use serde_json::Value;
     use std::collections::{BTreeMap, BTreeSet};
     use zeroize::Zeroizing;
 
