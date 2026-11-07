@@ -2775,7 +2775,18 @@ impl CatbirdMlsClient {
                             signed_req,
                             SignedMutationKind::ApplicationSend,
                             &outer_key.signature_public_key,
-                        )?;
+                        );
+                        // A tampered application entry is unreadable here, before decryption,
+                        // so the P9 plant (forced rejoin on an unreadable entry) fires here too.
+                        #[cfg(feature = "sim")]
+                        if verified.is_err()
+                            && crate::planted::is_planted_bug_active(
+                                crate::planted::PlantedBug::P9AutomatedForcedRejoinOnDecryptFailure,
+                            )
+                        {
+                            self.plant_p9_automated_forced_rejoin(cid, canonical_dev_id, signer)?;
+                        }
+                        let verified = verified?;
                         if verified["actorDid"].as_str() != Some(actor_did)
                             || verified["actorDeviceId"].as_str() != Some(actor_device_id)
                             || verified["messageId"].as_str() != Some(msg_id)
