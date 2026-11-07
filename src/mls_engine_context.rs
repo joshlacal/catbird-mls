@@ -23,7 +23,7 @@ use crate::message_limits::{
 use crate::mls_context::MLSContext as MLSContextInner;
 use crate::orchestrator::mls_provider::OwnEchoProof;
 use crate::orchestrator::mls_provider::{
-    IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome,
+    IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome, ReservedApplicationSend,
 };
 use crate::types::*;
 
@@ -31,6 +31,8 @@ use crate::keychain::KeychainAccess;
 use crate::storage::{BackgroundCheckpointReport, MlsAccountDb};
 
 const DEFAULT_EPOCH_SECRET_RETENTION: u64 = 5;
+/// `pending_ops` kind of an orchestrator send's pre-HTTP journal ([`ReservedApplicationSend`]).
+const ORCHESTRATOR_APPLICATION_SEND_OP: &str = "orchestrator_application_send";
 /// Standalone proposals remain in this short-lived authorization staging area
 /// only until the envelope DID has been bound to the authenticated MLS
 /// credential. Bound the queue so an authenticated-but-malicious member cannot
@@ -6537,6 +6539,139 @@ impl MLSContext {
         })
     }
 
+    /// [`MlsCryptoContext::reserve_application_send`] on this context's account database: the
+    /// cached group encrypts through a provider bound to the very write transaction that
+    /// reserves the `sendCounter` and journals the send, so all three commit or none does. A
+    /// rolled-back write fires the cache-eviction hook, and the group reloads from storage
+    /// before any reuse of the ratchet it advanced in memory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_application_send(
+        &self,
+        group_id: Vec<u8>,
+        expected_epoch: u64,
+        conversation_id: &str,
+        message_id: &str,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        complete: &dyn Fn(u64, &[u8]) -> Result<ReservedApplicationSend, MLSError>,
+    ) -> Result<ReservedApplicationSend, MLSError> {
+        self.check_suspended()?;
+        if aad.is_empty() || aad.len() > 16 * 1024 {
+            return Err(MLSError::invalid_input(
+                "Invalid canonical application AAD length",
+            ));
+        }
+        let _operation = self.begin_storage_operation("reserve_application_send");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let db = Arc::clone(inner.account_db());
+        if let Some(raw) =
+            db.read_tx(|tx| tx.get_pending_op(ORCHESTRATOR_APPLICATION_SEND_OP, message_id))?
+        {
+            let reserved: ReservedApplicationSend =
+                serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+            if reserved.conversation_id != conversation_id || reserved.message_id != message_id {
+                return Err(MLSError::invalid_input(
+                    "message_id already reserved for a different send",
+                ));
+            }
+            return Ok(reserved);
+        }
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group(&gid, |group, _, signer| {
+            if group.epoch().as_u64() != expected_epoch {
+                return Err(MLSError::invalid_input(
+                    "Canonical application epoch changed before encryption",
+                ));
+            }
+            db.write_tx(|tx| {
+                let counter_key = crate::client::chat_wire::send_counter_key(conversation_id);
+                let send_counter = crate::client::chat_wire::next_send_counter(
+                    tx.get_account_meta(&counter_key)?.as_deref(),
+                )?;
+                let provider = tx.openmls_provider();
+                group.set_aad(aad);
+                let message = group
+                    .create_message(&provider, signer, &plaintext)
+                    .map_err(|_| MLSError::EncryptionFailed);
+                group.set_aad(Vec::new());
+                let ciphertext = message?
+                    .tls_serialize_detached()
+                    .map_err(|_| MLSError::SerializationError)?;
+                let reserved = complete(send_counter, &ciphertext)?;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                tx.put_account_meta(&counter_key, &send_counter.to_string(), now_ms)?;
+                tx.put_pending_op(
+                    ORCHESTRATOR_APPLICATION_SEND_OP,
+                    message_id,
+                    &serde_json::to_string(&reserved).map_err(|_| MLSError::SerializationError)?,
+                    now_ms,
+                )?;
+                Ok(reserved)
+            })
+        })
+    }
+
+    /// [`MlsCryptoContext::discard_application_send`].
+    pub fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
+        self.account_db()?.write_tx(|tx| {
+            tx.delete_pending_op(ORCHESTRATOR_APPLICATION_SEND_OP, message_id)
+                .map(drop)
+        })
+    }
+
+    /// [`MlsCryptoContext::spend_application_send`].
+    pub fn spend_application_send(
+        &self,
+        message_id: &str,
+        proof: &OwnEchoProof,
+    ) -> Result<(), MLSError> {
+        let (key_hex, payload_json) = crate::mls_context::own_echo_proof_row(proof)?;
+        self.account_db()?.write_tx(|tx| {
+            tx.put_pending_op(
+                "own_echo_proof",
+                &key_hex,
+                &payload_json,
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            tx.delete_pending_op(ORCHESTRATOR_APPLICATION_SEND_OP, message_id)
+                .map(drop)
+        })
+    }
+
+    /// [`MlsCryptoContext::reserved_application_send`].
+    pub fn reserved_application_send(
+        &self,
+        conversation_id: &str,
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<Option<ReservedApplicationSend>, MLSError> {
+        self.account_db()?.read_tx(|tx| {
+            let mut stmt = tx
+                .conn()
+                .prepare("SELECT payload_json FROM pending_ops WHERE op_kind = ?1")
+                .map_err(|e| MLSError::Internal(format!("reserved sends.prepare: {e}")))?;
+            let rows = stmt
+                .query_map([ORCHESTRATOR_APPLICATION_SEND_OP], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| MLSError::Internal(format!("reserved sends.query: {e}")))?;
+            for row in rows {
+                let raw = row.map_err(|e| MLSError::Internal(format!("reserved send: {e}")))?;
+                let reserved: ReservedApplicationSend =
+                    serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+                if reserved.conversation_id == conversation_id
+                    && &reserved.ciphertext_sha256 == ciphertext_sha256
+                {
+                    return Ok(Some(reserved));
+                }
+            }
+            Ok(None)
+        })
+    }
+
     #[cfg(any(feature = "test-utils", feature = "e2e-aad"))]
     pub fn encrypt_message_with_aad_for_test(
         &self,
@@ -8595,14 +8730,47 @@ impl MlsCryptoContext for MLSContext {
         self.encrypt_message(group_id, plaintext)
     }
 
-    fn encrypt_message_with_aad(
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_application_send(
         &self,
         group_id: Vec<u8>,
+        expected_epoch: u64,
+        conversation_id: &str,
+        message_id: &str,
         plaintext: Vec<u8>,
         aad: Vec<u8>,
-        expected_epoch: u64,
-    ) -> Result<EncryptResult, MLSError> {
-        self.encrypt_message_with_aad(group_id, plaintext, aad, expected_epoch)
+        complete: &dyn Fn(u64, &[u8]) -> Result<ReservedApplicationSend, MLSError>,
+    ) -> Result<ReservedApplicationSend, MLSError> {
+        MLSContext::reserve_application_send(
+            self,
+            group_id,
+            expected_epoch,
+            conversation_id,
+            message_id,
+            plaintext,
+            aad,
+            complete,
+        )
+    }
+
+    fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
+        MLSContext::discard_application_send(self, message_id)
+    }
+
+    fn spend_application_send(
+        &self,
+        message_id: &str,
+        proof: &OwnEchoProof,
+    ) -> Result<(), MLSError> {
+        MLSContext::spend_application_send(self, message_id, proof)
+    }
+
+    fn reserved_application_send(
+        &self,
+        conversation_id: &str,
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<Option<ReservedApplicationSend>, MLSError> {
+        MLSContext::reserved_application_send(self, conversation_id, ciphertext_sha256)
     }
 
     fn decrypt_message(

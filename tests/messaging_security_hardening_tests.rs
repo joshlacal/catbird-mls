@@ -2498,6 +2498,61 @@ async fn send_message_response_validation_rejects_noncanonical_shapes_and_mutati
     assert!(err
         .to_string()
         .contains("seq must be in range 1..=9007199254740991"));
+
+    // 9. An I13 receipt is an object riding beside the entry and in it, identically: that shape
+    // passes (failing here only the request comparison), and every other spelling is refused.
+    let receipt = serde_json::json!({ "entryId": uuid::Uuid::new_v4().to_string(), "seq": 1 });
+    let entry_with = |receipt: Option<&serde_json::Value>| {
+        let mut entry = serde_json::json!({
+            "conversationId": &convo.conversation_id,
+            "entryId": uuid::Uuid::new_v4().to_string(),
+            "receivedAt": "2026-08-27T00:00:00.000Z",
+            "seq": 1,
+            "signedRequest": valid_signed_request
+        });
+        if let Some(receipt) = receipt {
+            entry["sequencerReceipt"] = receipt.clone();
+        }
+        entry
+    };
+    for (response, expected) in [
+        (
+            serde_json::json!({ "entry": entry_with(Some(&receipt)), "sequencerReceipt": receipt }),
+            "signedRequest does not match submitted signedRequest",
+        ),
+        (
+            serde_json::json!({ "entry": entry_with(None), "sequencerReceipt": receipt }),
+            "send_message response entry must have exactly 6 fields, got 5",
+        ),
+        (
+            serde_json::json!({ "entry": entry_with(Some(&receipt)) }),
+            "send_message response entry must have exactly 5 fields, got 6",
+        ),
+        (
+            serde_json::json!({
+                "entry": entry_with(Some(&receipt)),
+                "sequencerReceipt": { "entryId": uuid::Uuid::new_v4().to_string(), "seq": 1 },
+            }),
+            "entry sequencerReceipt differs from the response's",
+        ),
+        (
+            serde_json::json!({
+                "entry": entry_with(Some(&serde_json::Value::Null)),
+                "sequencerReceipt": null,
+            }),
+            "send_message response sequencerReceipt must be an object",
+        ),
+    ] {
+        world
+            .api_service
+            .set_next_send_custom_response(200, response);
+        let err = alice
+            .orchestrator
+            .send_message(group_id, "receipt shape")
+            .await
+            .expect_err(expected);
+        assert!(err.to_string().contains(expected), "{expected}: {err}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2706,6 +2761,13 @@ fn assert_canonical_application_wire(body: &serde_json::Value) {
         catbird_mls::orchestrator::canonical_application_aad_bytes(&body["aad"]).unwrap();
     assert!(!expected_aad.is_empty());
     assert_eq!(private.aad(), expected_aad);
+    // R3 #2: the bound AAD carries I13 archive evidence that verifies for exactly this message.
+    catbird_mls::messaging::receive::verify_application_aad_archive_evidence(
+        &expected_aad,
+        body["prior"]["conversationId"].as_str().unwrap(),
+        body["messageId"].as_str().unwrap(),
+    )
+    .expect("production send binds verifiable I13 archive evidence");
     let protocol = ProtocolMessage::from(private);
     assert_eq!(
         protocol.epoch().as_u64(),
@@ -2763,7 +2825,15 @@ async fn send_retries_only_explicit_stale_coordinates_with_exact_bound_aad() {
         }
         if sends.len() == 2 {
             assert_eq!(sends[0]["messageId"], sends[1]["messageId"]);
-            assert_eq!(sends[0]["aad"], sends[1]["aad"]);
+            // The retry binds the same ids and coordinates. The refused journal went with its
+            // frame nonce, so only the frame's I13 evidence (verified above) is fresh.
+            let bound = |body: &serde_json::Value| {
+                let mut aad = body["aad"].as_object().unwrap().clone();
+                assert!(aad.remove("archiveCommitment").is_some());
+                assert!(aad.remove("originalSenderAttestation").is_some());
+                aad
+            };
+            assert_eq!(bound(&sends[0]), bound(&sends[1]));
             assert_ne!(
                 sends[0]["applicationMessage"]["bytes"],
                 sends[1]["applicationMessage"]["bytes"]

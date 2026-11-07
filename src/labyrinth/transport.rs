@@ -16,7 +16,7 @@ use labyrinth::records::{ms_from_datetime, EpochPublicDef, MailboxKeysRecord};
 use labyrinth::store::pds::PublicRepoBackend;
 use labyrinth::store::{
     ChatDeviceKey, KeyPublisher, MailboxDirectory, MaybeSend, MaybeSync, MemberDeviceKey,
-    SequencerKey, SequencerReceiptKey,
+    SequencerReceiptKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -83,14 +83,6 @@ pub trait LabyrinthGateway: MaybeSend + MaybeSync {
         request: PreparedRequest,
         headers: Vec<(String, String)>,
     ) -> Result<GatewayResponse, String>;
-    /// Per-conversation `[CB-38]` Ed25519 redaction verifying key for `sequencer_did`.
-    async fn resolve_sequencer_key_for(
-        &self,
-        _conversation_id: &str,
-        _sequencer_did: Option<&str>,
-    ) -> Option<(String, [u8; 32])> {
-        None
-    }
     /// Per-conversation `I13` P-256 ES256 receipt verifying key for `sequencer_did`.
     async fn resolve_sequencer_receipt_key_for(
         &self,
@@ -141,16 +133,6 @@ impl<A: MLSAPIClient + 'static> LabyrinthGateway for ApiGateway<A> {
             })
             .await
             .map_err(|e| e.to_string())
-    }
-
-    async fn resolve_sequencer_key_for(
-        &self,
-        conversation_id: &str,
-        sequencer_did: Option<&str>,
-    ) -> Option<(String, [u8; 32])> {
-        self.api
-            .labyrinth_sequencer_key_for(conversation_id, sequencer_did)
-            .await
     }
 
     async fn resolve_sequencer_receipt_key_for(
@@ -440,16 +422,6 @@ impl GatewayXrpcTransport {
         )
     }
 
-    pub async fn resolve_sequencer_key_for(
-        &self,
-        conversation_id: &str,
-        sequencer_did: Option<&str>,
-    ) -> Option<(String, [u8; 32])> {
-        self.gateway
-            .resolve_sequencer_key_for(conversation_id, sequencer_did)
-            .await
-    }
-
     pub async fn resolve_sequencer_receipt_key_for(
         &self,
         conversation_id: &str,
@@ -590,14 +562,7 @@ fn deterministic_op_id(tag: &str, payload: &[u8]) -> [u8; 16] {
 }
 
 #[derive(Clone, Default)]
-struct CachedSequencerKeys {
-    redaction_key: Option<SequencerKey>,
-    receipt_key: Option<SequencerReceiptKey>,
-}
-
-#[derive(Clone, Default)]
 struct ParsedSequencerKeys {
-    redaction_key: Option<SequencerKey>,
     receipt_keys: std::collections::BTreeMap<String, SequencerReceiptKey>,
 }
 
@@ -637,7 +602,6 @@ fn parse_did_doc_sequencer_keys(
     }
     let mut parsed = ParsedSequencerKeys::default();
     if let Some(methods) = doc.get("verificationMethod").and_then(|v| v.as_array()) {
-        let redaction_full_id = format!("{base_did}#labyrinth-redaction-1");
         for m in methods {
             let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
                 continue;
@@ -671,19 +635,6 @@ fn parse_did_doc_sequencer_keys(
                         "duplicate receipt verification method",
                     ));
                 }
-            } else if (id == redaction_full_id
-                || id == "#labyrinth-redaction-1"
-                || id == format!("{base_did}#labyrinth-1")
-                || id == "#labyrinth-1")
-                && raw.starts_with(&[0xed, 0x01])
-                && raw[2..].len() == 32
-            {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&raw[2..]);
-                parsed.redaction_key = Some(SequencerKey {
-                    did: base_did.clone(),
-                    key,
-                });
             }
         }
     }
@@ -852,22 +803,19 @@ pub fn did_document_url(did: &str) -> Result<String, String> {
 /// Verifying `mls-ds` directory & epoch-head publisher over the 6 clean-slate endpoints.
 pub struct DsDirectoryStore {
     transport: Arc<GatewayXrpcTransport>,
-    sequencer_key: Option<SequencerKey>,
     sequencer_receipt_key: Option<SequencerReceiptKey>,
     placements: Option<(String, Arc<dyn super::state::StateVault>)>,
-    thread_keys: std::sync::Mutex<std::collections::HashMap<String, CachedSequencerKeys>>,
+    thread_keys: std::sync::Mutex<std::collections::HashMap<String, SequencerReceiptKey>>,
     did_doc_keys: std::sync::Mutex<std::collections::HashMap<String, ParsedSequencerKeys>>,
 }
 
 impl DsDirectoryStore {
     pub fn new(
         transport: Arc<GatewayXrpcTransport>,
-        sequencer_key: Option<SequencerKey>,
         sequencer_receipt_key: Option<SequencerReceiptKey>,
     ) -> Self {
         Self {
             transport,
-            sequencer_key,
             sequencer_receipt_key,
             placements: None,
             thread_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -932,7 +880,7 @@ impl DsDirectoryStore {
             return Ok(ParsedSequencerKeys::default());
         };
         let parsed = parse_did_doc_sequencer_keys(sequencer_did, &doc_bytes)?;
-        if parsed.redaction_key.is_some() || !parsed.receipt_keys.is_empty() {
+        if !parsed.receipt_keys.is_empty() {
             self.did_doc_keys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -941,10 +889,10 @@ impl DsDirectoryStore {
         Ok(parsed)
     }
 
-    async fn resolve_thread_sequencer_keys(
+    async fn resolve_thread_receipt_key(
         &self,
         thread_id: &str,
-    ) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
         let mut sequencer_did = self.saved_thread_authority(thread_id)?;
         if let Some(cached) = self
             .thread_keys
@@ -953,20 +901,13 @@ impl DsDirectoryStore {
             .get(thread_id)
             .cloned()
         {
-            if let Some(expected) = sequencer_did.as_deref() {
-                if cached
-                    .redaction_key
-                    .as_ref()
-                    .is_some_and(|key| key.did != expected)
-                    || cached
-                        .receipt_key
-                        .as_ref()
-                        .is_some_and(|key| key.did != expected)
-                {
-                    return Err(labyrinth::Error::Unattested);
-                }
+            if sequencer_did
+                .as_deref()
+                .is_some_and(|expected| cached.did != expected)
+            {
+                return Err(labyrinth::Error::Unattested);
             }
-            return Ok((cached.redaction_key, cached.receipt_key));
+            return Ok(Some(cached));
         }
 
         let state_res = self
@@ -1019,30 +960,6 @@ impl DsDirectoryStore {
             None => false,
         };
 
-        let mut redaction_key = None;
-        if redaction_key.is_none() {
-            if let Some(ref sk) = self.sequencer_key {
-                if matches_expected(&sk.did, sequencer_did.as_deref()) {
-                    redaction_key = Some(SequencerKey {
-                        did: normalize_sequencer_did(&sk.did),
-                        key: sk.key,
-                    });
-                }
-            }
-        }
-        if redaction_key.is_none() && sequencer_did.is_some() {
-            if let Some((did, key)) = self
-                .transport
-                .resolve_sequencer_key_for(thread_id, sequencer_did.as_deref())
-                .await
-            {
-                let norm = normalize_sequencer_did(&did);
-                if matches_expected(&norm, sequencer_did.as_deref()) {
-                    redaction_key = Some(SequencerKey { did: norm, key });
-                }
-            }
-        }
-
         let mut receipt_key = None;
         if receipt_key.is_none() {
             if let Some(ref rk) = self.sequencer_receipt_key {
@@ -1075,31 +992,21 @@ impl DsDirectoryStore {
         }
 
         if let Some(seq_did) = &sequencer_did {
-            if redaction_key.is_none() || receipt_key.is_none() {
-                let doc = self.resolve_did_doc_keys(seq_did).await?;
-                let resolved_receipt_key = doc.current_receipt_key();
-                if redaction_key.is_none() {
-                    redaction_key = doc.redaction_key;
-                }
-                if receipt_key.is_none() {
-                    receipt_key = resolved_receipt_key;
-                }
+            if receipt_key.is_none() {
+                receipt_key = self
+                    .resolve_did_doc_keys(seq_did)
+                    .await?
+                    .current_receipt_key();
             }
-            if redaction_key.is_some() || receipt_key.is_some() {
+            if let Some(key) = &receipt_key {
                 self.thread_keys
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        thread_id.to_owned(),
-                        CachedSequencerKeys {
-                            redaction_key: redaction_key.clone(),
-                            receipt_key: receipt_key.clone(),
-                        },
-                    );
+                    .insert(thread_id.to_owned(), key.clone());
             }
         }
 
-        Ok((redaction_key, receipt_key))
+        Ok(receipt_key)
     }
 
     pub async fn publish_epoch_head_public(&self, epoch: &EpochPublicDef) -> labyrinth::Result<()> {
@@ -1319,17 +1226,11 @@ impl MailboxDirectory for DsDirectoryStore {
         ))
     }
 
-    async fn sequencer_key(&self, thread_id: &str) -> labyrinth::Result<Option<SequencerKey>> {
-        let (redaction_key, _) = self.resolve_thread_sequencer_keys(thread_id).await?;
-        Ok(redaction_key)
-    }
-
     async fn sequencer_receipt_key(
         &self,
         thread_id: &str,
     ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
-        let (_, receipt_key) = self.resolve_thread_sequencer_keys(thread_id).await?;
-        Ok(receipt_key)
+        self.resolve_thread_receipt_key(thread_id).await
     }
 
     async fn sequencer_receipt_key_for_authority(
@@ -1548,13 +1449,6 @@ mod tests {
                     "publicKeyMultibase": multibase::encode(
                         multibase::Base::Base58Btc, [&[0x80, 0x24][..], &receipt_public].concat()
                     )
-                },
-                {
-                    "id": format!("{AUTHORITY}#labyrinth-redaction-1"),
-                    "controller": AUTHORITY,
-                    "publicKeyMultibase": multibase::encode(
-                        multibase::Base::Base58Btc, [&[0xed, 0x01][..], &[7; 32][..]].concat()
-                    )
                 }
             ]
         }))
@@ -1597,29 +1491,21 @@ mod tests {
             ));
             let directory = DsDirectoryStore::new(
                 transport,
-                configured.then(|| SequencerKey {
-                    did: AUTHORITY.into(),
-                    key: [7; 32],
-                }),
                 configured.then(|| SequencerReceiptKey {
                     did: AUTHORITY.into(),
                     public_key_sec1: receipt_public.clone(),
                 }),
             )
             .with_placements(OWNER, fixture.clone());
-            let result = directory.resolve_thread_sequencer_keys(THREAD).await;
+            let result = directory.resolve_thread_receipt_key(THREAD).await;
             if reported == ATTACKER {
                 assert_eq!(result.unwrap_err(), labyrinth::Error::Unattested);
             } else {
-                let (redaction, receipt) = result.unwrap();
+                let receipt = result.unwrap();
                 if has_document || configured {
-                    assert_eq!(redaction.unwrap().key, [7; 32]);
                     assert_eq!(receipt.unwrap().public_key_sec1, receipt_public);
                 } else {
-                    assert!(
-                        redaction.is_none() && receipt.is_none(),
-                        "inline keys must not be trusted"
-                    );
+                    assert!(receipt.is_none(), "inline keys must not be trusted");
                 }
             }
             let before = fixture.state_queries.load(Ordering::SeqCst);
@@ -1721,7 +1607,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111".into(),
         ));
         let directory =
-            DsDirectoryStore::new(transport, None, None).with_placements(OWNER, fixture.clone());
+            DsDirectoryStore::new(transport, None).with_placements(OWNER, fixture.clone());
         assert!(directory
             .sequencer_receipt_key(THREAD)
             .await
@@ -1862,7 +1748,7 @@ mod tests {
             "did:plc:alice".into(),
             "11111111-1111-4111-8111-111111111111".into(),
         ));
-        let directory = DsDirectoryStore::new(transport, None, None);
+        let directory = DsDirectoryStore::new(transport, None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

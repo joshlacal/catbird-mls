@@ -116,6 +116,20 @@ impl OwnEchoProof {
     }
 }
 
+/// The pre-HTTP journal of one orchestrator application send (seed 2323): the exact body to
+/// sign and submit, written in the storage transaction that reserved its `sendCounter` and
+/// advanced the sender ratchet. Only these bytes may ever be resubmitted for `message_id`, and
+/// an own-private echo with exactly this ciphertext is this device's own send.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReservedApplicationSend {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub ciphertext_sha256: [u8; 32],
+    pub body: serde_json::Value,
+    /// Canonical `MLSMessagePayload` JSON, restored if only the echo shows the send landed.
+    pub payload_json: String,
+}
+
 #[derive(Debug)]
 pub enum MlsDecryptOutcome {
     Message(DecryptResult),
@@ -648,19 +662,57 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError>;
 
-    /// Encrypt a canonical application artifact with its already-bound metadata.
-    /// Check the expected epoch under the same crypto mutation lock; return raw
-    /// MLS TLS framing, never the legacy length-prefixed padding envelope.
-    fn encrypt_message_with_aad(
+    /// Reserve one canonical application send before any HTTP (seed 2323). In a single storage
+    /// transaction: the next `sendCounter` this device signs in `conversation_id`, the
+    /// sender-ratchet advance that encrypts `plaintext` under `aad` at `expected_epoch` (raw MLS
+    /// TLS framing), and the journal `complete(send_counter, ciphertext)` builds. A journal
+    /// already reserved for `message_id` is returned unchanged; nothing else is encrypted.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_application_send(
         &self,
         _group_id: Vec<u8>,
+        _expected_epoch: u64,
+        _conversation_id: &str,
+        _message_id: &str,
         _plaintext: Vec<u8>,
         _aad: Vec<u8>,
-        _expected_epoch: u64,
-    ) -> Result<EncryptResult, MLSError> {
+        _complete: &dyn Fn(u64, &[u8]) -> Result<ReservedApplicationSend, MLSError>,
+    ) -> Result<ReservedApplicationSend, MLSError> {
         Err(MLSError::OperationNotSupported {
-            reason: "canonical application encryption is unavailable".into(),
+            reason: "journaled application send reservation is unavailable".into(),
         })
+    }
+
+    /// Drop the journal of `message_id`: `mls-ds` refused those exact bytes for good
+    /// (`StaleSend`, `StaleCoordinates`) and they must never be resubmitted.
+    fn discard_application_send(&self, _message_id: &str) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "journaled application send reservation is unavailable".into(),
+        })
+    }
+
+    /// Spend the journal of `message_id` once it is known sequenced: record `proof` for its echo
+    /// and drop the journal in one storage transaction, so a crash can never lose both and a
+    /// redelivered echo always finds one of them.
+    fn spend_application_send(
+        &self,
+        _message_id: &str,
+        _proof: &OwnEchoProof,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "journaled application send reservation is unavailable".into(),
+        })
+    }
+
+    /// The journal in `conversation_id` whose ciphertext digest is `ciphertext_sha256`, if any.
+    /// A context that cannot reserve sends holds no journal, so an own echo it cannot prove
+    /// otherwise stays unverified.
+    fn reserved_application_send(
+        &self,
+        _conversation_id: &str,
+        _ciphertext_sha256: &[u8; 32],
+    ) -> Result<Option<ReservedApplicationSend>, MLSError> {
+        Ok(None)
     }
 
     fn decrypt_message(

@@ -78,7 +78,9 @@ pub use credentials::{CleanChatSigningAuthority, CredentialStore};
 pub use direct_request_types::*;
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
-pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
+pub use mls_provider::{
+    MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof, ReservedApplicationSend,
+};
 pub(crate) use orchestrator::{with_batch_inventory_scope, with_batch_recovery_inbox_scope};
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 pub use recovery::DeferredRecoveryOutcome;

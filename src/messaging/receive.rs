@@ -367,9 +367,95 @@ struct CanonicalApplicationAadMap {
 const CANONICAL_APP_AAD_PREFIX: &[u8] = b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0";
 const DIRECT_REQUEST_APP_AAD_PREFIX: &[u8] = b"CATBIRD-DIRECT-REQUEST-APPLICATION-AAD\0";
 
+/// `(conversation_id, message_id, archive_commitment, original_sender_attestation)` of a
+/// canonical application AAD with its domain prefix stripped. Both archive fields are required,
+/// and the attestation must verify over the AAD's own conversation and message IDs.
+fn canonical_aad_archive_evidence(
+    cbor_aad: &[u8],
+) -> Result<
+    (
+        uuid::Uuid,
+        uuid::Uuid,
+        [u8; ARCHIVE_COMMITMENT_LEN],
+        OriginalSenderArchiveAttestationEnvelope,
+    ),
+    MLSError,
+> {
+    let parsed: CanonicalApplicationAadMap =
+        serde_ipld_dagcbor::from_slice(cbor_aad).map_err(|e| {
+            MLSError::Cryptography(format!("invalid canonical applicationAad CBOR: {e}"))
+        })?;
+    let uuid = |value: Option<CborByteVec>, field: &str| {
+        value
+            .and_then(|value| uuid::Uuid::from_slice(&value.0).ok())
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!("applicationAad {field} must be UUID bytes"))
+            })
+    };
+    let conversation_id = uuid(parsed.conversation_id, "conversationId")?;
+    let message_id = uuid(parsed.message_id, "messageId")?;
+    let commitment: [u8; ARCHIVE_COMMITMENT_LEN] = parsed
+        .archive_commitment
+        .ok_or_else(|| {
+            MLSError::Cryptography("I13: canonical applicationAad missing archiveCommitment".into())
+        })?
+        .0
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            MLSError::Cryptography(
+                "I13 canonical applicationAad archiveCommitment must be 32 bytes".into(),
+            )
+        })?;
+    let attestation = OriginalSenderArchiveAttestationEnvelope::try_from(
+        parsed.original_sender_attestation.ok_or_else(|| {
+            MLSError::Cryptography(
+                "canonical applicationAad missing original sender attestation".into(),
+            )
+        })?,
+    )?;
+    attestation.verify(
+        &conversation_id.hyphenated().to_string(),
+        &message_id.hyphenated().to_string(),
+        &commitment,
+    )?;
+    Ok((conversation_id, message_id, commitment, attestation))
+}
+
+/// Authenticate the archive evidence a signed canonical application AAD carries for the entry
+/// `(cid, msg_id)` without decrypting it: its `archiveCommitment` and the original sender's
+/// attestation over exactly that conversation, message and commitment. An entry this device
+/// can never decrypt is bound to its sender and receipt through this evidence alone.
+pub fn verify_application_aad_archive_evidence(
+    aad_bytes: &[u8],
+    cid: &str,
+    msg_id: &str,
+) -> Result<
+    (
+        [u8; ARCHIVE_COMMITMENT_LEN],
+        OriginalSenderArchiveAttestationEnvelope,
+    ),
+    MLSError,
+> {
+    let cbor_aad = aad_bytes
+        .strip_prefix(CANONICAL_APP_AAD_PREFIX)
+        .ok_or_else(|| MLSError::Cryptography("application AAD is not canonical".into()))?;
+    let (conversation_id, message_id, commitment, attestation) =
+        canonical_aad_archive_evidence(cbor_aad)?;
+    if uuid::Uuid::parse_str(cid).ok() != Some(conversation_id)
+        || uuid::Uuid::parse_str(msg_id).ok() != Some(message_id)
+    {
+        return Err(MLSError::Cryptography(
+            "applicationAad names a different conversation or message".into(),
+        ));
+    }
+    Ok((commitment, attestation))
+}
+
 /// Extract `(body, canonical_json, verified_archive_commitment,
 /// original_sender_attestation)` from an OpenMLS `ApplicationMessage`
-/// plaintext and its `PrivateMessage` AAD (`Spec §5 I13`, `C33`).
+/// plaintext and its `PrivateMessage` AAD (`Spec §5 I13`, `C33`). A canonical application
+/// AAD always carries a verified commitment and attestation, matched by the encrypted frame.
 pub fn extract_plaintext_body_and_verify_aad(
     decrypted_bytes: &[u8],
     aad_bytes: &[u8],
@@ -383,127 +469,29 @@ pub fn extract_plaintext_body_and_verify_aad(
     MLSError,
 > {
     if let Some(cbor_aad) = aad_bytes.strip_prefix(CANONICAL_APP_AAD_PREFIX) {
-        let parsed_aad: CanonicalApplicationAadMap = serde_ipld_dagcbor::from_slice(cbor_aad)
+        let (_, _, commitment, attestation) = canonical_aad_archive_evidence(cbor_aad)?;
+        let inner: PrivateMessagePlaintextEnvelope = serde_json::from_slice(decrypted_bytes)
             .map_err(|e| {
-                MLSError::Cryptography(format!("invalid canonical applicationAad CBOR: {e}"))
-            })?;
-        let expected_commitment: Option<[u8; ARCHIVE_COMMITMENT_LEN]> = match parsed_aad
-            .archive_commitment
-        {
-            Some(CborByteVec(raw)) => Some(raw.as_slice().try_into().map_err(|_| {
-                MLSError::Cryptography(
-                    "I13 canonical applicationAad archiveCommitment must be 32 bytes".to_string(),
-                )
-            })?),
-            None => None,
-        };
-
-        if let Ok(inner) =
-            serde_json::from_slice::<PrivateMessagePlaintextEnvelope>(decrypted_bytes)
-        {
-            let verified = if let Some(expected) = expected_commitment {
-                let actual = labyrinth_protocol::receipt::compute_archive_commitment(
-                    &inner.frame_nonce,
-                    &inner.canonical_payload_bytes,
-                );
-                if !bool::from(actual.ct_eq(&expected)) {
-                    return Err(MLSError::Cryptography(
-                        "I13 canonical applicationAad archiveCommitment mismatch".to_string(),
-                    ));
-                }
-                Some(expected)
-            } else {
-                Some(labyrinth_protocol::receipt::compute_archive_commitment(
-                    &inner.frame_nonce,
-                    &inner.canonical_payload_bytes,
+                MLSError::Cryptography(format!(
+                    "I13: canonical applicationAad requires PrivateMessagePlaintextEnvelope: {e}"
                 ))
-            };
-            let aad_attestation = parsed_aad
-                .original_sender_attestation
-                .map(OriginalSenderArchiveAttestationEnvelope::try_from)
-                .transpose()?;
-            let attestation = match (
-                expected_commitment,
-                aad_attestation,
-                inner.original_sender_attestation,
-            ) {
-                (Some(commitment), Some(aad_attestation), Some(inner_attestation))
-                    if aad_attestation == inner_attestation =>
-                {
-                    let thread_id = parsed_aad
-                        .conversation_id
-                        .as_ref()
-                        .ok_or_else(|| {
-                            MLSError::Cryptography(
-                                "original sender attestation missing AAD conversationId".into(),
-                            )
-                        })
-                        .and_then(|value| {
-                            uuid::Uuid::from_slice(&value.0)
-                                .map(|id| id.hyphenated().to_string())
-                                .map_err(|_| {
-                                    MLSError::Cryptography(
-                                        "applicationAad conversationId must be UUID bytes".into(),
-                                    )
-                                })
-                        })?;
-                    let message_id = parsed_aad
-                        .message_id
-                        .as_ref()
-                        .ok_or_else(|| {
-                            MLSError::Cryptography(
-                                "original sender attestation missing AAD messageId".into(),
-                            )
-                        })
-                        .and_then(|value| {
-                            uuid::Uuid::from_slice(&value.0)
-                                .map(|id| id.hyphenated().to_string())
-                                .map_err(|_| {
-                                    MLSError::Cryptography(
-                                        "applicationAad messageId must be UUID bytes".into(),
-                                    )
-                                })
-                        })?;
-                    aad_attestation.verify(&thread_id, &message_id, &commitment)?;
-                    Some(aad_attestation)
-                }
-                (Some(_), _, _) => {
-                    return Err(MLSError::Cryptography(
-                        "original sender attestation missing or differs between MLS body and AAD"
-                            .into(),
-                    ));
-                }
-                (None, None, attestation) => attestation,
-                (None, Some(_), _) => {
-                    return Err(MLSError::Cryptography(
-                        "original sender attestation without archive commitment".into(),
-                    ));
-                }
-            };
-            let (body, json_str) = parse_canonical_message_body(&inner.canonical_payload_bytes)?;
-            return Ok((body, json_str, verified, attestation));
-        }
-
-        if expected_commitment.is_some() {
+            })?;
+        let actual = labyrinth_protocol::receipt::compute_archive_commitment(
+            &inner.frame_nonce,
+            &inner.canonical_payload_bytes,
+        );
+        if !bool::from(actual.ct_eq(&commitment)) {
             return Err(MLSError::Cryptography(
-                "I13: canonical applicationAad with archiveCommitment requires PrivateMessagePlaintextEnvelope"
-                    .to_string(),
+                "I13 canonical applicationAad archiveCommitment mismatch".to_string(),
             ));
         }
-
-        if let Ok(cbor_val) = serde_ipld_dagcbor::from_slice::<serde_json::Value>(decrypted_bytes) {
-            if let Some(text) = cbor_val
-                .get("text")
-                .and_then(|v| v.as_str())
-                .or_else(|| cbor_val.get("content").and_then(|v| v.as_str()))
-            {
-                let json_str = serde_json::to_string(&cbor_val)
-                    .unwrap_or_else(|_| serde_json::json!({ "text": text }).to_string());
-                return Ok((text.to_string(), json_str, None, None));
-            }
+        if inner.original_sender_attestation.as_ref() != Some(&attestation) {
+            return Err(MLSError::Cryptography(
+                "original sender attestation missing or differs between MLS body and AAD".into(),
+            ));
         }
-        let (body, json_str) = parse_canonical_message_body(decrypted_bytes)?;
-        return Ok((body, json_str, None, None));
+        let (body, json_str) = parse_canonical_message_body(&inner.canonical_payload_bytes)?;
+        return Ok((body, json_str, Some(commitment), Some(attestation)));
     }
 
     if let Some(cbor_aad) = aad_bytes.strip_prefix(DIRECT_REQUEST_APP_AAD_PREFIX) {
@@ -539,12 +527,8 @@ pub fn extract_plaintext_body_and_verify_aad(
             None
         };
         let (body, json_str) = parse_canonical_message_body(&inner.canonical_payload_bytes)?;
-        return Ok((
-            body,
-            json_str,
-            commitment,
-            inner.original_sender_attestation,
-        ));
+        // Outside a canonical AAD an attestation is never authenticated: it is not returned.
+        return Ok((body, json_str, commitment, None));
     }
 
     if !aad_bytes.is_empty() {
@@ -573,4 +557,93 @@ pub fn handle_account_deleted_event(
         tx.purge_labyrinth_queue_from_sender(deleted_did)?;
         Ok(purged)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use ed25519_dalek::Signer as _;
+
+    const CID: &str = "a1234567-89ab-4cde-8123-456789abcdef";
+    const MID: &str = "b2234567-89ab-4cde-8123-456789abcdef";
+    const OTHER_MID: &str = "c3234567-89ab-4cde-8123-456789abcdef";
+    const NONCE: [u8; FRAME_NONCE_LEN] = [9; FRAME_NONCE_LEN];
+    const PAYLOAD: &[u8] = br#"{"text":"hello"}"#;
+
+    /// `(decrypted envelope, canonical AAD)` for message `MID`, whose inner attestation is
+    /// signed over `attested_mid`; the AAD binds the archive evidence only if `aad_evidence`.
+    fn sealed(attested_mid: &str, aad_evidence: bool) -> (Vec<u8>, Vec<u8>) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let commitment = labyrinth_protocol::receipt::compute_archive_commitment(&NONCE, PAYLOAD);
+        let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+            CID,
+            attested_mid,
+            &commitment,
+        );
+        let attestation = OriginalSenderArchiveAttestationEnvelope {
+            sender_did: "did:plc:bob".into(),
+            sender_device_id: "b0b00000-0000-4000-8000-000000000001".into(),
+            sender_transport_public_key: key.verifying_key().to_bytes().to_vec(),
+            signature: key.sign(&transcript).to_bytes().to_vec(),
+        };
+        let id = |id: &str| STANDARD.encode(uuid::Uuid::parse_str(id).unwrap().as_bytes());
+        let mut aad = serde_json::json!({
+            "protocolVersion": "1", "conversationId": id(CID), "generation": 0, "messageId": id(MID),
+            "prior": {
+                "conversationId": id(CID), "generation": 0, "stateVersion": 0, "epoch": 1,
+                "groupId": { "$bytes": STANDARD.encode([3u8; 32]) },
+                "groupContextHash": { "$bytes": STANDARD.encode([2u8; 32]) },
+                "confirmationTag": { "$bytes": STANDARD.encode([1u8; 32]) }, "lifecycle": "active",
+            },
+        });
+        if aad_evidence {
+            aad["archiveCommitment"] = serde_json::json!({ "$bytes": STANDARD.encode(commitment) });
+            aad["originalSenderAttestation"] = attestation.to_aad_json();
+        }
+        let envelope = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
+            frame_nonce: NONCE,
+            canonical_payload_bytes: PAYLOAD.to_vec(),
+            original_sender_attestation: Some(attestation),
+        })
+        .unwrap();
+        let aad = crate::orchestrator::canonical_transport::canonical_application_aad_bytes(&aad)
+            .unwrap();
+        (envelope, aad)
+    }
+
+    /// R4: a canonical AAD yields only the attestation it binds and that verifies for its own
+    /// message; an unbound or forged inner attestation is an error, never returned.
+    #[test]
+    fn canonical_aad_returns_only_a_bound_verified_attestation() {
+        let (envelope, aad) = sealed(MID, true);
+        let (body, _, commitment, attestation) =
+            extract_plaintext_body_and_verify_aad(&envelope, &aad).unwrap();
+        assert_eq!(body, "hello");
+        assert!(commitment.is_some() && attestation.is_some());
+        for (attested_mid, aad_evidence) in [(MID, false), (OTHER_MID, false), (OTHER_MID, true)] {
+            let (envelope, aad) = sealed(attested_mid, aad_evidence);
+            let result = extract_plaintext_body_and_verify_aad(&envelope, &aad);
+            assert!(
+                result.is_err(),
+                "{attested_mid} bound={aad_evidence}: {result:?}"
+            );
+        }
+    }
+
+    /// R4: outside a canonical AAD nothing authenticates the inner attestation, so even a valid
+    /// one is never returned.
+    #[test]
+    fn non_canonical_aad_never_returns_an_attestation() {
+        let (envelope, _) = sealed(MID, true);
+        let legacy_aad = PrivateMessageAadEnvelope::for_payload(&NONCE, PAYLOAD)
+            .to_aad_bytes()
+            .unwrap();
+        for aad in [Vec::new(), legacy_aad] {
+            let (body, _, _, attestation) =
+                extract_plaintext_body_and_verify_aad(&envelope, &aad).unwrap();
+            assert_eq!(body, "hello");
+            assert!(attestation.is_none(), "AAD {aad:?}");
+        }
+    }
 }

@@ -137,12 +137,9 @@ MLSOrchestrator<S, A, C, M>
 On iOS/Android: each trait is a UniFFI callback interface (Swift/Kotlin provides the impl).
 On WASM/CLI: Rust implementations used directly.
 
-`CatbirdMlsClient` reserves each live application's sender generation and immutable
-send body in `pending_ops` before HTTP dispatch. A timeout may still publish that
-ciphertext. `sync()` recovers its plaintext and archive queue from the journal only
-after matching the exact ciphertext and verifying the sequencer receipt; it never
-decrypts or blindly skips an own-message echo. Imported history does not advance
-the live entry cursor.
+**Send order (seed 2323/3966 contract).** Every application send signs `(generation, epoch, sendCounter)`. Every send path (`CatbirdMlsClient`, `MLSOrchestrator`, web `WasmMlsClient`) reserves the per-conversation `sendCounter`, advances the OpenMLS sender ratchet and writes the immutable pre-HTTP send journal in `pending_ops`, all in one storage transaction. A timeout may still publish that ciphertext. On the first `StaleSend` the refused journal is deleted and the message is re-encrypted once at a fresh counter. On any further `StaleSend`, or a failed reservation, the refused journal is deleted immediately; refused bytes are never resubmitted. `GroupConfig` uses a sender-ratchet window of 10 out of order / 2,000 forward on every live create/join path.
+
+**Cursor rule.** `sync()` advances `last_seq` or acknowledges an entry only after verifying the entry's I13 receipt under the exact key ID it names, the original-sender attestation, and active-roster membership. This applies to every entry kind: an undecryptable current-epoch tombstone, `payloadPruned`, `already_have`, an own echo and a control entry. A missing local group is an error. `sync()` recovers an own echo's plaintext and archive queue from the journal only after matching the exact ciphertext and verifying the receipt; it never decrypts or blindly skips an own-message echo. Imported history does not advance the live entry cursor.
 
 Joined clients discover fulfillable leaf-recovery requests through
 `getConversationState.pendingLeafRecoveryRequests`; `getLeafRecoveryInbox` belongs
@@ -204,8 +201,9 @@ deletes it. A lost response keeps the journal.
 C33 openings use an encrypted version-2 envelope containing `frameNonce` and the
 canonical `MLSMessagePayload`. The signed publication and MLS AAD bind the same blinded
 `archiveCommitment`; the publication outcome and delivered entry must carry the I13
-sequencer receipt. The versioned publication-receipt key and `#mls-receipt-1` are
-independent trust checks. Incomplete legacy openings fail closed instead of becoming
+sequencer receipt. The publication-receipt key and the I13 receipt key are independent
+trust checks; each is resolved from the key ID in its own signed evidence (an exact retained
+`#mls-receipt-N` method), never a hardcoded `#mls-receipt-1`. Incomplete legacy openings fail closed instead of becoming
 unsigned archive frames.
 
 An imported opening is staged with its frame, nonce and I13 receipt (`c33_pending_opening:{cid}`).
@@ -236,11 +234,9 @@ can reserve a sender ratchet step.
 
 ### Native archive contract (Labyrinth over Spaces)
 
-**Status (2026-11-04).** This section describes the Task 4 R1 provisional commits, not the bookmark.
-- The bookmark `clean-slate-2026-10-31` is R0 (`79a40b5f`).
-- The Task 4 R1 commits on top of the bookmark (starting at `7ab0572d`) are provisional and unsealed. They add the verified directory and Space auth, witness copies, send-time rosters, C33 I13 evidence, deleted-account hiding, pruned C33 openings and `getBlob repo=`.
-- R1 builds only against labyrinth's provisional R1 commit (path dependency `../labyrinth`).
-- The final Task 4 gate has not passed.
+**Status (2026-11-07).** This section describes the unsealed Task 4 contract on top of the bookmark.
+- The bookmark `clean-slate-2026-10-31` is R0 (`79a40b5f`). The latest reviewed cut is `bb43b958`, built against `labyrinth@276c0972` (path dependency `../labyrinth`).
+- The independent R3 review of that cut failed. Fix Round 4 is changing this contract as described below; nothing is sealed.
 
 Protocol detail is in `../labyrinth/docs/SPACE_CONVERSATIONS.md` and `../labyrinth/docs/MLSDS_BACKEND.md`.
 
@@ -276,9 +272,9 @@ Rows are dequeued only after their page is written, so a retry can republish ide
 
 **Receiptless rows are not a production path.** A queued row without I13 evidence fails its conversation's native flush (`ReceiptCommitmentMismatch`) and stays queued, which also stalls the rows behind it. Production `create_group`, `send_message`, `add_group_members` and `remove_group_member` therefore reject a conversation, message or device ID that is not UUIDv4 with `InvalidInput` before any MLS, database or archive effect. `add_group_members` also rejects a call that names no other account with `InvalidInput`. Both membership calls fail with `GroupNotFound` for a conversation not held locally; neither returns an unchanged row or a silent `Ok`. The local-only `create_group_local_offline`, `send_message_local_offline` (the only producer of receiptless rows) and `remove_group_member_local_offline` compile only under `test`, `test-utils` or `sim`. They are taken only on a client opened with `open_offline_archive_for_test`, whose flush is `offline_flush_labyrinth_queue`, never the native flush. An ID's shape never selects them.
 
-**Owner fallback.** OwnerBatch is used only for `Forbidden` or an authenticated local kick or leave. `rescue_conversation_on_kick` runs from `sync()` after a verified Commit removed this device. It seals every local message from its retained evidence, plus the queued rows, with `archive_owner_committed`. A message without evidence fails the rescue. A missing active Space or conversation fails closed.
+**Owner fallback.** OwnerBatch is used only for `Forbidden` from the authenticated Space authority, or an authenticated local kick or leave. `rescue_conversation_on_kick` runs from `sync()` after a verified Commit removed this device. It seals each local message from its retained evidence, plus the queued rows, with `archive_owner_committed`. A message whose own evidence fails validation is skipped and recorded in `native.rescue-report:{cid}` (`skippedEvidenceIds`); the rest are rescued. A transport, directory or Space failure fails the rescue and keeps the rows for retry. A missing active Space or conversation fails closed.
 
-**Restore.** `restore_conversation_from_owner_mailbox` restores an active member from the conversation Space (sender and witness copies). It uses owner copies when the authenticated Space denies access, the verified local roster lacks this account, or an exact authenticated `ConversationNotFound` accompanies the absence of local MLS state. A fresh device receiving exact HTTP 400 `NotEntitled` must first open authenticated owner evidence, recover its receipt-bound Space pin, and confirm denial through that Space; generic 400, authentication and directory failures fail closed.
+**Restore.** `restore_conversation_from_owner_mailbox` restores an active member from the conversation Space (sender and witness copies). It uses owner copies only when the authenticated Space denies access or the verified local roster lacks this account. A fresh device that gets HTTP 400 `NotEntitled` or `ConversationNotFound` from its home DS treats that answer only as a lead. It must first open authenticated owner evidence, recover its receipt-bound Space pin, and confirm denial through that Space. An unsigned home-DS 4xx is never denial evidence. Generic 400, authentication and directory failures fail closed.
 - Any undecryptable or unverified frame fails the restore.
 - Rejected witness copies are logged and ignored.
 - When copies of one message ID disagree, the copy equal to the local message wins; with no local match, that ID is skipped.

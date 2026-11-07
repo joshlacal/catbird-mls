@@ -257,29 +257,37 @@ impl DeterministicMockTransport {
         }
 
         if url.contains("blue.catbird.chat.enrollDevice") {
-            if let Some(ref b) = request.body {
-                if let Ok(req_json) = serde_json::from_slice::<serde_json::Value>(b) {
-                    let sbody = req_json.pointer("/signedRequest/body").unwrap_or(&req_json);
-                    if let Some(did) = sbody["actorDid"].as_str() {
-                        let pk = &sbody["signaturePublicKey"];
-                        let wrapped_pk = if pk.is_string() {
-                            serde_json::json!({ "$bytes": pk })
-                        } else {
-                            pk.clone()
-                        };
-                        self.chat_device_pubkeys
-                            .lock()
-                            .unwrap()
-                            .entry(did.to_string())
-                            .or_default()
-                            .push(serde_json::json!({ "signingPublicKey": wrapped_pk }));
-                    }
-                }
+            let req_json: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}"))
+                    .unwrap_or_default();
+            let sbody = req_json.pointer("/signedRequest/body").unwrap_or(&req_json);
+            let pk = &sbody["signaturePublicKey"];
+            let wrapped_pk = if pk.is_string() {
+                serde_json::json!({ "$bytes": pk })
+            } else {
+                pk.clone()
+            };
+            if let Some(did) = sbody["actorDid"].as_str() {
+                self.chat_device_pubkeys
+                    .lock()
+                    .unwrap()
+                    .entry(did.to_string())
+                    .or_default()
+                    .push(serde_json::json!({ "signingPublicKey": wrapped_pk.clone() }));
             }
-            return Ok(json_ok(serde_json::json!({
-                "enrolled": true,
-                "authGeneration": 1
-            })));
+            // `mls-ds` answers the registered `deviceView`.
+            let key = catbird_mls::client::chat_wire::json_bytes(pk).unwrap_or_default();
+            return Ok(json_ok(serde_json::json!({ "device": {
+                "deviceId": sbody["deviceId"],
+                "keyId": catbird_mls::orchestrator::canonical_transport::derive_key_id(&key),
+                "signaturePublicKey": wrapped_pk,
+                "authGeneration": 1,
+                "status": "active",
+                "createdAt": "2026-11-03T00:00:00.000Z",
+                "updatedAt": "2026-11-03T00:00:00.000Z",
+                "availablePackageCount": 2,
+                "reservedPackageCount": 0,
+            }})));
         }
 
         if url.contains("blue.catbird.chat.publishDirectRequestKeys") {
@@ -326,10 +334,18 @@ impl DeterministicMockTransport {
                     }),
                 );
             }
-            return Ok(json_ok(serde_json::json!({
-                "seq": 1,
-                "coordinates": next_coords
-            })));
+            // `mls-ds` answers `{result}` carrying the creation entry it sequenced at seq 1.
+            return Ok(json_ok(serde_json::json!({ "result": {
+                "$type": "blue.catbird.chat.defs#conversationCreatedResult",
+                "coordinates": next_coords,
+                "entry": {
+                    "entryId": sbody["transitionId"],
+                    "conversationId": sbody["conversationId"],
+                    "seq": 1,
+                    "signedRequest": req_json["signedRequest"],
+                    "receivedAt": sbody["signedAt"],
+                },
+            }})));
         }
 
         if url.contains("blue.catbird.chat.getConversationState") {
@@ -782,9 +798,12 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // is the native LabyrinthSession sealing the I13 `ArchivedReceipt { signed, generation }`
     // against the account-bound native Space host, and a solo-group flush makes no Space reads.
     // Moved again for seed 2323: every `sendMessage` body now signs its `sendCounter`.
+    // Moved again in R4 (two separate processes agree): enrollment checks the `enrollDevice`
+    // answer before any PDS write, so the device and declaration `putRecord`s now follow
+    // `enrollDevice` on the wire instead of preceding it.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "47f3e88362957e2e5ae0c7fb31e7b381ef88e5fd0410b5bd27c8956da4c1e47d",
+        "7a1856748d1703c488022b26a70c44e94ecacc9b8769a3fb034a2f44fa5eefab",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -847,10 +866,13 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
     // mailbox reads became authenticated (`native_archive_space.rs`: a PoP-bound Space credential
     // and a Want-MAC KEM share per read, drawn from SimEntropy) against the account-bound
     // `NativeArchiveAuthFixture`, shifting the seeded draws and clock ticks that precede the
-    // device/epoch/virtualDevice records.
+    // device/epoch/virtualDevice records. Moved again in R4 (three separate processes agree; seed
+    // 8_492_015 gives cd9923e7…): ordinary rotation now lists the mailbox's virtual devices twice
+    // (the report's recovery-method names, CB-39 expiry), two more authenticated reads ahead of
+    // epoch 1 and the recovery code.
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "49abb8fe1314e29aa22f5dc13a755267d14bcabd262fe62ee93349f82e9020fc",
+        "65a1a44dbd162bc10bc7e01722f82e2d497696e855a2023d9371114843466efd",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }

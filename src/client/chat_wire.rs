@@ -173,18 +173,8 @@ pub fn verify_signed_mutation_body(
     kind: SignedMutationKind,
     public_key: &[u8],
 ) -> Result<serde_json::Value, MLSError> {
-    let wrapper_name = match kind {
-        SignedMutationKind::CommitTransition => "signedCommitTransition",
-        SignedMutationKind::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
-        SignedMutationKind::PolicyTransition => "signedPolicyTransition",
-        SignedMutationKind::ConversationClose => "signedConversationClose",
-        SignedMutationKind::ApplicationSend => "signedApplicationSend",
-        _ => {
-            return Err(MLSError::Cryptography(
-                "unexpected signed transition kind".into(),
-            ))
-        }
-    };
+    let wrapper_name = signed_wrapper_name(kind)
+        .ok_or_else(|| MLSError::Cryptography("unexpected signed transition kind".into()))?;
     let mut normalized =
         normalize_read_presentation(&serde_json::to_vec(signed_request)?, wrapper_name, false)
             .map_err(|e| MLSError::Cryptography(format!("normalize signed transition: {e}")))?;
@@ -200,6 +190,395 @@ pub fn verify_signed_mutation_body(
     VerifiedMutation::verify(projected, wrapper.signature, public_key)
         .map_err(|e| MLSError::Cryptography(format!("verify signed transition: {e}")))?;
     Ok(normalized["body"].take())
+}
+
+/// Authenticate this device's own sequenced transition under its signer before any own-echo
+/// shortcut: the entry's actor labels are only a routing hint.
+pub fn verify_own_commit_body(
+    signed_request: &Value,
+    public_key: &[u8],
+) -> Result<Value, MLSError> {
+    let kind = signed_request
+        .pointer("/body/$type")
+        .and_then(Value::as_str)
+        .and_then(SignedMutationKind::from_type_id)
+        .ok_or_else(|| MLSError::Cryptography("own Commit has no signed mutation kind".into()))?;
+    verify_signed_mutation_body(signed_request, kind, public_key)
+}
+
+/// An own Commit-bearing transition journaled before HTTP (`pending_ops` kind
+/// `commit_transition`, keyed by `transition_id`): the staged MLS batch an accepted answer or
+/// its own sequenced echo applies. Native and `wasm32` clients share this one shape.
+#[derive(Serialize, Deserialize)]
+pub struct PendingCommitTransition {
+    pub conversation_id: String,
+    pub transition_id: String,
+    pub commit_sha256: [u8; 32],
+    pub prior: Value,
+    pub next: Value,
+    pub kv_batch: crate::storage::KvWriteBatch,
+    #[serde(default)]
+    pub removed_participant_did: Option<String>,
+}
+
+/// The signed wrapper definition that carries `kind` in a conversation entry or an answer.
+fn signed_wrapper_name(kind: SignedMutationKind) -> Option<&'static str> {
+    use SignedMutationKind as K;
+    Some(match kind {
+        K::ApplicationSend => "signedApplicationSend",
+        K::Creation => "signedCreation",
+        K::CommitTransition => "signedCommitTransition",
+        K::PolicyTransition => "signedPolicyTransition",
+        K::MetadataTransition => "signedMetadataTransition",
+        K::ParticipantAcceptance => "signedParticipantAcceptance",
+        K::ConversationClose => "signedConversationClose",
+        K::ResetRequest => "signedResetRequest",
+        K::ResetActivation => "signedResetActivation",
+        K::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
+        K::LeaveRequest => "signedLeaveRequest",
+        K::ZeroLeafLeave => "signedZeroLeafLeave",
+        K::LeaveCancellation => "signedLeaveCancellation",
+        K::LeaveCommitFulfillment => "signedLeaveCommitFulfillment",
+        _ => return None,
+    })
+}
+
+/// The `#conversationEntry` arm whose `signedRequest` is a `kind` body.
+pub fn entry_kind_of(kind: SignedMutationKind) -> Option<&'static str> {
+    use crate::chat_v2::wire as w;
+    use SignedMutationKind as K;
+    Some(match kind {
+        K::ApplicationSend => w::APPLICATION_ENTRY_KIND,
+        K::Creation => w::CREATION_ENTRY_KIND,
+        K::CommitTransition => w::COMMIT_ENTRY_KIND,
+        K::PolicyTransition => w::POLICY_ENTRY_KIND,
+        K::MetadataTransition => w::METADATA_ENTRY_KIND,
+        K::ParticipantAcceptance => w::PARTICIPANT_ACCEPTANCE_ENTRY_KIND,
+        K::ConversationClose => w::CONVERSATION_CLOSE_ENTRY_KIND,
+        K::ResetRequest => w::RESET_REQUEST_ENTRY_KIND,
+        K::ResetActivation => w::RESET_ACTIVATION_ENTRY_KIND,
+        K::LeafRecoveryFulfillment => w::LEAF_RECOVERY_FULFILLMENT_ENTRY_KIND,
+        K::LeaveRequest => w::LEAVE_REQUEST_ENTRY_KIND,
+        K::ZeroLeafLeave => w::ZERO_LEAF_LEAVE_ENTRY_KIND,
+        K::LeaveCancellation => w::LEAVE_CANCELLATION_ENTRY_KIND,
+        K::LeaveCommitFulfillment => w::LEAVE_COMMIT_FULFILLMENT_ENTRY_KIND,
+        _ => return None,
+    })
+}
+
+/// The signed kind of a sequenced entry, read from its signed body (unverified until the caller
+/// verifies that body under the kind's authority). A labelled entry must be the arm that carries
+/// that body, so a relabelled entry never borrows another kind's effects.
+pub fn signed_entry_kind(entry: &Value) -> Result<SignedMutationKind, MLSError> {
+    let kind = entry
+        .pointer("/signedRequest/body/$type")
+        .and_then(Value::as_str)
+        .and_then(SignedMutationKind::from_type_id)
+        .filter(|kind| entry_kind_of(*kind).is_some())
+        .ok_or_else(|| {
+            MLSError::Cryptography("entry carries no signed conversation body".into())
+        })?;
+    match entry.get("$type") {
+        Some(label) if label.as_str() != entry_kind_of(kind) => Err(MLSError::Cryptography(
+            "entry kind differs from its signed body".into(),
+        )),
+        _ => Ok(kind),
+    }
+}
+
+/// `to` is `from` with `stateVersion + 1` and lifecycle `to_lifecycle`, every other coordinate
+/// equal, both bound to `cid`, `from` active. Policy, metadata, acceptance and zero-leaf leave
+/// step to `active`; a close retires to `superseded`. Returns the canonical `to`.
+pub fn verify_coordinate_step(
+    from: &Value,
+    to: &Value,
+    cid: &str,
+    to_lifecycle: &str,
+) -> Result<Value, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("coordinate step: {what}"));
+    if from["conversationId"].as_str() != Some(cid) || to["conversationId"].as_str() != Some(cid) {
+        return Err(refused("not this conversation"));
+    }
+    if from["lifecycle"].as_str() != Some("active")
+        || to["lifecycle"].as_str() != Some(to_lifecycle)
+    {
+        return Err(refused("lifecycle"));
+    }
+    let from = canonicalize_wire_coordinate(from, None)?;
+    let to = canonicalize_wire_coordinate(to, None)?;
+    let mut expected = from.clone();
+    expected["stateVersion"] = json!(from["stateVersion"]
+        .as_i64()
+        .and_then(|version| version.checked_add(1))
+        .ok_or_else(|| refused("stateVersion"))?);
+    expected["lifecycle"] = json!(to_lifecycle);
+    if to != expected {
+        return Err(refused("changes more than stateVersion"));
+    }
+    Ok(to)
+}
+
+/// [`verify_coordinate_step`] from a verified body's `prior` to its active `next`.
+pub fn verify_state_version_step(body: &Value, cid: &str) -> Result<Value, MLSError> {
+    verify_coordinate_step(&body["prior"], &body["next"], cid, "active")
+}
+
+/// The invitation `invitee` holds in a verified `creationBody` or `policyTransitionBody` of
+/// `cid`: its one pending row, whose provenance names exactly this transition and its signer.
+/// `None` when the body invites no such row.
+pub fn invitation_provenance(
+    kind: SignedMutationKind,
+    body: &Value,
+    cid: &str,
+    invitee: &str,
+) -> Option<Value> {
+    let rows = match kind {
+        SignedMutationKind::Creation if body["conversationId"].as_str() == Some(cid) => {
+            &body["manifest"]["participants"]
+        }
+        SignedMutationKind::PolicyTransition
+            if body["prior"]["conversationId"].as_str() == Some(cid) =>
+        {
+            &body["participantChanges"]
+        }
+        _ => return None,
+    };
+    if body["next"]["conversationId"].as_str() != Some(cid) {
+        return None;
+    }
+    let mut matching = rows
+        .as_array()?
+        .iter()
+        .filter(|row| row["userDid"].as_str() == Some(invitee));
+    let row = matching.next()?;
+    if matching.next().is_some()
+        || row["status"] != "pending"
+        || (kind == SignedMutationKind::PolicyTransition
+            && row["$type"] != "blue.catbird.chat.defs#addParticipant")
+    {
+        return None;
+    }
+    let provenance = &row["invitationProvenance"];
+    (provenance["invitationTransitionId"] == body["transitionId"]
+        && provenance["invitedByDid"] == body["actorDid"]
+        && provenance["invitedByDeviceId"] == body["actorDeviceId"])
+        .then(|| provenance.clone())
+}
+
+/// The verified `leafRecoveryFulfillmentBody` of `cid` that produced `welcome` for exactly
+/// `(did, device)`: its signed bundle carries these Welcome bytes and digest, delivered only to
+/// that device, whose `addLeafByRecovery` the Commit makes under the request the bundle names.
+/// Returns its canonical `next`: the coordinate the joined group must name.
+pub fn fulfillment_welcome_next(
+    body: &Value,
+    cid: &str,
+    welcome: &[u8],
+    did: &str,
+    device: &str,
+) -> Result<Value, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("recovery Welcome: {what}"));
+    if body["prior"]["conversationId"].as_str() != Some(cid)
+        || body["next"]["conversationId"].as_str() != Some(cid)
+    {
+        return Err(refused("not this conversation's fulfillment"));
+    }
+    let request = &body["recoveryRequestId"];
+    let manifest = &body["manifest"];
+    let bundle = &manifest["welcomeBundle"];
+    let deliveries = bundle["deliveries"]
+        .as_array()
+        .ok_or_else(|| refused("deliveries"))?;
+    let adds_device = manifest["leafChanges"]
+        .as_array()
+        .ok_or_else(|| refused("leafChanges"))?
+        .iter()
+        .any(|change| {
+            change["$type"] == "blue.catbird.chat.defs#addLeafByRecovery"
+                && change["userDid"] == did
+                && change["deviceId"] == device
+                && change["recoveryRequestId"] == *request
+        });
+    if !request.is_string()
+        || manifest["leafRecoveryRequestId"] != *request
+        || !adds_device
+        || deliveries.len() != 1
+        || deliveries[0]["recipientDid"] != did
+        || deliveries[0]["recipientDeviceId"] != device
+        || deliveries[0]["provenance"]["recoveryRequestId"] != *request
+        || json_bytes(&bundle["opaqueWelcome"])? != welcome
+        || json_bytes(&bundle["sha256"])? != Sha256::digest(welcome).as_slice()
+    {
+        return Err(refused("not this device's Welcome"));
+    }
+    canonicalize_wire_coordinate(&body["next"], None)
+}
+
+/// A canonical coordinate names exactly `group`'s MLS state: group ID, epoch, GroupContext hash
+/// and confirmation tag. Generation and `stateVersion` have no MLS counterpart.
+pub fn require_coordinate_names_group<P: OpenMlsProvider>(
+    coordinate: &Value,
+    group: &MlsGroup,
+    provider: &P,
+) -> Result<(), MLSError> {
+    let (gch, tag) = compute_group_context_hash_and_tag(group, provider)?;
+    if json_bytes(&coordinate["groupId"])? != group.group_id().as_slice()
+        || coordinate["epoch"].as_u64() != Some(group.epoch().as_u64())
+        || json_bytes(&coordinate["groupContextHash"])? != gch
+        || json_bytes(&coordinate["confirmationTag"])? != tag
+    {
+        return Err(MLSError::Cryptography(
+            "coordinate does not name the local MLS state".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The key of `(did, device)`'s current leaf in `group` when that is the device's authorized
+/// key: PDS authorization alone grants no conversation authority, and a leaf whose key the PDS
+/// does not authorize grants none either.
+pub fn authorized_leaf_key(
+    group: &MlsGroup,
+    did: &str,
+    device: &str,
+    authorized_by_did: &BTreeMap<String, Vec<(String, Vec<u8>)>>,
+) -> Result<Vec<u8>, MLSError> {
+    group
+        .members()
+        .find(|member| {
+            parse_scoped_credential_did_device(member.credential.serialized_content())
+                .is_ok_and(|(leaf_did, leaf_device)| leaf_did == did && leaf_device == device)
+        })
+        .map(|member| member.signature_key)
+        .filter(|key| authorized_device_key(did, device, authorized_by_did) == Some(key.as_slice()))
+        .ok_or_else(|| {
+            MLSError::Cryptography(
+                "I4: control entry signer is not an authorized current leaf".into(),
+            )
+        })
+}
+
+/// The PDS-authorized signing key of exactly `(did, device)`.
+pub fn authorized_device_key<'a>(
+    did: &str,
+    device: &str,
+    authorized_by_did: &'a BTreeMap<String, Vec<(String, Vec<u8>)>>,
+) -> Option<&'a [u8]> {
+    authorized_by_did
+        .get(did)?
+        .iter()
+        .find(|(authorized, _)| authorized == device)
+        .map(|(_, key)| key.as_slice())
+}
+
+/// Inner deletion record transcript retained by the server's v2 authority signature.
+const ACCOUNT_DELETION_DOMAIN: &[u8] = b"catbird-mls-account-deletion-v1\0";
+/// Signature domain that binds the exact retained receipt verification method to the deletion.
+const ACCOUNT_DELETION_AUTHORITY_DOMAIN: &[u8] = b"catbird-mls-account-deletion-authority-v2\0";
+
+fn append_account_deletion_text(bytes: &mut Vec<u8>, text: &str) -> Option<()> {
+    bytes.extend_from_slice(&u32::try_from(text.len()).ok()?.to_be_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+    Some(())
+}
+
+/// Server transcript: v2 domain, key ID, then the complete v1 deletion record transcript.
+fn account_deletion_authority_signing_bytes(key_id: &str, fields: &[&str]) -> Option<Vec<u8>> {
+    let fields_len = fields.iter().try_fold(0usize, |len, field| {
+        len.checked_add(4)?.checked_add(field.len())
+    })?;
+    let capacity = ACCOUNT_DELETION_AUTHORITY_DOMAIN
+        .len()
+        .checked_add(4)?
+        .checked_add(key_id.len())?
+        .checked_add(ACCOUNT_DELETION_DOMAIN.len())?
+        .checked_add(fields_len)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(ACCOUNT_DELETION_AUTHORITY_DOMAIN);
+    append_account_deletion_text(&mut bytes, key_id)?;
+    bytes.extend_from_slice(ACCOUNT_DELETION_DOMAIN);
+    for field in fields {
+        append_account_deletion_text(&mut bytes, field)?;
+    }
+    Some(bytes)
+}
+
+fn account_deletion_signature_valid(
+    public_key: &[u8],
+    signature: &[u8],
+    key_id: &str,
+    fields: &[&str],
+) -> bool {
+    let Some(message) = account_deletion_authority_signing_bytes(key_id, fields) else {
+        return false;
+    };
+    p256::ecdsa::Signature::from_slice(signature)
+        .ok()
+        .filter(|signature| signature.normalize_s().is_none())
+        .zip(p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).ok())
+        .is_some_and(|(signature, key)| {
+            use p256::ecdsa::signature::Verifier as _;
+            key.verify(&message, &signature).is_ok()
+        })
+}
+
+/// `labyrinth_state` key: `cid` sequenced `did`'s account deletion; the value is its seq.
+pub fn account_deletion_key(cid: &str, did: &str) -> String {
+    format!("native.account_deleted:{cid}:{did}")
+}
+
+fn non_empty_text(value: &Value) -> Option<&str> {
+    value.as_str().filter(|s| !s.is_empty())
+}
+
+/// The exact versioned receipt method (`sequencerAuthority.keyId`) of an `accountDeletedEntry`
+/// bound to `cid` and the conversation's pinned `sequencer_did`. `None` for any other entry: it
+/// never has an effect.
+pub fn account_deleted_entry_key_id<'a>(
+    cid: &str,
+    sequencer_did: &str,
+    entry: &'a Value,
+) -> Option<&'a str> {
+    let sequencer = sequencer_did.split('#').next().unwrap_or(sequencer_did);
+    let authority = &entry["sequencerAuthority"];
+    entry["seq"].as_i64().filter(|seq| *seq > 0)?;
+    let key_id = non_empty_text(&authority["keyId"])?;
+    labyrinth_protocol::receipt::receipt_key_generation(sequencer, key_id).ok()?;
+    non_empty_text(&entry["deletedDid"])?;
+    non_empty_text(&entry["entryId"])?;
+    non_empty_text(&entry["receivedAt"])?;
+    (entry
+        .get("$type")
+        .is_none_or(|t| t == crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND)
+        && non_empty_text(&entry["conversationId"]) == Some(cid)
+        && non_empty_text(&entry["sequencerDid"]) == Some(sequencer)
+        && non_empty_text(&authority["sequencerDid"]) == Some(sequencer))
+    .then_some(key_id)
+}
+
+/// Verify the low-S ES256 v2 `sequencerAuthority` of an `accountDeletedEntry` under the key of
+/// the method [`account_deleted_entry_key_id`] named. Returns the deleted DID and seq.
+pub fn verify_account_deleted_entry_signature(
+    cid: &str,
+    sequencer_did: &str,
+    entry: &Value,
+    authority_key_sec1: &[u8],
+) -> Option<(String, i64)> {
+    let sequencer = sequencer_did.split('#').next().unwrap_or(sequencer_did);
+    let key_id = account_deleted_entry_key_id(cid, sequencer_did, entry)?;
+    let seq = entry["seq"].as_i64()?;
+    let deleted_did = non_empty_text(&entry["deletedDid"])?;
+    let seq_text = seq.to_string();
+    let fields = [
+        sequencer,
+        cid,
+        deleted_did,
+        seq_text.as_str(),
+        non_empty_text(&entry["entryId"])?,
+        non_empty_text(&entry["receivedAt"])?,
+    ];
+    let signature = json_bytes(&entry["sequencerAuthority"]["signature"]).ok()?;
+    account_deletion_signature_valid(authority_key_sec1, &signature, key_id, &fields)
+        .then(|| (deleted_did.to_owned(), seq))
 }
 
 /// Format current UTC wall-clock time as canonical RFC 3339 milliseconds (`YYYY-MM-DDTHH:MM:SS.sssZ`).
@@ -646,8 +1025,9 @@ pub fn decode_p256_sec1_from_did_doc(
     )))
 }
 
-/// Verify an `I13` ES256 `sequencerReceipt` wire JSON object against `{sequencer_did}#mls-receipt-1`
-/// and return `(seq, generation, archived_receipt_json)` ready for `labyrinth::message::seal_sender_committed`.
+/// Verify an `I13` ES256 `sequencerReceipt` wire JSON object under `sec1_pubkey`, the retained
+/// method its exact `kid` names ([`sequencer_receipt_kid`]), and return
+/// `(seq, generation, archived_receipt_json)` ready for `labyrinth::message::seal_sender_committed`.
 #[allow(clippy::too_many_arguments)]
 pub fn parse_and_verify_i13_sequencer_receipt(
     receipt_val: &Value,
@@ -794,6 +1174,102 @@ pub fn parse_and_verify_i13_sequencer_receipt(
         .map_err(|e| MLSError::Internal(format!("serialize StoredArchivedReceipt JSON: {e}")))?;
 
     Ok((seq, generation, archived_json))
+}
+
+/// The exact versioned method (`kid`) that signed an `I13` receipt: required, and a valid
+/// `{sequencer_did}#mls-receipt-<generation>` of the conversation's sequencer. Callers resolve
+/// that retained method; there is no default generation.
+pub fn sequencer_receipt_kid<'a>(
+    sequencer_did: &str,
+    receipt: &'a Value,
+) -> Result<&'a str, MLSError> {
+    let sequencer = sequencer_did.split('#').next().unwrap_or(sequencer_did);
+    let kid = receipt
+        .get("kid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MLSError::Cryptography("sequencerReceipt missing kid".into()))?;
+    labyrinth_protocol::receipt::receipt_key_generation(sequencer, kid)
+        .map_err(|e| MLSError::Cryptography(format!("sequencerReceipt kid: {e}")))?;
+    Ok(kid)
+}
+
+/// SEC1 key of the sequencer's current receipt method, the highest retained
+/// `{sequencer_did}#mls-receipt-<generation>` in its DID document. Only a pin made before any
+/// receipt exists uses it; a received receipt verifies under the method its own `kid` names.
+pub fn current_sequencer_receipt_key(
+    did_doc_bytes: &[u8],
+    sequencer_did: &str,
+) -> Result<Vec<u8>, MLSError> {
+    let doc: Value = serde_json::from_slice(did_doc_bytes)
+        .map_err(|e| MLSError::Cryptography(format!("invalid DID document JSON: {e}")))?;
+    let kid = doc["verificationMethod"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|method| method["id"].as_str())
+        .filter_map(|id| {
+            let kid = if id.starts_with('#') {
+                format!("{sequencer_did}{id}")
+            } else {
+                id.to_owned()
+            };
+            labyrinth_protocol::receipt::receipt_key_generation(sequencer_did, &kid)
+                .ok()
+                .map(|generation| (generation, kid))
+        })
+        .max_by_key(|(generation, _)| *generation)
+        .map(|(_, kid)| kid)
+        .ok_or_else(|| {
+            MLSError::Cryptography(format!(
+                "DID document for `{sequencer_did}` has no receipt verification method"
+            ))
+        })?;
+    decode_p256_sec1_from_did_doc(did_doc_bytes, sequencer_did, &kid)
+}
+
+/// A `payloadPruned` application entry this device holds no evidence for: only its signed
+/// receipt remains. It must name this conversation, group, entry and seq under `sec1_pubkey`
+/// (its own `kid`). Its epoch and commitment can only be self-bound, and a pruned entry carries
+/// no sender attestation.
+pub fn verify_pruned_application_receipt(
+    receipt: &Value,
+    sec1_pubkey: &[u8],
+    sequencer_did: &str,
+    conversation_id: &str,
+    group_id: &[u8],
+    entry_id: &str,
+    entry_seq: i64,
+) -> Result<(), MLSError> {
+    let epoch = receipt
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| MLSError::Cryptography("sequencerReceipt missing epoch".into()))?;
+    let commitment: [u8; 32] = json_bytes(receipt.get("archiveCommitment").ok_or_else(|| {
+        MLSError::Cryptography("sequencerReceipt missing archiveCommitment".into())
+    })?)?
+    .try_into()
+    .map_err(|_| {
+        MLSError::Cryptography("sequencerReceipt archiveCommitment must be 32 bytes".into())
+    })?;
+    // The message id only binds a sender attestation, which a pruned entry no longer has.
+    let (seq, _, _) = parse_and_verify_i13_sequencer_receipt(
+        receipt,
+        sec1_pubkey,
+        sequencer_did,
+        conversation_id,
+        group_id,
+        epoch,
+        entry_id,
+        entry_id,
+        &commitment,
+        None,
+    )?;
+    if i64::try_from(seq).ok() != Some(entry_seq) {
+        return Err(MLSError::Cryptography(format!(
+            "I13: pruned entry receipt seq {seq} != entry seq {entry_seq}"
+        )));
+    }
+    Ok(())
 }
 
 /// JSON-serializable persistence wrapper for a verified `I13` `ArchivedReceipt`.
@@ -1137,6 +1613,72 @@ pub fn sign_direct_request_wrapper(
     Ok(wrapper)
 }
 
+/// Verify a signed `C33` outcome under the coordinator's receipt key; returns its receipt.
+pub fn verify_c33_outcome(
+    outcome: &Value,
+    authority_did: &str,
+    authority_key: &[u8],
+) -> Result<Value, MLSError> {
+    let outcome = dr_transcript::normalize_read_presentation(
+        &serde_json::to_vec(outcome)?,
+        "signedDirectRequestReceipt",
+        outcome.get("$type").is_some(),
+    )
+    .map_err(|e| MLSError::Cryptography(format!("C33 outcome: {e}")))?;
+    let verified = dr_transcript::verify_signed_request_for_authority(
+        authority_did,
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&outcome)?,
+        authority_key,
+    )
+    .map_err(|e| MLSError::Cryptography(format!("C33 outcome signature: {e}")))?;
+    Ok(verified.body()["receipt"].clone())
+}
+
+/// The error code of a verified receipt that ends this attempt without publication, bound like
+/// a publication receipt: the journaled request and its preparation digest, its actor, and the
+/// digest of the journaled prepare (or sent publication) that triggered it. `None` for a
+/// publication receipt; any other kind or binding fails closed.
+pub fn c33_terminal_receipt_code(
+    receipt: &Value,
+    prepare: &dr_transcript::VerifiedDirectRequest,
+    publication: Option<&dr_transcript::VerifiedDirectRequest>,
+) -> Result<Option<String>, MLSError> {
+    let code = match receipt["$type"].as_str() {
+        Some("blue.catbird.chat.defs#directRequestPublishedReceipt") => return Ok(None),
+        Some("blue.catbird.chat.defs#directRequestRejectedReceipt") => receipt["code"].as_str(),
+        Some("blue.catbird.chat.defs#directRequestExpiredReceipt") => Some("PreparationExpired"),
+        Some("blue.catbird.chat.defs#directRequestExistingDirectReceipt") => Some("ExistingDirect"),
+        _ => None,
+    };
+    let digest =
+        |request: &dr_transcript::VerifiedDirectRequest| STANDARD.encode(request.request_digest());
+    let trigger = match receipt["requestKind"].as_str() {
+        Some("prepare") => Some(prepare),
+        Some("publish") => publication,
+        // A lease expiry is bound to the prepare, a published request's expiry to its publication.
+        Some("expiry") => [Some(prepare), publication]
+            .into_iter()
+            .flatten()
+            .find(|&request| receipt["requestDigest"] == digest(request)),
+        _ => None,
+    };
+    let p = prepare.body();
+    let bound = trigger.is_some_and(|request| receipt["requestDigest"] == digest(request))
+        && receipt["requestId"] == p["requestId"]
+        && receipt["preparationRequestDigest"] == digest(prepare)
+        && receipt["actorDid"] == p["actorDid"]
+        && receipt["actorDeviceId"] == p["actorDeviceId"]
+        && receipt["actorKeyId"] == p["keyId"]
+        && receipt["authGeneration"] == p["authGeneration"];
+    match code {
+        Some(code) if bound => Ok(Some(code.to_owned())),
+        _ => Err(MLSError::Cryptography(
+            "C33 outcome binding mismatch".into(),
+        )),
+    }
+}
+
 /// Normalize a JSON coordinate object so `$bytes` fields are consistently formatted for canonical
 /// mutations (`prior` / `next` in `submitTransition` and `sendMessage`).
 pub fn canonicalize_wire_coordinate(
@@ -1415,17 +1957,18 @@ fn deterministic_tid_wire(timestamp_ms: i64, sub_seq: u64, discriminator: &str) 
         .collect()
 }
 
-/// Build `(convo_space_uri, apply_writes_json_bytes)` for `com.atproto.space.applyWrites`
-/// using `labyrinth::message::seal_sender_committed` when a verified `sequencer_receipt_json`
-/// and 32-byte `frame_nonce_b64` are present (`I13`, `D4`).
+/// Build `(convo_space_uri, apply_writes_json_bytes)` for `com.atproto.space.applyWrites`: one
+/// `labyrinth::message::seal_sender_committed` frame under `mek`, written into the conversation
+/// Space as `repo_did` (the writing account, not necessarily the message's sender). The payload
+/// must carry its 32-byte frame nonce, verified I13 receipt and original sender attestation, and
+/// the receipt must retain that exact attestation (`I13`, `D4`); anything else is not archivable.
 #[cfg(feature = "labyrinth")]
 pub fn build_space_apply_writes_for_queue_payload(
     payload: &crate::client::QueuedLabyrinthArchivePayload,
-    mek_secret_32: [u8; 32],
+    mek: &labyrinth::mek::Mek,
     signer: &SignatureKeyPair,
+    repo_did: &str,
 ) -> Result<(String, Vec<u8>), MLSError> {
-    use zeroize::Zeroizing;
-
     struct WireTransportSigner<'a>(&'a SignatureKeyPair, [u8; 32]);
     impl labyrinth::sign::TransportSigner for WireTransportSigner<'_> {
         fn transport_public_key(&self) -> [u8; 32] {
@@ -1443,66 +1986,51 @@ pub fn build_space_apply_writes_for_queue_payload(
         .map_err(|_| MLSError::Cryptography("device signer pubkey must be 32 bytes".to_string()))?;
     let transport_signer = WireTransportSigner(signer, pub_key_32);
 
-    let head = Sha256::digest(format!("catbird.convo.mek:{}", payload.conversation_id).as_bytes());
-    let mut head_arr = [0u8; 32];
-    head_arr.copy_from_slice(&head);
-    let r_hash = labyrinth::mek::roster_hash(&[head_arr]);
-    let mek = labyrinth::mek::Mek::from_secret(
-        Zeroizing::new(mek_secret_32),
-        r_hash,
-        labyrinth::mek::MekProvenance::Transport {
-            transport_pub: pub_key_32,
-            created_here: true,
-        },
-    );
-
     let ts_ms = payload.created_at_ms.max(0) as u64;
-    let decoded_nonce_32: Option<[u8; 32]> = payload
-        .frame_nonce_b64
-        .as_ref()
-        .and_then(|b| STANDARD.decode(b.as_bytes()).ok())
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
     let item_seq_u64 = payload.seq.max(0) as u64;
     let item_sub_seq = item_seq_u64 % 1_000;
-
-    let sealed_msg = if let (Some(nonce_32), Some(ref receipt_json)) =
-        (decoded_nonce_32, &payload.sequencer_receipt_json)
-    {
-        let stored_receipt: StoredArchivedReceipt = serde_json::from_str(receipt_json)
-            .map_err(|e| MLSError::Internal(format!("parse StoredArchivedReceipt JSON: {e}")))?;
-        let archived = stored_receipt.to_labyrinth_archived()?;
-        labyrinth::message::seal_sender_committed(
-            &mek,
-            &payload.conversation_id,
-            &payload.message_id,
-            ts_ms,
-            &nonce_32,
-            payload.labyrinth_frame_json.as_bytes(),
-            &archived,
-            &transport_signer,
+    let nonce_32: [u8; 32] =
+        STANDARD
+            .decode(payload.frame_nonce_b64.as_deref().ok_or_else(|| {
+                MLSError::Cryptography("archive payload missing frame nonce".into())
+            })?)
+            .map_err(|e| MLSError::Cryptography(format!("archive frame nonce: {e}")))?
+            .try_into()
+            .map_err(|_| MLSError::Cryptography("archive frame nonce must be 32 bytes".into()))?;
+    let stored_receipt: StoredArchivedReceipt =
+        serde_json::from_str(payload.sequencer_receipt_json.as_deref().ok_or_else(|| {
+            MLSError::Cryptography("archive payload missing verified I13 receipt".into())
+        })?)
+        .map_err(|e| MLSError::Cryptography(format!("archive I13 receipt: {e}")))?;
+    let attestation: crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope =
+        serde_json::from_str(
+            payload
+                .original_sender_attestation_json
+                .as_deref()
+                .ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "archive payload missing original sender attestation".into(),
+                    )
+                })?,
         )
-        .map_err(|e| MLSError::Cryptography(format!("seal_sender_committed: {e}")))?
-    } else {
-        let sender_data: Zeroizing<Vec<u8>> = if let Some(nonce_32) = decoded_nonce_32 {
-            let mut combined = Vec::with_capacity(32 + payload.labyrinth_frame_json.len());
-            combined.extend_from_slice(&nonce_32);
-            combined.extend_from_slice(payload.labyrinth_frame_json.as_bytes());
-            Zeroizing::new(combined)
-        } else {
-            Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
-        };
-        let mut s = labyrinth::message::seal_sender(
-            &mek,
-            &payload.conversation_id,
-            &payload.message_id,
-            ts_ms,
-            &sender_data,
-            &transport_signer,
-        )
-        .map_err(|e| MLSError::Cryptography(format!("seal_sender: {e}")))?;
-        s.seq = Some(item_seq_u64);
-        s
-    };
+        .map_err(|e| MLSError::Cryptography(format!("archive original sender attestation: {e}")))?;
+    if stored_receipt.original_sender_attestation.as_ref() != Some(&attestation) {
+        return Err(MLSError::Cryptography(
+            "archive receipt does not retain the payload's original sender attestation".into(),
+        ));
+    }
+    let archived = stored_receipt.to_labyrinth_archived()?;
+    let sealed_msg = labyrinth::message::seal_sender_committed(
+        mek,
+        &payload.conversation_id,
+        &payload.message_id,
+        ts_ms,
+        &nonce_32,
+        payload.labyrinth_frame_json.as_bytes(),
+        &archived,
+        &transport_signer,
+    )
+    .map_err(|e| MLSError::Cryptography(format!("seal_sender_committed: {e}")))?;
 
     let sender_batch = labyrinth::records::Batch::from_messages(
         &payload.conversation_id,
@@ -1525,7 +2053,9 @@ pub fn build_space_apply_writes_for_queue_payload(
         )
     });
     let apply_body = serde_json::to_vec(&json!({
-        "repo": convo_space,
+        "space": convo_space,
+        "repo": repo_did,
+        "validate": false,
         "writes": [{
             "$type": "com.atproto.space.applyWrites#create",
             "collection": labyrinth::records::nsid::BATCH,
@@ -1535,4 +2065,295 @@ pub fn build_space_apply_writes_for_queue_payload(
     }))
     .map_err(|e| MLSError::Internal(format!("serialize applyWrites JSON: {e}")))?;
     Ok((convo_space, apply_body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEQUENCER: &str = "did:web:sequencer.example.com";
+    const CONVERSATION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const ENTRY: &str = "33333333-3333-4333-8333-333333333333";
+
+    fn receipt_signer(seed: u8) -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap()
+    }
+
+    fn sec1(key: &p256::ecdsa::SigningKey) -> Vec<u8> {
+        key.verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn signed_receipt(key: &p256::ecdsa::SigningKey, kid: &str, seq: u64) -> Value {
+        let payload = labyrinth_protocol::receipt::SequencerReceiptPayload {
+            sequencer_did: SEQUENCER.into(),
+            conversation_id: CONVERSATION.into(),
+            group_id: vec![7; 32],
+            epoch: 3,
+            sender_device_did_url: "did:plc:sender#device".into(),
+            entry_id: ENTRY.into(),
+            archive_commitment: [9; 32],
+            seq,
+            issued_at_ms: 1_762_000_000_000,
+        };
+        let signed =
+            labyrinth_protocol::receipt::sign_sequencer_receipt(key, kid, &payload).unwrap();
+        json!({
+            "kid": signed.key_id,
+            "sequencerDid": SEQUENCER,
+            "conversationId": CONVERSATION,
+            "generation": 0,
+            "groupId": { "$bytes": STANDARD.encode([7u8; 32]) },
+            "epoch": 3,
+            "seq": seq,
+            "entryId": ENTRY,
+            "senderDid": "did:plc:sender",
+            "senderDeviceId": "device",
+            "archiveCommitment": { "$bytes": STANDARD.encode([9u8; 32]) },
+            "issuedAtMs": 1_762_000_000_000i64,
+            "signature": { "$bytes": STANDARD.encode(signed.signature) },
+        })
+    }
+
+    #[test]
+    fn receipt_kid_is_required_exact_and_versioned() {
+        let rotated = format!("{SEQUENCER}#mls-receipt-2");
+        let receipt = signed_receipt(&receipt_signer(1), &rotated, 4);
+        assert_eq!(sequencer_receipt_kid(SEQUENCER, &receipt).unwrap(), rotated);
+        for kid in [
+            Value::Null,
+            json!("#mls-receipt-1"),
+            json!("did:web:other.example.com#mls-receipt-1"),
+            json!(format!("{SEQUENCER}#mls-receipt-01")),
+            json!(format!("{SEQUENCER}#atproto")),
+        ] {
+            let mut forged = receipt.clone();
+            forged["kid"] = kid;
+            assert!(
+                sequencer_receipt_kid(SEQUENCER, &forged).is_err(),
+                "{forged}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_receipt_key_is_the_highest_generation_and_history_still_verifies() {
+        let method = |generation: u8, key: &p256::ecdsa::SigningKey| {
+            json!({
+                "id": format!("{SEQUENCER}#mls-receipt-{generation}"),
+                "type": "Multikey",
+                "controller": SEQUENCER,
+                "publicKeyMultibase": multibase::encode(
+                    multibase::Base::Base58Btc,
+                    [&[0x80u8, 0x24][..], sec1(key).as_slice()].concat(),
+                ),
+            })
+        };
+        let (first, second) = (receipt_signer(1), receipt_signer(2));
+        let doc = serde_json::to_vec(&json!({
+            "id": SEQUENCER,
+            "verificationMethod": [method(2, &second), method(1, &first)],
+        }))
+        .unwrap();
+        assert_eq!(
+            current_sequencer_receipt_key(&doc, SEQUENCER).unwrap(),
+            sec1(&second)
+        );
+        // A retained generation-1 receipt verifies under its own method after rotation.
+        let receipt = signed_receipt(&first, &format!("{SEQUENCER}#mls-receipt-1"), 4);
+        let key = decode_p256_sec1_from_did_doc(
+            &doc,
+            SEQUENCER,
+            sequencer_receipt_kid(SEQUENCER, &receipt).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(key, sec1(&first));
+        verify_pruned_application_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            &[7; 32],
+            ENTRY,
+            4,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pruned_receipt_must_sequence_exactly_this_entry() {
+        let signer = receipt_signer(1);
+        let receipt = signed_receipt(&signer, &format!("{SEQUENCER}#mls-receipt-1"), 4);
+        let key = sec1(&signer);
+        let verify = |receipt: &Value, key: &[u8], sequencer, cid, group: &[u8], entry, seq| {
+            verify_pruned_application_receipt(receipt, key, sequencer, cid, group, entry, seq)
+        };
+        verify(&receipt, &key, SEQUENCER, CONVERSATION, &[7; 32], ENTRY, 4).unwrap();
+        let other_entry = "44444444-4444-4444-8444-444444444444";
+        let other_cid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        for (sequencer, cid, group, entry, seq) in [
+            (SEQUENCER, CONVERSATION, [7u8; 32], ENTRY, 5),
+            (SEQUENCER, CONVERSATION, [7u8; 32], other_entry, 4),
+            (SEQUENCER, CONVERSATION, [8u8; 32], ENTRY, 4),
+            (SEQUENCER, other_cid, [7u8; 32], ENTRY, 4),
+            (
+                "did:web:other.example.com",
+                CONVERSATION,
+                [7u8; 32],
+                ENTRY,
+                4,
+            ),
+        ] {
+            assert!(verify(&receipt, &key, sequencer, cid, &group, entry, seq).is_err());
+        }
+        assert!(verify(
+            &receipt,
+            &sec1(&receipt_signer(2)),
+            SEQUENCER,
+            CONVERSATION,
+            &[7; 32],
+            ENTRY,
+            4
+        )
+        .is_err());
+        let mut forged = receipt.clone();
+        forged["seq"] = json!(5);
+        assert!(verify(&forged, &key, SEQUENCER, CONVERSATION, &[7; 32], ENTRY, 5).is_err());
+        let mut unsigned = receipt;
+        unsigned.as_object_mut().unwrap().remove("signature");
+        assert!(verify(&unsigned, &key, SEQUENCER, CONVERSATION, &[7; 32], ENTRY, 4).is_err());
+    }
+
+    #[test]
+    fn account_deletion_v2_matches_server_vector_and_rejects_downgrades_and_mutations() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        const SEQUENCER: &str = "did:web:sequencer.example.com";
+        const CONVERSATION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const DELETED: &str = "did:web:deleted.example.com";
+        const ENTRY: &str = "33333333-3333-4333-8333-333333333333";
+        const RECEIVED_AT: &str = "2026-11-03T12:00:00.123Z";
+        const KEY_ID: &str = "did:web:sequencer.example.com#mls-receipt-1";
+        let fields = [SEQUENCER, CONVERSATION, DELETED, "12", ENTRY, RECEIVED_AT];
+        let transcript = account_deletion_authority_signing_bytes(KEY_ID, &fields).unwrap();
+        assert_eq!(
+            hex::encode(&transcript),
+            concat!(
+                "636174626972642d6d6c732d6163636f756e742d64656c6574696f6e2d61757468",
+                "6f726974792d7632000000002b6469643a7765623a73657175656e6365722e6578",
+                "616d706c652e636f6d236d6c732d726563656970742d31636174626972642d6d6c",
+                "732d6163636f756e742d64656c6574696f6e2d7631000000001d6469643a776562",
+                "3a73657175656e6365722e6578616d706c652e636f6d000000246161616161616161",
+                "2d616161612d346161612d386161612d6161616161616161616161610000001b64",
+                "69643a7765623a64656c657465642e6578616d706c652e636f6d00000002313200",
+                "00002433333333333333332d333333332d343333332d383333332d333333333333",
+                "33333333333300000018323032362d31312d30335431323a30303a30302e3132335a"
+            )
+        );
+
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
+        let sign = |message: &[u8]| {
+            let signature: Signature = key.sign(message);
+            signature
+                .normalize_s()
+                .unwrap_or(signature)
+                .to_bytes()
+                .to_vec()
+        };
+        let signature = sign(&transcript);
+        let public_key = key.verifying_key().to_encoded_point(true);
+        assert!(account_deletion_signature_valid(
+            public_key.as_bytes(),
+            &signature,
+            KEY_ID,
+            &fields,
+        ));
+
+        // The server's former v1-only signature is a downgrade, not a v2 authority.
+        let inner_offset = ACCOUNT_DELETION_AUTHORITY_DOMAIN.len() + 4 + KEY_ID.len();
+        let legacy_signature = sign(&transcript[inner_offset..]);
+        assert!(!account_deletion_signature_valid(
+            public_key.as_bytes(),
+            &legacy_signature,
+            KEY_ID,
+            &fields,
+        ));
+
+        for changed in [
+            [
+                "did:web:other.example.com",
+                CONVERSATION,
+                DELETED,
+                "12",
+                ENTRY,
+                RECEIVED_AT,
+            ],
+            [
+                SEQUENCER,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                DELETED,
+                "12",
+                ENTRY,
+                RECEIVED_AT,
+            ],
+            [
+                SEQUENCER,
+                CONVERSATION,
+                "did:web:other.example.com",
+                "12",
+                ENTRY,
+                RECEIVED_AT,
+            ],
+            [SEQUENCER, CONVERSATION, DELETED, "13", ENTRY, RECEIVED_AT],
+            [
+                SEQUENCER,
+                CONVERSATION,
+                DELETED,
+                "12",
+                "44444444-4444-4444-8444-444444444444",
+                RECEIVED_AT,
+            ],
+            [
+                SEQUENCER,
+                CONVERSATION,
+                DELETED,
+                "12",
+                ENTRY,
+                "2026-11-03T12:00:00.124Z",
+            ],
+        ] {
+            assert!(!account_deletion_signature_valid(
+                public_key.as_bytes(),
+                &signature,
+                KEY_ID,
+                &changed,
+            ));
+        }
+        for key_id in [
+            "did:web:sequencer.example.com#atproto",
+            "did:web:sequencer.example.com#mls-receipt-01",
+            "did:web:sequencer.example.com#mls-receipt-2",
+        ] {
+            assert!(!account_deletion_signature_valid(
+                public_key.as_bytes(),
+                &signature,
+                key_id,
+                &fields,
+            ));
+        }
+        let wrong_key = SigningKey::from_slice(&[8; 32]).unwrap();
+        let wrong_signature: Signature = wrong_key.sign(&transcript);
+        assert!(!account_deletion_signature_valid(
+            public_key.as_bytes(),
+            &wrong_signature
+                .normalize_s()
+                .unwrap_or(wrong_signature)
+                .to_bytes(),
+            KEY_ID,
+            &fields,
+        ));
+    }
 }

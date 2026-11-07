@@ -120,7 +120,10 @@ impl DirectRequestProjection {
         let i13_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
             &self.trusted_authority_document,
             &auth_did,
-            "#mls-receipt-1",
+            crate::client::chat_wire::sequencer_receipt_kid(
+                &auth_did,
+                &receipt["sequencerReceipt"],
+            )?,
         )?;
         let commitment: [u8; 32] = STANDARD
             .decode(body["archiveCommitment"].as_str().ok_or_else(invalid)?)

@@ -545,7 +545,10 @@ where
                         crate::client::chat_wire::decode_p256_sec1_from_did_doc(
                             &projection.trusted_authority_document,
                             &auth_did,
-                            "#mls-receipt-1",
+                            crate::client::chat_wire::sequencer_receipt_kid(
+                                &auth_did,
+                                &receipt["body"]["receipt"]["sequencerReceipt"],
+                            )?,
                         )?,
                     receipt_authority_did: auth_did,
                     receipt_authority_key: key,

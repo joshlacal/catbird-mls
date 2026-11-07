@@ -16,6 +16,10 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
+use crate::chat_v2::wire::{
+    COMMIT_ENTRY_KIND, CONVERSATION_CLOSE_ENTRY_KIND, CREATION_ENTRY_KIND, METADATA_ENTRY_KIND,
+    POLICY_ENTRY_KIND,
+};
 use crate::client::chat_wire;
 use crate::client::traits::{
     PlatformChangeEvent, PlatformHttpHeader, PlatformHttpRequest, PlatformHttpResponse,
@@ -32,7 +36,8 @@ use crate::metadata::{
 };
 use crate::orchestrator::canonical_transport::{
     canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
-    is_transient_wire_failure, retry_after_secs, CanonicalOperation, MAX_RETRY_AFTER_SECS,
+    is_transient_wire_failure, retry_after_secs, CanonicalOperation, PreparedRequest,
+    MAX_RETRY_AFTER_SECS,
 };
 use crate::orchestrator::direct_request_bootstrap::{self, DirectRequestBootstrapInput};
 use crate::orchestrator::direct_request_keys::{
@@ -57,17 +62,7 @@ pub(crate) struct PendingApplicationSend {
     pub(crate) archive: QueuedLabyrinthArchivePayload,
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct PendingCommitTransition {
-    pub(crate) conversation_id: String,
-    pub(crate) transition_id: String,
-    pub(crate) commit_sha256: [u8; 32],
-    pub(crate) prior: Value,
-    pub(crate) next: Value,
-    pub(crate) kv_batch: KvWriteBatch,
-    #[serde(default)]
-    pub(crate) removed_participant_did: Option<String>,
-}
+pub(crate) use super::chat_wire::PendingCommitTransition;
 
 /// The membership effect of a generic `#commitTransitionBody` Commit (besides the mandatory
 /// sender update). The generic form forbids participant changes: removing a participant is
@@ -96,6 +91,10 @@ pub(super) fn participant_removal_payload(conversation_id: &str, target_did: &st
 /// the DS retains the first acceptance even when relaying it fails, so retries replay it.
 pub(super) const DIRECT_REQUEST_ACCEPTANCE_OP: &str = "direct_request_acceptance";
 
+/// `pending_ops` kind holding this device's exact signed close per conversation (the
+/// `signedRequest` JSON), journaled before HTTP and replayed byte for byte until applied.
+const CONVERSATION_CLOSE_OP: &str = "conversation_close";
+
 /// `pending_ops` kind holding the one outgoing `C33` creation per normalized peer DID. The DS
 /// fences one live preparation per pair while the app names a new conversation on every tap,
 /// so the peer keys it. Retries replay the exact signed prepare and, once prepared, the exact
@@ -123,7 +122,6 @@ struct PendingDirectRequestCreation {
 struct PendingDirectRequestPublication {
     group_id: Vec<u8>,
     sequencer_did: String,
-    sequencer_receipt_key: Vec<u8>,
     bootstrap: direct_request_bootstrap::DirectRequestBootstrap,
     kv_batch: KvWriteBatch,
     publish_wrapper: Vec<u8>,
@@ -153,72 +151,6 @@ fn signed_request_body(wrapper: &[u8]) -> Vec<u8> {
     body
 }
 
-/// Verify a signed `C33` outcome under the coordinator's receipt key; returns its receipt.
-fn verify_c33_outcome(
-    outcome: &Value,
-    authority_did: &str,
-    authority_key: &[u8],
-) -> Result<Value, MLSError> {
-    let outcome = dr_transcript::normalize_read_presentation(
-        &serde_json::to_vec(outcome)?,
-        "signedDirectRequestReceipt",
-        outcome.get("$type").is_some(),
-    )
-    .map_err(|e| MLSError::Cryptography(format!("C33 outcome: {e}")))?;
-    let verified = dr_transcript::verify_signed_request_for_authority(
-        authority_did,
-        DirectRequestKind::Outcome,
-        &serde_json::to_vec(&outcome)?,
-        authority_key,
-    )
-    .map_err(|e| MLSError::Cryptography(format!("C33 outcome signature: {e}")))?;
-    Ok(verified.body()["receipt"].clone())
-}
-
-/// The error code of a verified receipt that ends this attempt without publication, bound like
-/// a publication receipt: the journaled request and its preparation digest, its actor, and the
-/// digest of the journaled prepare (or sent publication) that triggered it. `None` for a
-/// publication receipt; any other kind or binding fails closed.
-fn c33_terminal_receipt_code(
-    receipt: &Value,
-    prepare: &dr_transcript::VerifiedDirectRequest,
-    publication: Option<&dr_transcript::VerifiedDirectRequest>,
-) -> Result<Option<String>, MLSError> {
-    let code = match receipt["$type"].as_str() {
-        Some("blue.catbird.chat.defs#directRequestPublishedReceipt") => return Ok(None),
-        Some("blue.catbird.chat.defs#directRequestRejectedReceipt") => receipt["code"].as_str(),
-        Some("blue.catbird.chat.defs#directRequestExpiredReceipt") => Some("PreparationExpired"),
-        Some("blue.catbird.chat.defs#directRequestExistingDirectReceipt") => Some("ExistingDirect"),
-        _ => None,
-    };
-    let digest =
-        |request: &dr_transcript::VerifiedDirectRequest| STANDARD.encode(request.request_digest());
-    let trigger = match receipt["requestKind"].as_str() {
-        Some("prepare") => Some(prepare),
-        Some("publish") => publication,
-        // A lease expiry is bound to the prepare, a published request's expiry to its publication.
-        Some("expiry") => [Some(prepare), publication]
-            .into_iter()
-            .flatten()
-            .find(|&request| receipt["requestDigest"] == digest(request)),
-        _ => None,
-    };
-    let p = prepare.body();
-    let bound = trigger.is_some_and(|request| receipt["requestDigest"] == digest(request))
-        && receipt["requestId"] == p["requestId"]
-        && receipt["preparationRequestDigest"] == digest(prepare)
-        && receipt["actorDid"] == p["actorDid"]
-        && receipt["actorDeviceId"] == p["actorDeviceId"]
-        && receipt["actorKeyId"] == p["keyId"]
-        && receipt["authGeneration"] == p["authGeneration"];
-    match code {
-        Some(code) if bound => Ok(Some(code.to_owned())),
-        _ => Err(MLSError::Cryptography(
-            "C33 outcome binding mismatch".into(),
-        )),
-    }
-}
-
 /// Whether the DS will refuse these exact bytes again: a semantic 4xx. A transient failure
 /// ([`is_transient_wire_failure`], e.g. `503 CapacityUnavailable`, `429`) and every 5xx keep
 /// the journaled bytes for the identical retry.
@@ -246,6 +178,48 @@ pub(super) fn chat_response_error(
             String::from_utf8_lossy(&resp.body),
         )),
     }
+}
+
+/// The 2xx answer to this device's own signed control, verified before anything moves: its
+/// `entry` is an `entry_kind` entry of `conversation_id` that strictly projects and carries
+/// exactly `sent`, the signed request this device submitted (so it verifies under this
+/// device's key), and its `coordinates` are that request's signed `next`. Returns the entry
+/// seq. Callers write only the signed coordinates; an answer that does not verify is refused
+/// like a lost response, so the journal stays and sync applies the own echo.
+pub(super) fn verify_own_answer(
+    answer: &Value,
+    sent: &Value,
+    conversation_id: &str,
+    entry_kind: &str,
+) -> Result<i64, MLSError> {
+    let refused = |why: String| MLSError::Cryptography(format!("own {entry_kind} answer: {why}"));
+    // `createConversation` and `closeConversation` answer `{"result": {...}}`.
+    let answer = answer.get("result").unwrap_or(answer);
+    let raw = answer
+        .get("entry")
+        .ok_or_else(|| refused("missing entry".into()))?;
+    let entry = dr_transcript::normalize_read_presentation(
+        &serde_json::to_vec(raw)?,
+        entry_kind.trim_start_matches(crate::chat_v2::transcript::TYPE_PREFIX),
+        raw.get("$type").is_some(),
+    )
+    .map_err(|e| refused(e.to_string()))?;
+    if entry["conversationId"] != conversation_id || entry["signedRequest"] != *sent {
+        return Err(refused("not this device's signed request".into()));
+    }
+    if let Some(next) = sent["body"].get("next") {
+        let answered = answer
+            .get("coordinates")
+            .ok_or_else(|| refused("missing coordinates".into()))?;
+        if chat_wire::canonicalize_wire_coordinate(answered, None)?
+            != chat_wire::canonicalize_wire_coordinate(next, None)?
+        {
+            return Err(refused("coordinates are not the signed next".into()));
+        }
+    }
+    entry["seq"]
+        .as_i64()
+        .ok_or_else(|| refused("missing seq".into()))
 }
 
 fn active_member_dids(group: &MlsGroup) -> Result<Vec<String>, MLSError> {
@@ -465,6 +439,38 @@ impl CatbirdMlsClient {
             body_value,
             signer,
         )?;
+        self.submit_prepared(prepared, body_value)
+    }
+
+    /// [`Self::submit_signed_chat_op`] for this device's own control: also returns the exact
+    /// `signedRequest` it sent, which [`verify_own_answer`] holds the answer to.
+    pub(super) fn submit_own_control(
+        &self,
+        device_id: &str,
+        auth_generation: i64,
+        operation: CanonicalOperation,
+        body_value: &Value,
+        signer: &SignatureKeyPair,
+    ) -> Result<(Value, Value), MLSError> {
+        let prepared = chat_wire::sign_clean_chat_mutation(
+            &self.normalized_did,
+            device_id,
+            Some(auth_generation),
+            operation,
+            body_value,
+            signer,
+        )?;
+        let mut sent: Value = serde_json::from_slice(prepared.body.as_deref().unwrap_or_default())?;
+        let answer = self.submit_prepared(prepared, body_value)?;
+        Ok((answer, sent["signedRequest"].take()))
+    }
+
+    fn submit_prepared(
+        &self,
+        prepared: PreparedRequest,
+        body_value: &Value,
+    ) -> Result<Value, MLSError> {
+        let operation = prepared.operation;
         let url = format!("{}{}", self.ds_base(), prepared.path);
         let pending_transition_id = if matches!(operation, CanonicalOperation::SubmitTransition) {
             body_value.get("transitionId").and_then(Value::as_str)
@@ -711,10 +717,12 @@ impl CatbirdMlsClient {
             .map(str::to_owned)
     }
 
-    /// `mls-ds` bootstrap: PDS device + declaration records, `enrollDevice`, request keys and
+    /// `mls-ds` bootstrap: `enrollDevice`, PDS device + declaration records, request keys and
     /// KeyPackages. Completion is bound to the authoritative generation, canonical device ID and
     /// signer key; a retry after a crash or lost response confirms the exact enrollment because
-    /// `enrollDevice` is create-only and request-key revisions must advance by one.
+    /// `enrollDevice` is create-only and request-key revisions must advance by one. The PDS
+    /// records are written only once `mls-ds` holds this device under this exact key, so a
+    /// device ID registered under another key keeps that key's PDS record.
     pub(crate) fn enroll_device_live(
         &self,
         canonical_device_id: &str,
@@ -783,24 +791,7 @@ impl CatbirdMlsClient {
             })?;
             return Ok(());
         }
-        // 1. Publish ADR-009 PDS `blue.catbird.chat.device/{device_id}` + `blue.catbird.chat.declaration/self`.
-        let put_record_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
-        let dev_record_body = chat_wire::build_pds_device_put_record_body_at(
-            &self.normalized_did,
-            canonical_device_id,
-            pub_key,
-            &self.hooks.now_rfc3339_millis(),
-        )?;
-        let _ = self.execute_json_post(put_record_url.clone(), dev_record_body)?;
-
-        let decl_body = chat_wire::build_pds_chat_declaration_put_record_body_at(
-            &self.normalized_did,
-            &self.config.home_ds_did,
-            &self.hooks.now_rfc3339_millis(),
-        )?;
-        let _ = self.execute_json_post(put_record_url, decl_body)?;
-
-        // 2. Build 2 X-Wing KeyPackages in `write_tx` (`MlsMessageOut` framing, sorted by hash_ref).
+        // 1. Build 2 X-Wing KeyPackages in `write_tx` (`MlsMessageOut` framing, sorted by hash_ref).
         let now_secs = self.hooks.now_secs();
         let (signer, key_packages_json) = self.db.write_tx(|tx| {
             let signer_json = tx
@@ -887,6 +878,7 @@ impl CatbirdMlsClient {
             "signedAt": self.hooks.now_rfc3339_millis(),
         });
 
+        // 2. `enrollDevice`, or adopt the enrollment a lost response left behind.
         let (enroll_resp, request_keys_published) = match self.submit_signed_chat_op(
             canonical_device_id,
             None,
@@ -903,23 +895,42 @@ impl CatbirdMlsClient {
             }
             Err(e) => return Err(e),
         };
-        let auth_generation = enroll_resp
-            .get("device")
-            .and_then(|d| d.get("authGeneration"))
-            .and_then(|g| g.as_i64())
-            .or_else(|| enroll_resp.get("authGeneration").and_then(|g| g.as_i64()))
-            .ok_or_else(|| {
-                MLSError::Internal("enrollDevice response missing authGeneration".to_string())
-            })?
-            .max(1);
+        // The key check precedes every PDS write: a fresh answer or an adopted enrollment
+        // naming another device, key or generation leaves both PDS records untouched.
+        let auth_generation = chat_wire::own_active_device(
+            &json!({ "items": [&enroll_resp] }),
+            canonical_device_id,
+            pub_key,
+        )
+        .filter(|own| own["device"]["keyId"] == key_id.as_str())
+        .and_then(|own| own["device"]["authGeneration"].as_i64())
+        .filter(|generation| *generation >= 1)
+        .ok_or_else(|| MLSError::InvalidState("EnrollmentDeviceIdentityMismatch".into()))?;
 
-        // 3. Generate + publish the C33 DirectRequestKeyPublication unless the DS already has it.
+        // 3. Publish ADR-009 PDS `blue.catbird.chat.device/{device_id}` + `blue.catbird.chat.declaration/self`.
+        let put_record_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
+        let dev_record_body = chat_wire::build_pds_device_put_record_body_at(
+            &self.normalized_did,
+            canonical_device_id,
+            pub_key,
+            &self.hooks.now_rfc3339_millis(),
+        )?;
+        let _ = self.execute_json_post(put_record_url.clone(), dev_record_body)?;
+
+        let decl_body = chat_wire::build_pds_chat_declaration_put_record_body_at(
+            &self.normalized_did,
+            &self.config.home_ds_did,
+            &self.hooks.now_rfc3339_millis(),
+        )?;
+        let _ = self.execute_json_post(put_record_url, decl_body)?;
+
+        // 4. Generate + publish the C33 DirectRequestKeyPublication unless the DS already has it.
         let now_ms = self.hooks.now_ms();
         if !request_keys_published {
             let dr_exact_request = self.db.write_tx(|tx| {
                 let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
                 let provider = self.hooks.openmls_provider(storage);
-                let (raw_pub_rec, _bundles) = build_request_key_publication(
+                let (raw_pub_rec, _) = build_request_key_publication(
                     &provider,
                     &signer,
                     &DirectRequestKeyPublicationInput {
@@ -945,7 +956,7 @@ impl CatbirdMlsClient {
             let _ = self.execute_json_post(dr_keys_url, dr_exact_request)?;
         }
 
-        // 4. Persist the authoritative completion binding atomically. The generation, exact
+        // 5. Persist the authoritative completion binding atomically. The generation, exact
         // canonical device, and signer key must all match before a future call is a local no-op.
         self.db.write_tx(|tx| {
             tx.put_account_meta("auth_generation", &auth_generation.to_string(), now_ms)?;
@@ -1332,8 +1343,8 @@ impl CatbirdMlsClient {
             // A signed durable decision (e.g. the replayed lease expired) drops the attempt only
             // once it verifies like a publication outcome; anything else fails closed.
             let key = receipt_key(outcome["body"]["keyId"].as_str().unwrap_or_default())?;
-            let receipt = verify_c33_outcome(outcome, authority_did, &key)?;
-            let code = c33_terminal_receipt_code(&receipt, prepare, None)?
+            let receipt = chat_wire::verify_c33_outcome(outcome, authority_did, &key)?;
+            let code = chat_wire::c33_terminal_receipt_code(&receipt, prepare, None)?
                 .ok_or_else(|| MLSError::Cryptography("C33 outcome binding mismatch".into()))?;
             return Err(self.forget_c33_creation(peer_did, raw, MLSError::InvalidState(code)));
         }
@@ -1411,9 +1422,16 @@ impl CatbirdMlsClient {
             .and_then(|v| v.as_str())
             .ok_or_else(|| MLSError::Cryptography("C33 preparation missing receiptKeyId".into()))?;
         let authority_key = receipt_key(receipt_kid)?;
-        let sequencer_receipt_key = self
-            .resolve_sequencer_receipt_key(&effective_sequencer, "#mls-receipt-1")?
-            .ok_or_else(|| MLSError::Cryptography("C33: missing sequencer receipt key".into()))?;
+        // The bootstrap input pins the sequencer's current receipt method; the published
+        // opening receipt itself is verified under the method its own `kid` names.
+        let sequencer_receipt_key = chat_wire::current_sequencer_receipt_key(
+            &self
+                .resolve_did_document(&effective_sequencer)?
+                .ok_or_else(|| {
+                    MLSError::Cryptography("C33: missing sequencer DID document".into())
+                })?,
+            &effective_sequencer,
+        )?;
 
         if preparation["conversationId"].as_str() != Some(pending.conversation_id.as_str()) {
             return Err(MLSError::Cryptography(
@@ -1460,7 +1478,7 @@ impl CatbirdMlsClient {
                         preparation_request_digest: *prepare.request_digest(),
                         receipt_authority_key: authority_key.clone(),
                         sequencer_did: effective_sequencer.clone(),
-                        sequencer_receipt_authority_key: sequencer_receipt_key.clone(),
+                        sequencer_receipt_authority_key: sequencer_receipt_key,
                         text: pending.intro_text.clone(),
                         invitation: None,
                         metadata: GroupMetadataV1 {
@@ -1568,7 +1586,6 @@ impl CatbirdMlsClient {
         pending.publish = Some(PendingDirectRequestPublication {
             group_id: group_id_bytes,
             sequencer_did: effective_sequencer,
-            sequencer_receipt_key,
             bootstrap,
             kv_batch,
             publish_wrapper,
@@ -1638,7 +1655,6 @@ impl CatbirdMlsClient {
         let PendingDirectRequestPublication {
             group_id: group_id_bytes,
             sequencer_did: effective_sequencer,
-            sequencer_receipt_key,
             bootstrap,
             kv_batch,
             ..
@@ -1663,11 +1679,14 @@ impl CatbirdMlsClient {
             receipt_method,
         )
         .map_err(|e| MLSError::Cryptography(format!("C33 publication receipt key: {e}")))?;
-        let publication_receipt = verify_c33_outcome(outcome, effective_sequencer, &authority_key)?;
+        let publication_receipt =
+            chat_wire::verify_c33_outcome(outcome, effective_sequencer, &authority_key)?;
         // A signed decision not to publish (e.g. the lease expired before this replay).
-        if let Some(code) =
-            c33_terminal_receipt_code(&publication_receipt, prepare, Some(&verified_publication))?
-        {
+        if let Some(code) = chat_wire::c33_terminal_receipt_code(
+            &publication_receipt,
+            prepare,
+            Some(&verified_publication),
+        )? {
             return Err(self.forget_c33_creation(peer_did, &raw, MLSError::InvalidState(code)));
         }
         if publication_receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
@@ -1693,12 +1712,18 @@ impl CatbirdMlsClient {
                 "C33 publication outcome binding mismatch".into(),
             ));
         }
+        let opening_receipt = &publication_receipt["sequencerReceipt"];
+        let sequencer_receipt_key = chat_wire::decode_p256_sec1_from_did_doc(
+            &authority_doc,
+            effective_sequencer,
+            chat_wire::sequencer_receipt_kid(effective_sequencer, opening_receipt)?,
+        )?;
         let (opening_seq, _, opening_receipt_json) =
             direct_request_bootstrap::verify_opening_receipt(
                 bootstrap,
-                &publication_receipt["sequencerReceipt"],
+                opening_receipt,
                 effective_sequencer,
-                sequencer_receipt_key,
+                &sequencer_receipt_key,
             )?;
         let opening_seq = i64::try_from(opening_seq)
             .map_err(|_| MLSError::Cryptography("C33 sequence overflow".into()))?;
@@ -2127,32 +2152,22 @@ impl CatbirdMlsClient {
                 Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
             })?;
         }
-        let resp_val = self.submit_signed_chat_op(
+        let (resp_val, sent) = self.submit_own_control(
             canonical_dev_id,
-            Some(auth_generation),
+            auth_generation,
             CanonicalOperation::CreateConversation,
             &create_body,
             &signer,
         )?;
-
-        let server_coords = resp_val
-            .get("state")
-            .and_then(|s| s.get("coordinates"))
-            .or_else(|| resp_val.get("coordinates"))
-            .cloned()
-            .unwrap_or(next_coords);
-        let server_seq = resp_val
-            .get("seq")
-            .and_then(|s| s.as_i64())
-            .or_else(|| {
-                resp_val
-                    .get("entry")
-                    .and_then(|e| e.get("seq"))
-                    .and_then(|s| s.as_i64())
-            })
-            .unwrap_or(1)
-            .max(1);
-        let generation = server_coords
+        // A creation is its conversation's first entry; any other answer changes nothing.
+        let server_seq =
+            verify_own_answer(&resp_val, &sent, canonical_convo_id, CREATION_ENTRY_KIND)?;
+        if server_seq != 1 {
+            return Err(MLSError::Cryptography(format!(
+                "own creation answer: seq {server_seq} is not the first entry"
+            )));
+        }
+        let generation = next_coords
             .get("generation")
             .and_then(|g| g.as_i64())
             .unwrap_or(0);
@@ -2160,7 +2175,7 @@ impl CatbirdMlsClient {
             "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{canonical_convo_id}-{generation}"
         ));
         let coords_str =
-            serde_json::to_string(&server_coords).map_err(|e| MLSError::Internal(e.to_string()))?;
+            serde_json::to_string(&next_coords).map_err(|e| MLSError::Internal(e.to_string()))?;
         let snap_str = serde_json::to_string(&meta_snap_json)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
 
@@ -2304,32 +2319,18 @@ impl CatbirdMlsClient {
             "signedAt": self.hooks.now_rfc3339_millis(),
         });
 
-        let resp_val = self.submit_signed_chat_op(
+        let (resp_val, sent) = self.submit_own_control(
             &canonical_dev_id,
-            Some(auth_generation),
+            auth_generation,
             CanonicalOperation::SubmitTransition,
             &policy_body,
             &signer,
         )?;
-        let updated_coords = resp_val
-            .get("state")
-            .and_then(|s| s.get("coordinates"))
-            .or_else(|| resp_val.get("coordinates"))
-            .cloned()
-            .unwrap_or(next_coords);
-        let new_seq = resp_val
-            .get("seq")
-            .and_then(|s| s.as_i64())
-            .or_else(|| {
-                resp_val
-                    .get("entry")
-                    .and_then(|e| e.get("seq"))
-                    .and_then(|s| s.as_i64())
-            })
-            .unwrap_or(existing.last_seq.saturating_add(1));
+        // A foreign answer changes nothing, as a lost response; sync applies the own echo.
+        let new_seq = verify_own_answer(&resp_val, &sent, conversation_id, POLICY_ENTRY_KIND)?;
         let now_ms = self.hooks.now_ms();
-        let coords_str = serde_json::to_string(&updated_coords)
-            .map_err(|e| MLSError::Internal(e.to_string()))?;
+        let coords_str =
+            serde_json::to_string(&next_coords).map_err(|e| MLSError::Internal(e.to_string()))?;
 
         if crate::buggify!("after_http_2xx_before_db_commit") {
             return Err(MLSError::Internal(
@@ -2423,15 +2424,22 @@ impl CatbirdMlsClient {
         let canonical_dev_id = self.live_device_id()?;
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
         let canonical_msg_id = msg_uuid.hyphenated().to_string();
-        let reserve = |discard_refused| {
+        let reserve = || {
             self.reserve_application_send(
                 convo_uuid,
                 msg_uuid,
                 &canonical_dev_id,
                 &display_json,
                 &frame_json,
-                discard_refused,
             )
+        };
+        // `StaleSend` refuses those exact bytes for good: their journal goes, in its own write,
+        // before anything else can fail, so no later retry of this message id resubmits them.
+        let discard_refused = || {
+            self.db.write_tx(|tx| {
+                tx.delete_pending_op("application_send", &canonical_msg_id)
+                    .map(drop)
+            })
         };
         // Strictly outside `write_tx` (`I6`); retries reuse the journal's exact signed body.
         let submit =
@@ -2444,18 +2452,25 @@ impl CatbirdMlsClient {
                     signer,
                 )
             };
-        let (mut signer, mut auth_generation, mut pending, mut send_retry) = reserve(false)?;
+        let (mut signer, mut auth_generation, mut pending, mut send_retry) = reserve()?;
         let resp_val = match submit(&signer, auth_generation, &pending) {
             // `mls-ds` already sequenced a newer send from this device and refuses these bytes
             // for good. Send the same message id once more as a fresh frame and counter.
             Err(error) if chat_wire::is_stale_send(&error) => {
-                (signer, auth_generation, pending, send_retry) = reserve(true)?;
-                submit(&signer, auth_generation, &pending)?
+                discard_refused()?;
+                (signer, auth_generation, pending, send_retry) = reserve()?;
+                match submit(&signer, auth_generation, &pending) {
+                    Err(error) if chat_wire::is_stale_send(&error) => {
+                        discard_refused()?;
+                        return Err(error);
+                    }
+                    result => result?,
+                }
             }
             result => result?,
         };
 
-        // Enforce mandatory `I13` ES256 `sequencerReceipt` verification against `{sequencer_did}#mls-receipt-1`!
+        // Mandatory `I13` ES256 `sequencerReceipt`, verified under the method its `kid` names.
         let receipt_val = resp_val
             .get("sequencerReceipt")
             .or_else(|| {
@@ -2498,8 +2513,8 @@ impl CatbirdMlsClient {
 
     /// Reserve the sender generation, `sendCounter` and immutable recovery material atomically
     /// before HTTP. A timeout can still publish the ciphertext; rolling the ratchet back would
-    /// reuse its key. An existing journal for the message id is returned unchanged unless
-    /// `discard_refused` drops it (`StaleSend`: those exact bytes are refused for good).
+    /// reuse its key. An existing journal for the message id is returned unchanged: only a
+    /// `StaleSend` refusal discards one (those exact bytes are refused for good).
     fn reserve_application_send(
         &self,
         convo_uuid: uuid::Uuid,
@@ -2507,7 +2522,6 @@ impl CatbirdMlsClient {
         canonical_dev_id: &str,
         display_json: &str,
         frame_json: &str,
-        discard_refused: bool,
     ) -> Result<(SignatureKeyPair, i64, PendingApplicationSend, bool), MLSError> {
         let frame_nonce = self.hooks.random_array::<32>();
         let archive_commitment = labyrinth_protocol::receipt::compute_archive_commitment(
@@ -2553,9 +2567,6 @@ impl CatbirdMlsClient {
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(1)
                 .max(1);
-            if discard_refused {
-                tx.delete_pending_op("application_send", &canonical_msg_id)?;
-            }
             if let Some(raw) = tx.get_pending_op("application_send", &canonical_msg_id)? {
                 let pending: PendingApplicationSend = serde_json::from_str(&raw)
                     .map_err(|e| MLSError::Internal(format!("parse pending send: {e}")))?;
@@ -2757,15 +2768,12 @@ impl CatbirdMlsClient {
             &nonce,
             queued.labyrinth_frame_json.as_bytes(),
         );
-        let kid = receipt
-            .get("kid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("#mls-receipt-1");
+        let kid = chat_wire::sequencer_receipt_kid(&queued.sequencer_did, receipt)?;
         let sec1_key = self
             .resolve_sequencer_receipt_key(&queued.sequencer_did, kid)?
             .ok_or_else(|| {
                 MLSError::Cryptography(format!(
-                    "I13: unable to resolve `{}` receipt key",
+                    "I13: unable to resolve `{}` receipt method {kid}",
                     queued.sequencer_did
                 ))
             })?;
@@ -3203,9 +3211,9 @@ impl CatbirdMlsClient {
                     Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
                 })?;
             }
-            let resp_val = match self.submit_signed_chat_op(
+            let (resp_val, sent) = match self.submit_own_control(
                 canonical_dev_id,
-                Some(auth_gen),
+                auth_gen,
                 CanonicalOperation::SubmitTransition,
                 &body,
                 &signer,
@@ -3245,19 +3253,10 @@ impl CatbirdMlsClient {
                     return Err(err);
                 }
             };
-            let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
-                resp_val
-                    .get("entry")
-                    .and_then(|e| e.get("seq"))
-                    .and_then(|v| v.as_i64())
-            });
-            let updated_coords = resp_val
-                .get("state")
-                .and_then(|s| s.get("coordinates"))
-                .or_else(|| resp_val.get("coordinates"))
-                .cloned()
-                .unwrap_or(next_coords);
-            let coords_str = serde_json::to_string(&updated_coords)
+            // Only this device's own sequenced Commit moves anything. A foreign answer keeps
+            // the journal unmerged, as a lost response does, for the own echo in sync.
+            let auth_seq = verify_own_answer(&resp_val, &sent, conversation_id, COMMIT_ENTRY_KIND)?;
+            let coords_str = serde_json::to_string(&next_coords)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
             let snap_str = serde_json::to_string(&carried_snap)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
@@ -3269,7 +3268,7 @@ impl CatbirdMlsClient {
             let needs_gap_sync = self.db.write_tx(|tx| {
                 let current = tx.get_conversation(conversation_id)?;
                 if let Some(c) = &current {
-                    if auth_seq_opt.is_some_and(|seq| seq > c.last_seq.saturating_add(1)) {
+                    if auth_seq > c.last_seq.saturating_add(1) {
                         // Prior applications still need this epoch's roster for strict I4.
                         // Keep the journal and recover this Commit at its ordered entry.
                         return Ok(true);
@@ -3292,10 +3291,8 @@ impl CatbirdMlsClient {
                 }
                 if let Some(mut c) = current {
                     c.epoch = next_epoch as i64;
-                    if let Some(auth_seq) = auth_seq_opt {
-                        if auth_seq == c.last_seq.saturating_add(1) {
-                            c.last_seq = auth_seq;
-                        }
+                    if auth_seq == c.last_seq.saturating_add(1) {
+                        c.last_seq = auth_seq;
                     }
                     c.updated_at_ms = now_ms;
                     tx.upsert_conversation(&c)?;
@@ -3486,10 +3483,9 @@ impl CatbirdMlsClient {
                 &body,
                 signer,
             )?;
-            let resp = self.post_json_raw(
-                &format!("{}{}", self.ds_base(), prepared.path),
-                prepared.body.unwrap_or_default(),
-            )?;
+            let wire = prepared.body.unwrap_or_default();
+            let sent: Value = serde_json::from_slice(&wire)?;
+            let resp = self.post_json_raw(&format!("{}{}", self.ds_base(), prepared.path), wire)?;
             if resp.status >= 400 {
                 if serde_json::from_slice::<ChatProtocolFailure<'_>>(&resp.body)
                     .is_ok_and(|failure| failure.error == "StaleCoordinates")
@@ -3505,18 +3501,15 @@ impl CatbirdMlsClient {
             }
             let resp_val: Value = serde_json::from_slice(&resp.body)
                 .map_err(|e| MLSError::Internal(format!("parse policy response: {e}")))?;
-            let updated_coords = resp_val
-                .get("state")
-                .and_then(|s| s.get("coordinates"))
-                .or_else(|| resp_val.get("coordinates"))
-                .cloned()
-                .unwrap_or(next);
-            let coords_str = serde_json::to_string(&updated_coords)
-                .map_err(|e| MLSError::Internal(e.to_string()))?;
-            let new_seq = resp_val
-                .get("seq")
-                .or_else(|| resp_val.pointer("/entry/seq"))
-                .and_then(Value::as_i64);
+            // A foreign answer keeps the intent, as a lost response; sync applies the own echo.
+            let new_seq = verify_own_answer(
+                &resp_val,
+                &sent["signedRequest"],
+                conversation_id,
+                POLICY_ENTRY_KIND,
+            )?;
+            let coords_str =
+                serde_json::to_string(&next).map_err(|e| MLSError::Internal(e.to_string()))?;
             let now_ms = self.hooks.now_ms();
             gap |= self.db.write_tx(|tx| {
                 tx.delete_pending_op(PARTICIPANT_REMOVAL_OP, &op_key)?;
@@ -3529,10 +3522,10 @@ impl CatbirdMlsClient {
                     return Ok(false);
                 };
                 // Behind unseen entries, let `sync` apply them and this policy echo in order.
-                let Some(seq) = new_seq.filter(|seq| *seq == c.last_seq.saturating_add(1)) else {
-                    return Ok(new_seq.is_some_and(|seq| seq > c.last_seq));
-                };
-                c.last_seq = seq;
+                if new_seq != c.last_seq.saturating_add(1) {
+                    return Ok(new_seq > c.last_seq);
+                }
+                c.last_seq = new_seq;
                 c.updated_at_ms = now_ms;
                 tx.upsert_conversation(&c)?;
                 tx.put_account_meta(
@@ -3802,26 +3795,17 @@ impl CatbirdMlsClient {
                     Ok(kv_batch.apply(&RusqliteKvBackend(tx.conn()))?)
                 })?;
             }
-            let resp_val = self.submit_signed_chat_op(
+            let (resp_val, sent) = self.submit_own_control(
                 &dev_id,
-                Some(auth_gen),
+                auth_gen,
                 CanonicalOperation::SubmitTransition,
                 &body,
                 &signer,
             )?;
-            let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
-                resp_val
-                    .get("entry")
-                    .and_then(|e| e.get("seq"))
-                    .and_then(|v| v.as_i64())
-            });
-            let updated_coords = resp_val
-                .get("state")
-                .and_then(|s| s.get("coordinates"))
-                .or_else(|| resp_val.get("coordinates"))
-                .cloned()
-                .unwrap_or(next_coords);
-            let coords_str = serde_json::to_string(&updated_coords)
+            // A foreign answer changes nothing, as a lost response; sync applies the own echo.
+            let auth_seq =
+                verify_own_answer(&resp_val, &sent, conversation_id, METADATA_ENTRY_KIND)?;
+            let coords_str = serde_json::to_string(&next_coords)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
             let snap_str =
                 serde_json::to_string(&snap).map_err(|e| MLSError::Internal(e.to_string()))?;
@@ -3837,12 +3821,10 @@ impl CatbirdMlsClient {
                 let mut gap = false;
                 if let Some(mut convo) = tx.get_conversation(conversation_id)? {
                     convo.title = staged_row.title.clone();
-                    if let Some(auth_seq) = auth_seq_opt {
-                        if auth_seq == convo.last_seq.saturating_add(1) {
-                            convo.last_seq = auth_seq;
-                        } else if auth_seq > convo.last_seq.saturating_add(1) {
-                            gap = true;
-                        }
+                    if auth_seq == convo.last_seq.saturating_add(1) {
+                        convo.last_seq = auth_seq;
+                    } else if auth_seq > convo.last_seq.saturating_add(1) {
+                        gap = true;
                     }
                     convo.updated_at_ms = now_ms;
                     tx.upsert_conversation(&convo)?;
@@ -3912,25 +3894,24 @@ impl CatbirdMlsClient {
                 tx.get_account_meta(&format!("c33_publication_json:{}", req.conversation_id))
             })? {
                 let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+                let pub_val: Value = serde_json::from_str(&pub_str)
+                    .map_err(|e| MLSError::Internal(e.to_string()))?;
+                let p_body = pub_val.get("body").unwrap_or(&pub_val);
                 // The DS keeps the first signed acceptance even when relaying it to a remote
                 // coordinator fails, so every retry replays exactly those bytes.
                 let journaled = self.db.read_tx(|tx| {
                     tx.get_pending_op(DIRECT_REQUEST_ACCEPTANCE_OP, &req.request_id)
                 })?;
-                let (wrapper_bytes, next) = if let Some(raw) = journaled {
+                let wrapper_bytes = if let Some(raw) = journaled {
                     let saved: Value = serde_json::from_str(&raw).map_err(|e| {
                         MLSError::Internal(format!("parse pending acceptance: {e}"))
                     })?;
-                    let wrapper = STANDARD
+                    STANDARD
                         .decode(saved["wrapper"].as_str().unwrap_or_default())
                         .map_err(|e| {
                             MLSError::Internal(format!("pending acceptance wrapper: {e}"))
-                        })?;
-                    (wrapper, saved["next"].clone())
+                        })?
                 } else {
-                    let pub_val: Value = serde_json::from_str(&pub_str)
-                        .map_err(|e| MLSError::Internal(e.to_string()))?;
-                    let p_body = pub_val.get("body").unwrap_or(&pub_val);
                     let prior = p_body["next"].clone();
                     let prior_sv = prior["stateVersion"].as_u64().unwrap_or(1);
                     let mut next = prior.clone();
@@ -3970,7 +3951,7 @@ impl CatbirdMlsClient {
                             now_ms,
                         )
                     })?;
-                    (wrapper_bytes, next)
+                    wrapper_bytes
                 };
                 let mut wire = b"{\"directRequest\":".to_vec();
                 wire.extend_from_slice(&wrapper_bytes);
@@ -3994,30 +3975,13 @@ impl CatbirdMlsClient {
                         &resp,
                     ));
                 }
-                let resp_val: Value = serde_json::from_slice(&resp.body).map_err(|e| {
-                    MLSError::Internal(format!("parse acceptConversation JSON: {e}"))
-                })?;
-                let auth_seq_opt = resp_val.get("seq").and_then(|v| v.as_i64()).or_else(|| {
-                    resp_val
-                        .get("entry")
-                        .and_then(|e| e.get("seq"))
-                        .and_then(|v| v.as_i64())
-                });
-                let next_coords = resp_val
-                    .get("coordinates")
-                    .cloned()
-                    .or_else(|| {
-                        resp_val
-                            .get("acceptanceProof")
-                            .and_then(|p| p.get("receipt"))
-                            .and_then(|r| r.get("body"))
-                            .and_then(|b| b.get("next"))
-                            .cloned()
-                    })
-                    .unwrap_or(next);
-                let next_coords = chat_wire::canonicalize_wire_coordinate(
-                    &next_coords,
-                    Some(&req.conversation_id),
+                // The cursor moves only over the verified acceptance entry, and only when it is
+                // the next one. An unverifiable answer keeps the journal for the exact replay.
+                let (accepted_seq, next_coords) = self.verify_direct_request_acceptance(
+                    &req.conversation_id,
+                    &resp.body,
+                    signer.public(),
+                    p_body,
                 )?;
                 let coords_str = serde_json::to_string(&next_coords)
                     .map_err(|e| MLSError::Internal(e.to_string()))?;
@@ -4029,10 +3993,9 @@ impl CatbirdMlsClient {
                 let needs_gap_sync = self.db.write_tx(|tx| {
                     let mut gap = false;
                     if let Some(mut c) = tx.get_conversation(&req.conversation_id)? {
-                        let target_seq = auth_seq_opt.unwrap_or(2);
-                        if target_seq == c.last_seq.saturating_add(1) {
-                            c.last_seq = target_seq;
-                        } else if target_seq > c.last_seq.saturating_add(1) {
+                        if accepted_seq == c.last_seq.saturating_add(1) {
+                            c.last_seq = accepted_seq;
+                        } else if accepted_seq > c.last_seq.saturating_add(1) {
                             gap = true;
                         }
                         c.updated_at_ms = now_ms;
@@ -4074,6 +4037,62 @@ impl CatbirdMlsClient {
         self.notify_change(PlatformChangeEvent::RequestsUpdated);
         self.notify_change(PlatformChangeEvent::ConversationsUpdated);
         Ok(())
+    }
+
+    /// The `acceptConversation` answer's `acceptanceProof`, verified: the conversation
+    /// coordinator's acceptance-commit receipt, under the method its `keyId` names, over the
+    /// exact sequenced entry carrying this device's signed acceptance of `publication`'s
+    /// request. Returns that entry's seq and the receipt's next coordinates.
+    fn verify_direct_request_acceptance(
+        &self,
+        conversation_id: &str,
+        response: &[u8],
+        own_signature_key: &[u8],
+        publication: &Value,
+    ) -> Result<(i64, Value), MLSError> {
+        let refused = |what: String| MLSError::Cryptography(format!("C33 acceptance: {what}"));
+        let response: Value = serde_json::from_slice(response)?;
+        let proof = response
+            .get("acceptanceProof")
+            .ok_or_else(|| refused("missing acceptanceProof".into()))?;
+        let authority = self
+            .db
+            .read_tx(|tx| tx.get_conversation(conversation_id))?
+            .ok_or_else(|| MLSError::group_not_found(conversation_id))?
+            .sequencer_did;
+        let document = self
+            .resolve_did_document(&authority)?
+            .ok_or_else(|| refused("coordinator document unavailable".into()))?;
+        let method = proof
+            .pointer("/receipt/body/keyId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused("receipt keyId".into()))?;
+        let key = dr_transcript::resolve_direct_request_receipt_key_for_authority(
+            &authority, &document, method,
+        )
+        .map_err(|e| refused(e.to_string()))?;
+        let verified =
+            dr_transcript::verify_received_direct_request_acceptance_proof_for_authority(
+                &authority,
+                &serde_json::to_vec(proof)?,
+                &key,
+                own_signature_key,
+            )
+            .map_err(|e| refused(e.to_string()))?;
+        let accepted = &verified["entry"]["signedRequest"]["body"];
+        if accepted["requestId"] != publication["requestId"]
+            || accepted["prior"] != publication["next"]
+        {
+            return Err(refused("proof is for another request".into()));
+        }
+        let seq = verified["entry"]["seq"]
+            .as_i64()
+            .ok_or_else(|| refused("entry seq".into()))?;
+        let next = chat_wire::canonicalize_wire_coordinate(
+            &verified["receipt"]["body"]["next"],
+            Some(conversation_id),
+        )?;
+        Ok((seq, next))
     }
 
     /// Enqueue and archive a staged `C33` opening message ONLY after `directRequestAcceptance` (`Spec §2 C33`).
@@ -4250,7 +4269,9 @@ impl CatbirdMlsClient {
     ///
     /// Signs a canonical `CATBIRD-CHAT-CLOSE\0` `conversationCloseBody` and submits
     /// `blue.catbird.chat.closeConversation`, retiring the current coordinate to
-    /// `lifecycle = "superseded"` while retaining local history unsendable.
+    /// `lifecycle = "superseded"` while retaining local history unsendable. The signed close is
+    /// journaled before HTTP and every later attempt replays exactly those bytes
+    /// ([`Self::replay_journaled_close`]); it is never re-signed while journaled.
     pub fn close_conversation(&self, conversation_id: &str) -> Result<(), MLSError> {
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
@@ -4287,46 +4308,101 @@ impl CatbirdMlsClient {
         if self.is_conversation_closed(&canonical_cid)? {
             return self.apply_terminal_close(&canonical_cid, None, None);
         }
-        let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
-        let prior_coords = self.load_or_build_conversation_coords(&canonical_cid)?;
-        let prior_sv = prior_coords
-            .get("stateVersion")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let mut retired_coords = prior_coords.clone();
-        retired_coords["stateVersion"] = json!(prior_sv + 1);
-        retired_coords["lifecycle"] = json!("superseded");
+        let journaled = self
+            .db
+            .read_tx(|tx| tx.get_pending_op(CONVERSATION_CLOSE_OP, &canonical_cid))?;
+        let raw = match journaled {
+            Some(raw) => raw,
+            None => {
+                let (signer, auth_gen) = self.load_enrolled_signer_and_auth_gen()?;
+                let prior_coords = self.load_or_build_conversation_coords(&canonical_cid)?;
+                let prior_sv = prior_coords
+                    .get("stateVersion")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let mut retired_coords = prior_coords.clone();
+                retired_coords["stateVersion"] = json!(prior_sv + 1);
+                retired_coords["lifecycle"] = json!("superseded");
 
-        let kind = if is_direct { "direct" } else { "group" };
-        let transition = self.hooks.uuid_v4().to_string();
-        let close_body = json!({
-            "$type": "blue.catbird.chat.defs#conversationCloseBody",
-            "signatureDomain": "CATBIRD-CHAT-CLOSE\0",
-            "transitionId": transition,
-            "idempotencyKey": transition,
-            "actorDid": self.normalized_did,
-            "actorDeviceId": canonical_dev_id,
-            "keyId": derive_key_id(signer.public()),
-            "authGeneration": auth_gen,
-            "conversationKind": kind,
-            "prior": prior_coords,
-            "retired": retired_coords,
-            "signedAt": self.hooks.now_rfc3339_millis(),
-        });
-        let resp = self.submit_signed_chat_op(
-            &canonical_dev_id,
-            Some(auth_gen),
-            CanonicalOperation::CloseConversation,
-            &close_body,
-            &signer,
-        )?;
-        let terminal_seq = resp
-            .pointer("/result/tombstone/terminalSeq")
-            .or_else(|| resp.pointer("/result/entry/seq"))
-            .and_then(Value::as_i64);
+                let kind = if is_direct { "direct" } else { "group" };
+                let transition = self.hooks.uuid_v4().to_string();
+                let close_body = json!({
+                    "$type": "blue.catbird.chat.defs#conversationCloseBody",
+                    "signatureDomain": "CATBIRD-CHAT-CLOSE\0",
+                    "transitionId": transition,
+                    "idempotencyKey": transition,
+                    "actorDid": self.normalized_did,
+                    "actorDeviceId": canonical_dev_id,
+                    "keyId": derive_key_id(signer.public()),
+                    "authGeneration": auth_gen,
+                    "conversationKind": kind,
+                    "prior": prior_coords,
+                    "retired": retired_coords,
+                    "signedAt": self.hooks.now_rfc3339_millis(),
+                });
+                let prepared = chat_wire::sign_clean_chat_mutation(
+                    &self.normalized_did,
+                    &canonical_dev_id,
+                    Some(auth_gen),
+                    CanonicalOperation::CloseConversation,
+                    &close_body,
+                    &signer,
+                )?;
+                let mut wire: Value =
+                    serde_json::from_slice(prepared.body.as_deref().unwrap_or_default())?;
+                let raw = wire["signedRequest"].take().to_string();
+                self.db.write_tx(|tx| {
+                    tx.put_pending_op(
+                        CONVERSATION_CLOSE_OP,
+                        &canonical_cid,
+                        &raw,
+                        self.hooks.now_ms(),
+                    )
+                })?;
+                raw
+            }
+        };
+        self.replay_journaled_close(&canonical_cid, &raw)?;
+        self.notify_change(PlatformChangeEvent::ConversationsUpdated);
+        Ok(())
+    }
+
+    /// Submit the journaled close `raw` (the exact `signedRequest` JSON) of `cid` and apply the
+    /// terminal close once the answer verifies ([`verify_own_answer`]); that write erases the
+    /// journal (`$.body.prior.conversationId`). A lost, transient or unverifiable answer keeps the
+    /// journal for the identical replay, which mls-ds answers with its recorded result even after
+    /// the close wipe. A semantic 4xx proves mls-ds never sequenced these bytes and never will
+    /// (e.g. `StaleCoordinates`), so it drops the journal and the next close signs afresh.
+    fn replay_journaled_close(&self, cid: &str, raw: &str) -> Result<(), MLSError> {
+        let url = format!(
+            "{}/xrpc/blue.catbird.chat.closeConversation",
+            self.ds_base()
+        );
+        let resp = self.post_json_raw(&url, signed_request_body(raw.as_bytes()))?;
+        if resp.status >= 400 {
+            if is_terminal_rejection(&resp) {
+                self.db.write_tx(|tx| {
+                    tx.delete_pending_op_if_payload(CONVERSATION_CLOSE_OP, cid, raw)?;
+                    Ok(())
+                })?;
+            }
+            return Err(chat_response_error(format_args!("POST {url}"), &resp));
+        }
+        let answer: Value = serde_json::from_slice(&resp.body)
+            .map_err(|e| MLSError::Internal(format!("parse closeConversation answer: {e}")))?;
+        let sent: Value = serde_json::from_str(raw)?;
+        // Only this device's own sequenced close moves the cursor, and only onto the next entry.
+        let close_seq = verify_own_answer(&answer, &sent, cid, CONVERSATION_CLOSE_ENTRY_KIND)?;
+        let last_seq = self
+            .db
+            .read_tx(|tx| tx.get_conversation(cid))?
+            .map(|c| c.last_seq);
+        let terminal_seq =
+            Some(close_seq).filter(|seq| last_seq.map(|last| last.saturating_add(1)) == Some(*seq));
         // The terminal coordinate is the one this device signed, not a mutable
         // response/tombstone presentation supplied by the DS.
-        let retired_canon = chat_wire::canonicalize_wire_coordinate(&retired_coords, None)?;
+        let retired_canon =
+            chat_wire::canonicalize_wire_coordinate(&sent["body"]["retired"], None)?;
 
         if crate::buggify!("after_http_2xx_before_db_commit") {
             return Err(MLSError::Internal(
@@ -4334,10 +4410,39 @@ impl CatbirdMlsClient {
             ));
         }
 
-        self.apply_terminal_close(&canonical_cid, Some(&retired_canon), terminal_seq)?;
+        self.apply_terminal_close(cid, Some(&retired_canon), terminal_seq)
+    }
 
-        self.notify_change(PlatformChangeEvent::ConversationsUpdated);
-        Ok(())
+    /// `sync` replays every journaled close before any conversation's entries (a lost close
+    /// answer never arrives as an echo: mls-ds wipes the conversation) and applies each verified
+    /// answer. A failed replay keeps its journal for the next sync. Returns how many closed.
+    pub(crate) fn complete_pending_closes(&self) -> Result<u32, MLSError> {
+        let journaled: Vec<(String, String)> = self.db.read_tx(|tx| {
+            let mut stmt = tx
+                .conn()
+                .prepare(
+                    "SELECT op_key, payload_json FROM pending_ops WHERE op_kind = ?1 \
+                     ORDER BY op_key",
+                )
+                .map_err(|e| map_rusqlite_err("pending closes.prepare", &e))?;
+            let rows = stmt
+                .query_map([CONVERSATION_CLOSE_OP], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| map_rusqlite_err("pending closes.query", &e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| map_rusqlite_err("pending closes.row", &e))
+        })?;
+        let mut closed = 0;
+        for (cid, raw) in journaled {
+            match self.replay_journaled_close(&cid, &raw) {
+                Ok(()) => closed += 1,
+                Err(error) => {
+                    tracing::warn!(conversation_id = cid, %error, "journaled close not completed")
+                }
+            }
+        }
+        Ok(closed)
     }
 
     pub fn list_members(&self, conversation_id: &str) -> Result<Vec<String>, MLSError> {

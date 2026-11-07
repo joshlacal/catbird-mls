@@ -810,12 +810,13 @@ pub fn process_push_notification_with_hooks(
     // -------------------------------------------------------------------------
     let preview_res = db.write_tx(|tx| {
         // Re-check inside BEGIN IMMEDIATE in case the foreground app already inserted this message.
-        let concurrent_msg: Option<(String, String, i64, i64)> = tx
+        let concurrent_msg: Option<(String, String, String, i64, i64)> = tx
             .conn()
             .query_row(
-                "SELECT sender_did, plaintext_json, epoch, seq FROM messages WHERE message_id = ?1;",
+                "SELECT conversation_id, sender_did, plaintext_json, epoch, seq FROM messages \
+                 WHERE message_id = ?1;",
                 [&wake.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
             .map_err(|e| MLSError::Internal(format!("recheck message in write_tx: {e}")))?;
@@ -831,7 +832,13 @@ pub fn process_push_notification_with_hooks(
             .and_then(|m| m.title)
             .or_else(|| current_convo.title.clone());
 
-        if let Some((sender_did, plaintext_json, epoch, seq)) = concurrent_msg {
+        if let Some((conversation_id, sender_did, plaintext_json, epoch, seq)) = concurrent_msg {
+            // The wake's ids are unauthenticated: a cached row answers only the exact entry.
+            if conversation_id != wake.conversation_id || seq != wake.entry_seq {
+                return Err(MLSError::Cryptography(
+                    "push wake differs from the cached message's conversation or seq".into(),
+                ));
+            }
             let (body, _) = parse_canonical_message_body(plaintext_json.as_bytes())?;
             return Ok(NotificationPreview {
                 message_id: wake.message_id.clone(),
@@ -895,10 +902,9 @@ pub fn process_push_notification_with_hooks(
                 continue;
             }
             if entry.mls_bytes.is_empty() {
-                // I14 pruned entry: ciphertext was deleted on `mls-ds` once all active devices
-                // acknowledged it. Advance `last_seq` monotonically and continue catching up.
-                current_convo.last_seq = current_convo.last_seq.max(entry.seq);
-                continue;
+                // An `I14`-pruned entry carries nothing the NSE can verify: stop catching up
+                // below it. Foreground sync verifies it under its own receipt.
+                break;
             }
 
             let mls_in = MlsMessageIn::tls_deserialize_exact(&entry.mls_bytes).map_err(|e| {
@@ -991,9 +997,11 @@ pub fn process_push_notification_with_hooks(
                         .map_err(|e| MLSError::Cryptography(format!("push archive frame UTF-8: {e}")))?;
                     serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(frame)
                         .map_err(|e| MLSError::Cryptography(format!("push archive payload: {e}")))?;
-                    if commitment_opt.is_none() {
-                        return Err(MLSError::Cryptography("push message has no authenticated archive commitment".into()));
-                    }
+                    let commitment = commitment_opt.ok_or_else(|| {
+                        MLSError::Cryptography(
+                            "push message has no authenticated archive commitment".into(),
+                        )
+                    })?;
                     let original_sender_attestation =
                         original_sender_attestation.ok_or_else(|| {
                             MLSError::Cryptography(
@@ -1009,6 +1017,11 @@ pub fn process_push_notification_with_hooks(
                             "push original sender attestation differs from MLS sender leaf".into(),
                         ));
                     }
+                    original_sender_attestation.verify(
+                        &wake.conversation_id,
+                        &message_id,
+                        &commitment,
+                    )?;
                     // The full archive payload with the authenticated receive-time roster; the
                     // app enqueues it once the entry's I13 receipt verifies.
                     let evidence = crate::client::QueuedLabyrinthArchivePayload {
@@ -1078,16 +1091,14 @@ pub fn process_push_notification_with_hooks(
                         is_own,
                     })?;
 
-                    if let Some(commitment) = commitment_opt {
-                        tx.conn()
-                            .execute(
-                                "UPDATE messages SET archive_commitment = ?1 WHERE message_id = ?2;",
-                                rusqlite::params![commitment.as_slice(), message_id],
-                            )
-                            .map_err(|e| {
-                                MLSError::Internal(format!("persist archive_commitment: {e}"))
-                            })?;
-                    }
+                    tx.conn()
+                        .execute(
+                            "UPDATE messages SET archive_commitment = ?1 WHERE message_id = ?2;",
+                            rusqlite::params![commitment.as_slice(), message_id],
+                        )
+                        .map_err(|e| {
+                            MLSError::Internal(format!("persist archive_commitment: {e}"))
+                        })?;
 
                     current_convo.last_seq = current_convo.last_seq.max(entry.seq);
                     if !is_own {
@@ -1128,7 +1139,9 @@ pub fn process_push_notification_with_hooks(
                     current_convo.last_seq = current_convo.last_seq.max(entry.seq);
                 }
                 ProcessedMessageContent::OwnPrivateMessage => {
-                    current_convo.last_seq = current_convo.last_seq.max(entry.seq);
+                    // This device's own private message never decrypts here, so nothing
+                    // authenticates it: stop catching up below it for foreground sync.
+                    break;
                 }
                 ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
                     return Err(MLSError::InvalidInput {

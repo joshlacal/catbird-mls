@@ -256,6 +256,23 @@ struct StoredOwnEchoProof {
     ciphertext_sha256_hex: String,
 }
 
+/// `pending_ops` key and payload of `proof` (`op_kind = 'own_echo_proof'`).
+pub(crate) fn own_echo_proof_row(proof: &OwnEchoProof) -> Result<(String, String), MLSError> {
+    let key_hex = hex::encode(proof.canonical_entry_sha256);
+    let record = StoredOwnEchoProof {
+        canonical_entry_sha256_hex: key_hex.clone(),
+        accepted_request_sha256_hex: hex::encode(proof.accepted_request_sha256),
+        conversation_id: proof.conversation_id.clone(),
+        group_id_hex: hex::encode(&proof.group_id),
+        server_entry_id: proof.server_entry_id.clone(),
+        mls_epoch: proof.mls_epoch,
+        aad_sha256_hex: hex::encode(proof.aad_sha256),
+        ciphertext_sha256_hex: hex::encode(proof.ciphertext_sha256),
+    };
+    let payload_json = serde_json::to_string(&record).map_err(|_| MLSError::SerializationError)?;
+    Ok((key_hex, payload_json))
+}
+
 /// Unified metadata & bundle facade sharing the single [`MlsAccountDb`] connection
 /// (`account_meta` + `pending_ops` + `openmls_kv`).
 pub(crate) struct ManifestStorage {
@@ -609,19 +626,7 @@ impl ManifestStorage {
     }
 
     pub(crate) fn store_own_echo_proof(&self, proof: &OwnEchoProof) -> Result<(), MLSError> {
-        let key_hex = hex::encode(proof.canonical_entry_sha256);
-        let record = StoredOwnEchoProof {
-            canonical_entry_sha256_hex: key_hex.clone(),
-            accepted_request_sha256_hex: hex::encode(proof.accepted_request_sha256),
-            conversation_id: proof.conversation_id.clone(),
-            group_id_hex: hex::encode(&proof.group_id),
-            server_entry_id: proof.server_entry_id.clone(),
-            mls_epoch: proof.mls_epoch,
-            aad_sha256_hex: hex::encode(proof.aad_sha256),
-            ciphertext_sha256_hex: hex::encode(proof.ciphertext_sha256),
-        };
-        let payload_json =
-            serde_json::to_string(&record).map_err(|_| MLSError::SerializationError)?;
+        let (key_hex, payload_json) = own_echo_proof_row(proof)?;
         let now_ms = unix_now_ms();
         self.with_connection(|conn| {
             conn.execute(

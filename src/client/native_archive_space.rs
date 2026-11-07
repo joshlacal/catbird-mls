@@ -176,34 +176,44 @@ mod native_archive_space_auth {
                 return Err("native_space_unsupported_space_type".into());
             }
             let authority = self.space_document(&space.authority)?;
-            let kem_key = if writer == authority.id { authority.atproto_kem_did_key.clone() } else { self.space_document(&writer)?.atproto_kem_did_key };
-            // A refused credential exchange is the Space's answer (a removed member reads as
-            // Forbidden and degrades to its owner archive), not a transport failure.
+            let authority_kem = authority.atproto_kem_did_key.clone();
+            let kem_key = if writer == authority.id { authority_kem.clone() } else { self.space_document(&writer)?.atproto_kem_did_key };
+            // Only the Space authority can deny membership: the account PDS for its personal
+            // mailbox, the home DS for a conversation Space it is itself the authority of. A
+            // home DS relaying a foreign authority's refusal, of the credential or of a read
+            // after it was granted, proves no removal.
+            let authority_answers = personal || space.authority == self.config.home_ds_did.trim();
+            let relayed_denial = |status: u16| {
+                format!("{}: relayed HTTP {status}", super::NATIVE_UNAUTHENTICATED_DENIAL)
+            };
             let credential = match self.space_credential(&space, personal, authority)? {
                 Ok(credential) => credential,
-                Err(denied) => return Ok(into_response(denied)),
+                Err(denied) if authority_answers => return Ok(into_response(denied)),
+                Err(denied) => return Err(relayed_denial(denied.status)),
             };
             let mut context = ReadContext { space, writer, personal, kem_key, credential };
             if context.space.space_type == "blue.catbird.labyrinth.conversation"
                 && matches!(request.nsid.as_str(), GET_RECORD | LIST_RECORDS)
-                && self
-                    .verified_inventories
-                    .lock()
-                    .map_err(|_| "native_space_inventory_cache_poisoned")?
-                    .contains_key(&context.space.raw)
             {
-                let mut cached = PlatformHttpResponse {
-                    status: 200,
-                    headers: vec![],
-                    body: vec![],
-                };
-                if request.nsid == GET_RECORD {
-                    self.release_verified_inventory_record(&context, &params, &mut cached)?;
-                } else {
-                    self.release_verified_inventory_records(&context, &params, &mut cached)?;
+                // Conversation records are listed only from a verified writer inventory. A listing
+                // with none verified yet (unsend, leave, purge of the own repo) verifies it first.
+                if request.nsid == LIST_RECORDS && !self.inventory_verified(&context.space)? {
+                    self.verify_space_inventory(&mut context, authority_kem)?;
                 }
-                self.space_credential_live(&context)?;
-                return bounded(cached).map(into_response);
+                if self.inventory_verified(&context.space)? {
+                    let mut cached = PlatformHttpResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: vec![],
+                    };
+                    if request.nsid == GET_RECORD {
+                        self.release_verified_inventory_record(&context, &params, &mut cached)?;
+                    } else {
+                        self.release_verified_inventory_records(&context, &params, &mut cached)?;
+                    }
+                    self.space_credential_live(&context)?;
+                    return bounded(cached).map(into_response);
+                }
             }
             let mac_type = match request.nsid.as_str() {
                 GET_RECORD | LIST_RECORDS | "com.atproto.space.getBlob" => Some(RECORD_MAC_TYPE),
@@ -213,7 +223,12 @@ mod native_archive_space_auth {
                 _ => None,
             };
             let (mut response, secret) = self.space_read(&context, &request.nsid, &request.path, request.headers, mac_type)?;
-            if !(200..300).contains(&response.status) { return Ok(into_response(response)); }
+            if !(200..300).contains(&response.status) {
+                if !authority_answers && reads_as_space_denial(&response) {
+                    return Err(relayed_denial(response.status));
+                }
+                return Ok(into_response(response));
+            }
             match request.nsid.as_str() {
                 GET_RECORD => {
                     let (full, value) = verify_record(
@@ -383,6 +398,29 @@ mod native_archive_space_auth {
             };
             self.space_credential_live(context)?;
             Ok((bounded(response)?, negotiated.map(|(_, secret)| secret)))
+        }
+
+        fn inventory_verified(&self, space: &SpaceUri) -> Result<bool, String> {
+            Ok(self
+                .verified_inventories
+                .lock()
+                .map_err(|_| "native_space_inventory_cache_poisoned")?
+                .contains_key(&space.raw))
+        }
+
+        /// Verify and cache the Space's writer inventory as an authority read under the same
+        /// credential; `context` then addresses its own writer again.
+        fn verify_space_inventory(&self, context: &mut ReadContext, authority_kem: Option<String>) -> Result<(), String> {
+            let writer = std::mem::replace(&mut context.writer, context.space.authority.clone());
+            let kem_key = std::mem::replace(&mut context.kem_key, authority_kem);
+            let params = BTreeMap::from([("space".to_owned(), context.space.raw.clone())]);
+            let (mut response, secret) = self.space_read(context, LIST_REPOS, &query_path(LIST_REPOS, &params), vec![], Some(COMMIT_MAC_TYPE))?;
+            require_success(&response, "listRepos inventory")?;
+            self.verify_inventory(context, &params, &mut response, secret.as_deref().ok_or("native_space_missing_request_secret")?)
+                .map_err(|error| format!("ArchiveInventoryIncomplete: {error}"))?;
+            context.writer = writer;
+            context.kem_key = kem_key;
+            Ok(())
         }
 
         fn verify_inventory(
@@ -762,10 +800,11 @@ mod native_archive_space_auth {
                 .verified_inventories
                 .lock()
                 .map_err(|_| "native_space_inventory_cache_poisoned")?;
-            let records = inventories
+            let inventory = inventories
                 .get(&context.space.raw)
-                .and_then(|inventory| inventory.writers.get(&context.writer))
                 .ok_or("native_space_inventory_snapshot_missing")?;
+            // The verified inventory lists every writer: one it omits has no records here.
+            let records = inventory.writers.get(&context.writer).map(Vec::as_slice).unwrap_or_default();
             let limit = params
                 .get("limit")
                 .map(|value| value.parse::<usize>())
@@ -1073,6 +1112,15 @@ mod native_archive_space_auth {
         }
     }
 
+    /// Whether labyrinth reads this refusal as Space denial (`Error::Forbidden`).
+    fn reads_as_space_denial(response: &PlatformHttpResponse) -> bool {
+        let error = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body["error"].as_str().map(str::to_owned));
+        let refusal = labyrinth::store::space::SpaceError { status: response.status, error, message: None };
+        matches!(labyrinth::store::space::map_space_error(refusal), labyrinth::Error::Forbidden)
+    }
+
     fn decode<T: serde::de::DeserializeOwned>(body: &[u8], what: &str) -> Result<T, String> {
         serde_json::from_slice(body).map_err(|e| format!("native_space_invalid_{what}: {e}"))
     }
@@ -1306,6 +1354,10 @@ mod native_archive_space_auth {
                     .unwrap_or(space.authority.as_str());
                 if let Some(target) = relay_target {
                     assert_eq!(target, writer);
+                }
+                // The credential was granted; the read itself is refused.
+                if fault == "read_denied" {
+                    return Ok(PlatformHttpResponse { status: 403, headers: vec![], body: br#"{"error":"NotAuthorized","message":"not a member"}"#.to_vec() });
                 }
                 if read_nsid == "com.atproto.space.getBlob" {
                     return Ok(PlatformHttpResponse { status: 200, headers: vec![], body: BLOB.to_vec() });
@@ -1711,6 +1763,24 @@ mod native_archive_space_auth {
             assert_eq!(absent["error"], "RecordNotFound");
         }
 
+        /// A conversation listing with no inventory verified yet (unsend, leave or purge of the own
+        /// repo) verifies the writer inventory first; a writer the inventory omits lists nothing.
+        #[test]
+        fn conversation_listing_verifies_the_inventory_first_and_an_omitted_writer_lists_nothing() {
+            let (_directory, gateway, host) = gateway();
+            let listed = block_on_sync(gateway.execute_authenticated_space(request(LIST_RECORDS, false))).unwrap();
+            let listed: Value = serde_json::from_slice(&listed.body).unwrap();
+            assert_eq!(listed["records"][0]["rkey"], "batch-1");
+            assert!(host.requests.lock().unwrap().iter().any(|r| r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")
+                && serde_json::from_slice::<Value>(r.body.as_deref().unwrap()).unwrap()["nsid"] == LIST_REPOS));
+            let own = LabyrinthSpaceRequest::get(LIST_RECORDS, query_path(LIST_RECORDS, &BTreeMap::from([
+                ("space".into(), space(false).raw), ("repo".into(), ACCOUNT.into()), ("collection".into(), COLLECTION.into()),
+            ])));
+            let own = block_on_sync(gateway.execute_authenticated_space(own)).unwrap();
+            let own: Value = serde_json::from_slice(&own.body).unwrap();
+            assert_eq!(own["records"], json!([]));
+        }
+
         #[test]
         fn writer_inventory_rejects_every_incomplete_or_inconsistent_snapshot_shape() {
             for (fault, expected) in [
@@ -1773,9 +1843,10 @@ mod native_archive_space_auth {
 
 
         #[test]
-        fn native_space_auth_returns_a_refused_credential_exchange_as_the_space_denial() {
-            for personal in [false, true] {
-                let (_directory, gateway, host) = gateway();
+        fn native_space_auth_accepts_only_the_authoritys_own_refusal_as_space_denial() {
+            for (personal, home_ds_did) in [(true, "did:web:home.example"), (false, AUTHORITY)] {
+                let (_directory, mut gateway, host) = gateway();
+                gateway.config.home_ds_did = home_ds_did.into();
                 *host.fault.lock().unwrap() = "credential_denied";
                 let response = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, personal))).unwrap();
                 assert_eq!(response.status, 403, "personal {personal}");
@@ -1787,6 +1858,34 @@ mod native_archive_space_auth {
                 assert!(host.requests.lock().unwrap().iter().all(|r| !r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
                     "no read follows a refused credential");
             }
+            // The home DS relaying a foreign authority's refusal is no Space denial.
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "credential_denied";
+            let error = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false))).unwrap_err();
+            assert!(error.starts_with(super::super::NATIVE_UNAUTHENTICATED_DENIAL), "{error}");
+        }
+
+        /// A read refused after the credential was granted: the authority's own refusal is Space
+        /// denial; relayed from a foreign authority, the restore stays pending.
+        #[test]
+        fn native_space_read_refused_after_a_granted_credential_is_denial_only_from_the_authority() {
+            for (personal, home_ds_did) in [(true, "did:web:home.example"), (false, AUTHORITY)] {
+                let (_directory, mut gateway, host) = gateway();
+                gateway.config.home_ds_did = home_ds_did.into();
+                *host.fault.lock().unwrap() = "read_denied";
+                let response = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, personal))).unwrap();
+                assert_eq!(response.status, 403, "personal {personal}");
+                assert!(host.requests.lock().unwrap().iter().any(|r| r.url.contains("/xrpc/com.atproto.space.getRecord?") || r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
+                    "personal {personal}: the read followed a granted credential");
+            }
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "read_denied";
+            let transport = crate::labyrinth::SpaceXrpcTransport::new(Arc::new(gateway));
+            let refused = block_on_sync(transport.get_record(&space(false).raw, WRITER, COLLECTION, "batch-1")).unwrap_err();
+            assert!(host.requests.lock().unwrap().iter().any(|r| r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
+                "the read followed a granted credential");
+            let error = super::super::native_archive_error(crate::labyrinth::map_error(labyrinth::store::space::map_space_error(refused)));
+            assert!(matches!(&error, crate::MLSError::InvalidState(code) if code == "ArchiveRestorePending"), "{error}");
         }
 
         #[test]

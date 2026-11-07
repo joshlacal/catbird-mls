@@ -47,6 +47,7 @@ struct World {
     committed_space_writes: usize,
     inventory_fault: Option<&'static str>,
     directory_outage: bool,
+    write_outage: bool,
     denied_spaces: BTreeSet<(String, String)>,
 }
 
@@ -100,6 +101,11 @@ impl NativeArchiveAuthFixture {
     #[allow(dead_code)]
     pub fn set_directory_outage(&self, outage: bool) {
         self.world.lock().unwrap().directory_outage = outage;
+    }
+    /// Every Space write (`applyWrites`, `deleteRecord`) answers 503 until lifted.
+    #[allow(dead_code)]
+    pub fn set_write_outage(&self, outage: bool) {
+        self.world.lock().unwrap().write_outage = outage;
     }
     #[allow(dead_code)]
     pub fn set_space_denied(&self, account: &str, space: &str, denied: bool) {
@@ -528,6 +534,9 @@ impl NativeArchiveAuthFixture {
     }
 
     fn apply(&self, account: &str, body: &Value) -> Result<PlatformHttpResponse, MLSError> {
+        if self.world.lock().unwrap().write_outage {
+            return Ok(reply(503, json!({"error": "ServiceUnavailable"})));
+        }
         let space = SpaceUri::parse(text(body, "space")?).map_err(failure)?;
         let repo = text(body, "repo")?;
         if repo != account {

@@ -410,6 +410,9 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
     }
 }
 
+/// Bob's `(inner plaintext, canonical AAD)` for `message_id`. `tamper` may rewrite the signed
+/// original sender attestation and the AAD JSON before either is encoded.
+#[allow(clippy::too_many_arguments)]
 fn seal_bob_application_message<P: OpenMlsProvider>(
     fixture: &TwoPeerGroupFixture,
     group: &MlsGroup,
@@ -418,6 +421,7 @@ fn seal_bob_application_message<P: OpenMlsProvider>(
     payload_json: &[u8],
     message_id: &str,
     state_version: i64,
+    tamper: impl FnOnce(&mut OriginalSenderArchiveAttestationEnvelope, &mut serde_json::Value),
 ) -> Result<(Vec<u8>, Vec<u8>), MLSError> {
     let archive_commitment =
         labyrinth_protocol::receipt::compute_archive_commitment(&frame_nonce, payload_json);
@@ -426,7 +430,7 @@ fn seal_bob_application_message<P: OpenMlsProvider>(
         message_id,
         &archive_commitment,
     );
-    let attestation = OriginalSenderArchiveAttestationEnvelope {
+    let mut attestation = OriginalSenderArchiveAttestationEnvelope {
         sender_did: fixture.bob_did.clone(),
         sender_device_id: fixture.bob_device_id.clone(),
         sender_transport_public_key: fixture.bob_signer.public().to_vec(),
@@ -435,12 +439,6 @@ fn seal_bob_application_message<P: OpenMlsProvider>(
         })?,
     };
     attestation.verify(&fixture.conversation_id, message_id, &archive_commitment)?;
-    let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
-        frame_nonce,
-        canonical_payload_bytes: payload_json.to_vec(),
-        original_sender_attestation: Some(attestation.clone()),
-    })
-    .map_err(|error| MLSError::Internal(format!("serialize push plaintext: {error}")))?;
 
     let conversation_id = uuid::Uuid::parse_str(&fixture.conversation_id)
         .map_err(|error| MLSError::invalid_input(format!("conversation UUID: {error}")))?;
@@ -449,22 +447,33 @@ fn seal_bob_application_message<P: OpenMlsProvider>(
     let conversation_id_bytes = STANDARD.encode(conversation_id.as_bytes());
     let mut prior = push_coordinates(group, provider, &fixture.conversation_id, state_version);
     prior["conversationId"] = serde_json::json!(conversation_id_bytes);
-    let aad = catbird_mls::orchestrator::canonical_transport::canonical_application_aad_bytes(
-        &serde_json::json!({
-            "protocolVersion": "1",
-            "conversationId": conversation_id_bytes,
-            "generation": 0,
-            "messageId": STANDARD.encode(message_id.as_bytes()),
-            "prior": prior,
-            "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
-            "originalSenderAttestation": attestation.to_aad_json(),
-        }),
-    )
-    .map_err(|error| MLSError::Cryptography(format!("canonical application AAD: {error}")))?;
+    let mut aad = serde_json::json!({
+        "protocolVersion": "1",
+        "conversationId": conversation_id_bytes,
+        "generation": 0,
+        "messageId": STANDARD.encode(message_id.as_bytes()),
+        "prior": prior,
+        "archiveCommitment": { "$bytes": STANDARD.encode(archive_commitment) },
+        "originalSenderAttestation": attestation.to_aad_json(),
+    });
+    tamper(&mut attestation, &mut aad);
+    let inner_plaintext = serde_json::to_vec(&PrivateMessagePlaintextEnvelope {
+        frame_nonce,
+        canonical_payload_bytes: payload_json.to_vec(),
+        original_sender_attestation: Some(attestation),
+    })
+    .map_err(|error| MLSError::Internal(format!("serialize push plaintext: {error}")))?;
+    let aad = catbird_mls::orchestrator::canonical_transport::canonical_application_aad_bytes(&aad)
+        .map_err(|error| MLSError::Cryptography(format!("canonical application AAD: {error}")))?;
     Ok((inner_plaintext, aad))
 }
 
-fn bob_encrypt_app_message(fixture: &TwoPeerGroupFixture, text: &str, message_id: &str) -> Vec<u8> {
+fn bob_encrypt_app_message(
+    fixture: &TwoPeerGroupFixture,
+    text: &str,
+    message_id: &str,
+    tamper: impl FnOnce(&mut OriginalSenderArchiveAttestationEnvelope, &mut serde_json::Value),
+) -> Vec<u8> {
     let payload_json =
         serde_json::to_string(&catbird_mls::orchestrator::MLSMessagePayload::text(text)).unwrap();
 
@@ -485,6 +494,7 @@ fn bob_encrypt_app_message(fixture: &TwoPeerGroupFixture, text: &str, message_id
                 payload_json.as_bytes(),
                 message_id,
                 7,
+                tamper,
             )?;
             group.set_aad(aad);
             let msg_out = group
@@ -505,8 +515,12 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
         return;
     }
     let fixture = setup_alice_and_bob_group(true);
-    let ciphertext =
-        bob_encrypt_app_message(&fixture, "Offline hello from Bob!", INLINE_MESSAGE_ID);
+    let ciphertext = bob_encrypt_app_message(
+        &fixture,
+        "Offline hello from Bob!",
+        INLINE_MESSAGE_ID,
+        |_, _| {},
+    );
     assert!(
         ciphertext.len() <= INLINE_CIPHERTEXT_MAX_BYTES,
         "expected inline ciphertext <= 2200 B, got {}",
@@ -716,6 +730,7 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
                 payload_json.as_bytes(),
                 gap_message_id,
                 9,
+                |_, _| {},
             )?;
             group.set_aad(aad);
             let msg_out = group
@@ -992,6 +1007,7 @@ fn unverified_sender_leaf_key_fails_i4_and_never_persists_message() {
         &fixture,
         "Forged/unverified device wake",
         UNVERIFIED_MESSAGE_ID,
+        |_, _| {},
     );
 
     let keystore = Arc::new(MemoryPushKeystore::new(
@@ -1264,46 +1280,17 @@ fn catbird_mls_client_enforces_i8_i9_i15_d3_d4_and_pq_otc() {
     assert!(!client.is_handle_closed());
 }
 
+/// The NSE stops catching up at an entry it cannot verify: a pruned entry (no MLS bytes) or this
+/// device's own private message. `last_seq` stays below it and the entries behind it are left to
+/// foreground sync, which verifies them; the wake gets the generic preview.
+///
+/// Fail-before: the NSE advanced `last_seq` over either and decrypted Bob's later message.
 #[test]
-fn push_catchup_skips_i14_pruned_entry_and_decrypts_live_message() {
-    let fixture = setup_alice_and_bob_group(true);
-
-    let live_msg_bytes = fixture
-        .bob_db
-        .write_tx(|tx| {
-            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
-            let provider = OpenMlsKvProvider::new(storage)?;
-            let mut group =
-                MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
-                    .map_err(|e| MLSError::Internal(format!("load bob group: {e:?}")))?
-                    .expect("bob group");
-            let payload_json = serde_json::to_string(
-                &catbird_mls::orchestrator::MLSMessagePayload::text("Message after pruned seq 2!"),
-            )
-            .unwrap();
-            let (inner_plaintext, aad) = seal_bob_application_message(
-                &fixture,
-                &group,
-                &provider,
-                [0x88u8; 32],
-                payload_json.as_bytes(),
-                PRUNED_LIVE_MESSAGE_ID,
-                7,
-            )?;
-            group.set_aad(aad);
-            let msg_out = group
-                .create_message(&provider, &fixture.bob_signer, &inner_plaintext)
-                .map_err(|e| MLSError::Internal(format!("create_message: {e:?}")))?;
-            msg_out
-                .tls_serialize_detached()
-                .map_err(|e| MLSError::Internal(format!("ser msg: {e:?}")))
-        })
-        .expect("bob live msg");
-
-    struct PrunedWindowTransport {
+fn push_catchup_stops_at_entries_the_nse_cannot_verify() {
+    struct WindowTransport {
         bundle: PushFetchBundle,
     }
-    impl PushFetchTransport for PrunedWindowTransport {
+    impl PushFetchTransport for WindowTransport {
         fn fetch_missing_entries(
             &self,
             _conversation_id: String,
@@ -1322,68 +1309,124 @@ fn push_catchup_skips_i14_pruned_entry_and_decrypts_live_message() {
         }
     }
 
-    let mut dpop_map = HashMap::new();
-    dpop_map.insert(
-        fixture.alice_hash.clone(),
-        Some("cached-chat-dpop-jwt".to_string()),
-    );
-    let mut db_keys = HashMap::new();
-    db_keys.insert(fixture.alice_hash.clone(), fixture.alice_db_key);
-    let keystore = Arc::new(MemoryPushKeystore {
-        db_keys: Mutex::new(db_keys),
-        sig_keys: Mutex::new(HashMap::new()),
-        dpop_tokens: Mutex::new(dpop_map),
-    });
+    // (own private?, generic preview?, last_seq, stored messages) per blocking entry.
+    let mut outcomes = Vec::new();
+    for own_private in [false, true] {
+        let fixture = setup_alice_and_bob_group(true);
+        let live_msg_bytes = bob_encrypt_app_message(
+            &fixture,
+            "Message after an unverifiable seq 2",
+            PRUNED_LIVE_MESSAGE_ID,
+            |_, _| {},
+        );
+        // Pruned: no MLS bytes. Own: a private message Alice's own leaf sent.
+        let blocking_bytes = if own_private {
+            let alice_db = MlsAccountDb::open_native(
+                &fixture.alice_db_path,
+                &fixture.alice_db_key,
+                OpenMode::App,
+            )
+            .expect("alice db");
+            let own = alice_db
+                .write_tx(|tx| {
+                    let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                    let provider = OpenMlsKvProvider::new(storage)?;
+                    let mut group =
+                        MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
+                            .map_err(|e| MLSError::Internal(format!("load alice group: {e:?}")))?
+                            .expect("alice group");
+                    let signer = SignatureKeyPair::read(
+                        provider.storage(),
+                        group
+                            .own_leaf_node()
+                            .expect("own leaf")
+                            .signature_key()
+                            .as_slice(),
+                        CIPHERSUITE.signature_algorithm(),
+                    )
+                    .expect("alice signer");
+                    group
+                        .create_message(&provider, &signer, b"own message")
+                        .map_err(|e| MLSError::Internal(format!("create_message: {e:?}")))?
+                        .tls_serialize_detached()
+                        .map_err(|e| MLSError::Internal(format!("ser msg: {e:?}")))
+                })
+                .expect("alice own message");
+            let _ = alice_db.prepare_for_background();
+            own
+        } else {
+            Vec::new()
+        };
+        let transport = Arc::new(WindowTransport {
+            bundle: PushFetchBundle {
+                entries: vec![
+                    FetchedPushEntry {
+                        entry_id: "entry-unverifiable-seq-2".to_string(),
+                        seq: 2,
+                        epoch: 1,
+                        entry_kind: "application_message".to_string(),
+                        sender_did: String::new(),
+                        mls_bytes: blocking_bytes,
+                    },
+                    FetchedPushEntry {
+                        entry_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
+                        seq: 3,
+                        epoch: 1,
+                        entry_kind: "application_message".to_string(),
+                        sender_did: fixture.bob_did.clone(),
+                        mls_bytes: live_msg_bytes,
+                    },
+                ],
+                metadata_snapshot: None,
+                authorized_device_keys: Vec::new(),
+            },
+        });
+        let keystore = Arc::new(MemoryPushKeystore::new(
+            &fixture.alice_hash,
+            fixture.alice_db_key,
+            Some("cached-chat-dpop-jwt".to_string()),
+        ));
+        let wake = PushWakePayload {
+            message_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
+            conversation_id: fixture.conversation_id.clone(),
+            generation: 1,
+            entry_seq: 3,
+            kind: "application_message".to_string(),
+            fetch_required: true,
+            inline_ciphertext: None,
+            sender_did: Some(fixture.bob_did.clone()),
+            recipient_account_hash: fixture.alice_hash.clone(),
+        };
 
-    let transport = Arc::new(PrunedWindowTransport {
-        bundle: PushFetchBundle {
-            entries: vec![
-                FetchedPushEntry {
-                    entry_id: "entry-pruned-seq-2".to_string(),
-                    seq: 2,
-                    epoch: 1,
-                    entry_kind: "application_message".to_string(),
-                    sender_did: fixture.bob_did.clone(),
-                    mls_bytes: Vec::new(), // I14 pruned ciphertext!
-                },
-                FetchedPushEntry {
-                    entry_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
-                    seq: 3,
-                    epoch: 1,
-                    entry_kind: "application_message".to_string(),
-                    sender_did: fixture.bob_did.clone(),
-                    mls_bytes: live_msg_bytes,
-                },
-            ],
-            metadata_snapshot: None,
-            authorized_device_keys: Vec::new(),
-        },
-    });
+        let preview = process_push_notification(
+            fixture.temp_dir.path(),
+            &fixture.alice_hash,
+            keystore,
+            Some(transport),
+            &wake,
+        )
+        .expect("an unverifiable entry ends catch-up, not the wake");
 
-    let wake = PushWakePayload {
-        message_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
-        conversation_id: fixture.conversation_id.clone(),
-        generation: 1,
-        entry_seq: 3,
-        kind: "application_message".to_string(),
-        fetch_required: true,
-        inline_ciphertext: None,
-        sender_did: Some(fixture.bob_did.clone()),
-        recipient_account_hash: fixture.alice_hash.clone(),
-    };
-
-    let preview = process_push_notification(
-        fixture.temp_dir.path(),
-        &fixture.alice_hash,
-        keystore,
-        Some(transport),
-        &wake,
-    )
-    .expect("catch-up across I14 pruned entry must succeed");
-
-    assert!(!preview.fallback_generic);
-    assert_eq!(preview.body, "Message after pruned seq 2!");
-    assert_eq!(preview.seq, 3);
+        let generic = preview.fallback_generic;
+        let alice_db = MlsAccountDb::open_native(
+            &fixture.alice_db_path,
+            &fixture.alice_db_key,
+            OpenMode::PushExtension,
+        )
+        .expect("reopen alice db");
+        let (cursor, messages) = alice_db
+            .read_tx(|tx| {
+                Ok((
+                    tx.get_conversation(&fixture.conversation_id)?
+                        .expect("conversation")
+                        .last_seq,
+                    tx.list_messages(&fixture.conversation_id, None, 20)?.len(),
+                ))
+            })
+            .expect("alice state");
+        outcomes.push((own_private, generic, cursor, messages));
+    }
+    assert_eq!(outcomes, [(false, true, 1, 0), (true, true, 1, 0)]);
 }
 
 #[test]
@@ -1490,26 +1533,46 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                 });
             }
             if request.url.contains("/xrpc/blue.catbird.chat.enrollDevice") {
+                // `mls-ds` answers the registered `deviceView`.
+                let v: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).unwrap();
+                let b = &v["signedRequest"]["body"];
+                let key = catbird_mls::client::chat_wire::json_bytes(&b["signaturePublicKey"])
+                    .unwrap_or_default();
                 return Ok(PlatformHttpResponse {
                     status: 200,
                     headers: Vec::new(),
-                    body: br#"{"device":{"authGeneration":1}}"#.to_vec(),
+                    body: serde_json::to_vec(&serde_json::json!({ "device": {
+                        "deviceId": b["deviceId"],
+                        "keyId": catbird_mls::orchestrator::canonical_transport::derive_key_id(&key),
+                        "signaturePublicKey": b["signaturePublicKey"],
+                        "authGeneration": 1,
+                        "status": "active",
+                    }}))
+                    .unwrap(),
                 });
             }
             if request
                 .url
                 .contains("/xrpc/blue.catbird.chat.createConversation")
             {
+                // `mls-ds` answers `{result}` carrying the creation entry it sequenced at seq 1.
                 let v: serde_json::Value =
                     serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).unwrap();
-                let next_coords = v["signedRequest"]["body"]["next"].clone();
+                let b = &v["signedRequest"]["body"];
                 return Ok(PlatformHttpResponse {
                     status: 200,
                     headers: Vec::new(),
-                    body: serde_json::to_vec(&serde_json::json!({
-                        "seq": 1,
-                        "state": { "coordinates": next_coords }
-                    }))
+                    body: serde_json::to_vec(&serde_json::json!({ "result": {
+                        "coordinates": b["next"],
+                        "entry": {
+                            "entryId": b["transitionId"],
+                            "conversationId": b["conversationId"],
+                            "seq": 1,
+                            "signedRequest": v["signedRequest"],
+                            "receivedAt": b["signedAt"],
+                        },
+                    }}))
                     .unwrap(),
                 });
             }
@@ -1766,6 +1829,177 @@ fn push_commit_rejects_authenticated_prior_for_another_conversation_atomically()
             persisted,
             push_coordinates(&group, &provider, &fixture.conversation_id, 7)
         );
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn inline_wake(
+    fixture: &TwoPeerGroupFixture,
+    message_id: &str,
+    ciphertext: Vec<u8>,
+) -> PushWakePayload {
+    PushWakePayload {
+        kind: "application_message".to_string(),
+        conversation_id: fixture.conversation_id.clone(),
+        generation: 0,
+        entry_seq: 2,
+        message_id: message_id.to_string(),
+        recipient_account_hash: fixture.alice_hash.clone(),
+        fetch_required: false,
+        sender_did: Some(fixture.bob_did.clone()),
+        inline_ciphertext: Some(ciphertext),
+    }
+}
+
+/// R4: the NSE displays, sequences and queues for archive only an application message whose
+/// original sender attestation verifies for its authenticated conversation, message and archive
+/// commitment. A forged attestation is refused whether or not the canonical AAD binds it: by the
+/// receive path, or by the NSE's own `verify` should that ever let it through.
+#[test]
+fn push_refuses_an_original_sender_attestation_that_does_not_verify() {
+    let fixture = setup_alice_and_bob_group(true);
+    let keystore = Arc::new(MemoryPushKeystore::new(
+        &fixture.alice_hash,
+        fixture.alice_db_key,
+        None,
+    ));
+    // `(message id, attestation bound into the canonical AAD)`: unbound is the removed bypass.
+    let forged = [
+        ("b0b00000-0000-4000-8000-000000000005", false),
+        ("b0b00000-0000-4000-8000-000000000006", true),
+    ];
+    for (message_id, bound) in forged {
+        let ciphertext =
+            bob_encrypt_app_message(&fixture, "forged", message_id, |attestation, aad| {
+                attestation.signature[0] ^= 1;
+                if bound {
+                    aad["originalSenderAttestation"] = attestation.to_aad_json();
+                } else {
+                    let aad = aad.as_object_mut().unwrap();
+                    aad.remove("archiveCommitment");
+                    aad.remove("originalSenderAttestation");
+                }
+            });
+        let error = process_push_notification(
+            fixture.temp_dir.path(),
+            &fixture.alice_hash,
+            keystore.clone(),
+            None,
+            &inline_wake(&fixture, message_id, ciphertext),
+        )
+        .expect_err("a forged original sender attestation is refused");
+        assert!(
+            matches!(&error, MLSError::Cryptography(message)
+                if message.contains("invalid original sender archive attestation")
+                    || message.contains("missing archiveCommitment")),
+            "{message_id}: {error:?}"
+        );
+    }
+
+    let db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+            .unwrap();
+    db.read_tx(|tx| {
+        assert_eq!(
+            tx.get_conversation(&fixture.conversation_id)?
+                .unwrap()
+                .last_seq,
+            1
+        );
+        assert!(tx
+            .list_messages(&fixture.conversation_id, None, 20)?
+            .is_empty());
+        for (message_id, ..) in forged {
+            assert!(tx
+                .get_pending_op("native_archive_receipt", message_id)?
+                .is_none());
+            let evidence = format!("native.message:{}:{message_id}", fixture.conversation_id);
+            assert!(tx.get_labyrinth_state(&evidence)?.is_none());
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// R4: the write-phase cache recheck answers a wake only for its exact cached entry. A wake's ids
+/// are unauthenticated, so a message id reused at another seq or in another conversation never
+/// returns that message's preview.
+#[test]
+fn push_cache_recheck_answers_only_the_cached_conversation_and_seq() {
+    let fixture = setup_alice_and_bob_group(true);
+    let keystore = Arc::new(MemoryPushKeystore::new(
+        &fixture.alice_hash,
+        fixture.alice_db_key,
+        None,
+    ));
+    let ciphertext =
+        bob_encrypt_app_message(&fixture, "cached secret", INLINE_MESSAGE_ID, |_, _| {});
+    let wake = inline_wake(&fixture, INLINE_MESSAGE_ID, ciphertext);
+    process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        None,
+        &wake,
+    )
+    .expect("cache the message at seq 2");
+    // Another conversation Alice holds, with no message of its own.
+    let other = "d1234567-89ab-4cde-8123-456789abcdef";
+    let db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+            .unwrap();
+    db.write_tx(|tx| {
+        tx.upsert_conversation(&ConversationRow {
+            conversation_id: other.to_string(),
+            group_id: b"push-group-id-32-bytes-000000002".to_vec(),
+            generation: 0,
+            epoch: 0,
+            last_seq: 0,
+            sequencer_did: "did:web:ds.example".to_string(),
+            space_uri: None,
+            title: Some("Other Nest".to_string()),
+            unread_count: 0,
+            updated_at_ms: 1_700_000_000_000,
+        })
+    })
+    .unwrap();
+    drop(db);
+
+    for (conversation_id, entry_seq) in [(fixture.conversation_id.as_str(), 3), (other, 1)] {
+        let reused = PushWakePayload {
+            conversation_id: conversation_id.to_string(),
+            entry_seq,
+            // Never parsed: the recheck refuses before any MLS processing.
+            inline_ciphertext: Some(b"not an MLS message".to_vec()),
+            ..wake.clone()
+        };
+        let error = process_push_notification(
+            fixture.temp_dir.path(),
+            &fixture.alice_hash,
+            keystore.clone(),
+            None,
+            &reused,
+        )
+        .expect_err("a reused message id never answers with another entry's cached preview");
+        assert!(
+            matches!(&error, MLSError::Cryptography(message) if message.contains("cached message")),
+            "{conversation_id}#{entry_seq}: {error:?}"
+        );
+    }
+
+    let db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+            .unwrap();
+    db.read_tx(|tx| {
+        assert_eq!(
+            tx.get_conversation(&fixture.conversation_id)?
+                .unwrap()
+                .last_seq,
+            2
+        );
+        assert_eq!(tx.get_conversation(other)?.unwrap().last_seq, 0);
+        assert!(tx.list_messages(other, None, 20)?.is_empty());
         Ok(())
     })
     .unwrap();

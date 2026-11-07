@@ -11,8 +11,8 @@ use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PublicRepoBackend};
 use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, SpaceRpc};
 use labyrinth::store::{
-    KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend, MaybeSync, SequencerKey,
-    SequencerReceiptKey, TimeRange,
+    ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend, MaybeSync,
+    MemberDeviceKey, SequencerReceiptKey, TimeRange,
 };
 use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
@@ -69,6 +69,7 @@ fn rotation_report(
                     labyrinth::client::ExclusionReason::ChatDeviceNotCurrent => {
                         "chat-device-not-current"
                     }
+                    labyrinth::client::ExclusionReason::RecoveryExpired => "recovery-expired",
                 }
                 .into(),
                 recovery_method,
@@ -89,6 +90,14 @@ pub struct LocalGroupSnapshot {
     pub member_dids: Vec<String>,
 }
 
+/// One DID's leaves in this device's MLS group for a conversation, as of the
+/// last conversation entry the group applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalLeafKeys {
+    pub applied_chat_seq: u64,
+    pub keys: Vec<[u8; 32]>,
+}
+
 /// Local OpenMLS / storage authority consulted during archive flushes.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -100,6 +109,119 @@ pub trait LocalConversationAuthority: MaybeSend + MaybeSync {
         conversation_id: &str,
         queued_group_id_hex: Option<&str>,
     ) -> Result<Option<LocalGroupSnapshot>>;
+
+    /// `did`'s leaf signing keys in this device's live MLS group for
+    /// `conversation_id`. `None` when the authority holds no such group view
+    /// anchored at an applied conversation entry.
+    async fn leaf_keys(&self, conversation_id: &str, did: &str) -> Result<Option<LocalLeafKeys>> {
+        let _ = (conversation_id, did);
+        Ok(None)
+    }
+}
+
+/// `mls-ds` reports which devices are conversation members; this device's MLS
+/// group authenticates them independently. The devices the DS reports active
+/// at the last entry the local group applied must be exactly that group's
+/// leaves for the DID, so the DS can neither add a writer or sender
+/// attestation key nor hide one.
+/// ponytail: devices active only outside the local view (before this device
+/// joined, after a removal it applied) stay DS-attested; a durable local leaf
+/// log would cover them.
+struct LocallyCheckedDirectory {
+    inner: Box<dyn MailboxDirectory>,
+    authority: Arc<dyn LocalConversationAuthority>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl MailboxDirectory for LocallyCheckedDirectory {
+    async fn latest(
+        &self,
+        did: &str,
+    ) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        self.inner.latest(did).await
+    }
+
+    async fn latest_two_source(
+        &self,
+        did: &str,
+    ) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        self.inner.latest_two_source(did).await
+    }
+
+    async fn epoch(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        self.inner.epoch(did, seq).await
+    }
+
+    async fn epoch_chain(
+        &self,
+        did: &str,
+    ) -> labyrinth::Result<Option<(Vec<labyrinth_protocol::EpochPublicHeader>, u64)>> {
+        self.inner.epoch_chain(did).await
+    }
+
+    async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        self.inner.device_transport_keys(did).await
+    }
+
+    async fn member_device_keys(
+        &self,
+        thread_id: &str,
+        did: &str,
+    ) -> labyrinth::Result<Option<Vec<MemberDeviceKey>>> {
+        let reported = self.inner.member_device_keys(thread_id, did).await?;
+        let local = self
+            .authority
+            .leaf_keys(thread_id, did)
+            .await
+            .map_err(|error| labyrinth::Error::Backend(format!("local MLS group: {error}")))?;
+        if let Some(local) = local {
+            let active: std::collections::BTreeSet<[u8; 32]> = reported
+                .iter()
+                .flatten()
+                .filter(|device| device.active_at(local.applied_chat_seq))
+                .map(|device| device.key)
+                .collect();
+            if active != local.keys.into_iter().collect() {
+                return Err(labyrinth::Error::Backend(
+                    "mls-ds member devices disagree with the local MLS group".into(),
+                ));
+            }
+        }
+        Ok(reported)
+    }
+
+    async fn sequencer_receipt_key(
+        &self,
+        thread_id: &str,
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
+        self.inner.sequencer_receipt_key(thread_id).await
+    }
+
+    async fn sequencer_receipt_key_for_authority(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
+        self.inner
+            .sequencer_receipt_key_for_authority(thread_id, expected_authority)
+            .await
+    }
+
+    async fn sequencer_receipt_key_by_id(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+        key_id: &str,
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
+        self.inner
+            .sequencer_receipt_key_by_id(thread_id, expected_authority, key_id)
+            .await
+    }
 }
 
 /// Everything needed to open a Spaces-only Labyrinth session for one account and chat device.
@@ -117,8 +239,6 @@ pub struct SessionDeps {
     pub placements: Arc<dyn StateVault>,
     /// Local OpenMLS/storage authority for cross-checking `mls-ds` state.
     pub local_authority: Option<Arc<dyn LocalConversationAuthority>>,
-    /// Sequencer DS DID and Ed25519 verifying key (`[CB-38]`).
-    pub sequencer_key: Option<SequencerKey>,
     /// Sequencer ES256 receipt verifying key (`I13`, Gate 1).
     pub sequencer_receipt_key: Option<SequencerReceiptKey>,
     /// Optional fallback authority DID for conversation Space resolution in tests.
@@ -139,7 +259,7 @@ pub struct HistoryPage {
     pub rejected: usize,
     /// False if the Space refused the conversation's sender records; only the owner archive is included.
     pub space_readable: bool,
-    /// Redacted messages (`by_author`, `account_deleted`, or `removed_by_server`).
+    /// Messages their authors unsent (verified author redactions only).
     pub redacted: Vec<RedactedMessage>,
 }
 
@@ -190,12 +310,8 @@ impl labyrinth::client::Clock for TransportClock {
 
 impl SessionDeps {
     pub(crate) fn ds_directory(&self) -> DsDirectoryStore {
-        DsDirectoryStore::new(
-            self.transport.clone(),
-            self.sequencer_key.clone(),
-            self.sequencer_receipt_key.clone(),
-        )
-        .with_placements(self.did.clone(), self.placements.clone())
+        DsDirectoryStore::new(self.transport.clone(), self.sequencer_receipt_key.clone())
+            .with_placements(self.did.clone(), self.placements.clone())
     }
 
     fn space_store(&self) -> Option<SpaceMailboxStore> {
@@ -227,6 +343,13 @@ impl SessionDeps {
                 ),
                 None => (Box::new(self.ds_directory()), Vec::new()),
             };
+        let directory: Box<dyn MailboxDirectory> = match &self.local_authority {
+            Some(authority) => Box::new(LocallyCheckedDirectory {
+                inner: directory,
+                authority: authority.clone(),
+            }),
+            None => directory,
+        };
 
         let mailbox: Box<dyn MailboxStore> = Box::new(SpaceMailbox::new(space_mb, Some(ds_arc)));
         let threads = Box::new(ResolvingSpaceThreadStore::new(
@@ -547,6 +670,11 @@ impl SessionDeps {
             .map_err(OrchestratorError::Mls)?;
         let mut s = self.session(lab, fault, existing);
         s.recovery_method_stale = enrollment.stale_recovery_method;
+        // The enrolled head may still be pending; saving the state keeps the
+        // marker so `open` retries the publication (G15).
+        if let Some(error) = enrollment.unfinished {
+            s.note_directory_publication(&Err(error));
+        }
         s.save()?;
         Ok(s)
     }
@@ -1238,7 +1366,8 @@ impl LabyrinthSession {
         ))
     }
 
-    pub async fn rotate_epoch(&mut self) -> Result<u64> {
+    pub async fn rotate_epoch(&mut self) -> Result<SessionRotationReport> {
+        let recovery_methods = self.lab.list_recovery_methods().await.unwrap_or_default();
         let out = match self.lab.rotate_epoch().await {
             Err(labyrinth::Error::EpochSquatted { seq, reason: _ })
                 if self.try_heal_squat(seq).await =>
@@ -1246,7 +1375,8 @@ impl LabyrinthSession {
                 self.lab.rotate_epoch().await
             }
             other => other,
-        };
+        }
+        .map(|report| rotation_report(report, &recovery_methods));
         self.finish(out)
     }
 
@@ -1267,12 +1397,12 @@ impl LabyrinthSession {
     }
 
     /// `[CB-22]` / `Gate 5`: copies every readable message and own encrypted
-    /// attachment of `conversation_id` into the personal mailbox Space and
-    /// clears this caller's repo in the conversation Space before leaving.
+    /// attachment of `conversation_id` into the personal mailbox Space before
+    /// leaving. The conversation Space keeps this account's records.
     pub async fn rearchive_before_leave(&mut self, conversation_id: &str) -> Result<usize> {
         let out = self
             .lab
-            .rearchive_and_clear_before_leave(conversation_id)
+            .rearchive_before_leave(conversation_id)
             .await
             .map(|r| r.messages_archived);
         self.finish(out)
@@ -1307,7 +1437,7 @@ mod history_error_tests {
         let key = labyrinth::sign::XVerifyingKey([7; 32]);
         let report = labyrinth::client::RotationReport {
             new_epoch: 9,
-            revoked: labyrinth::sign::XVerifyingKey([8; 32]),
+            revoked: Some(labyrinth::sign::XVerifyingKey([8; 32])),
             excluded: vec![
                 labyrinth::client::ExcludedMember {
                     device_key: Some(key),

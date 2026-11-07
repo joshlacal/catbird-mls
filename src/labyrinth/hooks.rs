@@ -203,11 +203,6 @@ where
         } else {
             None
         };
-        let sequencer_key = self
-            .api_client()
-            .labyrinth_sequencer_key()
-            .await
-            .map(|(did, key)| labyrinth::store::SequencerKey { did, key });
         Ok(SessionDeps {
             pds,
             space,
@@ -222,7 +217,6 @@ where
             signer,
             did,
             local_authority: Some(local_authority),
-            sequencer_key,
             sequencer_receipt_key: None,
             default_conversation_authority_did: None,
         })

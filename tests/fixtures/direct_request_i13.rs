@@ -24,6 +24,23 @@ pub fn authority_document(
 }
 
 pub fn receipt(key: &SigningKey, publication: &Value, seq: u64, authority_did: &str) -> Value {
+    receipt_with_key_id(
+        key,
+        &expected_receipt_key_id(authority_did),
+        publication,
+        seq,
+        authority_did,
+    )
+}
+
+/// [`receipt`] signed under an exact retained method, e.g. a rotated `#mls-receipt-2`.
+pub fn receipt_with_key_id(
+    key: &SigningKey,
+    key_id: &str,
+    publication: &Value,
+    seq: u64,
+    authority_did: &str,
+) -> Value {
     let bytes = |value: &Value| {
         STANDARD
             .decode(value.as_str().or_else(|| value["$bytes"].as_str()).unwrap())
@@ -48,12 +65,7 @@ pub fn receipt(key: &SigningKey, publication: &Value, seq: u64, authority_did: &
         .unwrap()
         .timestamp_millis(),
     };
-    let signed = sign_sequencer_receipt(
-        key,
-        &expected_receipt_key_id(&payload.sequencer_did),
-        &payload,
-    )
-    .unwrap();
+    let signed = sign_sequencer_receipt(key, key_id, &payload).unwrap();
     json!({
         "sequencerDid":payload.sequencer_did,"conversationId":payload.conversation_id,
         "generation":publication["next"]["generation"],"groupId":STANDARD.encode(&payload.group_id),

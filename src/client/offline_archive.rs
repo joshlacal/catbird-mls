@@ -2205,7 +2205,7 @@ impl CatbirdMlsClient {
                 )
             })?;
         let key = self
-            .resolve_sequencer_receipt_key(&conversation.sequencer_did, "#mls-receipt-1")?
+            .resolve_sequencer_receipt_key(&conversation.sequencer_did, &signed.key_id)?
             .ok_or_else(|| {
                 MLSError::Cryptography(format!(
                     "I13 offline archive cannot resolve `{}` receipt key",

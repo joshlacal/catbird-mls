@@ -10,6 +10,7 @@ use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::{
     IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof,
+    ReservedApplicationSend,
 };
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
@@ -1372,6 +1373,48 @@ where
                     );
                     return Ok(None);
                 }
+                // A send whose response was lost: its pre-HTTP journal holds exactly this
+                // ciphertext, so the echo is ours. Keep its message, then spend the journal into
+                // the echo proof that recognises every redelivery of this entry.
+                if let (Some(server_entry_id), Some(reserved)) = (
+                    envelope.server_message_id.as_deref(),
+                    self.mls_context()
+                        .reserved_application_send(&resolved.conversation_id, &ciphertext_sha256)?,
+                ) {
+                    let payload = MLSMessagePayload::decode(reserved.payload_json.as_bytes())
+                        .map_err(|e| {
+                            OrchestratorError::InvalidInput(format!("journaled payload: {e}"))
+                        })?;
+                    let message = Message {
+                        id: reserved.message_id.clone(),
+                        conversation_id: envelope.conversation_id.clone(),
+                        sender_did: user_did.clone(),
+                        text: payload.display_text(),
+                        timestamp: envelope.timestamp,
+                        epoch,
+                        sequence_number: envelope.server_sequence.unwrap_or(0),
+                        is_own: true,
+                        delivery_status: None,
+                        payload_json: Some(reserved.payload_json),
+                    };
+                    self.storage().store_message(&message).await?;
+                    // The signed request came back only in the lost response; the journaled
+                    // body it signed identifies the accepted request instead.
+                    let body = serde_json::to_vec(&reserved.body)
+                        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+                    let proof = OwnEchoProof::new(
+                        sha2::Sha256::digest(&body).into(),
+                        resolved.conversation_id.clone(),
+                        group_id_bytes.clone(),
+                        server_entry_id.to_owned(),
+                        epoch,
+                        aad_sha256,
+                        ciphertext_sha256,
+                    );
+                    self.mls_context()
+                        .spend_application_send(&reserved.message_id, &proof)?;
+                    return Ok(Some(message));
+                }
                 tracing::warn!(
                     conversation_id = %envelope.conversation_id,
                     "OwnPrivateMessage without durable echo proof; refusing cursor advancement"
@@ -2042,7 +2085,16 @@ where
             }
         }
 
-        let (plaintext, payload_json) = match MLSMessagePayload::decode(&decrypt_result.plaintext) {
+        // Canonical senders wrap the frame in a `PrivateMessagePlaintextEnvelope`, which the MLS
+        // framing already authenticated: the payload is the frame inside.
+        let frame = match serde_json::from_slice::<
+            crate::messaging::receive::PrivateMessagePlaintextEnvelope,
+        >(&decrypt_result.plaintext)
+        {
+            Ok(inner) => inner.canonical_payload_bytes,
+            Err(_) => decrypt_result.plaintext.clone(),
+        };
+        let (plaintext, payload_json) = match MLSMessagePayload::decode(&frame) {
             Ok(payload) => {
                 if let Some(reference) = payload.checked_group_invitation().map_err(|_| {
                     OrchestratorError::InvalidInput("Invalid group invitation note".into())
@@ -2085,10 +2137,7 @@ where
                     "Decoded MLSMessagePayload"
                 );
 
-                (
-                    display_text,
-                    String::from_utf8(decrypt_result.plaintext.clone()).ok(),
-                )
+                (display_text, String::from_utf8(frame.clone()).ok())
             }
             Err(decode_err) => {
                 // If the plaintext looks like a JSON envelope that we failed
@@ -2099,16 +2148,12 @@ where
                 // into `Message.text`, which is what previously caused
                 // Android/Tauri/WASM UIs to render raw
                 // `{"messageType":"deliveryAck",...}` blobs.
-                let first_non_ws = decrypt_result
-                    .plaintext
-                    .iter()
-                    .find(|b| !b.is_ascii_whitespace())
-                    .copied();
+                let first_non_ws = frame.iter().find(|b| !b.is_ascii_whitespace()).copied();
                 if first_non_ws == Some(b'{') {
                     tracing::warn!(
                         conversation_id = %envelope.conversation_id,
                         epoch = decrypt_result.epoch,
-                        len = decrypt_result.plaintext.len(),
+                        len = frame.len(),
                         error = %decode_err,
                         "Dropping MLS message: JSON envelope did not match MLSMessagePayload schema"
                     );
@@ -2117,10 +2162,10 @@ where
 
                 // UTF-8 fallback remains ONLY for genuine legacy non-JSON
                 // plaintext bytes emitted by older clients.
-                let text = String::from_utf8(decrypt_result.plaintext.clone()).map_err(|_| {
+                let text = String::from_utf8(frame.clone()).map_err(|_| {
                     tracing::error!(
                         conversation_id = %envelope.conversation_id,
-                        plaintext_len = decrypt_result.plaintext.len(),
+                        plaintext_len = frame.len(),
                         "Invalid non-UTF8 MLS message payload"
                     );
                     OrchestratorError::InvalidInput("Invalid message payload".into())
@@ -2539,29 +2584,83 @@ where
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
 
+        // `I13` archive evidence: the frame's commitment and the original sender's attestation
+        // ride in the signed AAD; the secret frame nonce and the attestation ride inside the
+        // ciphertext, so every receiver authenticates the archive frame it decrypts.
+        let canonical_convo_id = convo_uuid.hyphenated().to_string();
+        let canonical_msg_id = msg_uuid.hyphenated().to_string();
+        let frame_nonce: [u8; 32] = rand::random();
+        let archive_commitment =
+            labyrinth_protocol::receipt::compute_archive_commitment(&frame_nonce, plaintext);
+        let identity = format!("{user_did}#{actor_device_id}").into_bytes();
+        let original_sender_attestation =
+            crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope {
+                sender_did: user_did.clone(),
+                sender_device_id: actor_device_id.clone(),
+                sender_transport_public_key: self
+                    .mls_context()
+                    .identity_public_key(identity.clone())?,
+                signature: self.mls_context().sign_with_identity_key(
+                    identity,
+                    labyrinth_protocol::transcripts::original_sender_archive_transcript(
+                        &canonical_convo_id,
+                        &canonical_msg_id,
+                        &archive_commitment,
+                    ),
+                )?,
+            };
+        original_sender_attestation.verify(
+            &canonical_convo_id,
+            &canonical_msg_id,
+            &archive_commitment,
+        )?;
+        body["aad"]["archiveCommitment"] =
+            serde_json::json!({ "$bytes": STANDARD.encode(archive_commitment) });
+        body["aad"]["originalSenderAttestation"] = original_sender_attestation.to_aad_json();
         let aad_bytes = super::canonical_transport::canonical_application_aad_bytes(&body["aad"])
             .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
+        let envelope = serde_json::to_vec(
+            &crate::messaging::receive::PrivateMessagePlaintextEnvelope {
+                frame_nonce,
+                canonical_payload_bytes: plaintext.to_vec(),
+                original_sender_attestation: Some(original_sender_attestation),
+            },
+        )
+        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+        let payload_json = String::from_utf8(plaintext.to_vec()).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("message payload is not UTF-8: {e}"))
+        })?;
         self.validate_send_actor(actor).await?;
-        // Reserved durably before the frame it orders exists: a crash in between only
-        // skips a counter, while a reused one would be refused as `StaleSend`.
-        body["sendCounter"] = serde_json::json!(
-            self.storage()
-                .reserve_send_counter(&convo_uuid.hyphenated().to_string())
-                .await?
-        );
-        // The signed body below carries this exact AAD. No state fetch or
-        // coordinate regeneration may occur between encryption and submission.
-        let encrypted = self.mls_context().encrypt_message_with_aad(
+        // One storage transaction reserves the next `sendCounter`, advances the sender ratchet
+        // and journals the exact body before any HTTP. A journal already reserved for this
+        // message id is the only frame ever resubmitted for it.
+        let reserved = self.mls_context().reserve_application_send(
             group_id_bytes.clone(),
-            plaintext.to_vec(),
-            aad_bytes.clone(),
             epoch,
+            convo_id,
+            message_id,
+            envelope,
+            aad_bytes,
+            &|send_counter, ciphertext| {
+                let mut body = body.clone();
+                body["sendCounter"] = serde_json::json!(send_counter);
+                body["applicationMessage"]["bytes"]["$bytes"] =
+                    serde_json::json!(STANDARD.encode(ciphertext));
+                body["applicationMessage"]["sha256"]["$bytes"] =
+                    serde_json::json!(STANDARD.encode(Sha256::digest(ciphertext)));
+                Ok(ReservedApplicationSend {
+                    conversation_id: convo_id.clone(),
+                    message_id: message_id.to_owned(),
+                    ciphertext_sha256: Sha256::digest(ciphertext).into(),
+                    body,
+                    payload_json: payload_json.clone(),
+                })
+            },
         )?;
-        let ciphertext = encrypted.ciphertext;
-        body["applicationMessage"]["bytes"]["$bytes"] =
-            serde_json::json!(STANDARD.encode(&ciphertext));
-        body["applicationMessage"]["sha256"]["$bytes"] =
-            serde_json::json!(STANDARD.encode(Sha256::digest(&ciphertext)));
+        let ciphertext_sha256 = reserved.ciphertext_sha256;
+        let body = reserved.body;
+        let aad_bytes = super::canonical_transport::canonical_application_aad_bytes(&body["aad"])
+            .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
 
         let binding = CleanChatSigningContext {
             actor_did: user_did.clone(),
@@ -2591,10 +2690,15 @@ where
             .await?;
 
         if response.status != 200 {
-            return Err(OrchestratorError::ServerError {
+            let error = OrchestratorError::ServerError {
                 status: response.status,
                 body: String::from_utf8_lossy(&response.body).to_string(),
-            });
+            };
+            // Refused for good before publication: those exact bytes never go out again.
+            if is_refusal(&error, "StaleSend") || is_refusal(&error, "StaleCoordinates") {
+                self.mls_context().discard_application_send(message_id)?;
+            }
+            return Err(error);
         }
         // An account transition after submission is an uncertain delivery for
         // the original actor. Never apply its acknowledgment to a new session.
@@ -2605,9 +2709,17 @@ where
         let resp_obj = resp_json.as_object().ok_or_else(|| {
             OrchestratorError::Serialization("send_message response must be an object".into())
         })?;
-        if resp_obj.len() != 1 || !resp_obj.contains_key("entry") {
+        // An I13 receipt, when issued, is an object riding both beside the entry and in it,
+        // identically.
+        let receipt = resp_obj.get("sequencerReceipt");
+        if !resp_obj.contains_key("entry") || resp_obj.len() != 1 + usize::from(receipt.is_some()) {
             return Err(OrchestratorError::Serialization(
-                "send_message response must contain only 'entry'".into(),
+                "send_message response must contain only 'entry' and its 'sequencerReceipt'".into(),
+            ));
+        }
+        if receipt.is_some_and(|receipt| !receipt.is_object()) {
+            return Err(OrchestratorError::Serialization(
+                "send_message response sequencerReceipt must be an object".into(),
             ));
         }
         let entry = resp_obj
@@ -2619,12 +2731,19 @@ where
                 )
             })?;
 
-        // applicationEntry has exactly 5 required properties: entryId, conversationId, seq, signedRequest, receivedAt
-        if entry.len() != 5 {
+        // applicationEntry has exactly 5 required properties (entryId, conversationId, seq,
+        // signedRequest, receivedAt), plus the response's sequencerReceipt when it carries one.
+        let fields = 5 + usize::from(receipt.is_some());
+        if entry.len() != fields {
             return Err(OrchestratorError::Serialization(format!(
-                "send_message response entry must have exactly 5 fields, got {}",
+                "send_message response entry must have exactly {fields} fields, got {}",
                 entry.len()
             )));
+        }
+        if entry.get("sequencerReceipt") != receipt {
+            return Err(OrchestratorError::Serialization(
+                "send_message response entry sequencerReceipt differs from the response's".into(),
+            ));
         }
 
         let entry_id_str = entry
@@ -2717,7 +2836,6 @@ where
             sha2::Sha256::digest(&accepted_request_bytes).into();
 
         let aad_sha256: [u8; 32] = sha2::Sha256::digest(&aad_bytes).into();
-        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
         let proof = OwnEchoProof::new(
             accepted_request_sha256,
             resolved.conversation_id.clone(),
@@ -2728,7 +2846,9 @@ where
             ciphertext_sha256,
         );
         self.validate_send_actor(actor).await?;
-        self.mls_context().store_own_echo_proof(&proof)?;
+        // Sequenced: the proof now identifies the echo, and the journal is spent.
+        self.mls_context()
+            .spend_application_send(message_id, &proof)?;
 
         Ok(SendMessageResponse {
             message_id: entry_id_str.to_string(),

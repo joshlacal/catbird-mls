@@ -124,8 +124,6 @@ struct Inner {
     /// Platform epoch-retention calls, recorded as `(conversation_id, cutoff)`.
     epoch_cleanup_calls: Vec<(String, u64)>,
     startup_probe_counts: StartupProbeCounts,
-    /// conversation_id -> last reserved `sendCounter` (survives simulated restart).
-    send_counters: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1908,16 +1906,6 @@ impl MLSStorageBackend for MockStorage {
     async fn remove_pending_message(&self, message_id: &str) -> Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         Ok(inner.pending_messages.remove(message_id))
-    }
-
-    async fn reserve_send_counter(&self, conversation_id: &str) -> Result<u64> {
-        let mut inner = self.inner.lock().unwrap();
-        let counter = inner
-            .send_counters
-            .entry(conversation_id.to_string())
-            .or_default();
-        *counter += 1;
-        Ok(*counter)
     }
 
     // ── Sequencer Receipts (WS-3 equivocation detection) ─────────────────

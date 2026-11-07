@@ -1689,6 +1689,7 @@ pub(crate) mod native_client {
                 #[cfg(feature = "labyrinth")]
                 {
                     st.epoch_seq = rotated_remote.new_epoch;
+                    st.rotation_exclusions = rotated_remote.exclusions.clone();
                 }
                 #[cfg(not(feature = "labyrinth"))]
                 {

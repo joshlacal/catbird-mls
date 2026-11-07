@@ -652,10 +652,9 @@ where
                     receipt_authority_key: key,
                     sequencer_did: auth_did.clone(),
                     sequencer_receipt_authority_key:
-                        crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                        crate::client::chat_wire::current_sequencer_receipt_key(
                             &intent.trusted_authority_document,
                             &auth_did,
-                            "#mls-receipt-1",
                         )?,
                     text: intent.input.text.clone(),
                     invitation: intent.input.invitation.clone(),

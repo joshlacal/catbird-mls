@@ -590,7 +590,7 @@ pub fn verify_pruned_opening_entry(
     let sequencer_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
         authority_document,
         authority_did,
-        "#mls-receipt-1",
+        crate::client::chat_wire::sequencer_receipt_kid(authority_did, sequencer)?,
     )?;
     verify_opening_receipt_binding(
         &serde_json::json!({

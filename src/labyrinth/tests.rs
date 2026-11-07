@@ -355,7 +355,6 @@ fn build_deps(
         space: Some(Arc::new(space_host.client(did))),
         placements: Arc::new(MemoryVault::default()),
         local_authority,
-        sequencer_key: None,
         sequencer_receipt_key: None,
         default_conversation_authority_did: None,
     }
@@ -822,7 +821,7 @@ async fn fault_line_3_session_heals_unanchored_squatted_epoch_and_preserves_anch
 #[tokio::test]
 async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_did_doc_receipt_keys(
 ) {
-    use labyrinth::store::{MailboxDirectory as _, SequencerKey, SequencerReceiptKey};
+    use labyrinth::store::{MailboxDirectory as _, SequencerReceiptKey};
     use p256::ecdsa::SigningKey as P256SigningKey;
 
     let alice = "did:plc:alicefl50000000000000000";
@@ -833,9 +832,6 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
     let foreign_conv = "conv-foreign-2";
     let unknown_conv = "conv-unknown-3";
 
-    let home_ed = SigningKey::from_bytes(&[61u8; 32])
-        .verifying_key()
-        .to_bytes();
     let home_p256_sk = P256SigningKey::from_bytes((&[62u8; 32]).into()).unwrap();
     let home_p256: [u8; 33] = home_p256_sk
         .verifying_key()
@@ -844,9 +840,6 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
         .try_into()
         .unwrap();
 
-    let foreign_ed = SigningKey::from_bytes(&[71u8; 32])
-        .verifying_key()
-        .to_bytes();
     let foreign_p256_sk = P256SigningKey::from_bytes((&[72u8; 32]).into()).unwrap();
     let foreign_p256: [u8; 33] = foreign_p256_sk
         .verifying_key()
@@ -855,17 +848,12 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
         .try_into()
         .unwrap();
 
-    // Encode foreign DS `#mls-receipt-1` (`[0x80, 0x24]` + 33-byte SEC1 P-256) and
-    // `#labyrinth-redaction-1` (`[0xed, 0x01]` + 32-byte Ed25519) as `Multikey` (`Base58Btc`).
+    // Encode foreign DS `#mls-receipt-1` (`[0x80, 0x24]` + 33-byte SEC1 P-256) as
+    // `Multikey` (`Base58Btc`).
     let mut p256_mc = Vec::with_capacity(35);
     p256_mc.extend_from_slice(&[0x80, 0x24]);
     p256_mc.extend_from_slice(&foreign_p256);
     let foreign_receipt_mb = multibase::encode(multibase::Base::Base58Btc, &p256_mc);
-
-    let mut ed_mc = Vec::with_capacity(34);
-    ed_mc.extend_from_slice(&[0xed, 0x01]);
-    ed_mc.extend_from_slice(&foreign_ed);
-    let foreign_ed_mb = multibase::encode(multibase::Base::Base58Btc, &ed_mc);
 
     let foreign_did_doc = serde_json::json!({
         "id": foreign_ds,
@@ -876,12 +864,6 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
                 "controller": foreign_ds,
                 "publicKeyMultibase": foreign_receipt_mb,
             },
-            {
-                "id": format!("{foreign_ds}#labyrinth-redaction-1"),
-                "type": "Multikey",
-                "controller": foreign_ds,
-                "publicKeyMultibase": foreign_ed_mb,
-            }
         ]
     });
 
@@ -919,38 +901,19 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
         "dev-fl5".to_owned(),
     ));
 
-    let home_seq_key = SequencerKey {
-        did: home_ds.to_owned(),
-        key: home_ed,
-    };
     let home_rcpt_key = SequencerReceiptKey {
         did: home_ds.to_owned(),
         public_key_sec1: home_p256.to_vec(),
     };
-    let dir = super::transport::DsDirectoryStore::new(
-        transport,
-        Some(home_seq_key.clone()),
-        Some(home_rcpt_key.clone()),
-    );
+    let dir = super::transport::DsDirectoryStore::new(transport, Some(home_rcpt_key.clone()));
 
-    // Home conversation resolves home DS keys.
-    assert_eq!(
-        dir.sequencer_key(home_conv).await.unwrap(),
-        Some(home_seq_key)
-    );
+    // Home conversation resolves the home DS receipt key.
     assert_eq!(
         dir.sequencer_receipt_key(home_conv).await.unwrap(),
         Some(home_rcpt_key)
     );
 
     // Federated conversation resolves foreign DS's DID document Multikeys, NOT home DS keys!
-    assert_eq!(
-        dir.sequencer_key(foreign_conv).await.unwrap(),
-        Some(SequencerKey {
-            did: foreign_ds.to_owned(),
-            key: foreign_ed,
-        })
-    );
     assert_eq!(
         dir.sequencer_receipt_key(foreign_conv).await.unwrap(),
         Some(SequencerReceiptKey {
@@ -960,13 +923,12 @@ async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_d
     );
 
     // Unknown federated DS with unresolvable DID doc MUST return `None`, NEVER falling back to home DS!
-    assert_eq!(dir.sequencer_key(unknown_conv).await.unwrap(), None);
     assert_eq!(dir.sequencer_receipt_key(unknown_conv).await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_placement_recovery() {
-    use labyrinth::store::{MailboxDirectory as _, SequencerKey, SequencerReceiptKey};
+    use labyrinth::store::{MailboxDirectory as _, SequencerReceiptKey};
     use p256::ecdsa::SigningKey as P256SigningKey;
 
     use super::space::{thread_placement_key, ThreadPlacement};
@@ -1053,9 +1015,6 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
     let foreign_ds = "did:web:foreign-ds.catbird.test";
     let kicked_conv = "conv-foreign-kicked";
 
-    let home_ed = SigningKey::from_bytes(&[0x31; 32])
-        .verifying_key()
-        .to_bytes();
     let home_p256 = P256SigningKey::from_bytes((&[0x32u8; 32]).into())
         .unwrap()
         .verifying_key()
@@ -1063,9 +1022,6 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         .as_bytes()
         .to_vec();
 
-    let foreign_ed = SigningKey::from_bytes(&[0x41; 32])
-        .verifying_key()
-        .to_bytes();
     let foreign_p256 = P256SigningKey::from_bytes((&[0x42u8; 32]).into())
         .unwrap()
         .verifying_key()
@@ -1073,19 +1029,11 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         .as_bytes()
         .to_vec();
 
-    let mut ed_mc = vec![0xed, 0x01];
-    ed_mc.extend_from_slice(&foreign_ed);
     let mut p256_mc = vec![0x80, 0x24];
     p256_mc.extend_from_slice(&foreign_p256);
     let foreign_doc = serde_json::to_vec(&serde_json::json!({
         "id": foreign_ds,
         "verificationMethod": [
-            {
-                "id": format!("{foreign_ds}#labyrinth-redaction-1"),
-                "type": "Multikey",
-                "controller": foreign_ds,
-                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, &ed_mc),
-            },
             {
                 "id": format!("{foreign_ds}#mls-receipt-1"),
                 "type": "Multikey",
@@ -1096,10 +1044,6 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
     }))
     .unwrap();
 
-    let home_seq = SequencerKey {
-        did: home_ds.to_owned(),
-        key: home_ed,
-    };
     let home_rcpt = SequencerReceiptKey {
         did: home_ds.to_owned(),
         public_key_sec1: home_p256,
@@ -1117,12 +1061,7 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         alice.to_owned(),
         "dev-503".into(),
     ));
-    let dir_503 = super::transport::DsDirectoryStore::new(
-        transport_503,
-        Some(home_seq.clone()),
-        Some(home_rcpt.clone()),
-    );
-    assert!(dir_503.sequencer_key(kicked_conv).await.is_err());
+    let dir_503 = super::transport::DsDirectoryStore::new(transport_503, Some(home_rcpt.clone()));
     assert!(dir_503.sequencer_receipt_key(kicked_conv).await.is_err());
 
     // Case B: 403 Forbidden WITHOUT saved ThreadPlacement MUST return `Ok(None)`, NEVER home DS keys!
@@ -1137,16 +1076,9 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         "dev-403".into(),
     ));
     let empty_placements: Arc<dyn StateVault> = Arc::new(MemoryVault::default());
-    let dir_403_no_pin = super::transport::DsDirectoryStore::new(
-        transport_403.clone(),
-        Some(home_seq.clone()),
-        Some(home_rcpt.clone()),
-    )
-    .with_placements(alice, empty_placements);
-    assert_eq!(
-        dir_403_no_pin.sequencer_key(kicked_conv).await.unwrap(),
-        None
-    );
+    let dir_403_no_pin =
+        super::transport::DsDirectoryStore::new(transport_403.clone(), Some(home_rcpt.clone()))
+            .with_placements(alice, empty_placements);
     assert_eq!(
         dir_403_no_pin
             .sequencer_receipt_key(kicked_conv)
@@ -1176,16 +1108,8 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         )
         .unwrap();
 
-    let dir_403_pinned =
-        super::transport::DsDirectoryStore::new(transport_403, Some(home_seq), Some(home_rcpt))
-            .with_placements(alice, pinned_placements);
-    assert_eq!(
-        dir_403_pinned.sequencer_key(kicked_conv).await.unwrap(),
-        Some(SequencerKey {
-            did: foreign_ds.to_owned(),
-            key: foreign_ed,
-        })
-    );
+    let dir_403_pinned = super::transport::DsDirectoryStore::new(transport_403, Some(home_rcpt))
+        .with_placements(alice, pinned_placements);
     assert_eq!(
         dir_403_pinned
             .sequencer_receipt_key(kicked_conv)

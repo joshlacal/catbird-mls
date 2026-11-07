@@ -442,25 +442,6 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         Ok(false)
     }
 
-    // -- Application send order --
-
-    /// Durably reserve the next `sendCounter` this device signs into an
-    /// `applicationSendBody` for `conversation_id` (canonical hyphenated
-    /// UUID): strictly greater than every counter reserved before for it,
-    /// persisted before the caller encrypts the frame. Native backends share
-    /// the `account_meta` key the live client uses
-    /// (`chat_wire::send_counter_key`), so both send paths stay ordered.
-    ///
-    /// `mls-ds` refuses with `StaleSend` any send whose counter does not
-    /// exceed the device's last accepted one, so a backend that forgot or
-    /// reused counters would have every later send refused. The default fails
-    /// closed rather than sign an unordered counter.
-    async fn reserve_send_counter(&self, _conversation_id: &str) -> Result<u64> {
-        Err(super::error::OrchestratorError::Storage(
-            "reserve_send_counter is required to sign application sends".to_string(),
-        ))
-    }
-
     // -- Sequencer Receipts --
 
     /// Store a sequencer receipt for a successful commit.
@@ -735,14 +716,5 @@ mod fail_closed_default_tests {
         assert!(initialization_error
             .to_string()
             .contains("get_recovery_state"));
-    }
-
-    #[tokio::test]
-    async fn omitted_send_counter_reservation_fails_closed() {
-        let error = MissingRecoveryBackoffStorage
-            .reserve_send_counter("00000000-0000-4000-8000-000000000001")
-            .await
-            .expect_err("an omitted reservation must never yield a counter");
-        assert!(error.to_string().contains("reserve_send_counter"));
     }
 }
