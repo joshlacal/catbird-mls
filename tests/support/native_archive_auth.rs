@@ -97,9 +97,11 @@ impl NativeArchiveAuthFixture {
     pub fn set_inventory_fault(&self, fault: Option<&'static str>) {
         self.world.lock().unwrap().inventory_fault = fault;
     }
+    #[allow(dead_code)]
     pub fn set_directory_outage(&self, outage: bool) {
         self.world.lock().unwrap().directory_outage = outage;
     }
+    #[allow(dead_code)]
     pub fn set_space_denied(&self, account: &str, space: &str, denied: bool) {
         let key = (account.to_owned(), space.to_owned());
         let mut world = self.world.lock().unwrap();
