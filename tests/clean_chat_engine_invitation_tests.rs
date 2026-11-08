@@ -178,15 +178,20 @@ async fn engine_add_invites_without_adding_a_leaf_until_recipient_accepts() {
         0,
         "accepting and requesting still wait for a current device Commit"
     );
+    // The orchestrator-backed engine holds no roster: an acceptance-created recovery is
+    // not its work. A native fulfiller admits Bob.
+    let before_event = world.delivery_service().submitted_prepared_requests().len();
     engine.process_server_event(&changed(cid)).unwrap();
-    let submissions = world.delivery_service().submitted_prepared_requests();
-    let fulfilled = submissions
-        .iter()
-        .rfind(|request| request.operation == CanonicalOperation::SubmitTransition)
-        .unwrap();
-    let fulfilled: Value = serde_json::from_slice(fulfilled.body.as_ref().unwrap()).unwrap();
+    assert!(
+        !world.delivery_service().submitted_prepared_requests()[before_event..]
+            .iter()
+            .any(|request| request.operation == CanonicalOperation::SubmitTransition)
+    );
+    let fulfilled = world
+        .admit_as_native_fulfiller("Alice", &bob.did, cid)
+        .await;
     assert_eq!(
-        fulfilled["signedRequest"]["body"]["recoveryRequestId"],
+        fulfilled["entry"]["signedRequest"]["body"]["recoveryRequestId"],
         recovery_id
     );
     bob_engine.process_server_event(&json!({"$type":"blue.catbird.chat.defs#welcomeAvailableEvent","conversationId":cid,"welcomeId":uuid::Uuid::new_v4().to_string()}).to_string()).unwrap();

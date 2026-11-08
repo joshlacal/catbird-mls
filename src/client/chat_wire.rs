@@ -235,6 +235,7 @@ fn signed_wrapper_name(kind: SignedMutationKind) -> Option<&'static str> {
         K::ResetRequest => "signedResetRequest",
         K::ResetActivation => "signedResetActivation",
         K::LeafRecoveryFulfillment => "signedLeafRecoveryFulfillment",
+        K::LeafRecoveryRequest => "signedLeafRecoveryRequest",
         K::LeaveRequest => "signedLeaveRequest",
         K::ZeroLeafLeave => "signedZeroLeafLeave",
         K::LeaveCancellation => "signedLeaveCancellation",
@@ -321,6 +322,558 @@ pub fn verify_coordinate_step(
 /// [`verify_coordinate_step`] from a verified body's `prior` to its active `next`.
 pub fn verify_state_version_step(body: &Value, cid: &str) -> Result<Value, MLSError> {
     verify_coordinate_step(&body["prior"], &body["next"], cid, "active")
+}
+
+/// Whether a verified coordinate step from `prior` to `next` applies against `local`, the
+/// conversation's current coordinate as this device last recorded it (`None` before it recorded
+/// any). It applies when it steps from `local`. `Ok(false)`: this device's `own` transition whose
+/// verified answer already recorded its `next`, which then only moves the cursor. Any other
+/// `prior` is an entry replayed or reordered by the delivery service and is refused, so no entry
+/// ever moves this device back to a coordinate it already left.
+pub fn steps_from_local(
+    prior: &Value,
+    next: &Value,
+    local: Option<&Value>,
+    own: bool,
+    cid: &str,
+) -> Result<bool, MLSError> {
+    let Some(local) = local else {
+        return Ok(true);
+    };
+    let local = canonicalize_wire_coordinate(local, Some(cid))?;
+    if canonicalize_wire_coordinate(prior, Some(cid))? == local {
+        return Ok(true);
+    }
+    if own && canonicalize_wire_coordinate(next, Some(cid))? == local {
+        return Ok(false);
+    }
+    Err(MLSError::Cryptography(
+        "coordinate step: prior is not this device's current coordinate".into(),
+    ))
+}
+
+/// The successor a verified `resetActivationBody` of `cid` opens, once it retires exactly its
+/// `prior`: `retired` is `prior` one `stateVersion` on and superseded, and `successor` is the
+/// next generation of `cid` at `stateVersion` 0 and epoch 0, active, on a fresh group ID.
+/// Returns the canonical `successor`.
+pub fn reset_successor(body: &Value, cid: &str) -> Result<Value, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("reset activation: {what}"));
+    verify_coordinate_step(&body["prior"], &body["retired"], cid, "superseded")?;
+    let prior = canonicalize_wire_coordinate(&body["prior"], None)?;
+    let successor = &body["successor"];
+    if successor["conversationId"].as_str() != Some(cid)
+        || successor["lifecycle"].as_str() != Some("active")
+    {
+        return Err(refused(
+            "successor is not this conversation's active successor",
+        ));
+    }
+    let successor = canonicalize_wire_coordinate(successor, None)?;
+    let generation = prior["generation"]
+        .as_i64()
+        .and_then(|generation| generation.checked_add(1))
+        .ok_or_else(|| refused("generation"))?;
+    if successor["generation"].as_i64() != Some(generation)
+        || successor["stateVersion"].as_i64() != Some(0)
+        || successor["epoch"].as_i64() != Some(0)
+        || successor["groupId"] == prior["groupId"]
+    {
+        return Err(refused(
+            "successor is not a fresh group at the next generation's start",
+        ));
+    }
+    Ok(successor)
+}
+
+/// `account_meta` key of the seq at which `did`'s pending invitation to `cid` last ended: this
+/// device verified that DID's acceptance or its removal there. An invitation sequenced at or
+/// before it is no longer pending and authorizes nothing.
+pub fn invitation_closed_key(cid: &str, did: &str) -> String {
+    format!("invitation_closed:{cid}:{did}")
+}
+
+/// The participants a verified body of `kind` removes from its conversation: the
+/// `removeParticipant` rows of a policy transition or a Commit manifest, and a zero-leaf
+/// leave's own actor.
+pub fn removed_participants(kind: SignedMutationKind, body: &Value) -> Vec<String> {
+    let changes = match kind {
+        SignedMutationKind::PolicyTransition => &body["participantChanges"],
+        SignedMutationKind::CommitTransition | SignedMutationKind::LeaveCommitFulfillment => {
+            &body["manifest"]["participantChanges"]
+        }
+        SignedMutationKind::ZeroLeafLeave => {
+            return body["actorDid"]
+                .as_str()
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        }
+        _ => return Vec::new(),
+    };
+    changes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|change| change["$type"] == "blue.catbird.chat.defs#removeParticipant")
+        .filter_map(|change| change["userDid"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// `account_meta` key of `cid`'s acceptance authorization: the one add recovery a verified
+/// participant acceptance authorizes this device to fulfill, recorded when it verified that
+/// acceptance together with the invitation the acceptance names.
+pub fn leaf_recovery_authorization_key(cid: &str) -> String {
+    format!("leaf_recovery_authorization:{cid}")
+}
+
+/// The authorization a verified `participantAcceptanceBody` of `cid` grants: the add request it
+/// signed for exactly the accepting device, key ID and auth generation, bound to the acceptance's
+/// `next` (mls-ds binds an acceptance's request to that coordinate, never to `prior`).
+pub fn leaf_recovery_authorization(acceptance: &Value, cid: &str) -> Result<Value, MLSError> {
+    Ok(json!({
+        "recoveryRequestId": acceptance["recoveryRequestId"],
+        "requesterDid": acceptance["actorDid"],
+        "requesterDeviceId": acceptance["actorDeviceId"],
+        "keyId": acceptance["keyId"],
+        "authGeneration": acceptance["authGeneration"],
+        "recoveryKind": "add",
+        "boundCoordinate": verify_state_version_step(acceptance, cid)?,
+    }))
+}
+
+/// The authorization a `leafRecoveryRequestBody` of `cid`, verified under its signing device's
+/// PDS-authorized key, grants: exactly the `add` or `replace` recovery of that device, key ID and
+/// auth generation, bound to its signed active `prior` (mls-ds binds an ordinary request to the
+/// coordinate it was signed at). Same shape as [`leaf_recovery_authorization`]. Whether its
+/// requester may be fulfilled at all is [`recovery_request_entitled`].
+pub fn leaf_recovery_request_authorization(body: &Value, cid: &str) -> Result<Value, MLSError> {
+    let prior = canonicalize_wire_coordinate(&body["prior"], None)?;
+    if prior["conversationId"] != cid
+        || prior["lifecycle"] != "active"
+        || !matches!(body["recoveryKind"].as_str(), Some("add" | "replace"))
+    {
+        return Err(MLSError::Cryptography(
+            "leaf recovery: not an active recovery request of this conversation".into(),
+        ));
+    }
+    Ok(json!({
+        "recoveryRequestId": body["recoveryRequestId"],
+        "requesterDid": body["actorDid"],
+        "requesterDeviceId": body["actorDeviceId"],
+        "keyId": body["keyId"],
+        "authGeneration": body["authGeneration"],
+        "recoveryKind": body["recoveryKind"],
+        "boundCoordinate": prior,
+    }))
+}
+
+/// Whether this device (`own_did`, `own_device`) may fulfill the request `authorization` (from
+/// [`leaf_recovery_request_authorization`]) in a group whose current leaves are `leaves`
+/// (`(did, device)`), given its verified `roster`. Never its own request. A `replace` re-adds an
+/// exact current leaf and is fulfilled only from another DID (`CHAT_PROTOCOL` §2: a healthy
+/// different-DID leaf contains a poisoned one). An `add` adds a device the tree does not hold,
+/// for a DID that was an entitled member of the verified prior state: it holds a current leaf, or
+/// this device's verified roster lists it active (a zero-leaf participant after a reset, or an
+/// accepted invitee). Without a roster no zero-leaf DID is entitled.
+pub fn recovery_request_entitled(
+    authorization: &Value,
+    leaves: &[(String, String)],
+    roster: Option<&Value>,
+    own_did: &str,
+    own_device: &str,
+) -> bool {
+    let (Some(did), Some(device)) = (
+        authorization["requesterDid"].as_str(),
+        authorization["requesterDeviceId"].as_str(),
+    ) else {
+        return false;
+    };
+    if did == own_did && device == own_device {
+        return false;
+    }
+    let holds_leaf = leaves
+        .iter()
+        .any(|(leaf_did, leaf_device)| leaf_did == did && leaf_device == device);
+    match authorization["recoveryKind"].as_str() {
+        Some("replace") => holds_leaf && did != own_did,
+        Some("add") => {
+            !holds_leaf
+                && (leaves.iter().any(|(leaf_did, _)| leaf_did == did)
+                    || roster_active(roster, did))
+        }
+        _ => false,
+    }
+}
+
+/// The `leafChanges` of the fulfillment of `authorization` with the reserved KeyPackage
+/// `key_package_ref`: its `addLeafByRecovery`, preceded for a `replace` by the `removeLeaf` of
+/// the same device (`removeLeaf` ranks before `addLeafByRecovery` for one device).
+pub fn recovery_leaf_changes(authorization: &Value, key_package_ref: &[u8]) -> Value {
+    let did = &authorization["requesterDid"];
+    let device = &authorization["requesterDeviceId"];
+    let mut changes = Vec::with_capacity(2);
+    if authorization["recoveryKind"] == "replace" {
+        changes.push(json!({
+            "$type": "blue.catbird.chat.defs#removeLeaf",
+            "userDid": did,
+            "deviceId": device,
+        }));
+    }
+    changes.push(json!({
+        "$type": "blue.catbird.chat.defs#addLeafByRecovery",
+        "userDid": did,
+        "deviceId": device,
+        "recoveryRequestId": authorization["recoveryRequestId"],
+        "keyPackageRef": { "$bytes": STANDARD.encode(key_package_ref) },
+    }));
+    Value::Array(changes)
+}
+
+/// `account_meta` key of the record of this device's own open leaf-recovery request in `cid`
+/// ([`own_leaf_recovery_record`]).
+pub fn own_leaf_recovery_key(cid: &str) -> String {
+    format!("own_leaf_recovery:{cid}")
+}
+
+/// This device's `requestLeafRecovery` body: a `recovery_kind` (`add` or `replace`) recovery of
+/// exactly the signing device, bound to `prior`, the conversation's current coordinate as mls-ds
+/// presents it.
+#[allow(clippy::too_many_arguments)]
+pub fn leaf_recovery_request_body(
+    recovery_request_id: &str,
+    actor_did: &str,
+    actor_device_id: &str,
+    key_id: &str,
+    auth_generation: i64,
+    prior: &Value,
+    recovery_kind: &str,
+    signed_at: &str,
+) -> Result<Value, MLSError> {
+    Ok(json!({
+        "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
+        "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0",
+        "recoveryRequestId": recovery_request_id,
+        "actorDid": actor_did,
+        "actorDeviceId": actor_device_id,
+        "keyId": key_id,
+        "authGeneration": auth_generation,
+        "prior": canonicalize_wire_coordinate(prior, None)?,
+        "recoveryKind": recovery_kind,
+        "idempotencyKey": recovery_request_id,
+        "signedAt": signed_at,
+    }))
+}
+
+/// What this device records of its own open request from mls-ds's `view` of it (the answer to
+/// its `requestLeafRecovery`, or its acceptance's `recovery`): the request ID, the coordinate it
+/// is bound to and its expiry in Unix milliseconds. A view of anything but an open request of
+/// this exact device in `cid` is refused.
+pub fn own_leaf_recovery_record(
+    view: &Value,
+    cid: &str,
+    own_did: &str,
+    own_device: &str,
+) -> Result<Value, MLSError> {
+    let refused = || MLSError::Cryptography("leaf recovery: not this device's open request".into());
+    let bound = canonicalize_wire_coordinate(&view["boundCoordinate"], None)?;
+    if view["conversationId"] != cid
+        || bound["conversationId"] != cid
+        || view["requesterDid"] != own_did
+        || view["requesterDeviceId"] != own_device
+        || view["status"] != "open"
+        || !view["recoveryRequestId"].is_string()
+    {
+        return Err(refused());
+    }
+    let expires_at_ms = view["expiresAt"]
+        .as_str()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.timestamp_millis())
+        .ok_or_else(refused)?;
+    Ok(json!({
+        "recoveryRequestId": view["recoveryRequestId"],
+        "boundCoordinate": bound,
+        "expiresAtMs": expires_at_ms,
+    }))
+}
+
+/// Whether the recorded own request `record` is still open at `current` (`cid`'s coordinate as
+/// mls-ds now presents it) at `now_ms`: bound to exactly that coordinate and unexpired. Every
+/// coordinate-changing transition supersedes an open request (`CHAT_PROTOCOL` §5), so any other
+/// record is renewed with a request bound to `current`.
+pub fn own_leaf_recovery_open(record: &Value, current: &Value, cid: &str, now_ms: i64) -> bool {
+    canonicalize_wire_coordinate(current, Some(cid))
+        .is_ok_and(|current| record["boundCoordinate"] == current)
+        && record["expiresAtMs"]
+            .as_i64()
+            .is_some_and(|expires| now_ms < expires)
+}
+
+/// The recovery `authorization` permits, as mls-ds presents it in `request` (a
+/// `leafRecoveryView`): the open recovery of exactly the authorized request and kind, by exactly
+/// its device, key ID and auth generation, in `cid`, with the request, its reservation and
+/// mls-ds's `state` coordinate all bound to `coordinate` — the conversation's current coordinate
+/// as this device verified it, which must still be the authorization's. Returns the
+/// reservation's KeyPackage bytes and reference, which [`require_recovery_key_package`] binds to
+/// the requester device.
+pub fn authorized_recovery_reservation(
+    authorization: &Value,
+    request: &Value,
+    state: &Value,
+    coordinate: &Value,
+    cid: &str,
+) -> Result<(Vec<u8>, Vec<u8>), MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("leaf recovery: {what}"));
+    let reservation = &request["reservation"];
+    let current = canonicalize_wire_coordinate(coordinate, Some(cid))?;
+    let bound_to_current = |bound: &Value| {
+        bound["conversationId"] == cid
+            && canonicalize_wire_coordinate(bound, None).is_ok_and(|bound| bound == current)
+    };
+    if ![
+        &authorization["boundCoordinate"],
+        &request["boundCoordinate"],
+        &reservation["boundCoordinate"],
+        state,
+    ]
+    .into_iter()
+    .all(bound_to_current)
+    {
+        return Err(refused("not bound to the current coordinate"));
+    }
+    let id = &authorization["recoveryRequestId"];
+    let did = &authorization["requesterDid"];
+    let device = &authorization["requesterDeviceId"];
+    if !id.is_string()
+        || !did.is_string()
+        || !device.is_string()
+        || [request, reservation].into_iter().any(|view| {
+            view["recoveryRequestId"] != *id
+                || view["conversationId"] != cid
+                || view["requesterDid"] != *did
+                || view["requesterDeviceId"] != *device
+        })
+        || !matches!(
+            authorization["recoveryKind"].as_str(),
+            Some("add" | "replace")
+        )
+        || request["recoveryKind"] != authorization["recoveryKind"]
+        || request["status"] != "open"
+        || reservation["requesterKeyId"] != authorization["keyId"]
+        || reservation["requesterAuthGeneration"] != authorization["authGeneration"]
+    {
+        return Err(refused("not the authorized request"));
+    }
+    Ok((
+        json_bytes(&reservation["keyPackage"]["bytes"])?,
+        json_bytes(&reservation["keyPackageRef"])?,
+    ))
+}
+
+/// The validated recovery `key_package` is the authorized requester device's own: its leaf
+/// credential is exactly `requesterDid#requesterDeviceId`, its signature key is `pds_key` (that
+/// device's PDS-authorized key) under the key ID the authorization's signed body names, and its
+/// reference is the reservation's `reserved_ref`.
+pub fn require_recovery_key_package<P: OpenMlsProvider>(
+    authorization: &Value,
+    key_package: &KeyPackage,
+    reserved_ref: &[u8],
+    pds_key: &[u8],
+    provider: &P,
+) -> Result<(), MLSError> {
+    let identity = format!(
+        "{}#{}",
+        authorization["requesterDid"].as_str().unwrap_or_default(),
+        authorization["requesterDeviceId"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    let leaf = key_package.leaf_node();
+    let reference = key_package
+        .hash_ref(provider.crypto())
+        .map_err(|e| MLSError::Cryptography(format!("recovery KeyPackage reference: {e:?}")))?;
+    if leaf.credential().serialized_content() != identity.as_bytes()
+        || leaf.signature_key().as_slice() != pds_key
+        || authorization["keyId"].as_str() != Some(derive_key_id(pds_key).as_str())
+        || reference.as_slice() != reserved_ref
+    {
+        return Err(MLSError::Cryptography(
+            "leaf recovery: KeyPackage is not the authorized device's own".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `account_meta` key of `cid`'s verified roster: `{userDid: {role, status}}` as this device
+/// verified it (the conversation's creation, a verified reset activation's manifest, or a
+/// recovery Welcome's roster attestation from its verified fulfiller) and kept current from every
+/// verified entry since ([`apply_roster_effects`]). Without it this device knows no participant's
+/// role, and no zero-leaf participant's entitlement, in `cid`.
+pub fn conversation_roster_key(cid: &str) -> String {
+    format!("conversation_roster:{cid}")
+}
+
+/// The verified roster a creation or reset manifest's `participants` state: each row a distinct
+/// `userDid` with role `admin` or `member` and status `active` or `pending`.
+pub fn roster_from_participants(participants: &Value) -> Result<Value, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("roster: {what}"));
+    let rows = participants
+        .as_array()
+        .filter(|rows| (1..=100).contains(&rows.len()))
+        .ok_or_else(|| refused("participants"))?;
+    let mut roster = serde_json::Map::new();
+    for row in rows {
+        let (Some(did), Some(role @ ("admin" | "member")), Some(status @ ("active" | "pending"))) = (
+            row["userDid"].as_str(),
+            row["role"].as_str(),
+            row["status"].as_str(),
+        ) else {
+            return Err(refused("participant row"));
+        };
+        if roster
+            .insert(did.to_owned(), json!({ "role": role, "status": status }))
+            .is_some()
+        {
+            return Err(refused("duplicate participant"));
+        }
+    }
+    Ok(Value::Object(roster))
+}
+
+/// The participant effects a verified body of `kind` has on `roster`: a policy transition's or a
+/// Commit manifest's `addParticipant` (a pending member), `removeParticipant` and
+/// `changeParticipantRole`; an acceptance activates its actor; a zero-leaf leave removes its
+/// actor. A reset replaces the roster with its manifest's ([`roster_from_participants`]); every
+/// other kind leaves it as it is.
+pub fn apply_roster_effects(roster: &mut Value, kind: SignedMutationKind, body: &Value) {
+    use SignedMutationKind as K;
+    let Some(roster) = roster.as_object_mut() else {
+        return;
+    };
+    let changes = match kind {
+        K::PolicyTransition => &body["participantChanges"],
+        K::CommitTransition | K::LeaveCommitFulfillment | K::LeafRecoveryFulfillment => {
+            &body["manifest"]["participantChanges"]
+        }
+        K::ParticipantAcceptance => {
+            if let Some(did) = body["actorDid"].as_str() {
+                roster
+                    .entry(did)
+                    .or_insert_with(|| json!({ "role": "member" }))["status"] = json!("active");
+            }
+            return;
+        }
+        K::ZeroLeafLeave => {
+            if let Some(did) = body["actorDid"].as_str() {
+                roster.remove(did);
+            }
+            return;
+        }
+        _ => return,
+    };
+    for change in changes.as_array().into_iter().flatten() {
+        let Some(did) = change["userDid"].as_str() else {
+            continue;
+        };
+        match change["$type"].as_str() {
+            Some("blue.catbird.chat.defs#addParticipant") => {
+                roster.insert(
+                    did.to_owned(),
+                    json!({ "role": "member", "status": "pending" }),
+                );
+            }
+            Some("blue.catbird.chat.defs#removeParticipant") => {
+                roster.remove(did);
+            }
+            Some("blue.catbird.chat.defs#changeParticipantRole") => {
+                if let (Some(row), Some(role)) = (roster.get_mut(did), change["role"].as_str()) {
+                    row["role"] = json!(role);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `did` is an active participant of the verified `roster`.
+pub fn roster_active(roster: Option<&Value>, did: &str) -> bool {
+    roster.is_some_and(|roster| roster[did]["status"] == "active")
+}
+
+/// `did` is an active admin of `cid` by this device's verified `roster`, the only authority an
+/// admin action (a reset activation) is accepted under. Without a verified roster nothing
+/// establishes it ([`MLSError::RosterUnverified`]): a participant's signature alone never does.
+pub fn require_active_admin(roster: Option<&Value>, did: &str, cid: &str) -> Result<(), MLSError> {
+    let roster = roster.ok_or_else(|| MLSError::RosterUnverified {
+        conversation_id: cid.to_owned(),
+    })?;
+    if roster[did]["status"] == "active" && roster[did]["role"] == "admin" {
+        return Ok(());
+    }
+    Err(MLSError::insufficient_permissions(format!(
+        "{did} is not an active admin of {cid}"
+    )))
+}
+
+/// Private-use (`RFC 9420` §17.3) GroupInfo extension type of a recovery Welcome's roster
+/// attestation ([`roster_attestation_extension`]).
+pub const ROSTER_ATTESTATION_EXTENSION_TYPE: u16 = 0xff01;
+
+/// The roster attestation a fulfiller puts in the GroupInfo of its recovery Welcome: `cid`, the
+/// joined `generation`, and the fulfiller's verified roster as of the coordinate it fulfills
+/// from. The GroupInfo is signed by the fulfiller's leaf and encrypted to the joiner, so the
+/// joiner learns its roster MLS-authenticated by the fulfiller it verifies ([`attested_roster`]).
+pub fn roster_attestation_extension(
+    cid: &str,
+    generation: i64,
+    roster: &Value,
+) -> Result<Extension, MLSError> {
+    let attestation = json!({
+        "conversationId": cid,
+        "generation": generation,
+        "roster": roster,
+    });
+    Ok(Extension::Unknown(
+        ROSTER_ATTESTATION_EXTENSION_TYPE,
+        UnknownExtension(serde_json::to_vec(&attestation)?),
+    ))
+}
+
+/// The roster a recovery Welcome's `attestation` ([`roster_attestation_extension`]) grants this
+/// device (`own_did`) joining `cid` at `generation`. The caller has staged the Welcome (so
+/// OpenMLS verified the GroupInfo signature) and verified that its sender is the fulfiller whose
+/// signed fulfillment it verified. The roster must be well-formed and consistent with the joined
+/// group: this account and every DID holding a leaf (`leaf_dids`) are active in it.
+pub fn attested_roster(
+    attestation: &[u8],
+    cid: &str,
+    generation: i64,
+    own_did: &str,
+    leaf_dids: &[String],
+) -> Result<Value, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("roster attestation: {what}"));
+    let attestation: Value =
+        serde_json::from_slice(attestation).map_err(|_| refused("not a roster attestation"))?;
+    if attestation["conversationId"] != cid
+        || attestation["generation"].as_i64() != Some(generation)
+    {
+        return Err(refused("not this conversation's generation"));
+    }
+    let rows = attestation["roster"]
+        .as_object()
+        .ok_or_else(|| refused("roster"))?
+        .iter()
+        .map(|(did, row)| json!({ "userDid": did, "role": row["role"], "status": row["status"] }))
+        .collect();
+    let roster = roster_from_participants(&Value::Array(rows))?;
+    if attestation["roster"] != roster
+        || !std::iter::once(own_did)
+            .chain(leaf_dids.iter().map(String::as_str))
+            .all(|did| roster_active(Some(&roster), did))
+    {
+        return Err(refused("not consistent with the joined group"));
+    }
+    Ok(roster)
 }
 
 /// The invitation `invitee` holds in a verified `creationBody` or `policyTransitionBody` of
@@ -2354,6 +2907,133 @@ mod tests {
                 .to_bytes(),
             KEY_ID,
             &fields,
+        ));
+    }
+
+    #[test]
+    fn recovery_entitlement_roster_and_attestation_fail_closed() {
+        let (alice, bob, carol) = ("did:plc:alice", "did:plc:bob", "did:plc:carol");
+        let leaves = vec![
+            (alice.to_owned(), "a1".to_owned()),
+            (bob.to_owned(), "b1".to_owned()),
+        ];
+        let auth = |did: &str, device: &str, kind: &str| json!({ "requesterDid": did, "requesterDeviceId": device, "recoveryKind": kind });
+        let mut roster = roster_from_participants(&json!([
+            { "userDid": alice, "role": "admin", "status": "active" },
+            { "userDid": bob, "role": "member", "status": "active" },
+            { "userDid": carol, "role": "member", "status": "pending" },
+        ]))
+        .unwrap();
+        let entitled = |a: &Value, roster: Option<&Value>| {
+            recovery_request_entitled(a, &leaves, roster, alice, "a1")
+        };
+        assert!(
+            entitled(&auth(bob, "b2", "add"), None),
+            "a member's new device"
+        );
+        assert!(
+            entitled(&auth(bob, "b1", "replace"), None),
+            "a member's exact leaf"
+        );
+        assert!(
+            !entitled(&auth(alice, "a2", "replace"), None),
+            "replace only from another DID"
+        );
+        assert!(
+            !entitled(&auth(alice, "a1", "add"), Some(&roster)),
+            "never its own"
+        );
+        assert!(
+            !entitled(&auth(bob, "b1", "add"), None),
+            "add of a held leaf"
+        );
+        assert!(
+            !entitled(&auth(carol, "c1", "add"), None),
+            "zero-leaf without a roster"
+        );
+        assert!(
+            !entitled(&auth(carol, "c1", "add"), Some(&roster)),
+            "pending"
+        );
+        apply_roster_effects(
+            &mut roster,
+            SignedMutationKind::ParticipantAcceptance,
+            &json!({ "actorDid": carol }),
+        );
+        assert!(
+            entitled(&auth(carol, "c1", "add"), Some(&roster)),
+            "accepted zero-leaf"
+        );
+
+        assert!(matches!(
+            require_active_admin(None, alice, CONVERSATION),
+            Err(MLSError::RosterUnverified { .. })
+        ));
+        assert!(require_active_admin(Some(&roster), alice, CONVERSATION).is_ok());
+        assert!(matches!(
+            require_active_admin(Some(&roster), bob, CONVERSATION),
+            Err(MLSError::InsufficientPermissions { .. })
+        ));
+        apply_roster_effects(
+            &mut roster,
+            SignedMutationKind::PolicyTransition,
+            &json!({ "participantChanges": [
+                { "$type": "blue.catbird.chat.defs#changeParticipantRole", "userDid": alice, "role": "member" },
+                { "$type": "blue.catbird.chat.defs#changeParticipantRole", "userDid": bob, "role": "admin" },
+                { "$type": "blue.catbird.chat.defs#removeParticipant", "userDid": carol },
+            ]}),
+        );
+        assert!(require_active_admin(Some(&roster), alice, CONVERSATION).is_err());
+        assert!(require_active_admin(Some(&roster), bob, CONVERSATION).is_ok());
+        assert!(!roster_active(Some(&roster), carol));
+
+        let Extension::Unknown(kind, UnknownExtension(bytes)) =
+            roster_attestation_extension(CONVERSATION, 2, &roster).unwrap()
+        else {
+            panic!("roster attestation is a private-use extension");
+        };
+        assert_eq!(kind, ROSTER_ATTESTATION_EXTENSION_TYPE);
+        let leaf_dids = [alice.to_owned()];
+        assert_eq!(
+            attested_roster(&bytes, CONVERSATION, 2, bob, &leaf_dids).unwrap(),
+            roster
+        );
+        assert!(attested_roster(&bytes, CONVERSATION, 3, bob, &leaf_dids).is_err());
+        assert!(attested_roster(&bytes, CONVERSATION, 2, carol, &leaf_dids).is_err());
+
+        let coordinate = |version: i64| {
+            json!({
+                "conversationId": CONVERSATION, "generation": 1, "stateVersion": version,
+                "groupId": { "$bytes": STANDARD.encode([1u8; 32]) }, "epoch": 4,
+                "groupContextHash": { "$bytes": STANDARD.encode([2u8; 32]) },
+                "confirmationTag": { "$bytes": STANDARD.encode([3u8; 32]) }, "lifecycle": "active",
+            })
+        };
+        let view = json!({
+            "recoveryRequestId": ENTRY, "conversationId": CONVERSATION, "requesterDid": bob,
+            "requesterDeviceId": "b2", "status": "open", "boundCoordinate": coordinate(5),
+            "expiresAt": "2026-11-07T00:05:00.000Z",
+        });
+        assert!(own_leaf_recovery_record(&view, CONVERSATION, carol, "b2").is_err());
+        let record = own_leaf_recovery_record(&view, CONVERSATION, bob, "b2").unwrap();
+        let expires = record["expiresAtMs"].as_i64().unwrap();
+        assert!(own_leaf_recovery_open(
+            &record,
+            &coordinate(5),
+            CONVERSATION,
+            expires - 1
+        ));
+        assert!(!own_leaf_recovery_open(
+            &record,
+            &coordinate(5),
+            CONVERSATION,
+            expires
+        ));
+        assert!(!own_leaf_recovery_open(
+            &record,
+            &coordinate(6),
+            CONVERSATION,
+            expires - 1
         ));
     }
 }

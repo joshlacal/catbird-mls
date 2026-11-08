@@ -737,6 +737,25 @@ impl MockDeliveryService {
                     .map(conversation_state_json)
             })
     }
+    /// `did`'s open leaf-recovery view in `conversation_id`, as `getConversationState` presents it.
+    pub fn open_leaf_recovery_for_test(
+        &self,
+        conversation_id: &str,
+        did: &str,
+    ) -> Option<serde_json::Value> {
+        self.state
+            .lock()
+            .unwrap()
+            .leaf_recovery_inbox_items
+            .iter()
+            .map(|item| item.get("recovery").unwrap_or(item))
+            .find(|recovery| {
+                recovery["conversationId"] == conversation_id
+                    && recovery["requesterDid"] == did
+                    && recovery["status"] == "open"
+            })
+            .cloned()
+    }
     pub fn set_next_leave_custom_response(&self, status: u16, body: serde_json::Value) {
         self.state.lock().unwrap().next_leave_custom_response = Some(
             catbird_mls::orchestrator::canonical_transport::GatewayResponse {
@@ -822,6 +841,23 @@ impl MockDeliveryService {
                 .unwrap();
             recovery["reservation"]["requesterKeyId"] =
                 serde_json::json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&binding.signature_key)));
+        }
+        // mls-ds binds every reservation to its request; fill what a seed leaves out.
+        let binding = serde_json::json!({
+            "conversationId": recovery["conversationId"],
+            "recoveryRequestId": recovery["recoveryRequestId"],
+            "requesterDid": recovery["requesterDid"],
+            "requesterDeviceId": recovery["requesterDeviceId"],
+            "boundCoordinate": recovery["boundCoordinate"],
+            "requesterAuthGeneration": recovery
+                .pointer("/signedRequest/body/authGeneration")
+                .cloned()
+                .unwrap_or(serde_json::json!(1)),
+        });
+        for (field, value) in binding.as_object().unwrap() {
+            if recovery["reservation"].get(field).is_none() {
+                recovery["reservation"][field] = value.clone();
+            }
         }
         guard.leaf_recovery_inbox_items.push(recovery);
     }
@@ -3902,8 +3938,12 @@ impl MLSAPIClient for MockDeliveryService {
                         "boundCoordinate":inner_body["prior"],"status":"open",
                         "expiresAt":(Utc::now()+chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
                         "reservation":{"keyPackageRef":base64::engine::general_purpose::STANDARD.encode(reference.as_slice()),
+                            "conversationId":cid,"recoveryRequestId":inner_body["recoveryRequestId"],
+                            "requesterDid":did,"requesterDeviceId":device,"boundCoordinate":inner_body["prior"],
                             "requesterKeyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&binding.signature_key)),
-                            "keyPackage":{"bytes":base64::engine::general_purpose::STANDARD.encode(package.data)}}
+                            "requesterAuthGeneration":inner_body["authGeneration"],
+                            "keyPackage":{"bytes":base64::engine::general_purpose::STANDARD.encode(package.data)}},
+                        "signedRequest":body_val["signedRequest"]
                     });
                     guard.leaf_recovery_inbox_items.push(request);
                 }

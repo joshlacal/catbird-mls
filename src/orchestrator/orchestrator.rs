@@ -1319,6 +1319,28 @@ where
         commits.insert(hash, Instant::now());
     }
 
+    /// Test-only: fence the echo of an epoch-changing Commit this device landed outside its
+    /// control journal (a fixture standing in for a native fulfiller on the same device).
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn track_own_commit_for_test(
+        &self,
+        commit_sha256: Vec<u8>,
+        conversation_id: &str,
+        group_id: &str,
+        target_epoch: u64,
+    ) {
+        self.track_epoch_changing_own_commit(
+            commit_sha256,
+            OwnCommitExpectation {
+                conversation_id: conversation_id.to_owned(),
+                group_id: group_id.to_owned(),
+                target_epoch,
+            },
+        )
+        .await;
+    }
+
     /// Retain the hash as a replay token after both crypto and application
     /// state are durable, but drop the transient epoch expectation.
     pub(crate) async fn mark_own_commit_durably_confirmed(&self, hash: &[u8]) {

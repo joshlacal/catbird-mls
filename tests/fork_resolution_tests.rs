@@ -398,9 +398,13 @@ async fn setup_alice_bob_group(label: &str) -> (TestWorld, String) {
             .orchestrator
             .fulfill_pending_leaf_recoveries()
             .await
-            .expect("add Bob to fork fixture"),
-        1
+            .expect("refusals stay isolated"),
+        0,
+        "the legacy orchestrator never admits an unsigned, zero-leaf requester"
     );
+    world
+        .admit_as_native_fulfiller("Alice", &bob_did, &created.conversation_id)
+        .await;
 
     let epoch = epoch_for(alice, &created.group_id);
     assert_eq!(epoch, 1);

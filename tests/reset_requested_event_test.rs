@@ -1492,9 +1492,9 @@ async fn welcome_network_error_with_reset_pending_never_authorizes_external_comm
     );
 }
 
-/// Real admission (invite → accept → fulfill): Alice invites Bob, Bob accepts,
-/// Alice adds Bob's accepted device. Bob's Welcome stays pending until he
-/// adopts it; a pending participant is never added directly.
+/// Real admission (invite → accept → fulfill): Alice invites Bob, Bob accepts, and a native
+/// fulfiller adds Bob's accepted device (the legacy orchestrator refuses: it holds no roster).
+/// Bob's Welcome stays pending until he adopts it; a pending participant is never added directly.
 async fn create_and_admit_bob(
     world: &TestWorld,
     name: &str,
@@ -1510,11 +1510,18 @@ async fn create_and_admit_bob(
         .accept_conversation(&conversation.conversation_id)
         .await
         .expect("Bob accepts the invitation");
-    alice
-        .orchestrator
-        .fulfill_leaf_recovery(&conversation.conversation_id)
-        .await
-        .expect("Alice adds Bob's accepted device");
+    assert!(matches!(
+        alice
+            .orchestrator
+            .fulfill_leaf_recovery(&conversation.conversation_id)
+            .await,
+        Err(catbird_mls::orchestrator::OrchestratorError::Mls(
+            MLSError::Cryptography(_)
+        ))
+    ));
+    world
+        .admit_as_native_fulfiller("Alice", &bob.did, &conversation.conversation_id)
+        .await;
     conversation
 }
 
@@ -1635,6 +1642,8 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .group_exists(hex::decode(&winner.group_id).expect("winner group id")));
 }
 
+// The fixture's same-device own-Commit fence needs `test-utils` (sim,test-utils gate).
+#[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_carries_adopted_reset_winner_past_a_stale_listing_snapshot() {
     let (world, conversation_id, loser, winner_id) =

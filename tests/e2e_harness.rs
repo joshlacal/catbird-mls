@@ -299,6 +299,291 @@ impl TestWorld {
         credentials.set_authorized_device_keys(root_did, keys);
     }
 
+    /// `name`'s own signed `requestLeafRecovery` of `kind` in `cid`, bound to the current
+    /// coordinate, with `package` reserved: the view mls-ds presents (seed it with
+    /// `MockDeliveryService::add_pending_leaf_recovery_request`).
+    pub async fn signed_leaf_recovery_view(
+        &self,
+        name: &str,
+        cid: &str,
+        kind: &str,
+        package: &catbird_mls::KeyPackageResult,
+    ) -> serde_json::Value {
+        use catbird_mls::client::chat_wire;
+        use catbird_mls::orchestrator::canonical_transport::{
+            derive_key_id, CanonicalOperation, CleanChatSigningContext,
+        };
+        use catbird_mls::orchestrator::CredentialStore as _;
+        let client = self.client(name);
+        let device = client.orchestrator.require_actor_device_id().await.unwrap();
+        let auth_generation = client
+            .credentials
+            .get_auth_generation(&client.did)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = client
+            .orchestrator
+            .mls_context()
+            .identity_public_key(format!("{}#{device}", client.did))
+            .unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let prior = self.api_service.lifecycle_state(cid).unwrap()["coordinates"].clone();
+        let body = chat_wire::leaf_recovery_request_body(
+            &request_id,
+            &client.did,
+            &device,
+            &derive_key_id(&key),
+            auth_generation,
+            &prior,
+            kind,
+            &chat_wire::now_rfc3339_millis(),
+        )
+        .unwrap();
+        let prepared = client
+            .orchestrator
+            .prepare_clean_chat_signed_request(
+                CleanChatSigningContext {
+                    actor_did: client.did.clone(),
+                    device_id: device.clone(),
+                    auth_generation: Some(auth_generation),
+                },
+                CanonicalOperation::RequestLeafRecovery,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .await
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&prepared.body.unwrap()).unwrap();
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        serde_json::json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryView",
+            "conversationId": cid, "recoveryRequestId": request_id,
+            "requesterDid": client.did, "requesterDeviceId": device,
+            "recoveryKind": kind, "status": "open", "boundCoordinate": prior,
+            "reservation": {
+                "keyPackageRef": b64(&package.hash_ref),
+                "keyPackage": {"bytes": b64(&package.key_package_data)},
+            },
+            "signedRequest": wire["signedRequest"],
+        })
+    }
+
+    /// Admit `joiner_did`'s open leaf recovery in `cid` the way a native fulfiller holding a
+    /// verified roster does. The legacy orchestrator refuses it (without a roster a DID with no
+    /// leaf is never entitled); a native `CatbirdMlsClient` admits it. Here `fulfiller`'s MLS
+    /// context builds the Add of the reserved KeyPackage and its Welcome locally and signs the
+    /// `leafRecoveryFulfillmentBody`; the mock DS accepts it as it accepts any submitted
+    /// fulfillment (state, entry, Welcome); the fulfiller then merges its Commit. Returns the DS
+    /// answer `{coordinates, entry, welcomes}`.
+    pub async fn admit_as_native_fulfiller(
+        &self,
+        fulfiller: &str,
+        joiner_did: &str,
+        cid: &str,
+    ) -> serde_json::Value {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use catbird_mls::orchestrator::canonical_transport::{
+            canonical_commit_aad_bytes, derive_key_id, CanonicalOperation, CleanChatSigningContext,
+        };
+        use catbird_mls::orchestrator::{
+            CredentialStore as _, MLSAPIClient as _, MLSStorageBackend as _, MlsCryptoContext,
+        };
+        use sha2::{Digest as _, Sha256};
+        let bytes = |value: &serde_json::Value| {
+            STANDARD
+                .decode(value.as_str().or_else(|| value["$bytes"].as_str()).unwrap())
+                .unwrap()
+        };
+        let client = self.client(fulfiller);
+        let orchestrator = &client.orchestrator;
+        let context: &MLSContext = orchestrator.mls_context();
+        let device = orchestrator.require_actor_device_id().await.unwrap();
+        let auth_generation = client
+            .credentials
+            .get_auth_generation(&client.did)
+            .await
+            .unwrap()
+            .unwrap();
+        let view = self
+            .api_service
+            .open_leaf_recovery_for_test(cid, joiner_did)
+            .expect("the joiner's open leaf recovery");
+        let state = self.api_service.lifecycle_state(cid).unwrap();
+        let prior = state["coordinates"].clone();
+        let group_id = bytes(&prior["groupId"]);
+        let generation = prior["generation"].as_i64().unwrap();
+        let prior_epoch = prior["epoch"].as_u64().unwrap();
+        let snapshot = &state["metadataSnapshot"];
+        let version = snapshot["metadataVersion"].as_u64().unwrap();
+        let metadata_key = |epoch| -> [u8; 32] {
+            MlsCryptoContext::export_metadata_key(context, group_id.clone(), epoch)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        };
+        let metadata = catbird_mls::metadata::decrypt_metadata_snapshot(
+            &metadata_key(prior_epoch),
+            &group_id,
+            prior_epoch,
+            version,
+            &bytes(&snapshot["nonce"]).try_into().unwrap(),
+            &bytes(&snapshot["ciphertext"]),
+        )
+        .unwrap();
+
+        let convo_uuid = STANDARD.encode(uuid::Uuid::parse_str(cid).unwrap().as_bytes());
+        let transition_id = uuid::Uuid::new_v4();
+        let mut aad_prior = prior.clone();
+        aad_prior["conversationId"] = serde_json::json!(convo_uuid);
+        let aad = serde_json::json!({
+            "conversationId": convo_uuid, "generation": generation, "protocolVersion": "1",
+            "transitionId": STANDARD.encode(transition_id.as_bytes()), "prior": aad_prior,
+        });
+        let added = MlsCryptoContext::add_members_with_aad(
+            context,
+            group_id.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bytes(&view["reservation"]["keyPackage"]["bytes"]),
+            }],
+            Some(canonical_commit_aad_bytes(&aad).unwrap()),
+        )
+        .unwrap();
+        let epoch = MlsCryptoContext::merge_pending_commit(context, group_id.clone()).unwrap();
+        let tag = MlsCryptoContext::get_confirmation_tag(context, group_id.clone()).unwrap();
+        let hash = MlsCryptoContext::get_group_context_hash(context, group_id.clone()).unwrap();
+        let nonce: [u8; 12] = rand::random();
+        let ciphertext = catbird_mls::metadata::encrypt_metadata_snapshot_with_nonce(
+            &metadata_key(epoch),
+            &group_id,
+            epoch,
+            version,
+            &nonce,
+            &metadata,
+        )
+        .unwrap();
+        let next = serde_json::json!({
+            "conversationId": cid, "groupId": {"$bytes": STANDARD.encode(&group_id)},
+            "epoch": epoch, "generation": generation,
+            "stateVersion": prior["stateVersion"].as_u64().unwrap() + 1,
+            "groupContextHash": {"$bytes": STANDARD.encode(&hash)},
+            "confirmationTag": {"$bytes": STANDARD.encode(&tag)}, "lifecycle": "active",
+        });
+        let mut metadata_snapshot = serde_json::json!({
+            "coordinate": {
+                "conversationId": convo_uuid, "generation": generation,
+                "groupId": {"$bytes": STANDARD.encode(&group_id)}, "epoch": epoch,
+                "groupContextHash": {"$bytes": STANDARD.encode(&hash)},
+                "confirmationTag": {"$bytes": STANDARD.encode(&tag)},
+            },
+            "originTransitionId": snapshot["originTransitionId"],
+            "metadataVersion": version,
+            "nonce": {"$bytes": STANDARD.encode(nonce)},
+            "ciphertext": {"$bytes": STANDARD.encode(&ciphertext)},
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+            "ciphertextSize": ciphertext.len(),
+            "authorProof": snapshot["authorProof"],
+        });
+        if let Some(binding) = snapshot.get("avatarBinding") {
+            metadata_snapshot["avatarBinding"] = binding.clone();
+        }
+        let request_id = &view["recoveryRequestId"];
+        let joiner_device = &view["requesterDeviceId"];
+        let key_package_ref = &view["reservation"]["keyPackageRef"];
+        let welcome = &added.welcome_data;
+        let public_key = MlsCryptoContext::identity_public_key(
+            context,
+            format!("{}#{device}", client.did).into_bytes(),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0",
+            "transitionId": transition_id.to_string(), "recoveryRequestId": request_id,
+            "actorDid": client.did, "actorDeviceId": device,
+            "keyId": derive_key_id(&public_key), "authGeneration": auth_generation,
+            "prior": prior, "next": next, "aad": aad,
+            "manifest": {
+                "participantChanges": [],
+                "leafChanges": [{
+                    "$type": "blue.catbird.chat.defs#addLeafByRecovery", "userDid": joiner_did,
+                    "deviceId": joiner_device, "recoveryRequestId": request_id,
+                    "keyPackageRef": key_package_ref,
+                }],
+                "leafRecoveryRequestId": request_id,
+                "welcomeBundle": {
+                    "welcomeId": uuid::Uuid::new_v4().to_string(), "framing": "mlsMessage",
+                    "contentType": "welcome", "opaqueWelcome": {"$bytes": STANDARD.encode(welcome)},
+                    "sha256": STANDARD.encode(Sha256::digest(welcome)),
+                    "deliveries": [{
+                        "recipientDid": joiner_did, "recipientDeviceId": joiner_device,
+                        "provenance": {"recoveryRequestId": request_id, "keyPackageRef": key_package_ref},
+                    }],
+                },
+            },
+            "commit": {
+                "framing": "mlsMessage", "contentType": "publicMessageCommit",
+                "bytes": {"$bytes": STANDARD.encode(&added.commit_data)},
+                "sha256": STANDARD.encode(Sha256::digest(&added.commit_data)),
+            },
+            "metadataSnapshot": metadata_snapshot,
+            "idempotencyKey": transition_id.to_string(),
+            "signedAt": catbird_mls::client::chat_wire::now_rfc3339_millis(),
+        });
+        let prepared = orchestrator
+            .prepare_clean_chat_signed_request(
+                CleanChatSigningContext {
+                    actor_did: client.did.clone(),
+                    device_id: device.clone(),
+                    auth_generation: Some(auth_generation),
+                },
+                CanonicalOperation::SubmitTransition,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = orchestrator
+            .api_client()
+            .submit_prepared_request(prepared)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        // Land the accepted transition as the orchestrator lands its own: projection from the
+        // merged tree, cached view at the new epoch, and (test-utils) the Commit echo's fence.
+        let gid = hex::encode(&group_id);
+        let mut projection = client.storage.get_group_state(&gid).await.unwrap().unwrap();
+        projection.epoch = epoch;
+        projection.members = MlsCryptoContext::group_member_identities(context, group_id.clone())
+            .unwrap()
+            .into_iter()
+            .map(|identity| String::from_utf8(identity).unwrap())
+            .collect();
+        client.storage.set_group_state(&projection).await.unwrap();
+        orchestrator
+            .group_states()
+            .lock()
+            .await
+            .insert(gid, projection);
+        if let Some(conversation) = orchestrator.conversations().lock().await.get_mut(cid) {
+            conversation.epoch = epoch;
+        }
+        #[cfg(feature = "test-utils")]
+        orchestrator
+            .track_own_commit_for_test(
+                Sha256::digest(&added.commit_data).to_vec(),
+                cid,
+                &hex::encode(&group_id),
+                epoch,
+            )
+            .await;
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
     /// Access the shared delivery service for introspection.
     pub fn delivery_service(&self) -> &MockDeliveryService {
         &self.api_service

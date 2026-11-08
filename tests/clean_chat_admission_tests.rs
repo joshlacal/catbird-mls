@@ -279,13 +279,22 @@ async fn fulfill_bob_recovery(f: &AdmissionFixture) -> (CanonicalState, Value) {
         .find(|request| request["requesterDid"] == BOB && request["status"] == "open")
         .unwrap()
         .clone();
+    // The legacy orchestrator holds no roster and refuses the acceptance-created recovery;
+    // a native fulfiller admits Bob.
+    assert!(matches!(
+        f.world
+            .client("Alice")
+            .orchestrator
+            .fulfill_leaf_recovery(&f.cid)
+            .await,
+        Err(catbird_mls::orchestrator::OrchestratorError::Mls(
+            catbird_mls::MLSError::Cryptography(_)
+        ))
+    ));
     let result = f
         .world
-        .client("Alice")
-        .orchestrator
-        .fulfill_leaf_recovery(&f.cid)
-        .await
-        .unwrap();
+        .admit_as_native_fulfiller("Alice", BOB, &f.cid)
+        .await;
     let body = &result["entry"]["signedRequest"]["body"];
     assert_eq!(
         body["manifest"]["leafRecoveryRequestId"],

@@ -160,6 +160,41 @@ pub enum MLSError {
     /// caller must discard the staged commit and re-sync before retrying.
     #[error("Epoch mismatch: local={local}, remote={remote}")]
     EpochMismatch { local: u64, remote: u64 },
+
+    /// This device holds no verified roster of `conversation_id` (it learned none from the
+    /// conversation's creation, a verified reset or a recovery Welcome's roster attestation), so
+    /// it can establish neither admin authority nor a zero-leaf participant's entitlement there.
+    #[error("no verified roster for conversation {conversation_id}")]
+    RosterUnverified { conversation_id: String },
+
+    /// `sync` reconciled every conversation it could; `applied` counts what the conversations
+    /// that finished applied. Each listed conversation stopped at a step that did not verify or
+    /// apply, with its cursor and acknowledgement still below that step. No failure is dropped.
+    #[error("sync incomplete ({applied} applied): {}", describe_sync_failures(.failures))]
+    SyncIncomplete {
+        applied: u32,
+        failures: Vec<ConversationSyncFailure>,
+    },
+}
+
+/// One conversation `sync` could not finish, and why.
+#[derive(Debug)]
+pub struct ConversationSyncFailure {
+    pub conversation_id: String,
+    pub error: Box<MLSError>,
+}
+
+fn describe_sync_failures(failures: &[ConversationSyncFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "conversation {}: {}",
+                failure.conversation_id, failure.error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl From<crate::metadata::MetadataError> for MLSError {

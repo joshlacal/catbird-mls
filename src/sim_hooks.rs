@@ -395,8 +395,39 @@ pub fn build_staged_welcome_at<P: openmls::storage::OpenMlsProvider>(
     ratchet_tree: Option<RatchetTreeIn>,
     now_secs: u64,
 ) -> Result<StagedWelcome, WelcomeError<P::StorageError>> {
+    build_staged_welcome_with_extension_at(
+        provider,
+        join_config,
+        welcome,
+        ratchet_tree,
+        now_secs,
+        None,
+    )
+    .map(|(staged, _)| staged)
+}
+
+/// [`build_staged_welcome_at`] that also returns the bytes of the GroupInfo extension of the
+/// private-use type `extension_type`, if the GroupInfo carries one. Staging verifies the GroupInfo
+/// signature that covers them under the Welcome sender's leaf (`StagedWelcome::welcome_sender`):
+/// once this returns `Ok`, that sender authenticated them.
+pub fn build_staged_welcome_with_extension_at<P: openmls::storage::OpenMlsProvider>(
+    provider: &P,
+    join_config: &MlsGroupJoinConfig,
+    welcome: Welcome,
+    ratchet_tree: Option<RatchetTreeIn>,
+    now_secs: u64,
+    extension_type: Option<u16>,
+) -> Result<(StagedWelcome, Option<Vec<u8>>), WelcomeError<P::StorageError>> {
     let sim_time = sim_unix_system_time(now_secs);
     let mut builder = StagedWelcome::build_from_welcome(provider, join_config, welcome)?;
+    let extension = extension_type.and_then(|extension_type| {
+        builder
+            .processed_welcome()
+            .unverified_group_info()
+            .extensions()
+            .unknown(extension_type)
+            .map(|extension| extension.0.clone())
+    });
     let ciphersuite = builder
         .processed_welcome()
         .unverified_group_info()
@@ -433,7 +464,7 @@ pub fn build_staged_welcome_at<P: openmls::storage::OpenMlsProvider>(
                 .map_err(LeafNodeValidationError::Lifetime)?;
         }
     }
-    Ok(staged)
+    Ok((staged, extension))
 }
 
 /// Shareable probe allowing `SimTransport::execute_http` to assert that no SQLite

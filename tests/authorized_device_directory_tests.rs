@@ -236,28 +236,47 @@ async fn repository_resolution_errors_retry_uncached_without_server_fallback() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn invitation_admission_requires_repository_key_even_when_server_claims_exact_device() {
-    let world = fixture().await;
+async fn sibling_admission_requires_repository_key_even_when_server_claims_exact_device() {
+    let mut world = fixture().await;
+    world.add_client_with_did("AlicePhone", ALICE).await;
+    world.register_device("AlicePhone").await.unwrap();
     let alice = world.client("Alice");
-    let bob = world.client("Bob");
+    let phone = world.client("AlicePhone");
     let actor = alice.orchestrator.require_actor_device_id().await.unwrap();
-    alice.credentials.clear_authorized_device_keys(BOB);
     let convo = alice
         .orchestrator
-        .create_group("repository admission", Some(&[BOB.into()]), None)
+        .create_group("repository admission", None, None)
         .await
         .unwrap();
     let cid = &convo.conversation_id;
     let group = hex::decode(&convo.group_id).unwrap();
-    world.delivery_service().set_conversation_leaves_for_test(
-        cid,
-        vec![json!({"userDid":ALICE,"deviceId":actor,"deviceStatus":"active","leafIndex":0})],
-    );
-    bob.orchestrator.accept_conversation(cid).await.unwrap();
-    let (_, forged_authority) = add_candidate(&world, "Bob").await;
+    let device = phone.orchestrator.require_actor_device_id().await.unwrap();
+    let package = phone
+        .orchestrator
+        .mls_context()
+        .create_key_package(format!("{ALICE}#{device}").into_bytes())
+        .unwrap();
+    let view = world
+        .signed_leaf_recovery_view("AlicePhone", cid, "add", &package)
+        .await;
     world
         .delivery_service()
-        .queue_device_directory_response(200, forged_authority);
+        .add_pending_leaf_recovery_request(view);
+    // The repository publishes only the laptop's key; the DS claims the phone's exact key.
+    let laptop_key = alice
+        .orchestrator
+        .mls_context()
+        .identity_public_key(format!("{ALICE}#{actor}"))
+        .unwrap();
+    alice
+        .credentials
+        .set_authorized_device_keys(ALICE, vec![laptop_key]);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    world.delivery_service().queue_device_directory_response(
+        200,
+        json!({"devices":[{"userDid":ALICE,"deviceId":device,
+            "keyId":KeyId::from_public_key(package.signature_public_key.as_slice().try_into().unwrap()).to_string()}]}),
+    );
     alice
         .orchestrator
         .fulfill_leaf_recovery(cid)
@@ -273,13 +292,13 @@ async fn invitation_admission_requires_repository_key_even_when_server_claims_ex
     );
     assert_eq!(directory_calls(&world), 0);
 
-    world.install_authorized_device_keys(&alice.credentials, BOB);
+    world.install_authorized_device_keys(&alice.credentials, ALICE);
     alice.orchestrator.invalidate_device_key_cache().await;
     alice
         .orchestrator
         .fulfill_leaf_recovery(cid)
         .await
-        .expect("repository-published key authorizes actual native admission");
+        .expect("repository-published key authorizes the signed sibling admission");
     assert_eq!(
         alice
             .orchestrator
@@ -288,8 +307,6 @@ async fn invitation_admission_requires_repository_key_even_when_server_claims_ex
             .unwrap(),
         1
     );
-    bob.orchestrator.join_or_rejoin(cid).await.unwrap();
-    assert_eq!(bob.orchestrator.mls_context().get_epoch(group).unwrap(), 1);
     assert_eq!(directory_calls(&world), 0);
 }
 

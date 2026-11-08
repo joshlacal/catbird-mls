@@ -1913,66 +1913,194 @@ mod tests {
         );
     }
 
+    /// Signed requests verify only under syntactically valid DIDs.
+    const ALICE_DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Contract §Orchestrator: only a verified signed request of an entitled requester is
+    /// fulfilled; every other view is refused, typed, before any MLS change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn orchestrator_fulfillment_requires_a_verified_entitled_signed_request() {
+        async fn package(world: &TestWorld, name: &str) -> crate::KeyPackageResult {
+            let client = world.client(name);
+            let device = client.orchestrator.require_actor_device_id().await.unwrap();
+            client
+                .orchestrator
+                .mls_context()
+                .create_key_package(format!("{}#{device}", client.did).into_bytes())
+                .unwrap()
+        }
+        async fn refusal(
+            world: &TestWorld,
+            cid: &str,
+            view: serde_json::Value,
+        ) -> OrchestratorError {
+            world
+                .delivery_service()
+                .add_pending_leaf_recovery_request(view.clone());
+            let alice = &world.client("Alice").orchestrator;
+            let error = alice
+                .fulfill_leaf_recovery_with_target(
+                    cid,
+                    view["recoveryRequestId"].as_str(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            let gid = alice.conversations().lock().await[cid].group_id.clone();
+            assert_eq!(
+                alice
+                    .mls_context()
+                    .get_epoch(hex::decode(gid).unwrap())
+                    .unwrap(),
+                0
+            );
+            assert!(!world
+                .delivery_service()
+                .submitted_prepared_requests()
+                .iter()
+                .any(|request| {
+                    request.operation
+                        == super::super::canonical_transport::CanonicalOperation::SubmitTransition
+                }));
+            error
+        }
+        let mut world = TestWorld::new();
+        world.add_client_with_did("Alice", ALICE_DID).await;
+        let did = world.client("Alice").did.clone();
+        world.add_client_with_did("Phone", &did).await;
+        world
+            .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+            .await;
+        for name in ["Alice", "Phone", "Bob"] {
+            world.register_device(name).await.unwrap();
+        }
+        let group = world
+            .client("Alice")
+            .orchestrator
+            .create_group("signed recovery", None, None)
+            .await
+            .unwrap();
+        let cid = group.conversation_id.as_str();
+        let cryptography = |error: OrchestratorError| {
+            matches!(error, OrchestratorError::Mls(MLSError::Cryptography(_)))
+        };
+
+        // An acceptance-created view carries no signed request.
+        let mut unsigned = world
+            .signed_leaf_recovery_view("Phone", cid, "add", &package(&world, "Phone").await)
+            .await;
+        unsigned.as_object_mut().unwrap().remove("signedRequest");
+        assert!(cryptography(refusal(&world, cid, unsigned).await));
+
+        let mut forged = world
+            .signed_leaf_recovery_view("Phone", cid, "add", &package(&world, "Phone").await)
+            .await;
+        let mut signature = STANDARD
+            .decode(forged["signedRequest"]["signature"].as_str().unwrap())
+            .unwrap();
+        signature[0] ^= 1;
+        forged["signedRequest"]["signature"] = serde_json::json!(STANDARD.encode(signature));
+        assert!(cryptography(refusal(&world, cid, forged).await));
+
+        // Bob holds no leaf: without a verified roster his DID is never entitled.
+        let stranger = world
+            .signed_leaf_recovery_view("Bob", cid, "add", &package(&world, "Bob").await)
+            .await;
+        assert!(matches!(
+            refusal(&world, cid, stranger).await,
+            OrchestratorError::Mls(MLSError::InsufficientPermissions { .. })
+        ));
+
+        // The phone's signed request with another device's KeyPackage reserved.
+        let mut mismatched = world
+            .signed_leaf_recovery_view("Phone", cid, "add", &package(&world, "Bob").await)
+            .await;
+        mismatched["reservation"]["requesterKeyId"] =
+            mismatched["signedRequest"]["body"]["keyId"].clone();
+        assert!(cryptography(refusal(&world, cid, mismatched).await));
+
+        // The refused views stay pending and never block the valid member add.
+        let valid = world
+            .signed_leaf_recovery_view("Phone", cid, "add", &package(&world, "Phone").await)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(valid.clone());
+        let alice = world.client("Alice");
+        let result = alice.orchestrator.fulfill_leaf_recovery(cid).await.unwrap();
+        let manifest = &result["entry"]["signedRequest"]["body"]["manifest"];
+        assert_eq!(
+            manifest["leafRecoveryRequestId"],
+            valid["recoveryRequestId"]
+        );
+        assert_eq!(manifest["leafChanges"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            manifest["leafChanges"][0]["deviceId"],
+            valid["requesterDeviceId"]
+        );
+        let gid = hex::decode(&group.group_id).unwrap();
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(gid.clone())
+                .unwrap(),
+            1
+        );
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .group_member_identities(gid)
+            .unwrap()
+            .contains(
+                &format!("{did}#{}", valid["requesterDeviceId"].as_str().unwrap()).into_bytes()
+            ));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn fulfill_leaf_recovery_discovers_authorized_state_without_requester_inbox() {
         let mut world = TestWorld::new();
-        world.add_client("Alice").await;
-        world.add_client("Bob").await;
+        world.add_client_with_did("Alice", ALICE_DID).await;
+        let did = world.client("Alice").did.clone();
+        world.add_client_with_did("AlicePhone", &did).await;
         world
             .register_device("Alice")
             .await
             .expect("register alice");
-        world.register_device("Bob").await.expect("register bob");
+        world
+            .register_device("AlicePhone")
+            .await
+            .expect("register alice phone");
 
         let alice = world.client("Alice");
-        let bob = world.client("Bob");
+        let phone = world.client("AlicePhone");
 
         let created = alice
             .orchestrator
-            .create_group("a", Some(std::slice::from_ref(&bob.did)), None)
+            .create_group("a", None, None)
             .await
             .expect("create conversation");
 
-        // Fetch Bob's key package
-        let bob_device_id = bob
+        // The phone signs its own request; the DS state alone presents it.
+        let phone_device_id = phone
             .orchestrator
             .require_actor_device_id()
             .await
-            .expect("bob device id");
-        let scoped_did = format!("{}#{}", bob.did, bob_device_id);
-        let kp_res = bob
+            .expect("phone device id");
+        let kp_res = phone
             .orchestrator
             .mls_context()
-            .create_key_package(scoped_did.as_bytes().to_vec())
-            .expect("create key package for bob");
-        let kp_b64 = STANDARD.encode(&kp_res.key_package_data);
-        let kp_ref_b64 = STANDARD.encode(&kp_res.hash_ref);
-
-        bob.orchestrator
-            .accept_conversation(&created.conversation_id)
-            .await
-            .expect("bob accepts conversation");
+            .create_key_package(format!("{did}#{phone_device_id}").into_bytes())
+            .expect("create key package for phone");
+        let view = world
+            .signed_leaf_recovery_view("AlicePhone", &created.conversation_id, "add", &kp_res)
+            .await;
         world
             .delivery_service()
-            .set_participant_leaf_count(&created.conversation_id, &bob.did, 0);
-        world
-            .delivery_service()
-            .add_pending_leaf_recovery_request(serde_json::json!({
-                "recovery": {
-                    "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
-                    "conversationId": created.conversation_id,
-                    "requesterDid": bob.did,
-                    "requesterDeviceId": bob_device_id,
-                    "recoveryKind": "add",
-                    "status": "open",
-                    "reservation": {
-                        "keyPackageRef": { "$bytes": kp_ref_b64 },
-                        "keyPackage": {
-                            "bytes": { "$bytes": kp_b64 }
-                        }
-                    }
-                }
-            }));
+            .add_pending_leaf_recovery_request(view);
 
         let initial_epoch = alice
             .orchestrator
@@ -2077,9 +2205,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pending_recovery_adds_and_replaces_only_the_same_account_target_device() {
+    async fn pending_recovery_adds_same_account_device_and_refuses_same_account_replace() {
         let mut world = TestWorld::new();
-        world.add_client("Alice").await;
+        world.add_client_with_did("Alice", ALICE_DID).await;
         let did = world.client("Alice").did.clone();
         world.add_client_with_did("AlicePhone", &did).await;
         world.register_device("Alice").await.unwrap();
@@ -2095,90 +2223,92 @@ mod tests {
         let target = phone.orchestrator.require_actor_device_id().await.unwrap();
         assert_ne!(actor, target);
         let group_id = hex::decode(&group.group_id).unwrap();
-        for (kind, epoch) in [("add", 1), ("replace", 2)] {
+        let (world, did, target, cid) = (&world, &did, &target, &group.conversation_id);
+        let seed = |kind: &'static str| async move {
             let package = phone
                 .orchestrator
                 .mls_context()
                 .create_key_package(format!("{did}#{target}").into_bytes())
                 .unwrap();
-            world.delivery_service().add_pending_leaf_recovery_request(serde_json::json!({
-                "conversationId":group.conversation_id,"recoveryRequestId":uuid::Uuid::new_v4().to_string(),
-                "requesterDid":did,"requesterDeviceId":target,"recoveryKind":kind,"status":"open",
-                "reservation":{"keyPackageRef":STANDARD.encode(package.hash_ref),"keyPackage":{"bytes":STANDARD.encode(package.key_package_data)}}
-            }));
+            let view = world
+                .signed_leaf_recovery_view("AlicePhone", cid, kind, &package)
+                .await;
             world
                 .delivery_service()
-                .drop_next_recovery_fulfillment_response();
-            assert_eq!(
-                alice
-                    .orchestrator
-                    .fulfill_pending_leaf_recoveries()
-                    .await
-                    .unwrap(),
-                1,
-                "{kind} succeeds through current-leaf discovery"
-            );
-            let members = alice
-                .orchestrator
-                .mls_context()
-                .group_member_identities(group_id.clone())
-                .unwrap();
-            assert_eq!(
-                members.len(),
-                2,
-                "{kind} must retain exactly the two devices"
-            );
-            assert!(
-                members.contains(&format!("{did}#{actor}").into_bytes()),
-                "healthy sibling remains"
-            );
-            assert!(
-                members.contains(&format!("{did}#{target}").into_bytes()),
-                "target present once"
-            );
-            assert_eq!(
-                alice
-                    .storage
-                    .get_group_state(&group.group_id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .epoch,
-                epoch
-            );
-            let requests = world.delivery_service().submitted_prepared_requests();
-            let sent = requests
-                .iter()
-                .rfind(|r| {
-                    r.operation
-                        == super::super::canonical_transport::CanonicalOperation::SubmitTransition
-                })
-                .unwrap();
-            let body: serde_json::Value =
-                serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
-            let changes = body
-                .pointer("/signedRequest/body/manifest/leafChanges")
-                .unwrap()
-                .as_array()
-                .unwrap();
-            assert_eq!(changes.len(), if kind == "add" { 1 } else { 2 });
-            assert!(changes.iter().all(|leaf| leaf["deviceId"] == target));
-        }
+                .add_pending_leaf_recovery_request(view);
+        };
+        seed("add").await;
+        world
+            .delivery_service()
+            .drop_next_recovery_fulfillment_response();
         assert_eq!(
             alice
                 .orchestrator
                 .fulfill_pending_leaf_recoveries()
                 .await
                 .unwrap(),
-            0,
-            "completed work is not replayed"
+            1,
+            "a same-account device add succeeds through current-leaf discovery"
+        );
+        let members = alice
+            .orchestrator
+            .mls_context()
+            .group_member_identities(group_id.clone())
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&format!("{did}#{actor}").into_bytes()));
+        assert!(members.contains(&format!("{did}#{target}").into_bytes()));
+        let requests = world.delivery_service().submitted_prepared_requests();
+        let sent = requests
+            .iter()
+            .rfind(|r| {
+                r.operation
+                    == super::super::canonical_transport::CanonicalOperation::SubmitTransition
+            })
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap();
+        let changes = body
+            .pointer("/signedRequest/body/manifest/leafChanges")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["deviceId"], *target);
+
+        // A replace is contained only by a different DID (CHAT_PROTOCOL §2).
+        seed("replace").await;
+        assert!(matches!(
+            alice
+                .orchestrator
+                .fulfill_leaf_recovery(&group.conversation_id)
+                .await,
+            Err(OrchestratorError::Mls(
+                MLSError::InsufficientPermissions { .. }
+            ))
+        ));
+        assert_eq!(
+            alice
+                .orchestrator
+                .fulfill_pending_leaf_recoveries()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_id)
+                .unwrap(),
+            1
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_recovery_replays_after_native_database_reopen() {
         let mut world = TestWorld::new();
-        world.add_client("Alice").await;
+        world.add_client_with_did("Alice", ALICE_DID).await;
         let did = world.client("Alice").did.clone();
         world.add_client_with_did("Phone", &did).await;
         world.register_device("Alice").await.unwrap();
@@ -2202,84 +2332,83 @@ mod tests {
             .await
             .unwrap();
         let gid = hex::decode(&group.group_id).unwrap();
-        for (kind, expected_epoch) in [("add", 1), ("replace", 2)] {
-            let package = world
-                .client("Phone")
+        let (kind, expected_epoch) = ("add", 1);
+        let package = world
+            .client("Phone")
+            .orchestrator
+            .mls_context()
+            .create_key_package(format!("{did}#{target}").into_bytes())
+            .unwrap();
+        let view = world
+            .signed_leaf_recovery_view("Phone", &group.conversation_id, kind, &package)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(view);
+        world
+            .delivery_service()
+            .drop_recovery_fulfillment_responses(3);
+        world.delivery_service().fail_next_get_entries();
+        assert!(
+            world
+                .client("Alice")
+                .orchestrator
+                .fulfill_leaf_recovery(&group.conversation_id)
+                .await
+                .is_err(),
+            "all acknowledgements lost for {kind}"
+        );
+        assert_eq!(
+            world
+                .client("Alice")
                 .orchestrator
                 .mls_context()
-                .create_key_package(format!("{did}#{target}").into_bytes())
-                .unwrap();
-            world.delivery_service().add_pending_leaf_recovery_request(serde_json::json!({
-                "conversationId":group.conversation_id,"recoveryRequestId":uuid::Uuid::new_v4().to_string(),"requesterDid":did,"requesterDeviceId":target,"recoveryKind":kind,"status":"open",
-                "reservation":{"keyPackageRef":STANDARD.encode(package.hash_ref),"keyPackage":{"bytes":STANDARD.encode(package.key_package_data)}}
-            }));
-            world
-                .delivery_service()
-                .drop_recovery_fulfillment_responses(3);
-            world.delivery_service().fail_next_get_entries();
-            assert!(
-                world
-                    .client("Alice")
-                    .orchestrator
-                    .fulfill_leaf_recovery(&group.conversation_id)
-                    .await
-                    .is_err(),
-                "all acknowledgements lost for {kind}"
-            );
-            assert_eq!(
-                world
-                    .client("Alice")
-                    .orchestrator
-                    .mls_context()
-                    .get_epoch(gid.clone())
-                    .unwrap(),
-                expected_epoch - 1,
-                "unconfirmed crypto stays pending"
-            );
-            world.restart_client("Alice").await;
-            let reopened = world.client("Alice");
-            if kind == "replace" {
-                assert!(
-                    !reopened
-                        .orchestrator
-                        .fulfill_pending_group_leave(&group.conversation_id)
-                        .await
-                        .unwrap(),
-                    "resuming a recovery journal must not report that a group leave was fulfilled"
-                );
-            }
+                .get_epoch(gid.clone())
+                .unwrap(),
+            expected_epoch - 1,
+            "unconfirmed crypto stays pending"
+        );
+        world.restart_client("Alice").await;
+        let reopened = world.client("Alice");
+        assert!(
+            !reopened
+                .orchestrator
+                .fulfill_pending_group_leave(&group.conversation_id)
+                .await
+                .unwrap(),
+            "resuming a recovery journal must not report that a group leave was fulfilled"
+        );
+        reopened
+            .orchestrator
+            .sync_with_server(false)
+            .await
+            .expect("startup replays exact journal before recovery");
+        assert_eq!(
             reopened
                 .orchestrator
-                .sync_with_server(false)
-                .await
-                .expect("startup replays exact journal before recovery");
-            assert_eq!(
-                reopened
-                    .orchestrator
-                    .mls_context()
-                    .get_epoch(gid.clone())
-                    .unwrap(),
-                expected_epoch
-            );
-            assert_eq!(
-                reopened
-                    .storage
-                    .get_group_state(&group.group_id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .epoch,
-                expected_epoch
-            );
-            let members = reopened
-                .orchestrator
                 .mls_context()
-                .group_member_identities(gid.clone())
-                .unwrap();
-            assert_eq!(members.len(), 2);
-            assert!(members.contains(&format!("{did}#{source}").into_bytes()));
-            assert!(members.contains(&format!("{did}#{target}").into_bytes()));
-        }
+                .get_epoch(gid.clone())
+                .unwrap(),
+            expected_epoch
+        );
+        assert_eq!(
+            reopened
+                .storage
+                .get_group_state(&group.group_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            expected_epoch
+        );
+        let members = reopened
+            .orchestrator
+            .mls_context()
+            .group_member_identities(gid.clone())
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&format!("{did}#{source}").into_bytes()));
+        assert!(members.contains(&format!("{did}#{target}").into_bytes()));
         assert!(
             !world
                 .delivery_service()
@@ -2298,7 +2427,7 @@ mod tests {
     async fn pending_recovery_reopens_after_competing_device_wins() {
         use super::super::canonical_transport::CanonicalOperation;
         let mut world = TestWorld::new();
-        world.add_client("Alice").await;
+        world.add_client_with_did("Alice", ALICE_DID).await;
         let did = world.client("Alice").did.clone();
         world.add_client_with_did("Peer", &did).await;
         world.add_client_with_did("Phone", &did).await;
@@ -2324,16 +2453,18 @@ mod tests {
             .require_actor_device_id()
             .await
             .unwrap();
-        let seed = |package: crate::KeyPackageResult, target: &str, kind: &str| serde_json::json!({"conversationId":group.conversation_id,"recoveryRequestId":uuid::Uuid::new_v4().to_string(),"requesterDid":did,"requesterDeviceId":target,"recoveryKind":kind,"status":"open","reservation":{"keyPackageRef":STANDARD.encode(package.hash_ref),"keyPackage":{"bytes":STANDARD.encode(package.key_package_data)}}});
         let peer_package = world
             .client("Peer")
             .orchestrator
             .mls_context()
             .create_key_package(format!("{did}#{peer_device}").into_bytes())
             .unwrap();
+        let view = world
+            .signed_leaf_recovery_view("Peer", &group.conversation_id, "add", &peer_package)
+            .await;
         world
             .delivery_service()
-            .add_pending_leaf_recovery_request(seed(peer_package, &peer_device, "add"));
+            .add_pending_leaf_recovery_request(view);
         let initial = world
             .client("Alice")
             .orchestrator
@@ -2427,9 +2558,12 @@ mod tests {
             .mls_context()
             .create_key_package(format!("{did}#{target_device}").into_bytes())
             .unwrap();
+        let view = world
+            .signed_leaf_recovery_view("Phone", &group.conversation_id, "add", &phone_package)
+            .await;
         world
             .delivery_service()
-            .add_pending_leaf_recovery_request(seed(phone_package, &target_device, "add"));
+            .add_pending_leaf_recovery_request(view);
         world
             .delivery_service()
             .fail_recovery_requests_before_acceptance(3);
@@ -2489,21 +2623,31 @@ mod tests {
             .mls_context()
             .create_key_package(format!("{did}#{target_device}").into_bytes())
             .unwrap();
+        let view = world
+            .signed_leaf_recovery_view("Phone", &group.conversation_id, "replace", &replacement)
+            .await;
         world
             .delivery_service()
-            .add_pending_leaf_recovery_request(seed(replacement, &target_device, "replace"));
-        reopened
-            .orchestrator
-            .fulfill_leaf_recovery(&group.conversation_id)
-            .await
-            .unwrap();
+            .add_pending_leaf_recovery_request(view);
+        assert!(
+            matches!(
+                reopened
+                    .orchestrator
+                    .fulfill_leaf_recovery(&group.conversation_id)
+                    .await,
+                Err(OrchestratorError::Mls(
+                    MLSError::InsufficientPermissions { .. }
+                ))
+            ),
+            "a same-DID device never fulfills a replace"
+        );
         assert_eq!(
             reopened
                 .orchestrator
                 .mls_context()
                 .get_epoch(gid.clone())
                 .unwrap(),
-            3
+            2
         );
         assert_eq!(
             reopened
@@ -2536,7 +2680,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_recovery_resumed_expiry_requires_terminal_error_and_exact_prior() {
         let mut world = TestWorld::new();
-        world.add_client("Alice").await;
+        world.add_client_with_did("Alice", ALICE_DID).await;
         let did = world.client("Alice").did.clone();
         world.add_client_with_did("Phone", &did).await;
         world.register_device("Alice").await.unwrap();
@@ -2560,7 +2704,12 @@ mod tests {
             .mls_context()
             .create_key_package(format!("{did}#{target}").into_bytes())
             .unwrap();
-        world.delivery_service().add_pending_leaf_recovery_request(serde_json::json!({"conversationId":group.conversation_id,"recoveryRequestId":uuid::Uuid::new_v4().to_string(),"requesterDid":did,"requesterDeviceId":target,"recoveryKind":"add","status":"open","reservation":{"keyPackageRef":STANDARD.encode(package.hash_ref),"keyPackage":{"bytes":STANDARD.encode(package.key_package_data)}}}));
+        let view = world
+            .signed_leaf_recovery_view("Phone", &group.conversation_id, "add", &package)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(view);
         world
             .delivery_service()
             .fail_recovery_requests_before_acceptance(3);
@@ -2647,7 +2796,12 @@ mod tests {
             .mls_context()
             .create_key_package(format!("{did}#{target}").into_bytes())
             .unwrap();
-        world.delivery_service().add_pending_leaf_recovery_request(serde_json::json!({"conversationId":group.conversation_id,"recoveryRequestId":uuid::Uuid::new_v4().to_string(),"requesterDid":did,"requesterDeviceId":target,"recoveryKind":"add","status":"open","reservation":{"keyPackageRef":STANDARD.encode(replacement.hash_ref),"keyPackage":{"bytes":STANDARD.encode(replacement.key_package_data)}}}));
+        let view = world
+            .signed_leaf_recovery_view("Phone", &group.conversation_id, "add", &replacement)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(view);
         alice
             .orchestrator
             .fulfill_leaf_recovery(&group.conversation_id)
@@ -2659,7 +2813,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_recovery_retired_group_does_not_block_verified_successor() {
         let mut world = TestWorld::new();
-        world.add_client("Alice").await;
+        world.add_client_with_did("Alice", ALICE_DID).await;
         let did = world.client("Alice").did.clone();
         world.add_client_with_did("Phone", &did).await;
         world.register_device("Alice").await.unwrap();
@@ -2683,7 +2837,12 @@ mod tests {
             .mls_context()
             .create_key_package(format!("{did}#{target}").into_bytes())
             .unwrap();
-        world.delivery_service().add_pending_leaf_recovery_request(serde_json::json!({"conversationId":old.conversation_id,"recoveryRequestId":uuid::Uuid::new_v4().to_string(),"requesterDid":did,"requesterDeviceId":target,"recoveryKind":"add","status":"open","reservation":{"keyPackageRef":STANDARD.encode(package.hash_ref),"keyPackage":{"bytes":STANDARD.encode(package.key_package_data)}}}));
+        let view = world
+            .signed_leaf_recovery_view("Phone", &old.conversation_id, "add", &package)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(view);
         world
             .delivery_service()
             .fail_recovery_requests_before_acceptance(3);
@@ -3245,8 +3404,10 @@ fn eligible_leaf_recovery(
 }
 
 /// Select work from a fresh authorized state read, including another device of
-/// the same account. The fulfillment operation repeats these checks under its
-/// locks; a notification request ID only narrows the candidate set.
+/// the same account. Only a view carrying the requester's `signedRequest` is work
+/// for this client (an acceptance-created recovery is a native fulfiller's). The
+/// fulfillment operation verifies it under its locks; a notification request ID
+/// only narrows the candidate set.
 pub(crate) fn pending_leaf_recovery_request_id(
     response: &serde_json::Value,
     conversation_id: &str,
@@ -3263,6 +3424,7 @@ pub(crate) fn pending_leaf_recovery_request_id(
         .iter()
         .find(|request| {
             request["conversationId"].as_str() == Some(conversation_id)
+                && request.get("signedRequest").is_some()
                 && eligible_leaf_recovery(
                     request,
                     prior,
@@ -3277,23 +3439,27 @@ pub(crate) fn pending_leaf_recovery_request_id(
         .map(str::to_owned)
 }
 
-/// Decode a leaf recovery reservation's key package into `(bytes, base64 ref)`.
-fn recovery_reservation_key_package(recovery: &serde_json::Value) -> Result<(Vec<u8>, String)> {
-    let reservation = recovery
-        .get("reservation")
-        .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
-    let key_package_ref_b64 = encoded_bytes_base64(reservation.get("keyPackageRef"))
-        .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?
-        .to_string();
-    let key_package = reservation
-        .get("keyPackage")
-        .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackage".into()))?;
-    let key_package_b64 = encoded_bytes_base64(key_package.get("bytes"))
-        .ok_or_else(|| OrchestratorError::Api("keyPackage missing bytes".into()))?;
-    let key_package_bytes = STANDARD
-        .decode(key_package_b64)
-        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-    Ok((key_package_bytes, key_package_ref_b64))
+/// Decode `data` (an `MLSMessage`-framed or bare KeyPackage) and validate it.
+fn validated_key_package(
+    data: &[u8],
+    provider: &openmls_rust_crypto::OpenMlsRustCrypto,
+) -> Result<openmls::prelude::KeyPackage> {
+    use openmls::prelude::{
+        tls_codec::DeserializeBytes as _, KeyPackageIn, MlsMessageBodyIn, MlsMessageIn,
+        ProtocolVersion,
+    };
+    use openmls_traits::OpenMlsProvider as _;
+    let invalid = || OrchestratorError::InvalidInput("not a valid MLS KeyPackage".into());
+    let key_package = match MlsMessageIn::tls_deserialize_exact_bytes(data) {
+        Ok(message) => match message.extract() {
+            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+            _ => return Err(invalid()),
+        },
+        Err(_) => KeyPackageIn::tls_deserialize_exact_bytes(data).map_err(|_| invalid())?,
+    };
+    key_package
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .map_err(|_| OrchestratorError::Mls(MLSError::OpenMLSError))
 }
 
 fn extract_bytes_32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
@@ -4510,7 +4676,14 @@ where
             .await
     }
 
-    /// Fulfill an open leaf recovery request, optionally taking explicit target recovery metadata.
+    /// Fulfill an open leaf recovery request at this device's verified current coordinate.
+    ///
+    /// Only a requester device's own signed `requestLeafRecovery` authorizes a Commit
+    /// ([`Self::authorized_leaf_recovery`]): an acceptance-created recovery carries none and is
+    /// refused, as is a request whose signature, coordinate, reservation or KeyPackage binding
+    /// does not verify, or whose requester this group's leaves do not entitle. The first eligible
+    /// pending view that verifies is fulfilled; when none does, the first refusal is returned
+    /// before any MLS change. Explicit target arguments only narrow which view is considered.
     pub async fn fulfill_leaf_recovery_with_target(
         &self,
         conversation_id: &str,
@@ -4637,14 +4810,25 @@ where
                 "sync this conversation before fulfilling recovery".into(),
             ));
         }
-        let recovery = state_response
+        let identities = self
+            .mls_context()
+            .group_member_identities(group_id_bytes.clone())?;
+        let leaves: Vec<(String, String)> = identities
+            .iter()
+            .filter_map(|identity| {
+                crate::client::chat_wire::parse_scoped_credential_did_device(identity).ok()
+            })
+            .collect();
+        let mut authorized = None;
+        let mut refusal = None;
+        for view in state_response
             .get("pendingLeafRecoveryRequests")
             .and_then(|value| value.as_array())
             .into_iter()
             .flatten()
-            .find(|request| {
+            .filter(|view| {
                 eligible_leaf_recovery(
-                    request,
+                    view,
                     &prior,
                     &user_did,
                     &actor_device_id,
@@ -4653,40 +4837,51 @@ where
                     explicit_requester_device_id,
                 )
             })
-            .ok_or_else(|| {
+        {
+            match self
+                .authorized_leaf_recovery(
+                    view,
+                    &prior,
+                    &resolved.conversation_id,
+                    &leaves,
+                    &user_did,
+                    &actor_device_id,
+                )
+                .await
+            {
+                Ok(found) => {
+                    authorized = Some(found);
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(conversation_id = %resolved.conversation_id, %error, "Refused leaf recovery request");
+                    refusal.get_or_insert(error);
+                }
+            }
+        }
+        let (authorization, kp_bytes, kp_ref) = authorized.ok_or_else(|| {
+            refusal.unwrap_or_else(|| {
                 OrchestratorError::Api("no open leaf recovery found to fulfill".into())
-            })?;
-        let recovery_request_id = recovery["recoveryRequestId"].as_str().unwrap().to_string();
-        let requester_did = recovery["requesterDid"].as_str().unwrap().to_string();
-        let requester_device_id = recovery["requesterDeviceId"].as_str().unwrap().to_string();
-        let recovery_kind = recovery["recoveryKind"].as_str().unwrap();
-        let (kp_bytes, key_package_ref_b64) = recovery_reservation_key_package(recovery)?;
+            })
+        })?;
+        let as_text = |field: &str| authorization[field].as_str().unwrap_or_default().to_owned();
+        let recovery_request_id = as_text("recoveryRequestId");
+        let requester_did = as_text("requesterDid");
+        let requester_device_id = as_text("requesterDeviceId");
+        let recovery_kind = as_text("recoveryKind");
+        let key_package_ref_b64 = STANDARD.encode(&kp_ref);
         // Explicit CLI arguments may narrow the authorized request but cannot
         // substitute an unreserved package or bypass server discovery.
         if explicit_key_package_b64.is_some_and(|value| {
             STANDARD.decode(value).ok().as_deref() != Some(kp_bytes.as_slice())
-        }) || explicit_key_package_ref_b64.is_some_and(|value| value != key_package_ref_b64)
+        }) || explicit_key_package_ref_b64
+            .is_some_and(|value| STANDARD.decode(value).ok().as_deref() != Some(kp_ref.as_slice()))
         {
             return Err(OrchestratorError::InvalidInput(
                 "recovery package does not match the server reservation".into(),
             ));
         }
         let target_identity = format!("{requester_did}#{requester_device_id}").into_bytes();
-        let package_binding = super::credential_binding::extract_key_package_binding(&kp_bytes)
-            .map_err(OrchestratorError::InvalidInput)?;
-        if package_binding.identity.as_bytes() != target_identity.as_slice()
-            || recovery
-                .pointer("/reservation/requesterKeyId")
-                .and_then(|value| value.as_str())
-                != Some(
-                    super::canonical_transport::derive_key_id(&package_binding.signature_key)
-                        .as_str(),
-                )
-        {
-            return Err(OrchestratorError::InvalidInput(
-                "reserved key package does not belong to the requested device".into(),
-            ));
-        }
         self.verify_fetched_key_packages(
             std::slice::from_ref(&requester_did),
             &[KeyPackageRef {
@@ -4699,17 +4894,6 @@ where
             Some(&resolved.conversation_id),
         )
         .await?;
-        let identities = self
-            .mls_context()
-            .group_member_identities(group_id_bytes.clone())?;
-        let target_present = identities
-            .iter()
-            .any(|identity| identity == &target_identity);
-        if (recovery_kind == "replace") != target_present {
-            return Err(OrchestratorError::Api(
-                "recovery kind does not match this device leaf; sync and retry".into(),
-            ));
-        }
         let prior_metadata_snapshot = state.get("metadataSnapshot").cloned();
 
         let transition_id = uuid::Uuid::new_v4().to_string();
@@ -4837,21 +5021,7 @@ where
             "Re-encrypted metadata ciphertext"
         );
 
-        let mut leaf_changes = Vec::new();
-        if recovery_kind == "replace" {
-            leaf_changes.push(serde_json::json!({
-                "$type": "blue.catbird.chat.defs#removeLeaf",
-                "userDid": requester_did,
-                "deviceId": requester_device_id
-            }));
-        }
-        leaf_changes.push(serde_json::json!({
-            "$type": "blue.catbird.chat.defs#addLeafByRecovery",
-            "userDid": requester_did,
-            "deviceId": requester_device_id,
-            "recoveryRequestId": recovery_request_id,
-            "keyPackageRef": key_package_ref_b64
-        }));
+        let leaf_changes = crate::client::chat_wire::recovery_leaf_changes(&authorization, &kp_ref);
 
         let mut metadata_snapshot_json = serde_json::json!({
             "coordinate": {
@@ -4962,6 +5132,80 @@ where
             .ok_or_else(|| {
                 OrchestratorError::Api("recovery confirmation journal disappeared".into())
             })
+    }
+
+    /// The authorization a pending leaf-recovery `view` grants this device (own DID and device
+    /// `own_did`, `own_device`), with the reserved KeyPackage bytes and reference.
+    ///
+    /// Only the requester device's own signed `requestLeafRecovery` authorizes a Commit. Its
+    /// `signedRequest` must verify under the reserved KeyPackage's signature key, which the
+    /// repository must authorize for `requesterDid` (the source
+    /// [`Self::verify_fetched_key_packages`] trusts); that KeyPackage's credential must be exactly
+    /// `requesterDid#requesterDeviceId` and the signed `keyId` must name that key. The request, its
+    /// reservation and mls-ds's state must all be bound to `coordinate`, the current coordinate
+    /// this device verified against its MLS group. The requester must be entitled by the group's
+    /// current `leaves` alone: this orchestrator holds no verified roster, so a DID without a leaf
+    /// is never entitled. An acceptance-created view carries no signed request and is refused.
+    /// Every refusal is an error, returned before any MLS change.
+    async fn authorized_leaf_recovery(
+        &self,
+        view: &serde_json::Value,
+        coordinate: &serde_json::Value,
+        conversation_id: &str,
+        leaves: &[(String, String)],
+        own_did: &str,
+        own_device: &str,
+    ) -> Result<(serde_json::Value, Vec<u8>, Vec<u8>)> {
+        use crate::client::chat_wire;
+        let refused = |what: &str| {
+            OrchestratorError::Mls(MLSError::Cryptography(format!("leaf recovery: {what}")))
+        };
+        let signed = view.get("signedRequest").ok_or_else(|| {
+            refused("no signed requester request (an acceptance-created recovery is not fulfilled here)")
+        })?;
+        let did = view["requesterDid"].as_str().unwrap_or_default();
+        // The reserved KeyPackage names the candidate key; only the repository authorizes it.
+        let candidate = super::credential_binding::extract_key_package_binding(
+            &chat_wire::json_bytes(&view["reservation"]["keyPackage"]["bytes"])?,
+        )
+        .map_err(|_| refused("reserved KeyPackage is not decodable"))?
+        .signature_key;
+        let key = match self.lookup_candidate_device_key(did, &candidate).await? {
+            super::credential_binding::DeviceKeyLookup::Keys(keys) if keys.contains(&candidate) => {
+                candidate
+            }
+            _ => return Err(refused("requester key is not repository-authorized")),
+        };
+        let body = chat_wire::verify_signed_mutation_body(
+            signed,
+            crate::chat_v2::transcript::SignedMutationKind::LeafRecoveryRequest,
+            &key,
+        )?;
+        let authorization = chat_wire::leaf_recovery_request_authorization(&body, conversation_id)?;
+        if !chat_wire::recovery_request_entitled(&authorization, leaves, None, own_did, own_device)
+        {
+            return Err(OrchestratorError::Mls(MLSError::InsufficientPermissions {
+                operation:
+                    "fulfill a leaf recovery whose requester this group's leaves do not entitle"
+                        .into(),
+            }));
+        }
+        let (key_package_bytes, key_package_ref) = chat_wire::authorized_recovery_reservation(
+            &authorization,
+            view,
+            coordinate,
+            coordinate,
+            conversation_id,
+        )?;
+        let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+        chat_wire::require_recovery_key_package(
+            &authorization,
+            &validated_key_package(&key_package_bytes, &provider)?,
+            &key_package_ref,
+            &key,
+            &provider,
+        )?;
+        Ok((authorization, key_package_bytes, key_package_ref))
     }
 
     async fn leaf_recovery_fulfillment_state(
@@ -7489,42 +7733,11 @@ where
                     "welcome provenance package/member cardinality mismatch".into(),
                 ));
             }
-            use openmls::prelude::{
-                tls_codec::DeserializeBytes as _, KeyPackageIn, MlsMessageBodyIn, MlsMessageIn,
-                ProtocolVersion,
-            };
-            use openmls_rust_crypto::OpenMlsRustCrypto;
             use openmls_traits::OpenMlsProvider;
-            let provider = OpenMlsRustCrypto::default();
+            let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
             let mut deliveries = Vec::with_capacity(packages.len());
             for (package, member_did) in packages.iter().zip(member_dids) {
-                let key_package_in =
-                    if let Ok(message) = MlsMessageIn::tls_deserialize_exact_bytes(&package.data) {
-                        match message.extract() {
-                            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
-                            _ => {
-                                return Err(OrchestratorError::InvalidInput(
-                                    "welcome provenance requires a KeyPackage message".into(),
-                                ))
-                            }
-                        }
-                    } else {
-                        let (pkg, remaining) = KeyPackageIn::tls_deserialize_bytes(&package.data)
-                            .map_err(|_| {
-                            OrchestratorError::InvalidInput(
-                                "welcome provenance key package is not a valid MLS message".into(),
-                            )
-                        })?;
-                        if !remaining.is_empty() {
-                            return Err(OrchestratorError::InvalidInput(
-                                "welcome provenance key package has trailing bytes".into(),
-                            ));
-                        }
-                        pkg
-                    };
-                let key_package = key_package_in
-                    .validate(provider.crypto(), ProtocolVersion::default())
-                    .map_err(|_| OrchestratorError::Mls(MLSError::OpenMLSError))?;
+                let key_package = validated_key_package(&package.data, &provider)?;
                 let key_package_ref = key_package
                     .hash_ref(provider.crypto())
                     .map_err(|_| OrchestratorError::Mls(MLSError::OpenMLSError))?;

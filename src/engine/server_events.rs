@@ -871,17 +871,18 @@ mod tests {
                 .mls_context()
                 .create_key_package(format!("{did}#{device}").into_bytes())
                 .unwrap();
-            world.delivery_service().add_pending_leaf_recovery_request(json!({
-                "conversationId":group.conversation_id,"recoveryRequestId":ID,"requesterDid":did,
-                "requesterDeviceId":device,"recoveryKind":"add","status":"open",
-                "reservation":{"keyPackageRef":STANDARD.encode(package.hash_ref),"keyPackage":{"bytes":STANDARD.encode(package.key_package_data)}}
-            }));
+            let view = world
+                .signed_leaf_recovery_view("Phone", &group.conversation_id, "add", &package)
+                .await;
+            world
+                .delivery_service()
+                .add_pending_leaf_recovery_request(view.clone());
             let engine = engine_for(&world, "Alice").await;
             // Notification status is deliberately stale. Only the fresh read
             // selects current open work and its exact reserved device package.
             let payload = event(
                 "leafRecoveryEvent",
-                json!({"conversationId":group.conversation_id,"recoveryRequestId":ID,"status":"cancelled"}),
+                json!({"conversationId":group.conversation_id,"recoveryRequestId":view["recoveryRequestId"],"status":"cancelled"}),
             );
             engine.process_server_event(&payload.to_string()).unwrap();
             assert_eq!(

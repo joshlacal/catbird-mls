@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "e4227af68226a61a4cae7478496d1a7b930f28f6",
-    "sourceSha256": "1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075",
-    "sourceTree": "2ce27d72e2a84fd363cba629d2847a3f32921743"
+    "sourceRevision": "e782e46ca8489c881517186fe0bf1a9c35c99634",
+    "sourceSha256": "cf931d0fda7b68082f7f0ac9105dd62122692ee35afbf0ddf7eb2d134340f848",
+    "sourceTree": "d9a3c6cfc19c439435332b7d85c8ff80e5edb3af"
   },
   "defs": {
     "accessEndedEvent": {
@@ -4745,6 +4745,11 @@
         },
         "reservation": {
           "ref": "#leafRecoveryReservation",
+          "type": "ref"
+        },
+        "signedRequest": {
+          "description": "The requester device's exact signed requestLeafRecovery, present exactly when that request created this recovery. An acceptance-created recovery carries none; its participantAcceptanceEntry carries the signed acceptance. A fulfiller verifies it under the PDS-authorized key of exactly requesterDid#requesterDeviceId and binds every view and reservation field to it before any Commit.",
+          "ref": "#signedLeafRecoveryRequest",
           "type": "ref"
         },
         "status": {

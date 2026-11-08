@@ -6526,10 +6526,13 @@ mod tests {
                 .orchestrator
                 .fulfill_pending_leaf_recoveries()
                 .await
-                .expect("add Bob to fork fixture"),
-            1,
-            "fork fixture must contain a complement member"
+                .expect("refusals stay isolated"),
+            0,
+            "the legacy orchestrator never admits an unsigned, zero-leaf requester"
         );
+        world
+            .admit_as_native_fulfiller("Alice", &bob_did, &group.conversation_id)
+            .await;
 
         let epoch = alice
             .orchestrator

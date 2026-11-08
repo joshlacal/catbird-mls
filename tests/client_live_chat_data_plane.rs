@@ -15,9 +15,15 @@ use p256::ecdsa::signature::Signer as _;
 
 #[path = "fixtures/direct_request_i13.rs"]
 mod direct_request_i13;
+#[path = "client_live_chat_data_plane/leaf_recovery_signed.rs"]
+mod leaf_recovery_signed;
 #[allow(dead_code)]
 #[path = "support/native_archive_auth.rs"]
 mod native_archive_auth;
+#[path = "client_live_chat_data_plane/reset_activation.rs"]
+mod reset_activation;
+#[path = "client_live_chat_data_plane/verified_roster.rs"]
+mod verified_roster;
 use native_archive_auth::NativeArchiveAuthFixture;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::RngCore;
@@ -182,6 +188,9 @@ struct MockDsState {
     // `getEntries` serves `actorDeviceId` only entries from this seq on: the device joined there,
     // and mls-ds never makes a device a recipient of control entries sequenced before it joined.
     readable_from: BTreeMap<String, i64>,
+    // `getEntries` serves `actorDeviceId` only entries up to this seq and refuses any read past it
+    // (`AccessOutsideMembershipInterval`): a reset closed the device's membership interval there.
+    readable_until: BTreeMap<String, i64>,
     // `prepareDirectRequest` also selects a request key of another of the actor's devices: mls-ds
     // makes the sender's other devices Welcome recipients of its opening.
     select_sender_siblings: bool,
@@ -192,6 +201,10 @@ struct MockDsState {
     // Closed conversation -> (exact request bytes, recorded answer): mls-ds answers an exact
     // replay with the recorded result and refuses any other close.
     closes: BTreeMap<String, (Vec<u8>, Value)>,
+    // Reset requests by conversation: `#resetRequestView`s, at most one `pending`.
+    reset_requests: BTreeMap<String, Vec<Value>>,
+    // Sequence the next `activateReset`, then lose its response.
+    lose_next_reset_response: bool,
 }
 
 struct SharedMockDs {
@@ -249,10 +262,13 @@ impl SharedMockDs {
                 forge_next_acceptance: false,
                 forge_next_transition_answer: None,
                 readable_from: BTreeMap::new(),
+                readable_until: BTreeMap::new(),
                 select_sender_siblings: false,
                 lose_next_close_response: false,
                 forge_next_close_answer: false,
                 closes: BTreeMap::new(),
+                reset_requests: BTreeMap::new(),
+                lose_next_reset_response: false,
             }),
             archive_auth: NativeArchiveAuthFixture::new(
                 ALICE_DID,
@@ -1184,7 +1200,7 @@ impl SharedMockDs {
                 request["status"] = json!("superseded");
                 request["reservation"]["status"] = json!("released");
             }
-            requests.push(json!({
+            let view = json!({
                 "$type": "blue.catbird.chat.defs#leafRecoveryView",
                 "conversationId": cid,
                 "recoveryRequestId": rec_req_id,
@@ -1210,8 +1226,90 @@ impl SharedMockDs {
                     "expiresAt": expires_at,
                     "keyPackage": kp,
                 },
+            });
+            requests.push(view.clone());
+            // `mls-ds` `acceptance_response`: the acceptance's coordinate and recovery view.
+            return ok_json(json!({
+                "seq": next_seq, "coordinates": next_coords, "recovery": view,
             }));
-            return ok_json(json!({ "seq": next_seq }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.chat.requestLeafRecovery") {
+            // `mls-ds` `plan_leaf_recovery_request_inner`, verifying nothing: one open request per
+            // device, of the kind its leaf allows, bound to the current coordinate, reserving one
+            // of the requester device's KeyPackages for five minutes. The view carries the exact
+            // signed request; every later coordinate change supersedes it.
+            let sr = body_json["signedRequest"].clone();
+            let b = &sr["body"];
+            let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
+            let did = b["actorDid"].as_str().unwrap().to_string();
+            let dev = b["actorDeviceId"].as_str().unwrap().to_string();
+            let Some(state) = g.conversations.get(&cid) else {
+                return xrpc_error(400, "ConversationNotFound", "conversation not found");
+            };
+            if state["coordinates"] != b["prior"] {
+                return xrpc_error(400, "StaleCoordinates", "StaleCoordinates");
+            }
+            let holds_leaf = state["leaves"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|leaf| leaf["userDid"] == did && leaf["deviceId"] == dev);
+            if holds_leaf != (b["recoveryKind"] == "replace") {
+                return xrpc_error(400, "RecoveryKindMismatch", "RecoveryKindMismatch");
+            }
+            if g.leaf_recoveries
+                .get(&cid)
+                .into_iter()
+                .flatten()
+                .any(|request| {
+                    request["status"] == "open"
+                        && request["requesterDid"] == did
+                        && request["requesterDeviceId"] == dev
+                })
+            {
+                return xrpc_error(409, "LeafRecoveryAlreadyOpen", "LeafRecoveryAlreadyOpen");
+            }
+            let Some(kp) = g
+                .convo_kps
+                .get_mut(&(did.clone(), dev.clone()))
+                .and_then(Vec::pop)
+            else {
+                return xrpc_error(400, "KeyPackageUnavailable", "KeyPackageUnavailable");
+            };
+            let expires_at =
+                (chrono::DateTime::parse_from_rfc3339(b["signedAt"].as_str().unwrap()).unwrap()
+                    + chrono::Duration::minutes(5))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let view = json!({
+                "conversationId": cid,
+                "recoveryRequestId": b["recoveryRequestId"],
+                "requesterDid": did,
+                "requesterDeviceId": dev,
+                "recoveryKind": b["recoveryKind"],
+                "boundCoordinate": b["prior"],
+                "status": "open",
+                "requestedAt": b["signedAt"],
+                "expiresAt": expires_at,
+                "reservation": {
+                    "conversationId": cid,
+                    "recoveryRequestId": b["recoveryRequestId"],
+                    "boundCoordinate": b["prior"],
+                    "requesterDid": did,
+                    "requesterDeviceId": dev,
+                    "requesterKeyId": b["keyId"],
+                    "requesterAuthGeneration": b["authGeneration"],
+                    "keyPackageRef": kp["keyPackageRef"],
+                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    "purpose": "leafRecovery",
+                    "status": "active",
+                    "expiresAt": expires_at,
+                    "keyPackage": kp,
+                },
+                "signedRequest": sr,
+            });
+            g.leaf_recoveries.entry(cid).or_default().push(view.clone());
+            return ok_json(json!({ "recovery": view }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.submitTransition") {
@@ -1396,6 +1494,119 @@ impl SharedMockDs {
             return Ok(response);
         }
 
+        if url.contains("/xrpc/blue.catbird.chat.requestReset") {
+            // mls-ds `plan_reset_request_inner`: an active admin of a group requests at the
+            // current coordinate, one pending request at a time.
+            let sr = body_json["signedRequest"].clone();
+            let b = &sr["body"];
+            let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
+            let state = &g.conversations[&cid];
+            if state["coordinates"] != b["prior"] {
+                return xrpc_error(400, "StaleCoordinates", "not the current coordinate");
+            }
+            if !state["participants"].as_array().unwrap().iter().any(|p| {
+                p["userDid"] == b["actorDid"] && p["role"] == "admin" && p["status"] == "active"
+            }) {
+                return xrpc_error(400, "AdminRequired", "active admin required");
+            }
+            let requests = g.reset_requests.entry(cid.clone()).or_default();
+            if requests
+                .iter()
+                .any(|request| request["status"] == "pending")
+            {
+                return xrpc_error(400, "ResetAlreadyPending", "a reset request is pending");
+            }
+            let view = json!({
+                "resetRequestId": b["resetRequestId"], "conversationId": cid,
+                "requesterDid": b["actorDid"], "requesterDeviceId": b["actorDeviceId"],
+                "prior": b["prior"], "reason": b["reason"], "status": "pending",
+                "requestedAt": b["signedAt"], "expiresAt": "2099-01-01T00:00:00.000Z",
+            });
+            requests.push(view.clone());
+            let entries = g.entries.entry(cid.clone()).or_default();
+            let mut entry = json!({
+                "$type": "blue.catbird.chat.defs#resetRequestEntry",
+                "entryId": b["resetRequestId"], "conversationId": cid,
+                "seq": entries.len() as i64 + 1, "receivedAt": b["signedAt"], "signedRequest": sr,
+            });
+            entries.push(entry.clone());
+            // A `ref` output carries no `$type`.
+            entry.as_object_mut().unwrap().remove("$type");
+            return ok_json(json!({ "resetRequest": view, "entry": entry }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.chat.activateReset") {
+            // mls-ds `plan_reset_activation_inner`: an active admin activates the exact pending
+            // request bound to the current coordinate, its metadata authored at the activation's
+            // seq; anything else is refused with nothing changed. The successor holds only the
+            // activator's leaf, and every open leaf recovery is superseded.
+            let sr = body_json["signedRequest"].clone();
+            let b = &sr["body"];
+            let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
+            let seq = g.entries.get(&cid).map_or(0, Vec::len) as i64 + 1;
+            let state = &g.conversations[&cid];
+            if !state["participants"].as_array().unwrap().iter().any(|p| {
+                p["userDid"] == b["actorDid"] && p["role"] == "admin" && p["status"] == "active"
+            }) {
+                return xrpc_error(400, "AdminRequired", "active admin required");
+            }
+            if state["coordinates"] != b["prior"] {
+                return xrpc_error(400, "StaleCoordinates", "not the current coordinate");
+            }
+            if b["metadataSnapshot"]["authorProof"]["originSeq"].as_i64() != Some(seq) {
+                return xrpc_error(400, "InvalidRequest", "metadata not authored at its seq");
+            }
+            let Some(request) =
+                g.reset_requests
+                    .get_mut(&cid)
+                    .into_iter()
+                    .flatten()
+                    .find(|request| {
+                        request["resetRequestId"] == b["resetRequestId"]
+                            && request["status"] == "pending"
+                            && request["prior"] == b["prior"]
+                    })
+            else {
+                return xrpc_error(400, "ResetRequestNotFound", "no pending reset request");
+            };
+            request["status"] = json!("consumed");
+            let mut entry = json!({
+                "$type": "blue.catbird.chat.defs#resetActivationEntry",
+                "entryId": b["transitionId"], "conversationId": cid, "seq": seq,
+                "receivedAt": b["signedAt"], "signedRequest": sr,
+            });
+            g.entries
+                .entry(cid.clone())
+                .or_default()
+                .push(entry.clone());
+            let state = g.conversations.get_mut(&cid).unwrap();
+            state["coordinates"] = b["successor"].clone();
+            state["snapshotSeq"] = json!(seq);
+            state["metadataSnapshot"] = b["metadataSnapshot"].clone();
+            state["leaves"] = json!([b["manifest"]["actorLeaf"]]);
+            for participant in state["participants"].as_array_mut().unwrap() {
+                participant["leafCount"] =
+                    json!(usize::from(participant["userDid"] == b["actorDid"]));
+            }
+            for request in g.leaf_recoveries.get_mut(&cid).into_iter().flatten() {
+                if request["status"] == "open" {
+                    request["status"] = json!("superseded");
+                    request["reservation"]["status"] = json!("released");
+                }
+            }
+            if std::mem::take(&mut g.lose_next_reset_response) {
+                return Err(MLSError::Internal(
+                    "activateReset response lost after sequencing".into(),
+                ));
+            }
+            entry.as_object_mut().unwrap().remove("$type");
+            return ok_json(json!({
+                "retiredCoordinates": b["retired"],
+                "successorCoordinates": b["successor"],
+                "entry": entry,
+            }));
+        }
+
         if url.contains("/xrpc/blue.catbird.chat.getConversations") {
             let list: Vec<Value> = g.conversations.values().cloned().collect();
             return ok_json(json!({ "conversations": list }));
@@ -1444,18 +1655,20 @@ impl SharedMockDs {
                 .get(cid)
                 .into_iter()
                 .flatten()
+                // Every coordinate change supersedes the open requests: exactly the open ones
+                // are pending, served as the DS holds them.
                 .filter(|request| {
                     current_leaf
                         && request["requesterDeviceId"].as_str() != Some(dev.as_str())
                         && request["status"] == "open"
-                        && request["boundCoordinate"] == state["coordinates"]
                 })
                 .cloned()
                 .collect();
             return ok_json(json!({
                 "state": state,
                 "pendingLeafRecoveryRequests": requests,
-                "pendingResetRequests": [],
+                "pendingResetRequests": g.reset_requests.get(cid).into_iter().flatten()
+                    .filter(|request| request["status"] == "pending").cloned().collect::<Vec<_>>(),
                 "pendingLeaveRequests": [],
                 // Plain `#accountDeletedEntry` refs: the state list carries no `$type`.
                 "accountDeletions": g.account_deletions.get(cid).into_iter().flatten().map(|entry| {
@@ -1490,8 +1703,19 @@ impl SharedMockDs {
             }
             let cid = q.get("conversationId").cloned().unwrap_or_default();
             let after: i64 = q.get("afterSeq").and_then(|s| s.parse().ok()).unwrap_or(0);
-            let readable_from = q
-                .get("actorDeviceId")
+            let device = q.get("actorDeviceId");
+            let readable_until = device
+                .and_then(|device| g.readable_until.get(device))
+                .copied()
+                .unwrap_or(i64::MAX);
+            if after >= readable_until {
+                return xrpc_error(
+                    400,
+                    "AccessOutsideMembershipInterval",
+                    "read past the device's membership interval",
+                );
+            }
+            let readable_from = device
                 .and_then(|device| g.readable_from.get(device))
                 .copied()
                 .unwrap_or(0);
@@ -1503,7 +1727,7 @@ impl SharedMockDs {
                 .into_iter()
                 .filter(|e| {
                     let seq = e["seq"].as_i64().unwrap_or(0);
-                    seq > after && seq >= readable_from
+                    seq > after && seq >= readable_from && seq <= readable_until
                 })
                 .collect();
             return ok_json(json!({ "entries": list }));
@@ -3278,8 +3502,11 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
         if code == "ConversationNotFound" {
             result.expect("only the exact close-race code is ignored");
         } else {
+            // One conversation's failure surfaces as itself inside the typed aggregate.
             assert!(
-                matches!(&result, Err(MLSError::InvalidState(actual)) if actual == code),
+                matches!(&result, Err(MLSError::SyncIncomplete { failures, .. })
+                    if matches!(failures.as_slice(), [failure] if failure.conversation_id == cid
+                        && matches!(&*failure.error, MLSError::InvalidState(actual) if actual == code))),
                 "{code}: {result:?}"
             );
         }
@@ -7165,6 +7392,271 @@ fn reset_request_moves_only_the_cursor_and_only_from_a_participant() {
     );
 }
 
+/// A verified `resetActivationEntry` retires this device's old-generation leaf (`CHAT_PROTOCOL`
+/// §6: every old leaf but the activator only closes), from exactly the state this device holds.
+/// Alice activates a reset; Bob, an old leaf, is served it first retiring a coordinate he already
+/// left and then opening a successor on the retired group ID: each fails his sync with nothing
+/// changed. The genuine one moves his conversation to the successor generation's group,
+/// coordinate and cursor in one step, erases the old group and acknowledges nothing. The retired
+/// row then reads nothing past its reset: the same activation replayed at the next seq and an
+/// old-generation message are never read.
+///
+/// Fail-before: a reset activation only moved the cursor, so Bob kept the retired group as
+/// current and applied old-generation entries after the reset.
+#[test]
+fn reset_activation_retires_the_old_leaf_from_exactly_its_current_state() {
+    let f = send_order_fixture(false);
+    let (ds, cid, alice, bob) = (&f.ds, f.cid.as_str(), &f.alice, &f.bob);
+    let prior: Value = serde_json::from_str(&stored_coordinates(bob, cid).unwrap()).unwrap();
+    let version = prior["stateVersion"].as_i64().unwrap();
+    let generation = prior["generation"].as_i64().unwrap();
+    let creation = ds.inner.lock().unwrap().entries[cid][0].clone();
+    let mut participants = creation["signedRequest"]["body"]["manifest"]["participants"].clone();
+    for participant in participants.as_array_mut().unwrap() {
+        participant["status"] = json!("active");
+    }
+    let alice_signer = enrolled_signer(alice);
+    let alice_key = alice_signer.public().to_vec();
+    let successor_group = [0x5a_u8; 32];
+    let activation = |prior: &Value, successor_group: &[u8]| {
+        let mut retired = prior.clone();
+        retired["stateVersion"] = json!(prior["stateVersion"].as_i64().unwrap() + 1);
+        retired["lifecycle"] = json!("superseded");
+        let bytes = |byte: u8| json!({ "$bytes": STANDARD.encode([byte; 32]) });
+        let successor = json!({
+            "conversationId": cid, "generation": generation + 1, "stateVersion": 0,
+            "groupId": { "$bytes": STANDARD.encode(successor_group) }, "epoch": 0,
+            "groupContextHash": bytes(0x61), "confirmationTag": bytes(0x62),
+            "lifecycle": "active",
+        });
+        let (transition, ciphertext, group_info) = (new_id(), [0x63_u8; 48], [0x64_u8; 64]);
+        let key_id = derive_key_id(&alice_key);
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#resetActivationBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\0",
+            "resetRequestId": new_id(), "transitionId": transition, "idempotencyKey": transition,
+            "conversationKind": "group", "authGeneration": 1,
+            "prior": prior, "retired": retired, "successor": successor,
+            "manifest": {
+                "participants": participants,
+                "actorLeaf": { "userDid": ALICE_DID, "deviceId": f.alice_dev, "leafOrigin": "genesis" },
+            },
+            "genesisGroupInfo": {
+                "framing": "mlsMessage", "contentType": "groupInfo",
+                "bytes": { "$bytes": STANDARD.encode(group_info) },
+                "sha256": STANDARD.encode(Sha256::digest(group_info)),
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": 1, "authorDeviceId": f.alice_dev,
+                    "authorDid": ALICE_DID, "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active", "originSeq": 1,
+                    "originTransitionId": transition, "roleAtOrigin": "admin",
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&alice_key) },
+                },
+                "ciphertext": { "$bytes": STANDARD.encode(ciphertext) },
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
+                "ciphertextSize": ciphertext.len(),
+                "coordinate": {
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(cid).unwrap().as_bytes()),
+                    "generation": generation + 1, "epoch": 0,
+                    "groupId": { "$bytes": STANDARD.encode(successor_group) },
+                    "groupContextHash": bytes(0x61), "confirmationTag": bytes(0x62),
+                },
+                "metadataVersion": 2, "nonce": { "$bytes": STANDARD.encode([0x65_u8; 12]) },
+                "originTransitionId": transition,
+            },
+            "signedAt": "2026-11-07T00:00:00.000Z",
+        });
+        signed_by(
+            &alice_signer,
+            ALICE_DID,
+            &f.alice_dev,
+            CanonicalOperation::ActivateReset,
+            &body,
+        )
+    };
+    let serve = |signed_request: Value| {
+        let mut g = ds.inner.lock().unwrap();
+        let entries = g.entries.get_mut(cid).unwrap();
+        let seq = entries.len() as i64 + 1;
+        entries.push(json!({
+            "$type": "blue.catbird.chat.defs#resetActivationEntry",
+            "entryId": new_id(), "conversationId": cid, "seq": seq,
+            "receivedAt": "2026-11-07T00:00:00.000Z", "signedRequest": signed_request,
+        }));
+        seq
+    };
+    let unserve = || {
+        ds.inner.lock().unwrap().entries.get_mut(cid).unwrap().pop();
+    };
+    let row = || {
+        bob.db()
+            .read_tx(|tx| tx.get_conversation(cid))
+            .unwrap()
+            .unwrap()
+    };
+    let before = (row(), stored_coordinates(bob, cid));
+
+    let mut left = prior.clone();
+    left["stateVersion"] = json!(version - 1);
+    for (case, request, reason) in [
+        (
+            "a prior Bob already left",
+            activation(&left, &successor_group),
+            "prior is not this device's current coordinate",
+        ),
+        (
+            "a successor on the retired group",
+            activation(&prior, &chat_wire::json_bytes(&prior["groupId"]).unwrap()),
+            "successor is not a fresh group",
+        ),
+    ] {
+        serve(request);
+        let error = bob.sync().expect_err(case).to_string();
+        assert!(error.contains(reason), "{case}: {error}");
+        assert_eq!((row(), stored_coordinates(bob, cid)), before, "{case}");
+        assert!(bob.list_members(cid).is_ok(), "{case}: the old group stays");
+        unserve();
+    }
+
+    let acked = || {
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.to_owned(), f.bob_dev.clone()))
+            .copied()
+    };
+    let acked_before = acked();
+    let genuine = activation(&prior, &successor_group);
+    let reset_seq = serve(genuine.clone());
+    bob.sync()
+        .expect("the genuine activation retires bob's leaf");
+    let retired = row();
+    assert_eq!(
+        (
+            retired.generation,
+            retired.group_id.as_slice(),
+            retired.epoch,
+            retired.last_seq
+        ),
+        (generation + 1, successor_group.as_slice(), 0, reset_seq)
+    );
+    let successor =
+        chat_wire::canonicalize_wire_coordinate(&genuine["body"]["successor"], Some(cid)).unwrap();
+    assert_eq!(stored_coordinates(bob, cid), Some(successor.to_string()));
+    assert!(bob.list_members(cid).is_err(), "the old group is erased");
+    assert!(bob.send_message(cid, &new_id(), "retired").is_err());
+    assert_eq!(acked(), acked_before, "nothing acknowledged past the reset");
+    bob.sync().expect("nothing past the reset is read");
+
+    serve(genuine);
+    // Alice never journaled this activation signed with her key, so her own sync would refuse
+    // it; her old-generation send is sequenced all the same.
+    let _ = alice.send_message(cid, &new_id(), "old generation");
+    assert_eq!(ds.entry_count(cid), reset_seq + 2);
+    bob.sync()
+        .expect("a retired row reads nothing past its reset");
+    assert_eq!(row(), retired);
+    assert_eq!(stored_coordinates(bob, cid), Some(successor.to_string()));
+}
+
+/// One conversation's failing entry never stops another conversation's sync. Alice and Bob
+/// share two groups; mls-ds serves Bob, in the first, a genuine message and then one whose
+/// signature no longer verifies, and in the second a genuine message. Bob's sync returns the
+/// typed aggregate naming only the first conversation, with its cursor and acknowledgement at
+/// the genuine message before the forged one; the second conversation's message applies and is
+/// acknowledged. The forged entry keeps failing only its own conversation.
+///
+/// Fail-before: the first failing conversation returned from `sync` before its verified prefix
+/// was acknowledged and before any later conversation was read.
+#[test]
+fn one_conversations_failing_entry_never_stops_another() {
+    let f = send_order_fixture(false);
+    let (ds, first, alice, bob) = (&f.ds, f.cid.as_str(), &f.alice, &f.bob);
+    let second = new_id();
+    alice
+        .create_group(
+            &second,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("Second".into()),
+            None,
+        )
+        .expect("alice creates a second group");
+    bob.sync().expect("bob accepts");
+    alice.sync().expect("alice adds bob");
+    bob.sync().expect("bob joins");
+
+    let (genuine, forged, other) = (new_id(), new_id(), new_id());
+    alice.send_message(first, &genuine, "genuine").unwrap();
+    alice.send_message(first, &forged, "forged").unwrap();
+    alice.send_message(&second, &other, "other").unwrap();
+    let seq_of = |cid: &str, message_id: &str| {
+        let mut g = ds.inner.lock().unwrap();
+        let entry = g
+            .entries
+            .get_mut(cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == message_id)
+            .unwrap();
+        if message_id == forged {
+            entry["signedRequest"]["signature"] = json!(STANDARD.encode([7u8; 64]));
+        }
+        entry["seq"].as_i64().unwrap()
+    };
+    let (genuine_seq, forged_seq, other_seq) = (
+        seq_of(first, &genuine),
+        seq_of(first, &forged),
+        seq_of(&second, &other),
+    );
+    assert_eq!(forged_seq, genuine_seq + 1);
+    let acked = |cid: &str| {
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.to_owned(), f.bob_dev.clone()))
+            .copied()
+    };
+    let has = |cid: &str, message_id: &str| {
+        bob.list_messages(cid, None, 100)
+            .unwrap()
+            .iter()
+            .any(|row| row.message_id == message_id)
+    };
+
+    for _ in 0..2 {
+        let error = bob
+            .sync()
+            .expect_err("the forged entry fails its conversation");
+        let MLSError::SyncIncomplete { failures, .. } = &error else {
+            panic!("not the typed aggregate: {error:?}");
+        };
+        assert_eq!(failures.len(), 1, "{error}");
+        assert_eq!(failures[0].conversation_id, first);
+        assert!(
+            failures[0]
+                .error
+                .to_string()
+                .contains("verify signed transition"),
+            "{error}"
+        );
+        assert_eq!(
+            (last_seq(bob, first), acked(first)),
+            (genuine_seq, Some(genuine_seq))
+        );
+        assert!(has(first, &genuine) && !has(first, &forged));
+        assert_eq!(
+            (last_seq(bob, &second), acked(&second)),
+            (other_seq, Some(other_seq))
+        );
+        assert!(has(&second, &other));
+    }
+}
+
 /// A direct conversation's pending invitee may close it from any PDS-authorized device, leaf or
 /// not: Bob's second device, holding no leaf of Alice's request, closes it and Alice's sync
 /// applies the terminal close at its signed retired coordinate.
@@ -7376,6 +7868,170 @@ fn own_leaf_recovery_fulfillment_moves_nothing_on_a_forged_answer() {
         .unwrap()
         .iter()
         .any(|row| row.conversation_id == cid));
+}
+
+/// Leaf-recovery fulfillment adds only the requester of a pending invitation this device
+/// verified: the add request of a participant acceptance whose invitation verified, for exactly
+/// that device, key, auth generation and KeyPackage, at exactly the coordinate the acceptance
+/// bound it to, and only once. mls-ds lists a request for Carol, whom nobody invited, with her
+/// own genuine KeyPackage at the current coordinate: Alice sends nothing and nothing moves. Eve
+/// accepts her invitation; mls-ds lists her request with another device's KeyPackage, another
+/// key, another auth generation and another device: each fails that conversation's sync with no
+/// Commit sent and Alice's MLS state unchanged. The genuine request adds Eve once; listed again
+/// at the new coordinate, it adds nothing.
+///
+/// Fail-before: Alice fulfilled any request whose KeyPackage was the requesting account's own,
+/// so a delivery service could add anyone with a registered device.
+#[test]
+fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
+    let f = send_order_fixture(true);
+    let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+    let fulfillments = || {
+        ds.inner
+            .lock()
+            .unwrap()
+            .http_log
+            .iter()
+            .filter(|(account, url, body)| {
+                account == ALICE_DID
+                    && url.ends_with("/xrpc/blue.catbird.chat.submitTransition")
+                    && String::from_utf8_lossy(body).contains("leafRecoveryFulfillmentBody")
+            })
+            .count()
+    };
+    let epoch = || {
+        alice
+            .db()
+            .read_tx(|tx| tx.get_conversation(cid))
+            .unwrap()
+            .unwrap()
+            .epoch
+    };
+    let local = || {
+        (
+            fulfillments(),
+            epoch(),
+            last_seq(alice, cid),
+            stored_coordinates(alice, cid),
+        )
+    };
+    let list = |requests: Vec<Value>| {
+        ds.inner
+            .lock()
+            .unwrap()
+            .leaf_recoveries
+            .insert(cid.to_owned(), requests);
+    };
+    let carol_dev = new_id();
+    let _carol = enrolled(&f.tmp, ds, "carol", CAROL_DID, &carol_dev);
+    let carol_package = ds
+        .inner
+        .lock()
+        .unwrap()
+        .convo_kps
+        .get_mut(&(CAROL_DID.to_owned(), carol_dev.clone()))
+        .and_then(Vec::pop)
+        .expect("carol's KeyPackage");
+
+    // A request for a device nobody invited is no work: nothing is sent or moves.
+    let current = ds.inner.lock().unwrap().conversations[cid]["coordinates"].clone();
+    let injected_id = new_id();
+    list(vec![json!({
+        "$type": "blue.catbird.chat.defs#leafRecoveryView",
+        "conversationId": cid, "recoveryRequestId": injected_id,
+        "requesterDid": CAROL_DID, "requesterDeviceId": carol_dev,
+        "recoveryKind": "add", "boundCoordinate": current, "status": "open",
+        "requestedAt": "2026-11-07T00:00:00.000Z", "expiresAt": "2099-01-01T00:00:00.000Z",
+        "reservation": {
+            "conversationId": cid, "recoveryRequestId": injected_id, "boundCoordinate": current,
+            "requesterDid": CAROL_DID, "requesterDeviceId": carol_dev,
+            "requesterKeyId": derive_key_id(enrolled_signer(&_carol).public()),
+            "requesterAuthGeneration": 1, "keyPackageRef": carol_package["keyPackageRef"],
+            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            "purpose": "leafRecovery", "status": "active",
+            "expiresAt": "2099-01-01T00:00:00.000Z", "keyPackage": carol_package,
+        },
+    })]);
+    let before = local();
+    alice
+        .sync()
+        .expect("a request this device cannot authorize is no error");
+    assert_eq!(local(), before, "nobody invited Carol");
+
+    // Eve accepts; mls-ds lists her request with any field the acceptance did not authorize.
+    f.eve.sync().expect("eve accepts her invitation");
+    let genuine = ds.inner.lock().unwrap().leaf_recoveries[cid]
+        .last()
+        .cloned()
+        .expect("eve's request");
+    assert_eq!(genuine["requesterDid"], EVE_DID);
+    let forged = |edit: &dyn Fn(&mut Value)| {
+        let mut request = genuine.clone();
+        edit(&mut request);
+        request
+    };
+    let variants = [
+        (
+            "another device's KeyPackage",
+            forged(&|request| {
+                request["reservation"]["keyPackage"] = carol_package.clone();
+                request["reservation"]["keyPackageRef"] = carol_package["keyPackageRef"].clone();
+            }),
+            "not the authorized device's own",
+        ),
+        (
+            "another key",
+            forged(&|request| {
+                request["reservation"]["requesterKeyId"] =
+                    json!(derive_key_id(enrolled_signer(&_carol).public()))
+            }),
+            "not the authorized request",
+        ),
+        (
+            "another auth generation",
+            forged(&|request| request["reservation"]["requesterAuthGeneration"] = json!(2)),
+            "not the authorized request",
+        ),
+        (
+            "another device",
+            forged(&|request| {
+                request["requesterDeviceId"] = json!(carol_dev);
+                request["reservation"]["requesterDeviceId"] = json!(carol_dev);
+            }),
+            "not the authorized request",
+        ),
+    ];
+    let mut acceptance_seq = None;
+    for (case, request, reason) in variants {
+        list(vec![request]);
+        let error = alice.sync().expect_err(case);
+        assert!(
+            matches!(&error, MLSError::SyncIncomplete { failures, .. }
+                if failures.len() == 1 && failures[0].conversation_id == cid),
+            "{case}: {error:?}"
+        );
+        assert!(error.to_string().contains(reason), "{case}: {error}");
+        // The acceptance itself applied once; nothing else moved.
+        let seq = *acceptance_seq.get_or_insert(last_seq(alice, cid));
+        assert_eq!(
+            (fulfillments(), epoch(), last_seq(alice, cid)),
+            (before.0, before.1, seq),
+            "{case}"
+        );
+    }
+
+    list(vec![genuine.clone()]);
+    alice.sync().expect("the authorized add");
+    assert_eq!((fulfillments(), epoch()), (before.0 + 1, before.1 + 1));
+    // Listed again at the new coordinate, the consumed request adds nothing.
+    let mut again = genuine;
+    let current = ds.inner.lock().unwrap().conversations[cid]["coordinates"].clone();
+    again["status"] = json!("open");
+    again["boundCoordinate"] = current.clone();
+    again["reservation"]["boundCoordinate"] = current;
+    list(vec![again]);
+    alice.sync().expect("a consumed request is no work");
+    assert_eq!((fulfillments(), epoch()), (before.0 + 1, before.1 + 1));
 }
 
 /// Alice's open group `cid` (with Bob), synced to the DS head.

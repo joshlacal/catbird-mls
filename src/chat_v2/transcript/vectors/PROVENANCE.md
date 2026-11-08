@@ -76,10 +76,10 @@ be **the same bytes the server embeds** — the server reaches it through
 | | |
 |---|---|
 | Source path | `PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json` (canonical); mls-ds mirror `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
-| Source revision | `e4227af68226a61a4cae7478496d1a7b930f28f6` (PetrelCatbird, tree `2ce27d72e2a84fd363cba629d2847a3f32921743`) |
-| SHA-256 | `1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075` |
-| Size / defs | 235,876 bytes / 258 definitions |
-| Prior SHA-256 | `3764fc1be74a50e72ca9201eb2793357aaec3b27a7024a3e97e1d9e33ef7aab6` @ PetrelCatbird `b740c2cc`, 234,853 bytes / 258 definitions |
+| Source revision | `e782e46ca8489c881517186fe0bf1a9c35c99634` (PetrelCatbird, tree `d9a3c6cfc19c439435332b7d85c8ff80e5edb3af`) |
+| SHA-256 | `cf931d0fda7b68082f7f0ac9105dd62122692ee35afbf0ddf7eb2d134340f848` |
+| Size / defs | 236,397 bytes / 258 definitions |
+| Prior SHA-256 | `1c21d1b04555c800a0491e997b74e3185520b0634362e68a2a27e6b8babdb075` @ PetrelCatbird `e4227af6`, 235,876 bytes / 258 definitions; `3764fc1be74a50e72ca9201eb2793357aaec3b27a7024a3e97e1d9e33ef7aab6` @ `b740c2cc`, 234,853 bytes / 258 definitions |
 | Earlier SHA-256 | `eb3af0eb332f4ea28d99b97f83aface8e7409d456b69be0d19b4bcb9f108c8ad` @ PetrelCatbird `0f4f58a2`, 233,296 bytes; `125b7462eac11e4a46cfda5c1d6de154567c8903844cf2be93ca2d7c0f301581` @ `c517b5db`, 232,961 bytes; `fca4178c643f4468fc896b38ad258e477f14e6565d094f7f3237c1863be97e39` @ `df7653aa`, 231,566 bytes / 257 definitions; `a2e783d38ababcb5e7572c0b4b95d7db9a8d50427a2aeca28db279bfaca0da5d` @ `f102084e` (unchanged through `854142ea`), 230,449 bytes / 257 definitions |
 
 **The changes from `a2e783d3…` to `fca4178c…`** are the C33 opening-evidence
@@ -117,15 +117,22 @@ accepts a first-seen `messageId` only if (`prior.generation`, `prior.epoch`,
 refuses it `StaleSend` otherwise; an exact replay of an accepted send still
 returns its stored outcome. The definition count is unchanged at 258.
 
+**The changes from `1c21d1b0…` to `cf931d0f…`** are the signed leaf-recovery
+request: `leafRecoveryView` gains an optional `signedRequest`
+(`#signedLeafRecoveryRequest`), the requester device's exact signed
+`requestLeafRecovery`, present exactly when that request created the recovery.
+An acceptance-created recovery carries none. The definition count is unchanged
+at 258.
+
 **Verified identical across every live copy at sync time** — this vendored copy,
 `PetrelCatbird/lexicons/` (the canonical codegen source), and the mls-ds mirror
-the server embeds all hash to `1c21d1b0…`.
+the server embeds all hash to `cf931d0f…`.
 
 To re-check:
 
 ```sh
 cd Catbird+Petrel/catbird-mls
-/usr/bin/git -C ../PetrelCatbird show e4227af68226a61a4cae7478496d1a7b930f28f6:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
+/usr/bin/git -C ../PetrelCatbird show e782e46ca8489c881517186fe0bf1a9c35c99634:lexicons/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
 shasum -a 256 src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json ../mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json
 python3 scripts/generate_chat_schema.py --check-mirror
 ```
