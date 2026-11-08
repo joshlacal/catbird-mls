@@ -5616,6 +5616,10 @@
           "type": "ref",
           "ref": "#signedCommitTransition"
         },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
@@ -5648,6 +5652,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedPolicyTransition"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -5682,6 +5690,10 @@
           "type": "ref",
           "ref": "#signedMetadataTransition"
         },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
@@ -5714,6 +5726,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedCreation"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -5752,6 +5768,10 @@
         "recovery": {
           "type": "ref",
           "ref": "#leafRecoveryView"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -5792,6 +5812,10 @@
           "type": "ref",
           "ref": "#conversationCloseTombstone"
         },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
@@ -5824,6 +5848,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedResetRequest"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -5858,6 +5886,10 @@
           "type": "ref",
           "ref": "#signedResetActivation"
         },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
@@ -5890,6 +5922,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedLeafRecoveryFulfillment"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -5924,6 +5960,10 @@
           "type": "ref",
           "ref": "#signedLeaveRequest"
         },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
@@ -5956,6 +5996,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedZeroLeafLeave"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -5990,6 +6034,10 @@
           "type": "ref",
           "ref": "#signedLeaveCancellation"
         },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
+        },
         "receivedAt": {
           "type": "ref",
           "ref": "#canonicalDatetime"
@@ -6022,6 +6070,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedLeaveCommitFulfillment"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -6095,6 +6147,10 @@
           "type": "bytes",
           "minLength": 64,
           "maxLength": 64
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",
@@ -8115,6 +8171,10 @@
         "signedRequest": {
           "type": "ref",
           "ref": "#signedDirectRequestAcceptance"
+        },
+        "sequencerReceipt": {
+          "type": "ref",
+          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",

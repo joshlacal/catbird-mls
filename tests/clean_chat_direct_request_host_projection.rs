@@ -3,8 +3,6 @@
 //! On reopen, projection is replayed only, first-message count stays one,
 //! and native ratchet never rolls back.
 #![allow(dead_code)]
-#[path = "fixtures/direct_request_i13.rs"]
-mod direct_request_i13;
 mod e2e_harness;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -18,6 +16,7 @@ use catbird_mls::orchestrator::{
 use catbird_mls::{
     DirectRequestInput, DirectRequestOutcome, RequestConsent, RequestCrypto, RequestPreview,
 };
+use e2e_harness::mock_api_client::direct_request_i13;
 use e2e_harness::TestWorld;
 use p256::ecdsa::signature::Signer;
 use serde_json::{json, Value};

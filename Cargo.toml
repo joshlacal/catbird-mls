@@ -110,20 +110,26 @@ test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_m
 # Labyrinth 1.1 encrypted history backup over ATProto Spaces (enabled by default per D4).
 labyrinth = ["dep:labyrinth"]
 # Deterministic simulation testing (DST) fault-injection (`buggify!`) and `SimClock` KP lifetime hooks.
-sim = ["openmls/unchecked-conversions"]
+sim = ["openmls/unchecked-conversions", "labyrinth?/sim"]
 plant_p1 = ["sim"]
 plant_p2 = ["sim"]
 plant_p3 = ["sim"]
 plant_p4 = ["sim"]
 plant_p5 = ["sim"]
 plant_p6 = ["sim"]
+plant_p7 = ["sim"]
 plant_p8 = ["sim"]
 plant_p9 = ["sim"]
 plant_p10 = ["sim"]
 plant_p11 = ["sim"]
 plant_p12 = ["sim"]
 plant_p13 = ["sim"]
+plant_p14 = ["sim"]
 plant_p15 = ["sim"]
+plant_p16 = ["sim", "labyrinth?/plant_p16"]
+plant_p17 = ["sim"]
+plant_mutation_journal_roll_forward = ["sim"]
+plant_oversized_inline_push = ["sim"]
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }

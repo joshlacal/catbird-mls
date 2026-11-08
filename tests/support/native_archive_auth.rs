@@ -48,6 +48,7 @@ struct World {
     inventory_fault: Option<&'static str>,
     directory_outage: bool,
     write_outage: bool,
+    unsigned_space_not_found: Option<(&'static str, u16)>,
     /// `(account, space)` refused, with the MLS group the authority signs into its denial.
     denied_spaces: BTreeMap<(String, String), Vec<u8>>,
 }
@@ -107,6 +108,12 @@ impl NativeArchiveAuthFixture {
     #[allow(dead_code)]
     pub fn set_write_outage(&self, outage: bool) {
         self.world.lock().unwrap().write_outage = outage;
+    }
+    /// Make one conversation-Space operation return an unsigned `SpaceNotFound`.
+    #[allow(dead_code)]
+    pub fn set_unsigned_space_not_found(&self, operation: Option<&'static str>, status: u16) {
+        self.world.lock().unwrap().unsigned_space_not_found =
+            operation.map(|operation| (operation, status));
     }
     /// Refuse `account` a credential for `space` with the authority's signed denial binding
     /// `group` (the Space's MLS group, as mls-ds signs it); `None` admits the account again.
@@ -541,6 +548,14 @@ impl NativeArchiveAuthFixture {
             return Ok(reply(503, json!({"error": "ServiceUnavailable"})));
         }
         let space = SpaceUri::parse(text(body, "space")?).map_err(failure)?;
+        let unsigned_space_not_found = self.world.lock().unwrap().unsigned_space_not_found;
+        if space.space_type == "blue.catbird.labyrinth.conversation" {
+            if let Some((_, status)) = unsigned_space_not_found
+                .filter(|(operation, _)| *operation == "com.atproto.space.applyWrites")
+            {
+                return Ok(reply(status, json!({"error": "SpaceNotFound"})));
+            }
+        }
         let repo = text(body, "repo")?;
         if repo != account {
             return Ok(reply(403, json!({"error": "NotAuthorized"})));
@@ -672,6 +687,14 @@ impl NativeArchiveAuthFixture {
             && (space.authority != account || writer != account || space.rkey != "self")
         {
             return Ok(reply(403, json!({"error": "NotAuthorized"})));
+        }
+        let unsigned_space_not_found = self.world.lock().unwrap().unsigned_space_not_found;
+        if space.space_type == "blue.catbird.labyrinth.conversation" {
+            if let Some((_, status)) =
+                unsigned_space_not_found.filter(|(operation, _)| *operation == nsid)
+            {
+                return Ok(reply(status, json!({"error": "SpaceNotFound"})));
+            }
         }
         let world = self.world.lock().unwrap();
         let entries: Vec<_> = world

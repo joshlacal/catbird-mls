@@ -542,19 +542,20 @@ pub fn extract_plaintext_body_and_verify_aad(
     Ok((body, json_str, None, None))
 }
 
-/// Purge all locally stored messages authored by `deleted_did` across `<did_hash>.db`
-/// upon observing a sequenced `accountDeleted` entry (`Spec §5 I13`).
+/// Purge locally stored messages authored by `deleted_did` after `conversation_id` sequenced an
+/// `accountDeleted` entry (`Spec §5 I13`).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn handle_account_deleted_event(
     db: &crate::storage::MlsAccountDb,
+    conversation_id: &str,
     deleted_did: &str,
 ) -> Result<usize, MLSError> {
     if deleted_did.trim().is_empty() {
         return Err(MLSError::invalid_input("deleted_did must not be empty"));
     }
     db.write_tx(|tx| {
-        let purged = tx.purge_messages_from_sender(None, deleted_did)?;
-        tx.purge_labyrinth_queue_from_sender(deleted_did)?;
+        let purged = tx.purge_messages_from_sender(Some(conversation_id), deleted_did)?;
+        tx.purge_labyrinth_queue_from_sender(conversation_id, deleted_did)?;
         Ok(purged)
     })
 }

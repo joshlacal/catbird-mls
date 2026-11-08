@@ -1,5 +1,6 @@
-//! Post-SQLite-commit `acknowledgeEntries` discipline (`Spec §5 I2, I6`):
-//! network acknowledgments NEVER run inside a SQLite transaction or before `COMMIT` succeeds.
+//! Post-power-loss-durable SQLite commit `acknowledgeEntries` discipline (`Spec §5 I2, I6`):
+//! network acknowledgments NEVER run inside a SQLite transaction or before a FULL-synchronous
+//! `COMMIT` succeeds.
 
 use std::future::Future;
 
@@ -9,9 +10,9 @@ use crate::storage::{WasmAccountDb, WasmSqlBackend};
 use crate::MLSError;
 
 /// Commit decrypted/applied sequencer entries inside an atomic `write_tx` (`BEGIN IMMEDIATE` ->
-/// `COMMIT`) and ONLY AFTER SQLite durability succeeds invoke `acknowledge_on_ds` with the
-/// committed sequence numbers (`I2`, `I6`). If `write_tx` fails or rolls back,
-/// `acknowledge_on_ds` is never called so `mls-ds` retains the transient delivery entries.
+/// FULL-synchronous `COMMIT`) and ONLY AFTER power-loss durability succeeds invoke
+/// `acknowledge_on_ds` with the committed sequence numbers (`I2`, `I6`). If `write_tx` fails or
+/// rolls back, `acknowledge_on_ds` is never called so `mls-ds` retains the transient entries.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn persist_entries_then_acknowledge<WriteFn, AckFn, AckFut>(
     db: &MlsAccountDb,

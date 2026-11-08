@@ -675,14 +675,16 @@ where
             .await?;
         let proof = &state["state"]["directRequest"]["acceptanceProof"];
         if !proof.is_null() && candidate.acceptance_proof.is_none() {
-            let body = &proof["entry"]["signedRequest"]["body"];
+            let (legacy_proof, sequencer_receipt) =
+                super::projection::normalize_acceptance_proof_with_i13(proof.clone())?;
+            let body = &legacy_proof["entry"]["signedRequest"]["body"];
             let recipient = body["actorDid"].as_str().ok_or_else(invalid)?;
             let key_id = body["keyId"].as_str().ok_or_else(invalid)?;
             let recipient_device = body["actorDeviceId"].as_str().ok_or_else(invalid)?;
             let key = self
                 .request_authorized_device_key(recipient, recipient_device, key_id)
                 .await?;
-            let method = proof["receipt"]["body"]["keyId"]
+            let method = legacy_proof["receipt"]["body"]["keyId"]
                 .as_str()
                 .ok_or_else(invalid)?;
             let auth_did = {
@@ -690,22 +692,26 @@ where
                     .map_err(|_| invalid())?;
                 val["id"].as_str().ok_or_else(invalid)?.to_string()
             };
+            let i13_method =
+                crate::client::chat_wire::sequencer_receipt_kid(&auth_did, &sequencer_receipt)?;
             if transcript::resolve_direct_request_receipt_key_for_authority(
                 &auth_did,
                 &candidate.trusted_authority_document,
                 method,
             )
             .is_err()
+                || crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                    &candidate.trusted_authority_document,
+                    &auth_did,
+                    i13_method,
+                )
+                .is_err()
             {
                 let doc = self
                     .credentials()
                     .direct_request_receipt_authority_document(&auth_did)
                     .await?
                     .ok_or_else(invalid)?;
-                transcript::resolve_direct_request_receipt_key_for_authority(
-                    &auth_did, &doc, method,
-                )
-                .map_err(|_| invalid())?;
                 candidate.trusted_authority_document =
                     super::intent::merge_trusted_documents_for_expected_authority(
                         &candidate.trusted_authority_document,
@@ -719,14 +725,20 @@ where
                 method,
             )
             .map_err(|_| invalid())?;
-            let canonical =
-                transcript::verify_received_direct_request_acceptance_proof_for_authority(
-                    &auth_did,
-                    &serde_json::to_vec(proof).map_err(|_| invalid())?,
-                    &authority_key,
-                    &key,
-                )
-                .map_err(|_| invalid())?;
+            let i13_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                &candidate.trusted_authority_document,
+                &auth_did,
+                i13_method,
+            )?;
+            let mut canonical = super::projection::verify_acceptance_proof_with_i13(
+                &auth_did,
+                &legacy_proof,
+                &sequencer_receipt,
+                &authority_key,
+                &i13_key,
+                &key,
+            )?;
+            canonical["entry"]["sequencerReceipt"] = sequencer_receipt;
             candidate.acceptance_proof =
                 Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
             candidate.recipient_public_key = Some(key);
@@ -737,18 +749,29 @@ where
         }
         let expected = if let Some(accepted) = &projection.acceptance_proof {
             let value: Value = serde_json::from_slice(accepted).map_err(|_| invalid())?;
-            value["receipt"]["body"]["next"].clone()
+            value["entry"]["signedRequest"]["body"]["next"].clone()
         } else {
             let value: Value =
                 serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
             value["body"]["next"].clone()
         };
+        let projected_state = if let Some(accepted) = &projection.acceptance_proof {
+            // The generated state schema predates the outer I13 extension. Only after the
+            // retained proof verified above may its legacy projection feed that schema.
+            let accepted: Value = serde_json::from_slice(accepted).map_err(|_| invalid())?;
+            let (legacy, _) = super::projection::normalize_acceptance_proof_with_i13(accepted)?;
+            let mut projected = state["state"].clone();
+            projected["directRequest"]["acceptanceProof"] = legacy;
+            projected
+        } else {
+            state["state"].clone()
+        };
         // Point-read metadata cannot establish acceptance. After the independent
         // proof reducer succeeds, retain only its exact current coordinate so
         // normal sends use the accepted policy version at the same MLS epoch.
-        if same_request_coordinates(&state["state"]["coordinates"], &expected)? {
+        if same_request_coordinates(&projected_state["coordinates"], &expected)? {
             if let Some(view) =
-                super::super::admission::conversation_view_from_state_json(&state["state"])
+                super::super::admission::conversation_view_from_state_json(&projected_state)
             {
                 if view.canonical_state.is_some() {
                     super::super::admission::validate_conversation_view(&view)?;
@@ -772,7 +795,7 @@ where
                             return Ok(false)
                         }
                     };
-                    self.retain_conversation_policy_json(cid, &state["state"])
+                    self.retain_conversation_policy_json(cid, &projected_state)
                         .await?;
                     let mut conversations = self.conversations().lock().await;
                     for alias in aliases {
@@ -834,15 +857,82 @@ where
         let mut projection = self
             .authorize_direct_request_projection(&mut raw, &owner, &device)
             .await?;
-        let entry = entry.clone();
+        let body_value = &entry["signedRequest"]["body"];
+        let body = crate::chat_v2::transcript::decode_strict_json(
+            &serde_json::to_vec(body_value).map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        let projected = crate::chat_v2::transcript::project_signed_body(
+            crate::chat_v2::transcript::SignedMutationKind::ConversationClose,
+            &body,
+        )
+        .map_err(|_| invalid())?;
+        let signature: [u8; 64] = STANDARD
+            .decode(
+                entry["signedRequest"]["signature"]
+                    .as_str()
+                    .ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?
+            .try_into()
+            .map_err(|_| invalid())?;
+        let verified =
+            crate::chat_v2::transcript::VerifiedMutation::verify(projected, signature, key)
+                .map_err(|_| invalid())?;
+        let authority: Value = serde_json::from_slice(&projection.trusted_authority_document)
+            .map_err(|_| invalid())?;
+        let authority_did = authority["id"].as_str().ok_or_else(invalid)?.to_owned();
+        let mut entry = entry.clone();
+        let receipt = super::projection::normalize_control_sequencer_receipt(&mut entry)?;
+        let kid = crate::client::chat_wire::sequencer_receipt_kid(&authority_did, &receipt)
+            .map_err(|_| invalid())?;
+        if crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+            &projection.trusted_authority_document,
+            &authority_did,
+            kid,
+        )
+        .is_err()
+        {
+            let current = self
+                .credentials()
+                .direct_request_receipt_authority_document(&authority_did)
+                .await?
+                .ok_or_else(invalid)?;
+            projection.trusted_authority_document =
+                super::intent::merge_trusted_documents_for_expected_authority(
+                    &projection.trusted_authority_document,
+                    &current,
+                    &authority_did,
+                )?;
+        }
+        let receipt_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+            &projection.trusted_authority_document,
+            &authority_did,
+            kid,
+        )
+        .map_err(|_| invalid())?;
+        crate::client::chat_wire::verify_control_sequencer_receipt(
+            &receipt,
+            &receipt_key,
+            &authority_did,
+            cid,
+            entry["entryId"].as_str().ok_or_else(invalid)?,
+            entry["seq"].as_i64().ok_or_else(invalid)?,
+            body_value["actorDid"].as_str().ok_or_else(invalid)?,
+            body_value["actorDeviceId"].as_str().ok_or_else(invalid)?,
+            &body_value["retired"],
+            verified.request_digest(),
+        )
+        .map_err(|_| invalid())?;
         let hash = super::projection::DirectRequestCloseProof::hash(&entry)?;
         if let Some(old) = &projection.close_proof {
             if old.entry_sha256 != hash {
                 return Err(invalid());
             }
+            let next = projection.encode()?;
             if !self
                 .mls_context()
-                .commit_closed_direct_request_projection(cid, &raw, &raw)?
+                .commit_closed_direct_request_projection(cid, &raw, &next)?
             {
                 return Err(invalid());
             }
@@ -1081,6 +1171,21 @@ mod coordinate_tests {
                 "signature": STANDARD.encode([5u8; 64])
             },
             "receivedAt": "2026-07-22T12:34:56.000Z",
+            "sequencerReceipt": {
+                "sequencerDid": "did:web:chat.catbird.blue",
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "generation": 0,
+                "groupId": STANDARD.encode([2u8; 32]),
+                "epoch": 0,
+                "senderDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                "senderDeviceId": "72727272-7272-4272-b272-727272727272",
+                "entryId": "66666666-6666-4666-a666-666666666666",
+                "archiveCommitment": STANDARD.encode([6u8; 32]),
+                "seq": 10,
+                "issuedAtMs": 1,
+                "kid": "did:web:chat.catbird.blue#mls-receipt-1",
+                "signature": STANDARD.encode([7u8; 64])
+            },
             "tombstone": tombstone
         });
         let canonical_hash =

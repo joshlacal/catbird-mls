@@ -348,6 +348,18 @@ async fn i13_archive_commitment_account_deleted_purge_post_commit_ack() {
                 created_at_ms: 101,
                 is_own: false,
             })?;
+            tx.insert_message(&MessageRow {
+                message_id: "m-other-conversation".into(),
+                conversation_id: "convo-other".into(),
+                group_id: b"gid-other".to_vec(),
+                epoch: 1,
+                seq: 3,
+                sender_did: "did:plc:deleteduser000000000000".into(),
+                sender_device_id: "dev-1".into(),
+                plaintext_json: "{}".into(),
+                created_at_ms: 102,
+                is_own: false,
+            })?;
             Ok(vec![10, 11])
         },
         move |seqs| {
@@ -363,11 +375,20 @@ async fn i13_archive_commitment_account_deleted_purge_post_commit_ack() {
     assert_eq!(*acked_seqs.lock().unwrap(), vec![10, 11]);
 
     // 3. `accountDeleted` event purges local messages from deleted sender (`I13`):
-    let purged = handle_account_deleted_event(&db, "did:plc:deleteduser000000000000").unwrap();
+    let purged =
+        handle_account_deleted_event(&db, "convo-i13", "did:plc:deleteduser000000000000").unwrap();
     assert_eq!(purged, 1);
     let remaining = db
         .read_tx(|tx| tx.list_messages("convo-i13", None, 50))
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].sender_did, "did:plc:activeuser0000000000000");
+    let other = db
+        .read_tx(|tx| tx.list_messages("convo-other", None, 50))
+        .unwrap();
+    assert_eq!(
+        other.len(),
+        1,
+        "a deletion sequenced by one conversation cannot purge another"
+    );
 }

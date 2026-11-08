@@ -7,7 +7,7 @@ use std::fs;
 
 use catbird_mls::storage::{
     derive_sqlcipher_96hex_key_spec, ConversationRow, MessageRow, MlsAccountDb, OpenMode,
-    UNIFIED_SCHEMA_TABLES,
+    UNIFIED_SCHEMA_DDL, UNIFIED_SCHEMA_TABLES,
 };
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -191,6 +191,54 @@ fn i8_sqlcipher_96hex_plaintext_header_cold_reopen_never_bricks() {
 }
 
 #[test]
+fn pre_round4_database_is_refused_before_open_can_mutate_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("pre-round4.db");
+    let db_key_32 = [0x24u8; 32];
+    let key_spec = derive_sqlcipher_96hex_key_spec(&db_key_32);
+
+    // Exact b2a401cf schema (sha256 b4ac1538…), which predates the format row.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open fixture");
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_memory_security = OFF;\n\
+             PRAGMA key = \"{key_spec}\";\n\
+             PRAGMA cipher_plaintext_header_size = 32;\n\
+             PRAGMA journal_mode = WAL;\n\
+             {UNIFIED_SCHEMA_DDL}"
+        ))
+        .expect("construct b2a401cf database");
+    }
+
+    let error = match MlsAccountDb::open_native(&db_path, &db_key_32, OpenMode::App) {
+        Err(error) => error,
+        Ok(_) => panic!("an unversioned pre-Round-4 database must be rejected at open"),
+    };
+    assert_eq!(
+        format!("{error:?}"),
+        "LocalStateFormatUnsupported { found: 0, required: 1 }"
+    );
+
+    // The failed open cannot upgrade or otherwise partially mutate the old database.
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen fixture");
+    conn.execute_batch(&format!(
+        "PRAGMA cipher_memory_security = OFF;\n\
+         PRAGMA key = \"{key_spec}\";\n\
+         PRAGMA cipher_plaintext_header_size = 32;"
+    ))
+    .expect("unlock fixture");
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM account_meta WHERE key = 'local_state_format_version'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn openmls_kv_and_app_tables_rollback_atomically_on_write_tx_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("rollback_atomicity.db");
@@ -264,4 +312,34 @@ fn openmls_kv_and_app_tables_rollback_atomically_on_write_tx_error() {
         kv_count, 0,
         "all openmls_kv writes from failed tx must roll back"
     );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn apple_app_and_push_connections_request_full_drive_flushes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, mode) in [
+        ("app.db", OpenMode::App),
+        ("push.db", OpenMode::PushExtension),
+    ] {
+        let db = MlsAccountDb::open_native(dir.path().join(name), &[0x5a; 32], mode)
+            .expect("open SQLCipher database");
+        let (fullfsync, checkpoint_fullfsync): (i64, i64) = db
+            .read_tx(|tx| {
+                Ok((
+                    tx.conn()
+                        .query_row("PRAGMA fullfsync", [], |row| row.get(0))
+                        .map_err(|_| catbird_mls::MLSError::StorageFailed)?,
+                    tx.conn()
+                        .query_row("PRAGMA checkpoint_fullfsync", [], |row| row.get(0))
+                        .map_err(|_| catbird_mls::MLSError::StorageFailed)?,
+                ))
+            })
+            .expect("read Darwin durability pragmas");
+        assert_eq!(
+            (fullfsync, checkpoint_fullfsync),
+            (1, 1),
+            "{mode:?} must request F_FULLFSYNC for transactions and WAL checkpoints"
+        );
+    }
 }

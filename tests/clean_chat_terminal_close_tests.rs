@@ -104,21 +104,16 @@ async fn closed_pair_with_closing_device(new_device: bool) -> (TestWorld, String
     } else {
         alice.orchestrator.leave_conversation(&cid).await.unwrap();
     }
-    // The real leave facade allocates the outer entry independently of the
-    // signed transition. Keep the original signed bytes and terminal sequence.
-    let mut entries = world.delivery_service().terminal_entries_for_test();
+    // The server allocates the outer row independently of the signed transition.
+    let entries = world.delivery_service().terminal_entries_for_test();
     let close = entries
-        .iter_mut()
+        .iter()
         .find(|entry| entry["$type"] == "blue.catbird.chat.defs#conversationCloseEntry")
         .unwrap();
-    close["entryId"] = json!(uuid::Uuid::new_v4().to_string());
     assert_ne!(
         close["entryId"],
         close["signedRequest"]["body"]["transitionId"]
     );
-    world
-        .delivery_service()
-        .set_terminal_entries_for_test(entries);
     (world, cid, group)
 }
 

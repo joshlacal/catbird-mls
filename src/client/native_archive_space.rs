@@ -187,9 +187,6 @@ mod native_archive_space_auth {
             // of this credential request (`verify_space_denial`), which a home DS relays byte for
             // byte whether or not it is that authority. An unsigned refusal, of the credential or
             // of a read after it was granted, proves no removal.
-            let unsigned_denial = |status: u16| {
-                format!("{}: unsigned HTTP {status}", super::NATIVE_UNAUTHENTICATED_DENIAL)
-            };
             let credential = match self.space_credential(&space, personal, authority)? {
                 Ok(credential) => credential,
                 Err(denied) => return Ok(into_response(denied)),
@@ -227,9 +224,6 @@ mod native_archive_space_auth {
             };
             let (mut response, secret) = self.space_read(&context, &request.nsid, &request.path, request.headers, mac_type)?;
             if !(200..300).contains(&response.status) {
-                if !personal && reads_as_space_denial(&response) {
-                    return Err(unsigned_denial(response.status));
-                }
                 return Ok(into_response(response));
             }
             match request.nsid.as_str() {
@@ -474,6 +468,16 @@ mod native_archive_space_auth {
                 })).map_err(|e| format!("native_space_encode_read_relay: {e}"))?;
                 self.execute(&self.config.home_ds_endpoint, "POST".into(), "/xrpc/blue.catbird.chat.relaySpaceRead".into(), vec![], Some(body))?
             };
+            if !context.personal
+                && !(200..300).contains(&response.status)
+                && reads_as_space_denial(&response)
+            {
+                return Err(format!(
+                    "{}: unsigned HTTP {}",
+                    super::NATIVE_UNAUTHENTICATED_DENIAL,
+                    response.status
+                ));
+            }
             self.space_credential_live(context)?;
             Ok((bounded(response)?, negotiated.map(|(_, secret)| secret)))
         }
@@ -1181,22 +1185,46 @@ mod native_archive_space_auth {
         Ok(())
     }
 
-    fn into_response(response: PlatformHttpResponse) -> LabyrinthSpaceResponse {
+    pub(super) fn into_response(response: PlatformHttpResponse) -> LabyrinthSpaceResponse {
+        let content_type = response.header("content-type").map(str::to_owned);
+        let omit_mac = crate::planted::is_planted_bug_active(
+            crate::planted::PlantedBug::P17OmitSpaceMacHeaderForwarding,
+        );
         LabyrinthSpaceResponse {
             status: response.status,
-            content_type: response.header("content-type").map(str::to_owned),
-            headers: response.headers.into_iter().map(|h| (h.name, h.value)).collect(),
+            content_type,
+            headers: response
+                .headers
+                .into_iter()
+                .filter(|header| {
+                    !omit_mac || !header.name.eq_ignore_ascii_case("atproto-space-mac")
+                })
+                .map(|header| (header.name, header.value))
+                .collect(),
             body: response.body,
         }
     }
 
-    /// Whether labyrinth reads this refusal as Space denial (`Error::Forbidden`).
+    /// Whether an unsigned post-credential refusal could be mistaken for membership denial.
     fn reads_as_space_denial(response: &PlatformHttpResponse) -> bool {
         let error = serde_json::from_slice::<Value>(&response.body)
             .ok()
             .and_then(|body| body["error"].as_str().map(str::to_owned));
-        let refusal = labyrinth::store::space::SpaceError { status: response.status, error, message: None };
-        matches!(labyrinth::store::space::map_space_error(refusal), labyrinth::Error::Forbidden)
+        if matches!(response.status, 400 | 404) && error.as_deref() == Some("SpaceNotFound") {
+            // P16 lets the unsigned refusal through to Labyrinth's planted mapping.
+            return !crate::planted::is_planted_bug_active(
+                crate::planted::PlantedBug::P16MemberRepoSpaceNotFoundAsNotFound,
+            );
+        }
+        let refusal = labyrinth::store::space::SpaceError {
+            status: response.status,
+            error,
+            message: None,
+        };
+        matches!(
+            labyrinth::store::space::map_space_error(refusal),
+            labyrinth::Error::Forbidden
+        )
     }
 
     fn decode<T: serde::de::DeserializeOwned>(body: &[u8], what: &str) -> Result<T, String> {
@@ -1345,6 +1373,31 @@ mod native_archive_space_auth {
 
         fn response(body: Value) -> PlatformHttpResponse {
             PlatformHttpResponse { status: 200, headers: vec![], body: serde_json::to_vec(&body).unwrap() }
+        }
+
+        #[cfg(feature = "sim")]
+        #[test]
+        fn p17_omits_only_the_space_mac_header() {
+            let platform = PlatformHttpResponse {
+                status: 200,
+                headers: vec![
+                    PlatformHttpHeader {
+                        name: "Atproto-Space-Mac".into(),
+                        value: "mac".into(),
+                    },
+                    PlatformHttpHeader {
+                        name: "Content-Type".into(),
+                        value: "application/json".into(),
+                    },
+                ],
+                body: b"{}".to_vec(),
+            };
+            assert_eq!(into_response(platform.clone()).headers.len(), 2);
+            let planted = crate::planted::with_planted_bug(
+                Some(crate::planted::PlantedBug::P17OmitSpaceMacHeaderForwarding),
+                || into_response(platform),
+            );
+            assert_eq!(planted.headers, vec![("Content-Type".into(), "application/json".into())]);
         }
 
         fn header<'a>(request: &'a PlatformHttpRequest, name: &str) -> &'a str {
@@ -2103,4 +2156,11 @@ mod native_archive_space_auth {
             }
         }
     }
+}
+
+#[cfg(feature = "sim")]
+pub fn convert_platform_space_response_for_sim(
+    response: PlatformHttpResponse,
+) -> crate::labyrinth::LabyrinthSpaceResponse {
+    native_archive_space_auth::into_response(response)
 }

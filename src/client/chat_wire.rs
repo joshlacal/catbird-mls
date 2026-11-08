@@ -73,13 +73,57 @@ pub fn is_stale_send(error: &MLSError) -> bool {
     matches!(error, MLSError::InvalidState(code) if code == STALE_SEND)
 }
 
-/// `account_meta` key of the last `sendCounter` this device signed in `conversation_id`.
+/// SQLite `account_meta` key of the last send this device knows the sequencer accepted.
 pub fn send_counter_key(conversation_id: &str) -> String {
     format!("send_counter:{conversation_id}")
 }
+/// SQLite `account_meta` key of the last verified peer `sendCounter` in one MLS epoch.
+pub fn peer_send_counter_key(
+    conversation_id: &str,
+    generation: i64,
+    epoch: i64,
+    sender_did: &str,
+    sender_device_id: &str,
+) -> String {
+    format!(
+        "peer_last_send_counter:{conversation_id}:{generation}:{epoch}:{sender_did}:{sender_device_id}"
+    )
+}
 
-/// The `sendCounter` after `last`, the persisted value (absent before the first send). Callers
-/// persist the result in the same write transaction that encrypts the frame, before any HTTP.
+/// Require a verified peer sender's counter to increase once initialized.
+pub fn verify_next_peer_send_counter(last: Option<&str>, next: u64) -> Result<(), MLSError> {
+    if next > 9_007_199_254_740_991 {
+        return Err(MLSError::Cryptography(
+            "peer sendCounter exceeds the canonical safe-integer range".into(),
+        ));
+    }
+    let Some(last) = last else {
+        return Ok(());
+    };
+    let last = last
+        .parse::<u64>()
+        .map_err(|_| MLSError::Internal(format!("corrupt peer send counter {last:?}")))?;
+    if next <= last {
+        return Err(MLSError::Cryptography(format!(
+            "non-increasing peer sendCounter: last {last}, received {next}"
+        )));
+    }
+    Ok(())
+}
+
+/// Durable fork evidence for a conversation whose peer signed a different current-epoch prior.
+pub fn fork_detected_key(conversation_id: &str) -> String {
+    format!("fork_detected:{conversation_id}")
+}
+
+/// Latest own reset request that ordinary entry sync verified and applied contiguously.
+pub fn verified_reset_request_key(conversation_id: &str) -> String {
+    format!("verified_reset_request:{conversation_id}")
+}
+
+/// The counter after the last send known to be sequenced (absent before the first send). A
+/// reservation does not advance this value: uncertain delivery keeps its exact journal, while a
+/// definitive unsequenced refusal may safely reuse the counter with a fresh MLS frame.
 pub fn next_send_counter(last: Option<&str>) -> Result<u64, MLSError> {
     let last = match last {
         Some(raw) => raw
@@ -90,6 +134,22 @@ pub fn next_send_counter(last: Option<&str>) -> Result<u64, MLSError> {
     last.checked_add(1)
         .filter(|next| *next <= 9_007_199_254_740_991)
         .ok_or_else(|| MLSError::Internal("send counter exhausted".into()))
+}
+
+/// Advance the durable accepted-send watermark without ever moving it backwards.
+pub fn confirmed_send_counter(last: Option<&str>, confirmed: u64) -> Result<u64, MLSError> {
+    if !(1..=9_007_199_254_740_991).contains(&confirmed) {
+        return Err(MLSError::Internal(
+            "confirmed send counter is outside the safe-integer range".into(),
+        ));
+    }
+    let last = match last {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| MLSError::Internal(format!("corrupt send counter {raw:?}")))?,
+        None => 0,
+    };
+    Ok(last.max(confirmed))
 }
 
 /// Why a current-epoch application message can never be decrypted by this device: its
@@ -138,6 +198,9 @@ pub struct UndecryptableEntryEvidence {
     pub epoch: i64,
     pub sender_did: String,
     pub sender_device_id: String,
+    /// The signed peer counter, absent only in legacy persisted evidence.
+    #[serde(default)]
+    pub send_counter: Option<u64>,
     pub reason: String,
     pub recorded_at_ms: i64,
 }
@@ -166,18 +229,26 @@ impl UndecryptableEntryEvidence {
     }
 }
 
-/// Verify an outer signed transition or application send under `public_key` and return its
-/// strictly projected body (native sync, NSE and `wasm32` sync share this one check).
-pub fn verify_signed_mutation_body(
+/// Normalize a signed mutation's JSON read presentation so equivalent byte encodings compare
+/// identically while its closed body and signature wrapper remain exact.
+pub fn normalize_signed_mutation_presentation(
     signed_request: &serde_json::Value,
     kind: SignedMutationKind,
-    public_key: &[u8],
 ) -> Result<serde_json::Value, MLSError> {
     let wrapper_name = signed_wrapper_name(kind)
         .ok_or_else(|| MLSError::Cryptography("unexpected signed transition kind".into()))?;
-    let mut normalized =
-        normalize_read_presentation(&serde_json::to_vec(signed_request)?, wrapper_name, false)
-            .map_err(|e| MLSError::Cryptography(format!("normalize signed transition: {e}")))?;
+    normalize_read_presentation(&serde_json::to_vec(signed_request)?, wrapper_name, false)
+        .map_err(|e| MLSError::Cryptography(format!("normalize signed transition: {e}")))
+}
+
+/// Verify an outer signed transition or application send and return its strictly projected body
+/// plus SHA-256 request transcript digest.
+pub fn verify_signed_mutation_body_and_digest(
+    signed_request: &serde_json::Value,
+    kind: SignedMutationKind,
+    public_key: &[u8],
+) -> Result<(serde_json::Value, [u8; 32]), MLSError> {
+    let mut normalized = normalize_signed_mutation_presentation(signed_request, kind)?;
     let wrapper = SignedWrapper::decode(&serde_json::to_vec(&normalized)?)
         .map_err(|e| MLSError::Cryptography(format!("decode signed transition: {e}")))?;
     if wrapper.kind() != Some(kind) {
@@ -187,9 +258,33 @@ pub fn verify_signed_mutation_body(
     }
     let projected = project_signed_body(kind, &wrapper.body)
         .map_err(|e| MLSError::Cryptography(format!("project signed transition: {e}")))?;
-    VerifiedMutation::verify(projected, wrapper.signature, public_key)
+    let verified = VerifiedMutation::verify(projected, wrapper.signature, public_key)
         .map_err(|e| MLSError::Cryptography(format!("verify signed transition: {e}")))?;
-    Ok(normalized["body"].take())
+    Ok((normalized["body"].take(), *verified.request_digest()))
+}
+
+/// Verify an outer signed transition or application send under `public_key` and return its
+/// strictly projected body (native sync, NSE and `wasm32` sync share this one check).
+pub fn verify_signed_mutation_body(
+    signed_request: &serde_json::Value,
+    kind: SignedMutationKind,
+    public_key: &[u8],
+) -> Result<serde_json::Value, MLSError> {
+    verify_signed_mutation_body_and_digest(signed_request, kind, public_key).map(|(body, _)| body)
+}
+
+/// Authenticate this device's own sequenced transition under its signer before any own-echo
+/// shortcut, retaining the request digest used by its sequencer receipt.
+pub fn verify_own_commit_body_and_digest(
+    signed_request: &Value,
+    public_key: &[u8],
+) -> Result<(Value, [u8; 32]), MLSError> {
+    let kind = signed_request
+        .pointer("/body/$type")
+        .and_then(Value::as_str)
+        .and_then(SignedMutationKind::from_type_id)
+        .ok_or_else(|| MLSError::Cryptography("own Commit has no signed mutation kind".into()))?;
+    verify_signed_mutation_body_and_digest(signed_request, kind, public_key)
 }
 
 /// Authenticate this device's own sequenced transition under its signer before any own-echo
@@ -198,12 +293,188 @@ pub fn verify_own_commit_body(
     signed_request: &Value,
     public_key: &[u8],
 ) -> Result<Value, MLSError> {
-    let kind = signed_request
-        .pointer("/body/$type")
-        .and_then(Value::as_str)
-        .and_then(SignedMutationKind::from_type_id)
-        .ok_or_else(|| MLSError::Cryptography("own Commit has no signed mutation kind".into()))?;
-    verify_signed_mutation_body(signed_request, kind, public_key)
+    verify_own_commit_body_and_digest(signed_request, public_key).map(|(body, _)| body)
+}
+
+/// A group creation journaled before HTTP. The staged epoch-zero MLS state exists once; signed
+/// attempts are append-only (bounded at [`GROUP_CREATION_MAX_ATTEMPTS`]) so every operation that
+/// could have committed remains exactly replayable.
+pub const GROUP_CREATION_JOURNAL_VERSION: u32 = 3;
+
+/// Maximum signed attempts retained in one group-creation journal.
+pub const GROUP_CREATION_MAX_ATTEMPTS: usize = 8;
+
+/// One exact signed attempt over a journal's single staged genesis.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingGroupCreationAttempt {
+    pub operation_id: String,
+    pub signed_at: String,
+    pub request: Vec<u8>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired_confirmed: bool,
+}
+
+/// App-visible disposition of a durable group-creation journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
+#[serde(rename_all = "camelCase")]
+pub enum PendingGroupCreationState {
+    PendingRetry,
+    /// ABI-reserved. The creation resolver currently has no state with a user-remediable action.
+    NeedsUserAction,
+}
+
+/// Current state of one durable group creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+#[serde(rename_all = "camelCase")]
+pub struct PendingGroupCreationStatus {
+    pub conversation_id: String,
+    pub state: PendingGroupCreationState,
+    pub retry_at_ms: Option<i64>,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PendingGroupCreation {
+    pub version: u32,
+    pub conversation_id: String,
+    /// Stable storage key: the first attempt's operation id.
+    pub journal_id: String,
+    /// Stable sequencer identity. The endpoint is resolved from current client configuration.
+    pub sequencer_did: String,
+    pub group_id: Vec<u8>,
+    pub signer_public_key: Vec<u8>,
+    pub attempts: Vec<PendingGroupCreationAttempt>,
+    pub kv_batch: crate::storage::KvWriteBatch,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub new_signer_json: Option<String>,
+    pub created_at_ms: i64,
+    /// Earliest wall-clock time at which sync may resolve this journal.
+    #[serde(default)]
+    pub retry_at_ms: i64,
+    /// Consecutive retained failures, used for bounded exponential backoff.
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Typed server refusal reported while a retained request is deferred.
+    #[serde(default)]
+    pub retry_code: Option<String>,
+}
+
+impl PendingGroupCreation {
+    pub fn status_at(&self, now_ms: i64) -> PendingGroupCreationStatus {
+        let retry_at_ms = (self.retry_count > 0 || self.retry_code.is_some()).then_some(
+            self.retry_at_ms
+                .min(now_ms.saturating_add(GROUP_CREATION_MAX_RETRY_MS)),
+        );
+        PendingGroupCreationStatus {
+            conversation_id: self.conversation_id.clone(),
+            state: PendingGroupCreationState::PendingRetry,
+            retry_at_ms,
+            last_error_code: self.retry_code.clone(),
+        }
+    }
+
+    /// Ignore a persisted deadline farther than the maximum delay from the current wall clock.
+    /// This bounds a backward clock jump instead of deferring the journal forever.
+    pub fn retry_is_deferred_at(&self, now_ms: i64) -> bool {
+        self.retry_count > 0
+            && self.retry_at_ms > now_ms
+            && self.retry_at_ms.saturating_sub(now_ms) <= GROUP_CREATION_MAX_RETRY_MS
+    }
+}
+
+/// Server's maximum accepted age for a first-execution signed operation.
+///
+/// Keep aligned with `mls-ds/server/src/chat_protocol/validation.rs:14,444-465`.
+pub const GROUP_CREATION_FRESHNESS_WINDOW_MS: i64 = 300_000;
+
+/// The server's accepted future skew is also the guard beyond the first-execution window.
+///
+/// Keep aligned with `mls-ds/server/src/chat_protocol/validation.rs:15,444-465`.
+pub const GROUP_CREATION_FRESHNESS_SAFETY_MARGIN_MS: i64 = 60_000;
+
+pub const GROUP_CREATION_ABANDON_AFTER_MS: i64 =
+    GROUP_CREATION_FRESHNESS_WINDOW_MS + GROUP_CREATION_FRESHNESS_SAFETY_MARGIN_MS;
+
+/// Maximum generated or honored delay for a retained group-creation retry.
+pub const GROUP_CREATION_MAX_RETRY_MS: i64 = 300_000;
+
+pub fn group_creation_attempt_signed_at_ms(
+    attempt: &PendingGroupCreationAttempt,
+) -> Result<i64, MLSError> {
+    chrono::DateTime::parse_from_rfc3339(&attempt.signed_at)
+        .map(|value| value.timestamp_millis())
+        .map_err(|_| MLSError::Cryptography("creation attempt signedAt is invalid".into()))
+}
+
+pub fn group_creation_attempts_expired_at(
+    pending: &PendingGroupCreation,
+    local_now_ms: i64,
+) -> Result<bool, MLSError> {
+    if pending.attempts.is_empty() {
+        return Err(MLSError::Cryptography(
+            "group creation journal has no signed attempts".into(),
+        ));
+    }
+    pending.attempts.iter().try_fold(true, |all, attempt| {
+        let signed_at_ms = group_creation_attempt_signed_at_ms(attempt)?;
+        Ok(all
+            && (attempt.expired_confirmed
+                || local_now_ms.saturating_sub(signed_at_ms) > GROUP_CREATION_ABANDON_AFTER_MS))
+    })
+}
+
+pub fn group_creation_refusal_is_expired(status: u16, code: Option<&str>) -> bool {
+    matches!((status, code), (400, Some("SignedOperationExpired")))
+}
+
+pub fn group_creation_refusal_is_exists_evidence(status: u16, code: Option<&str>) -> bool {
+    matches!(
+        (status, code),
+        (
+            400 | 409,
+            Some("ConversationAlreadyExists" | "IdempotencyConflict")
+        )
+    )
+}
+
+/// Refusals that re-signing the same stale credentials/request cannot repair. This is only a
+/// classifier: deletion additionally requires authenticated absence/foreign proof and expiry of
+/// every attempt.
+pub fn group_creation_refusal_is_permanent(status: u16, code: Option<&str>) -> bool {
+    if group_creation_refusal_is_exists_evidence(status, code)
+        || group_creation_refusal_is_expired(status, code)
+    {
+        return false;
+    }
+    match status {
+        400 | 403 => true,
+        401 => matches!(
+            code,
+            Some(
+                "NotAuthorized"
+                    | "DeviceRevoked"
+                    | "DeviceBindingMismatch"
+                    | "InvalidRequest"
+                    | "CutoverRequired"
+                    | "ProtocolUpgradeRequired"
+            )
+        ),
+        500 => matches!(code, Some("InvalidRequest")),
+        _ => false,
+    }
+}
+
+/// One attempt per caller; retained failures wait exponentially from 1 s, capped at 300 s.
+/// A valid `Retry-After` replaces the exponential delay but is capped to the same bound.
+pub fn group_creation_retry_delay_ms(retry_count: u32, retry_after_secs: Option<u64>) -> i64 {
+    let fallback = 1_u64 << retry_count.saturating_sub(1).min(8);
+    retry_after_secs
+        .unwrap_or(fallback)
+        .clamp(1, (GROUP_CREATION_MAX_RETRY_MS / 1_000) as u64)
+        .saturating_mul(1_000) as i64
 }
 
 /// An own Commit-bearing transition journaled before HTTP (`pending_ops` kind
@@ -426,6 +697,12 @@ pub fn leaf_recovery_authorization_key(cid: &str) -> String {
     format!("leaf_recovery_authorization:{cid}")
 }
 
+/// Durable proof that this device verified an account's signed invitation and acceptance for
+/// `cid`. Server participant state never creates this marker.
+pub fn verified_participant_admission_key(cid: &str, did: &str) -> String {
+    format!("verified_participant_admission:{cid}:{did}")
+}
+
 /// The authorization a verified `participantAcceptanceBody` of `cid` grants: the add request it
 /// signed for exactly the accepting device, key ID and auth generation, bound to the acceptance's
 /// `next` (mls-ds binds an acceptance's request to that coordinate, never to `prior`).
@@ -469,16 +746,17 @@ pub fn leaf_recovery_request_authorization(body: &Value, cid: &str) -> Result<Va
 
 /// Whether this device (`own_did`, `own_device`) may fulfill the request `authorization` (from
 /// [`leaf_recovery_request_authorization`]) in a group whose current leaves are `leaves`
-/// (`(did, device)`), given its verified `roster`. Never its own request. A `replace` re-adds an
-/// exact current leaf and is fulfilled only from another DID (`CHAT_PROTOCOL` §2: a healthy
-/// different-DID leaf contains a poisoned one). An `add` adds a device the tree does not hold,
-/// for a DID that was an entitled member of the verified prior state: it holds a current leaf, or
-/// this device's verified roster lists it active (a zero-leaf participant after a reset, or an
-/// accepted invitee). Without a roster no zero-leaf DID is entitled.
+/// (`(did, device)`), given its verified `roster` and durable `verified_admission`. Never its own
+/// request. A `replace` re-adds an exact current leaf and is fulfilled only from another DID
+/// (`CHAT_PROTOCOL` §2: a healthy different-DID leaf contains a poisoned one). An `add` adds a
+/// device the tree does not hold, for a DID that either holds another current leaf or is active in
+/// the verified roster and whose invitation and acceptance this device verified. Server roster
+/// state alone never entitles a zero-leaf account.
 pub fn recovery_request_entitled(
     authorization: &Value,
     leaves: &[(String, String)],
     roster: Option<&Value>,
+    verified_admission: bool,
     own_did: &str,
     own_device: &str,
 ) -> bool {
@@ -499,7 +777,7 @@ pub fn recovery_request_entitled(
         Some("add") => {
             !holds_leaf
                 && (leaves.iter().any(|(leaf_did, _)| leaf_did == did)
-                    || roster_active(roster, did))
+                    || (verified_admission && roster_active(roster, did)))
         }
         _ => false,
     }
@@ -714,7 +992,9 @@ pub fn conversation_roster_key(cid: &str) -> String {
 }
 
 /// The verified roster a creation or reset manifest's `participants` state: each row a distinct
-/// `userDid` with role `admin` or `member` and status `active` or `pending`.
+/// `userDid` with role `admin` or `member` and status `active` or `pending`. A pending row retains
+/// its immutable invitation provenance when present, so a member-authenticated baseline can prove
+/// an invitation that predates this device's membership interval.
 pub fn roster_from_participants(participants: &Value) -> Result<Value, MLSError> {
     let refused = |what: &str| MLSError::Cryptography(format!("roster: {what}"));
     let rows = participants
@@ -730,10 +1010,13 @@ pub fn roster_from_participants(participants: &Value) -> Result<Value, MLSError>
         ) else {
             return Err(refused("participant row"));
         };
-        if roster
-            .insert(did.to_owned(), json!({ "role": role, "status": status }))
-            .is_some()
-        {
+        let mut verified = json!({ "role": role, "status": status });
+        if status == "pending" {
+            if let Some(provenance) = canonical_invitation_provenance(row) {
+                verified["invitationProvenance"] = provenance;
+            }
+        }
+        if roster.insert(did.to_owned(), verified).is_some() {
             return Err(refused("duplicate participant"));
         }
     }
@@ -757,9 +1040,11 @@ pub fn apply_roster_effects(roster: &mut Value, kind: SignedMutationKind, body: 
         }
         K::ParticipantAcceptance => {
             if let Some(did) = body["actorDid"].as_str() {
-                roster
-                    .entry(did)
-                    .or_insert_with(|| json!({ "role": "member" }))["status"] = json!("active");
+                if let Some(row) = roster.get_mut(did).filter(|row| row["status"] == "pending") {
+                    row["status"] = json!("active");
+                    row.as_object_mut()
+                        .map(|row| row.remove("invitationProvenance"));
+                }
             }
             return;
         }
@@ -777,10 +1062,11 @@ pub fn apply_roster_effects(roster: &mut Value, kind: SignedMutationKind, body: 
         };
         match change["$type"].as_str() {
             Some("blue.catbird.chat.defs#addParticipant") => {
-                roster.insert(
-                    did.to_owned(),
-                    json!({ "role": "member", "status": "pending" }),
-                );
+                let mut row = json!({ "role": "member", "status": "pending" });
+                if let Some(provenance) = canonical_invitation_provenance(change) {
+                    row["invitationProvenance"] = provenance;
+                }
+                roster.insert(did.to_owned(), row);
             }
             Some("blue.catbird.chat.defs#removeParticipant") => {
                 roster.remove(did);
@@ -798,6 +1084,40 @@ pub fn apply_roster_effects(roster: &mut Value, kind: SignedMutationKind, body: 
 /// `did` is an active participant of the verified `roster`.
 pub fn roster_active(roster: Option<&Value>, did: &str) -> bool {
     roster.is_some_and(|roster| roster[did]["status"] == "active")
+}
+
+/// Whether `did` has the exact pending invitation provenance in a verified roster. The
+/// provenance is useful only when all three immutable fields are present and canonical.
+pub fn roster_has_pending_invitation(
+    roster: Option<&Value>,
+    did: &str,
+    provenance: &Value,
+) -> bool {
+    let Some(claimed) = canonical_invitation_provenance_value(provenance) else {
+        return false;
+    };
+    roster
+        .and_then(|roster| roster.get(did))
+        .filter(|row| row["status"] == "pending")
+        .and_then(canonical_invitation_provenance)
+        .is_some_and(|stored| stored == claimed)
+}
+
+fn canonical_invitation_provenance(row: &Value) -> Option<Value> {
+    canonical_invitation_provenance_value(row.get("invitationProvenance")?)
+}
+
+fn canonical_invitation_provenance_value(provenance: &Value) -> Option<Value> {
+    let transition = provenance["invitationTransitionId"].as_str()?;
+    let inviter = provenance["invitedByDid"].as_str()?;
+    let device = provenance["invitedByDeviceId"].as_str()?;
+    (!transition.is_empty() && !inviter.is_empty() && !device.is_empty()).then(|| {
+        json!({
+            "invitationTransitionId": transition,
+            "invitedByDid": inviter,
+            "invitedByDeviceId": device,
+        })
+    })
 }
 
 /// `did` is an active admin of `cid` by this device's verified `roster`, the only authority an
@@ -863,7 +1183,14 @@ pub fn attested_roster(
         .as_object()
         .ok_or_else(|| refused("roster"))?
         .iter()
-        .map(|(did, row)| json!({ "userDid": did, "role": row["role"], "status": row["status"] }))
+        .map(|(did, row)| {
+            let mut participant =
+                json!({ "userDid": did, "role": row["role"], "status": row["status"] });
+            if let Some(provenance) = row.get("invitationProvenance") {
+                participant["invitationProvenance"] = provenance.clone();
+            }
+            participant
+        })
         .collect();
     let roster = roster_from_participants(&Value::Array(rows))?;
     if attestation["roster"] != roster
@@ -959,7 +1286,7 @@ pub fn fulfillment_welcome_next(
         || deliveries[0]["recipientDeviceId"] != device
         || deliveries[0]["provenance"]["recoveryRequestId"] != *request
         || json_bytes(&bundle["opaqueWelcome"])? != welcome
-        || json_bytes(&bundle["sha256"])? != Sha256::digest(welcome).as_slice()
+        || json_bytes(&bundle["sha256"])? != Sha256::digest(welcome)[..]
     {
         return Err(refused("not this device's Welcome"));
     }
@@ -1398,34 +1725,42 @@ pub fn parse_pds_device_list_records(
 ) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
     let val: Value = serde_json::from_slice(body_bytes)
         .map_err(|e| MLSError::Internal(format!("invalid listRecords JSON for `{did}`: {e}")))?;
-    let Some(records) = val.get("records").and_then(|r| r.as_array()) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
+    let records = val
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            MLSError::insufficient_permissions(format!(
+                "I4: PDS listRecords({did}) has no records array"
+            ))
+        })?;
+    let mut out = Vec::with_capacity(records.len());
     for rec in records {
-        let uri = rec.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-        let rkey = uri.rsplit('/').next().unwrap_or("").trim().to_string();
+        let Some(uri) = rec.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let rkey = uri.rsplit('/').next().unwrap_or("").trim();
         if rkey.is_empty() {
             continue;
         }
-        let Some(value) = rec.get("value") else {
+        let Some(value) = rec.get("value").and_then(Value::as_object) else {
             continue;
         };
-        let alg = value
-            .get("algorithm")
-            .and_then(|a| a.as_str())
-            .unwrap_or("ed25519");
+        let Some(alg) = value.get("algorithm").and_then(Value::as_str) else {
+            continue;
+        };
         if !alg.eq_ignore_ascii_case("ed25519") {
             continue;
         }
         let Some(pk_val) = value.get("mlsSignaturePublicKey") else {
             continue;
         };
-        if let Ok(pk_bytes) = json_bytes(pk_val) {
-            if pk_bytes.len() == 32 {
-                out.push((rkey, pk_bytes));
-            }
+        let Ok(pk_bytes) = json_bytes(pk_val) else {
+            continue;
+        };
+        if pk_bytes.len() != 32 {
+            continue;
         }
+        out.push((rkey.to_string(), pk_bytes));
     }
     Ok(out)
 }
@@ -1701,12 +2036,16 @@ pub fn parse_and_verify_i13_sequencer_receipt(
         signature,
     };
 
-    labyrinth_protocol::receipt::verify_sequencer_receipt_sec1(
-        sec1_pubkey,
-        expected_sequencer_did,
-        &signed,
-    )
-    .map_err(|e| MLSError::Cryptography(format!("I13 sequencerReceipt verify failed: {e}")))?;
+    if !crate::planted::is_planted_bug_active(
+        crate::planted::PlantedBug::P7SkipSequencerReceiptSignatureCheck,
+    ) {
+        labyrinth_protocol::receipt::verify_sequencer_receipt_sec1(
+            sec1_pubkey,
+            expected_sequencer_did,
+            &signed,
+        )
+        .map_err(|e| MLSError::Cryptography(format!("I13 sequencerReceipt verify failed: {e}")))?;
+    }
 
     let stored = StoredArchivedReceipt {
         sequencer_did: signed.payload.sequencer_did,
@@ -1780,6 +2119,60 @@ pub fn current_sequencer_receipt_key(
     decode_p256_sec1_from_did_doc(did_doc_bytes, sequencer_did, &kid)
 }
 
+/// Verify the sequencer's receipt for a signed control entry before any transition effect.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_control_sequencer_receipt(
+    receipt: &Value,
+    sec1_pubkey: &[u8],
+    sequencer_did: &str,
+    conversation_id: &str,
+    entry_id: &str,
+    entry_seq: i64,
+    actor_did: &str,
+    actor_device_id: &str,
+    coordinate: &Value,
+    request_digest: &[u8; 32],
+) -> Result<(), MLSError> {
+    let coordinate = canonicalize_wire_coordinate(coordinate, Some(conversation_id))?;
+    let generation = coordinate["generation"]
+        .as_u64()
+        .ok_or_else(|| MLSError::Cryptography("control receipt coordinate generation".into()))?;
+    let epoch = coordinate["epoch"]
+        .as_u64()
+        .ok_or_else(|| MLSError::Cryptography("control receipt coordinate epoch".into()))?;
+    let group_id = json_bytes(&coordinate["groupId"])?;
+    let (receipt_seq, receipt_generation, _) = parse_and_verify_i13_sequencer_receipt(
+        receipt,
+        sec1_pubkey,
+        sequencer_did,
+        conversation_id,
+        &group_id,
+        epoch,
+        entry_id,
+        entry_id,
+        request_digest,
+        None,
+    )?;
+    if i64::try_from(receipt_seq).ok() != Some(entry_seq)
+        || receipt_generation != generation
+        || receipt["senderDid"].as_str() != Some(actor_did)
+        || receipt["senderDeviceId"].as_str() != Some(actor_device_id)
+    {
+        return Err(MLSError::Cryptography(
+            "I13 control sequencerReceipt entry, coordinate, or actor mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedApplicationReceipt {
+    pub generation: i64,
+    pub epoch: i64,
+    pub sender_did: String,
+    pub sender_device_id: String,
+}
+
 /// A `payloadPruned` application entry this device holds no evidence for: only its signed
 /// receipt remains. It must name this conversation, group, entry and seq under `sec1_pubkey`
 /// (its own `kid`). Its epoch and commitment can only be self-bound, and a pruned entry carries
@@ -1792,7 +2185,7 @@ pub fn verify_pruned_application_receipt(
     group_id: &[u8],
     entry_id: &str,
     entry_seq: i64,
-) -> Result<(), MLSError> {
+) -> Result<PrunedApplicationReceipt, MLSError> {
     let epoch = receipt
         .get("epoch")
         .and_then(Value::as_u64)
@@ -1805,7 +2198,7 @@ pub fn verify_pruned_application_receipt(
         MLSError::Cryptography("sequencerReceipt archiveCommitment must be 32 bytes".into())
     })?;
     // The message id only binds a sender attestation, which a pruned entry no longer has.
-    let (seq, _, _) = parse_and_verify_i13_sequencer_receipt(
+    let (seq, generation, _) = parse_and_verify_i13_sequencer_receipt(
         receipt,
         sec1_pubkey,
         sequencer_did,
@@ -1822,7 +2215,20 @@ pub fn verify_pruned_application_receipt(
             "I13: pruned entry receipt seq {seq} != entry seq {entry_seq}"
         )));
     }
-    Ok(())
+    let sender_did = receipt["senderDid"]
+        .as_str()
+        .ok_or_else(|| MLSError::Cryptography("sequencerReceipt missing senderDid".into()))?;
+    let sender_device_id = receipt["senderDeviceId"]
+        .as_str()
+        .ok_or_else(|| MLSError::Cryptography("sequencerReceipt missing senderDeviceId".into()))?;
+    Ok(PrunedApplicationReceipt {
+        generation: i64::try_from(generation)
+            .map_err(|_| MLSError::Cryptography("receipt generation overflow".into()))?,
+        epoch: i64::try_from(epoch)
+            .map_err(|_| MLSError::Cryptography("receipt epoch overflow".into()))?,
+        sender_did: sender_did.to_owned(),
+        sender_device_id: sender_device_id.to_owned(),
+    })
 }
 
 /// JSON-serializable persistence wrapper for a verified `I13` `ArchivedReceipt`.
@@ -2455,6 +2861,13 @@ pub fn verify_leaf_slice_i4(
     signature_key: &[u8],
     keys: &[crate::push::AuthorizedPeerDeviceKey],
 ) -> Result<(String, String), MLSError> {
+    if keys.is_empty()
+        && crate::planted::is_planted_bug_active(
+            crate::planted::PlantedBug::P14TofuOnDeviceDirectory503,
+        )
+    {
+        return crate::push::root_did_from_credential_bytes(identity_bytes);
+    }
     let mut map: std::collections::HashMap<String, Vec<crate::push::AuthorizedPeerDeviceKey>> =
         std::collections::HashMap::new();
     for k in keys {
@@ -2924,35 +3337,35 @@ mod tests {
             { "userDid": carol, "role": "member", "status": "pending" },
         ]))
         .unwrap();
-        let entitled = |a: &Value, roster: Option<&Value>| {
-            recovery_request_entitled(a, &leaves, roster, alice, "a1")
+        let entitled = |a: &Value, roster: Option<&Value>, verified_admission: bool| {
+            recovery_request_entitled(a, &leaves, roster, verified_admission, alice, "a1")
         };
         assert!(
-            entitled(&auth(bob, "b2", "add"), None),
+            entitled(&auth(bob, "b2", "add"), None, false),
             "a member's new device"
         );
         assert!(
-            entitled(&auth(bob, "b1", "replace"), None),
+            entitled(&auth(bob, "b1", "replace"), None, false),
             "a member's exact leaf"
         );
         assert!(
-            !entitled(&auth(alice, "a2", "replace"), None),
+            !entitled(&auth(alice, "a2", "replace"), None, false),
             "replace only from another DID"
         );
         assert!(
-            !entitled(&auth(alice, "a1", "add"), Some(&roster)),
+            !entitled(&auth(alice, "a1", "add"), Some(&roster), true),
             "never its own"
         );
         assert!(
-            !entitled(&auth(bob, "b1", "add"), None),
+            !entitled(&auth(bob, "b1", "add"), None, false),
             "add of a held leaf"
         );
         assert!(
-            !entitled(&auth(carol, "c1", "add"), None),
+            !entitled(&auth(carol, "c1", "add"), None, true),
             "zero-leaf without a roster"
         );
         assert!(
-            !entitled(&auth(carol, "c1", "add"), Some(&roster)),
+            !entitled(&auth(carol, "c1", "add"), Some(&roster), true),
             "pending"
         );
         apply_roster_effects(
@@ -2961,8 +3374,12 @@ mod tests {
             &json!({ "actorDid": carol }),
         );
         assert!(
-            entitled(&auth(carol, "c1", "add"), Some(&roster)),
-            "accepted zero-leaf"
+            !entitled(&auth(carol, "c1", "add"), Some(&roster), false),
+            "active roster state alone"
+        );
+        assert!(
+            entitled(&auth(carol, "c1", "add"), Some(&roster), true),
+            "verified accepted zero-leaf"
         );
 
         assert!(matches!(
@@ -3035,5 +3452,62 @@ mod tests {
             CONVERSATION,
             expires - 1
         ));
+    }
+
+    #[test]
+    fn pending_invitation_round_trips_only_in_its_member_attested_generation() {
+        let provenance = json!({
+            "$type": "blue.catbird.chat.defs#invitationProvenance",
+            "invitationTransitionId": "00000000-0000-4000-8000-0000000000aa",
+            "invitedByDid": "did:plc:alice",
+            "invitedByDeviceId": "00000000-0000-4000-8000-0000000000a1",
+        });
+        let roster = roster_from_participants(&json!([
+            { "userDid": "did:plc:alice", "role": "admin", "status": "active" },
+            {
+                "userDid": "did:plc:carol",
+                "role": "member",
+                "status": "pending",
+                "invitationProvenance": provenance,
+            },
+        ]))
+        .unwrap();
+        assert!(roster_has_pending_invitation(
+            Some(&roster),
+            "did:plc:carol",
+            &provenance
+        ));
+        let Extension::Unknown(_, UnknownExtension(bytes)) =
+            roster_attestation_extension(CONVERSATION, 7, &roster).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            attested_roster(
+                &bytes,
+                CONVERSATION,
+                7,
+                "did:plc:alice",
+                &["did:plc:alice".into()]
+            )
+            .unwrap(),
+            roster
+        );
+        assert!(attested_roster(
+            &bytes,
+            "00000000-0000-4000-8000-0000000000ff",
+            7,
+            "did:plc:alice",
+            &["did:plc:alice".into()]
+        )
+        .is_err());
+        assert!(attested_roster(
+            &bytes,
+            CONVERSATION,
+            8,
+            "did:plc:alice",
+            &["did:plc:alice".into()]
+        )
+        .is_err());
     }
 }

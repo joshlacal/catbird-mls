@@ -14,6 +14,7 @@ use openmls::prelude::tls_codec::{Deserialize as TlsDeserialize, Serialize as Tl
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::{signatures::Signer as _, OpenMlsProvider};
+use p256::ecdsa::SigningKey as P256SigningKey;
 use tempfile::TempDir;
 
 use catbird_mls::client::config::account_did_hash_hex;
@@ -206,6 +207,7 @@ struct TwoPeerGroupFixture {
     bob_db: MlsAccountDb,
     conversation_id: String,
     group_id: Vec<u8>,
+    sequencer_signer: P256SigningKey,
 }
 
 fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFixture {
@@ -224,6 +226,11 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
 
     let conversation_id = "a1234567-89ab-4cde-8123-456789abcdef".to_string();
     let group_id_bytes = b"push-group-id-32-bytes-000000001".to_vec();
+    let sequencer_signer = P256SigningKey::from_bytes((&[0x34u8; 32]).into()).unwrap();
+    let sequencer_point = sequencer_signer.verifying_key().to_encoded_point(true);
+    let mut codec_prefixed = vec![0x80, 0x24];
+    codec_prefixed.extend_from_slice(sequencer_point.as_bytes());
+    let sequencer_pub_multibase = multibase::encode(multibase::Base::Base58Btc, &codec_prefixed);
 
     let alice_signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).expect("alice sig");
     let bob_signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).expect("bob sig");
@@ -274,9 +281,11 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
                     signature_key: alice_signer.public().into(),
                 };
                 let join_cfg = MlsGroupJoinConfig::builder()
+                    .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                     .use_ratchet_tree_extension(true)
                     .build();
                 let create_cfg = MlsGroupCreateConfig::builder()
+                    .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                     .ciphersuite(CIPHERSUITE)
                     .use_ratchet_tree_extension(true)
                     .max_past_epochs(5)
@@ -306,6 +315,20 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
                     &push_coordinates(&group, &provider, &conversation_id, 7).to_string(), now_ms,
                 )?;
                 tx.put_account_meta("owner_did", alice_did, now_ms)?;
+                tx.put_account_meta(
+                    "did_doc:did:web:ds.example",
+                    &serde_json::json!({
+                        "id": "did:web:ds.example",
+                        "verificationMethod": [{
+                            "id": "did:web:ds.example#mls-receipt-1",
+                            "type": "Multikey",
+                            "controller": "did:web:ds.example",
+                            "publicKeyMultibase": sequencer_pub_multibase,
+                        }],
+                    })
+                    .to_string(),
+                    now_ms,
+                )?;
                 let alice_keys = vec![AuthorizedPeerDeviceKey {
                     did: alice_did.to_string(),
                     device_id: "dev-alice".to_string(),
@@ -384,6 +407,7 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
                 }
             };
             let join_cfg = MlsGroupJoinConfig::builder()
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                 .use_ratchet_tree_extension(true)
                 .max_past_epochs(5)
                 .build();
@@ -407,6 +431,7 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
         bob_db,
         conversation_id,
         group_id: group_id_bytes,
+        sequencer_signer,
     }
 }
 
@@ -509,6 +534,26 @@ fn bob_encrypt_app_message(
 
 #[test]
 fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
+    struct FailingFetch;
+    impl PushFetchTransport for FailingFetch {
+        fn fetch_missing_entries(
+            &self,
+            _conversation_id: String,
+            _after_seq: i64,
+            _chat_dpop_token: String,
+        ) -> Result<PushFetchBundle, MLSError> {
+            Err(MLSError::Internal("bounded transport timeout".into()))
+        }
+
+        fn get_authorized_device_keys(
+            &self,
+            _did: String,
+            _chat_dpop_token: Option<String>,
+        ) -> Result<Vec<AuthorizedPeerDeviceKey>, MLSError> {
+            Ok(Vec::new())
+        }
+    }
+
     if ensure_isolated_single_thread_process(
         "inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff",
     ) {
@@ -540,7 +585,7 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
     ));
 
     let wake = PushWakePayload {
-        kind: "application_message".to_string(),
+        kind: "applicationMessage".to_string(),
         conversation_id: fixture.conversation_id.clone(),
         generation: 0,
         entry_seq: 2,
@@ -578,22 +623,59 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
     assert_eq!(preview.body, "Offline hello from Bob!");
     assert!(!preview.from_cache);
     assert!(!preview.fallback_generic);
+    assert!(!preview.receipt_verified);
     assert_eq!(
         preview.darwin_notification_name,
         "blue.catbird.mls.nseDidCommit"
     );
 
-    // Duplicate delivery returns cached preview without re-decrypting.
-    let cached_preview = process_push_notification(
+    let online_keystore = Arc::new(MemoryPushKeystore::new(
+        &fixture.alice_hash,
+        fixture.alice_db_key,
+        Some("cached-chat-dpop-jwt".into()),
+    ));
+    let fallback = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        online_keystore,
+        Some(Arc::new(FailingFetch)),
+        &wake,
+    )
+    .expect("a bounded fetch failure falls back to the authenticated inline preview");
+    assert_eq!(fallback.body, "Offline hello from Bob!");
+    assert!(!fallback.from_cache);
+    assert!(!fallback.fallback_generic);
+    assert!(!fallback.receipt_verified);
+
+    // Without an I13 receipt, duplicate inline delivery decrypts again but remains rollback-only.
+    let repeated_preview = process_push_notification(
         fixture.temp_dir.path(),
         &fixture.alice_hash,
         keystore.clone(),
         None,
         &wake,
     )
-    .expect("cached inline push preview");
-    assert!(cached_preview.from_cache);
-    assert_eq!(cached_preview.body, "Offline hello from Bob!");
+    .expect("repeated offline inline push preview");
+    assert!(!repeated_preview.from_cache);
+    assert!(!repeated_preview.receipt_verified);
+    assert_eq!(repeated_preview.body, "Offline hello from Bob!");
+    let db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+            .unwrap();
+    db.read_tx(|tx| {
+        assert_eq!(
+            tx.get_conversation(&fixture.conversation_id)?
+                .unwrap()
+                .last_seq,
+            1
+        );
+        assert!(tx
+            .list_messages(&fixture.conversation_id, None, 20)?
+            .is_empty());
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
 
     // I12: inline ciphertext > 2200 B with fetch_required=false must be rejected.
     let oversized_wake = PushWakePayload {
@@ -613,14 +695,89 @@ fn inline_wake_decrypts_offline_with_zero_tokio_and_enforces_2200b_cutoff() {
     assert!(matches!(err, MLSError::InvalidInput { .. }));
 }
 
+/// Every receipt-less preview path rolls back the entire write transaction, including proposal
+/// deferral markers and conversation-row timestamps.
 #[test]
-fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypts_metadata() {
+fn receiptless_inline_preview_rolls_back_proposal_and_stale_exits() {
+    let fixture = setup_alice_and_bob_group(true);
+    let proposal = fixture
+        .bob_db
+        .write_tx(|tx| {
+            let provider =
+                OpenMlsKvProvider::new(OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn())))?;
+            let mut group =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
+                    .map_err(|error| MLSError::Internal(format!("load Bob group: {error:?}")))?
+                    .expect("Bob group");
+            let (message, _) = group
+                .propose_remove_member(&provider, &fixture.bob_signer, LeafNodeIndex::new(0))
+                .map_err(|error| MLSError::Internal(format!("propose remove: {error:?}")))?;
+            message
+                .tls_serialize_detached()
+                .map_err(|error| MLSError::Internal(format!("serialize proposal: {error:?}")))
+        })
+        .unwrap();
+    assert!(should_inline_push_ciphertext(&proposal));
+    let state = || {
+        let db =
+            MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+                .unwrap();
+        db.read_tx(|tx| {
+            Ok((
+                tx.get_pending_op("nse_deferred_control", &fixture.conversation_id)?,
+                tx.get_conversation(&fixture.conversation_id)?.unwrap(),
+                tx.list_messages(&fixture.conversation_id, None, 20)?,
+            ))
+        })
+        .unwrap()
+    };
+    let before = state();
+    let keystore = Arc::new(MemoryPushKeystore::new(
+        &fixture.alice_hash,
+        fixture.alice_db_key,
+        None,
+    ));
+    let preview = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        None,
+        &inline_wake(&fixture, "b0b00000-0000-4000-8000-0000000000aa", proposal),
+    )
+    .expect("proposal bytes return a generic rollback-only preview");
+    assert!(preview.fallback_generic);
+    assert!(!preview.receipt_verified);
+    assert_eq!(state(), before, "proposal preview persisted state");
+
+    let stale = PushWakePayload {
+        entry_seq: 1,
+        ..inline_wake(
+            &fixture,
+            "b0b00000-0000-4000-8000-0000000000ab",
+            vec![1, 2, 3],
+        )
+    };
+    let stale_preview = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore,
+        None,
+        &stale,
+    )
+    .expect("stale bytes return a generic rollback-only preview");
+    assert!(stale_preview.fallback_generic);
+    assert!(!stale_preview.receipt_verified);
+    assert_eq!(state(), before, "stale preview rewrote durable state");
+}
+
+#[test]
+fn fetch_required_defers_peer_commits_and_their_tail_to_foreground_sync() {
     if ensure_isolated_single_thread_process(
-        "fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypts_metadata",
+        "fetch_required_defers_peer_commits_and_their_tail_to_foreground_sync",
     ) {
         return;
     }
-    let fixture = setup_alice_and_bob_group(false);
+    let fixture = setup_alice_and_bob_group(true);
     let gap_message_id = "b2234567-89ab-4cde-8123-456789abcdef";
     let gap_entry_id = "c2234567-89ab-4cde-8123-456789abcdef";
 
@@ -643,8 +800,8 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
         let _ = alice_db.prepare_for_background().expect("close alice db");
     }
 
-    // Bob performs TWO self_update Commits (advancing epoch 1 -> 2 -> 3), seals GroupMetadataV1
-    // at epoch 3, and encrypts an ApplicationMessage at epoch 3 (seq 4).
+    // Bob performs two self-update Commits and then sends an application at epoch 3. The NSE must
+    // stop at the first Commit because foreground sync alone has its sequencer receipt.
     let (commit_e2_bytes, commit_e3_bytes, snapshot_e3, app_msg_e3_bytes) = fixture
         .bob_db
         .write_tx(|tx| {
@@ -759,6 +916,7 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
         alice_db_key: [u8; 32],
         bundle: PushFetchBundle,
         bob_key: AuthorizedPeerDeviceKey,
+        invalidated_did: String,
         fetch_calls: AtomicUsize,
         wrote_concurrently_without_busy: AtomicBool,
         threads_during_fetch: AtomicUsize,
@@ -795,6 +953,10 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
                     .execute_batch("PRAGMA busy_timeout = 0;")
                     .map_err(|e| MLSError::Internal(e.to_string()))?;
                 tx.put_account_meta("i6_concurrent_probe", "ok", 1_700_000_000_001)?;
+                tx.delete_account_meta(&format!(
+                    "authorized_device_keys:{}",
+                    self.invalidated_did
+                ))?;
                 Ok(())
             })?;
             let _ = probe_db.prepare_for_background()?;
@@ -835,6 +997,8 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
                     entry_kind: "commit".to_string(),
                     sender_did: fixture.bob_did.clone(),
                     mls_bytes: commit_e2_bytes,
+                    signed_request: None,
+                    sequencer_receipt: None,
                 },
                 FetchedPushEntry {
                     entry_id: "entry-commit-3".to_string(),
@@ -843,6 +1007,8 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
                     entry_kind: "commit".to_string(),
                     sender_did: fixture.bob_did.clone(),
                     mls_bytes: commit_e3_bytes,
+                    signed_request: None,
+                    sequencer_receipt: None,
                 },
                 FetchedPushEntry {
                     entry_id: gap_entry_id.to_string(),
@@ -851,12 +1017,15 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
                     entry_kind: "application_message".to_string(),
                     sender_did: fixture.bob_did.clone(),
                     mls_bytes: app_msg_e3_bytes,
+                    signed_request: None,
+                    sequencer_receipt: None,
                 },
             ],
             metadata_snapshot: Some(snapshot_e3),
             authorized_device_keys: vec![bob_key.clone()],
         },
         bob_key,
+        invalidated_did: fixture.bob_did.clone(),
         fetch_calls: AtomicUsize::new(0),
         wrote_concurrently_without_busy: AtomicBool::new(false),
         threads_during_fetch: AtomicUsize::new(0),
@@ -895,7 +1064,8 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
     assert_eq!(fallback_preview.body, "New encrypted message");
     assert_eq!(transport.fetch_calls.load(Ordering::SeqCst), 0);
 
-    // Now provide a valid cached chat-dpop token and verify full 2-epoch catch-up + metadata!
+    // With a valid cached token, the real fetch path still leaves the peer Commit and its tail
+    // untouched for foreground receipt verification.
     let valid_keystore = Arc::new(MemoryPushKeystore::new(
         &fixture.alice_hash,
         fixture.alice_db_key,
@@ -909,7 +1079,7 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
         Some(transport.clone()),
         &wake,
     )
-    .expect("2-epoch catch-up push decrypt");
+    .expect("receiptless Commit is deferred, not applied");
     let threads_after = current_process_thread_count();
 
     assert!(
@@ -924,35 +1094,8 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
         threads_before,
         "G1: zero worker threads spawned during push network fetch"
     );
-    assert_eq!(preview.sender_did, fixture.bob_did);
-    assert_eq!(preview.group_title.as_deref(), Some("Project Peregrine"));
-    assert_eq!(preview.body, "Caught up 2 epochs in NSE!");
-    assert_eq!(preview.epoch, 3);
-    assert_eq!(preview.seq, 4);
-    assert!(!preview.fallback_generic);
-    assert_eq!(preview.message_id, gap_message_id);
-    let mismatched_wake = PushWakePayload {
-        message_id: uuid::Uuid::new_v4().to_string(),
-        ..wake.clone()
-    };
-    let mismatch = process_push_notification(
-        fixture.temp_dir.path(),
-        &fixture.alice_hash,
-        Arc::new(MemoryPushKeystore::new(
-            &fixture.alice_hash,
-            fixture.alice_db_key,
-            Some("cached-chat-dpop-jwt".to_string()),
-        )),
-        Some(transport.clone()),
-        &mismatched_wake,
-    )
-    .expect_err("supplied wake identity is only a comparator");
-    assert!(
-        mismatch
-            .to_string()
-            .contains("messageId differs from authenticated MLS AAD"),
-        "{mismatch}"
-    );
+    assert!(preview.fallback_generic);
+    assert_eq!(preview.body, "New encrypted message");
 
     let app_db =
         MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
@@ -964,36 +1107,156 @@ fn fetch_required_and_two_epoch_behind_wake_fetches_outside_write_tx_and_decrypt
             let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
                 .unwrap()
                 .unwrap();
+            let row = tx
+                .get_conversation(&fixture.conversation_id)?
+                .expect("conversation");
             let persisted: serde_json::Value = serde_json::from_str(
                 &tx.get_account_meta(&format!("conversation_coords:{}", fixture.conversation_id))?
-                    .expect("NSE persists authenticated next coordinates"),
+                    .expect("original coordinates remain"),
             )
             .unwrap();
+            assert_eq!((group.epoch().as_u64(), row.epoch, row.last_seq), (1, 1, 1));
             assert_eq!(
                 persisted,
-                push_coordinates(&group, &provider, &fixture.conversation_id, 9)
+                push_coordinates(&group, &provider, &fixture.conversation_id, 7)
             );
-            assert!(tx.get_message(gap_message_id)?.is_some());
             assert!(
-                tx.get_message(gap_entry_id)?.is_none(),
-                "transport entryId is not the authenticated messageId"
+                tx.get_account_meta(&format!("authorized_device_keys:{}", fixture.bob_did))?
+                    .is_none(),
+                "NSE must not restore the device-key row foreground invalidated during fetch"
             );
-            let evidence: serde_json::Value = serde_json::from_slice(
-                &tx.get_labyrinth_state(&format!(
+            assert!(tx.get_message(gap_message_id)?.is_none());
+            assert!(tx.get_message(gap_entry_id)?.is_none());
+            assert!(tx
+                .get_labyrinth_state(&format!(
                     "native.message:{}:{gap_message_id}",
                     fixture.conversation_id
                 ))?
-                .unwrap(),
-            )
+                .is_none());
+            assert!(tx
+                .get_pending_op("native_archive_receipt", gap_message_id)?
+                .is_none());
+            assert_eq!(
+                tx.get_pending_op("nse_deferred_control", &fixture.conversation_id)?
+                    .as_deref(),
+                Some("2"),
+                "the first deferred control leaves a durable foreground-sync reason"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn push_defers_own_pending_commit_without_merging_or_moving_the_cursor() {
+    struct CommitTransport(PushFetchBundle);
+    impl PushFetchTransport for CommitTransport {
+        fn fetch_missing_entries(
+            &self,
+            _conversation_id: String,
+            after_seq: i64,
+            _chat_dpop_token: String,
+        ) -> Result<PushFetchBundle, MLSError> {
+            assert_eq!(after_seq, 1);
+            Ok(self.0.clone())
+        }
+
+        fn get_authorized_device_keys(
+            &self,
+            _did: String,
+            _chat_dpop_token: Option<String>,
+        ) -> Result<Vec<AuthorizedPeerDeviceKey>, MLSError> {
+            Ok(Vec::new())
+        }
+    }
+
+    let fixture = setup_alice_and_bob_group(true);
+    let own_commit = {
+        let alice_db =
+            MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+                .unwrap();
+        let commit = alice_db
+            .write_tx(|tx| {
+                let provider =
+                    OpenMlsKvProvider::new(OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn())))?;
+                let mut group =
+                    MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
+                        .unwrap()
+                        .unwrap();
+                let signer = SignatureKeyPair::read(
+                    provider.storage(),
+                    group.own_leaf_node().unwrap().signature_key().as_slice(),
+                    CIPHERSUITE.signature_algorithm(),
+                )
+                .unwrap();
+                set_push_commit_aad(&mut group, &provider, &fixture.conversation_id, 7);
+                let commit = group
+                    .self_update(&provider, &signer, LeafNodeParameters::default())
+                    .unwrap()
+                    .into_commit()
+                    .tls_serialize_detached()
+                    .unwrap();
+                assert!(group.pending_commit().is_some());
+                Ok(commit)
+            })
             .unwrap();
-            assert!(evidence["sequencer_receipt_json"].is_null());
-            assert_eq!(evidence["frame_nonce_b64"], STANDARD.encode([0x77u8; 32]));
-            let pending: serde_json::Value = serde_json::from_str(
-                &tx.get_pending_op("native_archive_receipt", gap_message_id)?
-                    .unwrap(),
-            )
+        alice_db.prepare_for_background().unwrap();
+        commit
+    };
+    let transport = Arc::new(CommitTransport(PushFetchBundle {
+        entries: vec![FetchedPushEntry {
+            entry_id: "own-pending-commit".into(),
+            seq: 2,
+            epoch: 1,
+            entry_kind: "commit".into(),
+            sender_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            mls_bytes: own_commit,
+            signed_request: None,
+            sequencer_receipt: None,
+        }],
+        metadata_snapshot: None,
+        authorized_device_keys: Vec::new(),
+    }));
+    let wake = PushWakePayload {
+        kind: "commit".into(),
+        conversation_id: fixture.conversation_id.clone(),
+        generation: 0,
+        entry_seq: 2,
+        message_id: "own-pending-commit".into(),
+        recipient_account_hash: fixture.alice_hash.clone(),
+        fetch_required: true,
+        sender_did: Some("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        inline_ciphertext: None,
+    };
+    let preview = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        Arc::new(MemoryPushKeystore::new(
+            &fixture.alice_hash,
+            fixture.alice_db_key,
+            Some("cached-chat-dpop-jwt".into()),
+        )),
+        Some(transport),
+        &wake,
+    )
+    .expect("own Commit is deferred");
+    assert!(preview.fallback_generic);
+
+    let alice_db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
             .unwrap();
-            assert_eq!(pending["entry_id"], gap_entry_id);
+    alice_db
+        .read_tx(|tx| {
+            let provider =
+                OpenMlsKvProvider::new(OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn())))?;
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
+                .unwrap()
+                .unwrap();
+            let row = tx
+                .get_conversation(&fixture.conversation_id)?
+                .expect("conversation");
+            assert_eq!((group.epoch().as_u64(), row.epoch, row.last_seq), (1, 1, 1));
+            assert!(group.pending_commit().is_some());
             Ok(())
         })
         .unwrap();
@@ -1013,8 +1276,14 @@ fn unverified_sender_leaf_key_fails_i4_and_never_persists_message() {
     let keystore = Arc::new(MemoryPushKeystore::new(
         &fixture.alice_hash,
         fixture.alice_db_key,
-        None,
+        Some("cached-chat-dpop-jwt".into()),
     ));
+    let transport = receipt_bound_transport(
+        &fixture,
+        UNVERIFIED_MESSAGE_ID,
+        "Forged/unverified device wake",
+        ciphertext.clone(),
+    );
 
     let wake = PushWakePayload {
         kind: "application_message".to_string(),
@@ -1032,7 +1301,7 @@ fn unverified_sender_leaf_key_fails_i4_and_never_persists_message() {
         fixture.temp_dir.path(),
         &fixture.alice_hash,
         keystore,
-        None,
+        Some(transport),
         &wake,
     )
     .expect_err("unverified sender leaf key must fail I4");
@@ -1367,6 +1636,8 @@ fn push_catchup_stops_at_entries_the_nse_cannot_verify() {
                         entry_kind: "application_message".to_string(),
                         sender_did: String::new(),
                         mls_bytes: blocking_bytes,
+                        signed_request: None,
+                        sequencer_receipt: None,
                     },
                     FetchedPushEntry {
                         entry_id: PRUNED_LIVE_MESSAGE_ID.to_string(),
@@ -1375,6 +1646,8 @@ fn push_catchup_stops_at_entries_the_nse_cannot_verify() {
                         entry_kind: "application_message".to_string(),
                         sender_did: fixture.bob_did.clone(),
                         mls_bytes: live_msg_bytes,
+                        signed_request: None,
+                        sequencer_receipt: None,
                     },
                 ],
                 metadata_snapshot: None,
@@ -1435,11 +1708,15 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
         Engine as _,
     };
+    use catbird_mls::chat_v2::transcript::{
+        decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+    };
     use catbird_mls::client::{
         CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpRequest, PlatformHttpResponse,
         PlatformKeyStore, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
     };
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+    use p256::ecdsa::SigningKey as P256SigningKey;
     use sha2::{Digest as _, Sha256};
 
     struct CapturingKeystore {
@@ -1489,6 +1766,8 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
     struct CapturingTransport {
         ack_bodies: Mutex<Vec<serde_json::Value>>,
         pds_records: Mutex<Vec<serde_json::Value>>,
+        sequencer_signing_key: P256SigningKey,
+        sequencer_pub_multibase: String,
     }
     impl PlatformTransport for CapturingTransport {
         fn execute_http(
@@ -1532,6 +1811,54 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                     body: serde_json::to_vec(&serde_json::json!({ "records": records })).unwrap(),
                 });
             }
+            if request
+                .url
+                .contains("/xrpc/com.atproto.identity.resolveDid")
+            {
+                let requested_sequencer = request.url.contains("did%3Aweb%3Achat.catbird.blue")
+                    || request.url.contains("did:web:chat.catbird.blue");
+                let did_doc = if requested_sequencer {
+                    serde_json::json!({
+                        "id": "did:web:chat.catbird.blue",
+                        "verificationMethod": [{
+                            "id": "did:web:chat.catbird.blue#mls-receipt-1",
+                            "type": "Multikey",
+                            "controller": "did:web:chat.catbird.blue",
+                            "publicKeyMultibase": self.sequencer_pub_multibase,
+                        }]
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": "did:plc:signedtranscriptuseraaaa",
+                        "service": [{
+                            "id": "#atproto_pds",
+                            "type": "AtprotoPersonalDataServer",
+                            "serviceEndpoint": "https://swan.place",
+                        }]
+                    })
+                };
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&serde_json::json!({ "didDoc": did_doc })).unwrap(),
+                });
+            }
+            if request.url.contains("/.well-known/did.json") {
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "id": "did:web:chat.catbird.blue",
+                        "verificationMethod": [{
+                            "id": "did:web:chat.catbird.blue#mls-receipt-1",
+                            "type": "Multikey",
+                            "controller": "did:web:chat.catbird.blue",
+                            "publicKeyMultibase": self.sequencer_pub_multibase,
+                        }]
+                    }))
+                    .unwrap(),
+                });
+            }
             if request.url.contains("/xrpc/blue.catbird.chat.enrollDevice") {
                 // `mls-ds` answers the registered `deviceView`.
                 let v: serde_json::Value =
@@ -1560,17 +1887,75 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                 let v: serde_json::Value =
                     serde_json::from_slice(request.body.as_deref().unwrap_or(b"{}")).unwrap();
                 let b = &v["signedRequest"]["body"];
+                let kind = SignedMutationKind::Creation;
+                let strict =
+                    decode_strict_json(&serde_json::to_vec(b).unwrap()).expect("creation body");
+                let projected = project_signed_body(kind, &strict).expect("creation projection");
+                let request_digest = *SigningTranscript::build_for(kind, &projected)
+                    .expect("creation transcript")
+                    .request_digest();
+                let group_id = catbird_mls::client::chat_wire::json_bytes(&b["next"]["groupId"])
+                    .expect("creation group id");
+                let issued_at_ms = chrono::DateTime::parse_from_rfc3339(
+                    b["signedAt"].as_str().expect("creation signedAt"),
+                )
+                .expect("creation timestamp")
+                .timestamp_millis();
+                let receipt_kid = "did:web:chat.catbird.blue#mls-receipt-1";
+                let signed = labyrinth_protocol::receipt::sign_sequencer_receipt(
+                    &self.sequencer_signing_key,
+                    receipt_kid,
+                    &labyrinth_protocol::receipt::SequencerReceiptPayload {
+                        sequencer_did: "did:web:chat.catbird.blue".to_string(),
+                        conversation_id: b["conversationId"]
+                            .as_str()
+                            .expect("creation conversation")
+                            .to_string(),
+                        group_id,
+                        epoch: b["next"]["epoch"].as_u64().expect("creation epoch"),
+                        sender_device_did_url: format!(
+                            "{}#{}",
+                            b["actorDid"].as_str().expect("creation actor"),
+                            b["actorDeviceId"].as_str().expect("creation device")
+                        ),
+                        entry_id: b["transitionId"]
+                            .as_str()
+                            .expect("creation transition")
+                            .to_string(),
+                        archive_commitment: request_digest,
+                        seq: 1,
+                        issued_at_ms,
+                    },
+                )
+                .expect("sign creation receipt");
+                let sequencer_receipt = serde_json::json!({
+                    "sequencerDid": "did:web:chat.catbird.blue",
+                    "kid": receipt_kid,
+                    "conversationId": b["conversationId"],
+                    "generation": b["next"]["generation"],
+                    "groupId": b["next"]["groupId"],
+                    "epoch": b["next"]["epoch"],
+                    "seq": 1,
+                    "senderDid": b["actorDid"],
+                    "senderDeviceId": b["actorDeviceId"],
+                    "entryId": b["transitionId"],
+                    "archiveCommitment": { "$bytes": STANDARD.encode(request_digest) },
+                    "issuedAtMs": issued_at_ms,
+                    "signature": { "$bytes": STANDARD.encode(signed.signature) },
+                });
                 return Ok(PlatformHttpResponse {
                     status: 200,
                     headers: Vec::new(),
                     body: serde_json::to_vec(&serde_json::json!({ "result": {
                         "coordinates": b["next"],
                         "entry": {
+                            "$type": "blue.catbird.chat.defs#creationEntry",
                             "entryId": b["transitionId"],
                             "conversationId": b["conversationId"],
                             "seq": 1,
                             "signedRequest": v["signedRequest"],
                             "receivedAt": b["signedAt"],
+                            "sequencerReceipt": sequencer_receipt,
                         },
                     }}))
                     .unwrap(),
@@ -1614,9 +1999,16 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
     let keystore = Arc::new(CapturingKeystore {
         keys: Mutex::new(HashMap::new()),
     });
+    let sequencer_signing_key = P256SigningKey::from_bytes((&[0x34u8; 32]).into()).unwrap();
+    let sec1_compressed = sequencer_signing_key.verifying_key().to_encoded_point(true);
+    let mut codec_prefixed = vec![0x80, 0x24];
+    codec_prefixed.extend_from_slice(sec1_compressed.as_bytes());
+    let sequencer_pub_multibase = multibase::encode(multibase::Base::Base58Btc, &codec_prefixed);
     let transport = Arc::new(CapturingTransport {
         ack_bodies: Mutex::new(Vec::new()),
         pds_records: Mutex::new(Vec::new()),
+        sequencer_signing_key,
+        sequencer_pub_multibase,
     });
 
     let client = CatbirdMlsClient::open(
@@ -1720,7 +2112,7 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
 }
 
 #[test]
-fn push_commit_rejects_authenticated_prior_for_another_conversation_atomically() {
+fn push_defers_a_commit_with_cross_conversation_prior_atomically() {
     let fixture = setup_alice_and_bob_group(true);
     let bad_commit = fixture
         .bob_db
@@ -1775,6 +2167,8 @@ fn push_commit_rejects_authenticated_prior_for_another_conversation_atomically()
             entry_kind: "commit".into(),
             sender_did: fixture.bob_did.clone(),
             mls_bytes: bad_commit,
+            signed_request: None,
+            sequencer_receipt: None,
         }],
         metadata_snapshot: None,
         authorized_device_keys: vec![AuthorizedPeerDeviceKey {
@@ -1794,7 +2188,7 @@ fn push_commit_rejects_authenticated_prior_for_another_conversation_atomically()
         sender_did: Some(fixture.bob_did.clone()),
         inline_ciphertext: None,
     };
-    let error = process_push_notification(
+    let preview = process_push_notification(
         fixture.temp_dir.path(),
         &fixture.alice_hash,
         Arc::new(MemoryPushKeystore::new(
@@ -1805,10 +2199,9 @@ fn push_commit_rejects_authenticated_prior_for_another_conversation_atomically()
         Some(transport),
         &wake,
     )
-    .expect_err("an authorized MLS signer cannot bind another conversation's coordinates");
-    assert!(
-        matches!(&error, MLSError::Cryptography(message) if message.contains("local conversation prior"))
-    );
+    .expect("the NSE defers every Commit before inspecting its control metadata");
+    // Commit prior/control validation belongs to receipt-verifying foreground sync.
+    assert!(preview.fallback_generic);
     let db =
         MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
             .unwrap();
@@ -1852,6 +2245,122 @@ fn inline_wake(
     }
 }
 
+struct ReceiptBoundTransport {
+    conversation_id: String,
+    bundle: PushFetchBundle,
+}
+
+impl PushFetchTransport for ReceiptBoundTransport {
+    fn fetch_missing_entries(
+        &self,
+        conversation_id: String,
+        after_seq: i64,
+        chat_dpop_token: String,
+    ) -> Result<PushFetchBundle, MLSError> {
+        assert_eq!(conversation_id, self.conversation_id);
+        assert_eq!(after_seq, 1);
+        assert_eq!(chat_dpop_token, "cached-chat-dpop-jwt");
+        Ok(self.bundle.clone())
+    }
+
+    fn get_authorized_device_keys(
+        &self,
+        _did: String,
+        _chat_dpop_token: Option<String>,
+    ) -> Result<Vec<AuthorizedPeerDeviceKey>, MLSError> {
+        Ok(Vec::new())
+    }
+}
+
+fn receipt_bound_transport(
+    fixture: &TwoPeerGroupFixture,
+    message_id: &str,
+    text: &str,
+    ciphertext: Vec<u8>,
+) -> Arc<ReceiptBoundTransport> {
+    let canonical_payload =
+        serde_json::to_vec(&catbird_mls::orchestrator::MLSMessagePayload::text(text)).unwrap();
+    let archive_commitment =
+        labyrinth_protocol::receipt::compute_archive_commitment(&[0x5A; 32], &canonical_payload);
+    let payload = labyrinth_protocol::receipt::SequencerReceiptPayload {
+        sequencer_did: "did:web:ds.example".into(),
+        conversation_id: fixture.conversation_id.clone(),
+        group_id: fixture.group_id.clone(),
+        epoch: 1,
+        sender_device_did_url: format!("{}#{}", fixture.bob_did, fixture.bob_device_id),
+        entry_id: message_id.into(),
+        archive_commitment,
+        seq: 2,
+        issued_at_ms: 1_700_000_000_001,
+    };
+    let signed = labyrinth_protocol::receipt::sign_sequencer_receipt(
+        &fixture.sequencer_signer,
+        "did:web:ds.example#mls-receipt-1",
+        &payload,
+    )
+    .unwrap();
+    let receipt = serde_json::json!({
+        "kid": signed.key_id,
+        "sequencerDid": signed.payload.sequencer_did,
+        "conversationId": signed.payload.conversation_id,
+        "generation": 0,
+        "groupId": { "$bytes": STANDARD.encode(&signed.payload.group_id) },
+        "epoch": signed.payload.epoch,
+        "seq": signed.payload.seq,
+        "entryId": signed.payload.entry_id,
+        "senderDid": fixture.bob_did,
+        "senderDeviceId": fixture.bob_device_id,
+        "archiveCommitment": {
+            "$bytes": STANDARD.encode(signed.payload.archive_commitment),
+        },
+        "issuedAtMs": signed.payload.issued_at_ms,
+        "signature": { "$bytes": STANDARD.encode(signed.signature) },
+    });
+    let db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+            .unwrap();
+    let did_document = db
+        .read_tx(|tx| {
+            tx.get_account_meta("did_doc:did:web:ds.example")?
+                .ok_or_else(|| MLSError::Internal("missing receipt DID document".into()))
+        })
+        .unwrap();
+    let receipt_key = catbird_mls::client::chat_wire::decode_p256_sec1_from_did_doc(
+        did_document.as_bytes(),
+        "did:web:ds.example",
+        "did:web:ds.example#mls-receipt-1",
+    )
+    .unwrap();
+    catbird_mls::client::chat_wire::verify_pruned_application_receipt(
+        &receipt,
+        &receipt_key,
+        "did:web:ds.example",
+        &fixture.conversation_id,
+        &fixture.group_id,
+        message_id,
+        2,
+    )
+    .unwrap();
+    drop(db);
+    Arc::new(ReceiptBoundTransport {
+        conversation_id: fixture.conversation_id.clone(),
+        bundle: PushFetchBundle {
+            entries: vec![FetchedPushEntry {
+                entry_id: message_id.into(),
+                seq: 2,
+                epoch: 1,
+                entry_kind: catbird_mls::chat_v2::wire::APPLICATION_ENTRY_KIND.into(),
+                sender_did: fixture.bob_did.clone(),
+                mls_bytes: ciphertext,
+                signed_request: None,
+                sequencer_receipt: Some(serde_json::to_vec(&receipt).unwrap()),
+            }],
+            metadata_snapshot: None,
+            authorized_device_keys: Vec::new(),
+        },
+    })
+}
+
 /// R4: the NSE displays, sequences and queues for archive only an application message whose
 /// original sender attestation verifies for its authenticated conversation, message and archive
 /// commitment. A forged attestation is refused whether or not the canonical AAD binds it: by the
@@ -1862,7 +2371,7 @@ fn push_refuses_an_original_sender_attestation_that_does_not_verify() {
     let keystore = Arc::new(MemoryPushKeystore::new(
         &fixture.alice_hash,
         fixture.alice_db_key,
-        None,
+        Some("cached-chat-dpop-jwt".into()),
     ));
     // `(message id, attestation bound into the canonical AAD)`: unbound is the removed bypass.
     let forged = [
@@ -1881,11 +2390,12 @@ fn push_refuses_an_original_sender_attestation_that_does_not_verify() {
                     aad.remove("originalSenderAttestation");
                 }
             });
+        let transport = receipt_bound_transport(&fixture, message_id, "forged", ciphertext.clone());
         let error = process_push_notification(
             fixture.temp_dir.path(),
             &fixture.alice_hash,
             keystore.clone(),
-            None,
+            Some(transport),
             &inline_wake(&fixture, message_id, ciphertext),
         )
         .expect_err("a forged original sender attestation is refused");
@@ -1931,19 +2441,26 @@ fn push_cache_recheck_answers_only_the_cached_conversation_and_seq() {
     let keystore = Arc::new(MemoryPushKeystore::new(
         &fixture.alice_hash,
         fixture.alice_db_key,
-        None,
+        Some("cached-chat-dpop-jwt".into()),
     ));
     let ciphertext =
         bob_encrypt_app_message(&fixture, "cached secret", INLINE_MESSAGE_ID, |_, _| {});
+    let transport = receipt_bound_transport(
+        &fixture,
+        INLINE_MESSAGE_ID,
+        "cached secret",
+        ciphertext.clone(),
+    );
     let wake = inline_wake(&fixture, INLINE_MESSAGE_ID, ciphertext);
-    process_push_notification(
+    let seeded = process_push_notification(
         fixture.temp_dir.path(),
         &fixture.alice_hash,
         keystore.clone(),
-        None,
+        Some(transport),
         &wake,
     )
     .expect("cache the message at seq 2");
+    assert!(!seeded.fallback_generic, "{seeded:?}");
     // Another conversation Alice holds, with no message of its own.
     let other = "d1234567-89ab-4cde-8123-456789abcdef";
     let db =

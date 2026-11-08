@@ -111,7 +111,13 @@ where
                 if original["signedRequest"]["body"]["transitionId"] != transition {
                     continue;
                 }
-                let entry = super::projection::request_control_entry(original.clone())?;
+                let mut control = original.clone();
+                let receipt = super::projection::normalize_control_sequencer_receipt(&mut control)?;
+                let _ = control
+                    .as_object_mut()
+                    .ok_or_else(invalid)?
+                    .remove("sequencerReceipt");
+                let entry = super::projection::request_control_entry(control)?;
                 let body = &entry["signedRequest"]["body"];
                 let (kind, changes) = match original["$type"].as_str() {
                     Some("blue.catbird.chat.defs#creationEntry")
@@ -172,7 +178,40 @@ where
                         body["keyId"].as_str().ok_or_else(invalid)?,
                     )
                     .await?;
-                VerifiedMutation::verify(projected, signature, &key).map_err(|_| invalid())?;
+                let verified =
+                    VerifiedMutation::verify(projected, signature, &key).map_err(|_| invalid())?;
+                let sequencer_did = state["sequencerDid"].as_str().ok_or_else(invalid)?;
+                let document = self
+                    .credentials()
+                    .direct_request_receipt_authority_document(sequencer_did)
+                    .await?
+                    .ok_or_else(invalid)?;
+                super::intent::validate_authority_document_for_expected_authority(
+                    &document,
+                    sequencer_did,
+                )
+                .map_err(|_| invalid())?;
+                let kid = crate::client::chat_wire::sequencer_receipt_kid(sequencer_did, &receipt)
+                    .map_err(|_| invalid())?;
+                let receipt_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                    &document,
+                    sequencer_did,
+                    kid,
+                )
+                .map_err(|_| invalid())?;
+                crate::client::chat_wire::verify_control_sequencer_receipt(
+                    &receipt,
+                    &receipt_key,
+                    sequencer_did,
+                    cid,
+                    entry["entryId"].as_str().ok_or_else(invalid)?,
+                    i64::try_from(seq).map_err(|_| invalid())?,
+                    actor,
+                    actor_device,
+                    &body["next"],
+                    verified.request_digest(),
+                )
+                .map_err(|_| invalid())?;
                 return Ok(Some(GroupInvitationReference {
                     authority_did: "did:web:chat.catbird.blue".into(),
                     conversation_id: cid.into(),

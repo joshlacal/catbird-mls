@@ -265,26 +265,28 @@ fn creator_tracks_the_verified_roster_through_verified_entries() {
             None,
         )
         .expect("alice creates the group");
+    let creation = ds.inner.lock().unwrap().entries[&cid][0]["signedRequest"]["body"].clone();
+    let mut expected =
+        chat_wire::roster_from_participants(&creation["manifest"]["participants"]).unwrap();
     assert_eq!(
         roster(&alice, &cid),
-        Some(roster_of(&[
-            (ALICE_DID, "admin", "active"),
-            (BOB_DID, "member", "pending"),
-        ])),
+        Some(expected.clone()),
         "creation: the manifest alice signed"
     );
 
     alice
         .add_group_members(&cid, vec![EVE_DID.to_string()])
         .expect("alice invites eve");
-    let invited = roster_of(&[
-        (ALICE_DID, "admin", "active"),
-        (BOB_DID, "member", "pending"),
-        (EVE_DID, "member", "pending"),
-    ]);
+    let invitation =
+        ds.inner.lock().unwrap().entries[&cid].last().unwrap()["signedRequest"]["body"].clone();
+    chat_wire::apply_roster_effects(
+        &mut expected,
+        SignedMutationKind::PolicyTransition,
+        &invitation,
+    );
     assert_eq!(
         roster(&alice, &cid),
-        Some(invited),
+        Some(expected.clone()),
         "her invitation's answer"
     );
 
@@ -292,13 +294,24 @@ fn creator_tracks_the_verified_roster_through_verified_entries() {
     alice
         .sync()
         .expect("alice applies bob's acceptance and adds his device");
+    let acceptance = ds.inner.lock().unwrap().entries[&cid]
+        .iter()
+        .find(|entry| {
+            matches!(
+                chat_wire::signed_entry_kind(entry),
+                Ok(SignedMutationKind::ParticipantAcceptance)
+            ) && entry["signedRequest"]["body"]["actorDid"] == BOB_DID
+        })
+        .unwrap()["signedRequest"]["body"]
+        .clone();
+    chat_wire::apply_roster_effects(
+        &mut expected,
+        SignedMutationKind::ParticipantAcceptance,
+        &acceptance,
+    );
     assert_eq!(
         roster(&alice, &cid),
-        Some(roster_of(&[
-            (ALICE_DID, "admin", "active"),
-            (BOB_DID, "member", "active"),
-            (EVE_DID, "member", "pending"),
-        ])),
+        Some(expected.clone()),
         "bob's verified acceptance"
     );
 
@@ -371,32 +384,43 @@ fn creator_tracks_the_verified_roster_through_verified_entries() {
 
     // Alice's own promotion of Bob, sequenced while its answer was lost, applies from its echo.
     let promotion = promote_bob(&alice_signer, ALICE_DID, &alice_dev);
+    let promotion_body = promotion["body"].clone();
     ds.inner
         .lock()
         .unwrap()
         .conversations
         .get_mut(&cid)
-        .unwrap()["coordinates"] = promotion["body"]["next"].clone();
+        .unwrap()["coordinates"] = promotion_body["next"].clone();
     let seq = serve_policy(&ds, &cid, promotion);
     alice.sync().expect("alice's own promotion applies once");
     assert_eq!(last_seq(&alice, &cid), seq);
+    chat_wire::apply_roster_effects(
+        &mut expected,
+        SignedMutationKind::PolicyTransition,
+        &promotion_body,
+    );
     assert_eq!(
         roster(&alice, &cid),
-        Some(roster_of(&[
-            (ALICE_DID, "admin", "active"),
-            (BOB_DID, "admin", "active"),
-            (EVE_DID, "member", "pending"),
-        ])),
+        Some(expected.clone()),
         "her verified role change"
     );
 
     alice
         .remove_group_member(MemberRole::Admin, &cid, BOB_DID)
         .expect("alice removes bob");
-    let removed = roster_of(&[
-        (ALICE_DID, "admin", "active"),
-        (EVE_DID, "member", "pending"),
-    ]);
+    for entry in ds.inner.lock().unwrap().entries[&cid]
+        .iter()
+        .filter(|entry| {
+            entry["seq"]
+                .as_i64()
+                .is_some_and(|entry_seq| entry_seq > seq)
+        })
+    {
+        if let Ok(kind) = chat_wire::signed_entry_kind(entry) {
+            chat_wire::apply_roster_effects(&mut expected, kind, &entry["signedRequest"]["body"]);
+        }
+    }
+    let removed = expected.clone();
     assert_eq!(
         roster(&alice, &cid),
         Some(removed.clone()),
@@ -492,9 +516,31 @@ fn recovery_welcome_attests_the_fulfillers_roster_and_nothing_else_does() {
         Some(carols.clone()),
         "carol's attestation"
     );
+    assert!(
+        bob.db()
+            .read_tx(|tx| {
+                tx.get_account_meta(&chat_wire::verified_participant_admission_key(
+                    &valid, CAROL_DID,
+                ))
+            })
+            .unwrap()
+            .is_some(),
+        "the attested active row carries admission authority"
+    );
     for (case, cid) in &refused {
         assert!(joined(cid), "{case}: the join still proceeds");
         assert_eq!(roster(bob, cid), None, "{case}");
+        assert!(
+            bob.db()
+                .read_tx(|tx| {
+                    tx.get_account_meta(&chat_wire::verified_participant_admission_key(
+                        cid, CAROL_DID,
+                    ))
+                })
+                .unwrap()
+                .is_none(),
+            "{case}: an invalid attestation grants no admission authority"
+        );
     }
 
     bob.sync().expect("bob syncs his conversations");

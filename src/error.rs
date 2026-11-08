@@ -161,6 +161,15 @@ pub enum MLSError {
     #[error("Epoch mismatch: local={local}, remote={remote}")]
     EpochMismatch { local: u64, remote: u64 },
 
+    /// A peer's valid device signature proves that it sent from a different MLS state at this
+    /// device's current epoch. The entry is not decrypted, stored, or acknowledged.
+    #[error("fork detected for conversation {conversation_id} at generation {generation}, epoch {epoch}")]
+    ForkDetected {
+        conversation_id: String,
+        generation: i64,
+        epoch: i64,
+    },
+
     /// This device holds no verified roster of `conversation_id` (it learned none from the
     /// conversation's creation, a verified reset or a recovery Welcome's roster attestation), so
     /// it can establish neither admin authority nor a zero-leaf participant's entitlement there.
@@ -175,6 +184,46 @@ pub enum MLSError {
         applied: u32,
         failures: Vec<ConversationSyncFailure>,
     },
+    /// A valid, coordinate-bound recovery request named a participant for which this device has
+    /// neither a current same-account leaf nor member-authenticated admission authority.
+    #[error(
+        "no member-authenticated admission proof for participant {participant_did} in conversation {conversation_id}"
+    )]
+    AdmissionProofUnavailable {
+        conversation_id: String,
+        participant_did: String,
+    },
+    /// A retained creation is waiting for its bounded retry deadline.
+    #[error("group creation {conversation_id} is pending until {retry_at_ms} ({last_error_code})")]
+    GroupCreationPending {
+        conversation_id: String,
+        retry_at_ms: i64,
+        last_error_code: String,
+    },
+    /// A retained creation needs an explicit user decision before it can continue.
+    #[error("group creation {conversation_id} needs user action: {reason}")]
+    GroupCreationNeedsUserAction {
+        conversation_id: String,
+        reason: String,
+    },
+    /// The sequencer proved that this retained creation cannot be completed.
+    #[error("group creation {conversation_id} was rejected: {code}")]
+    GroupCreationRejected {
+        conversation_id: String,
+        code: String,
+    },
+    /// Cancellation could not prove that no server-side conversation exists.
+    #[error("cannot cancel group creation {conversation_id}: {reason}")]
+    GroupCreationCancellationUnproven {
+        conversation_id: String,
+        reason: String,
+    },
+    /// The whole encrypted client database predates or exceeds this build's storage contract.
+    /// Refuse it before any operation; the app must wipe local state and re-enrol.
+    #[error(
+        "local state format {found} is unsupported; format {required} is required (wipe and re-enrol)"
+    )]
+    LocalStateFormatUnsupported { found: u32, required: u32 },
 }
 
 /// One conversation `sync` could not finish, and why.
@@ -379,7 +428,9 @@ impl From<MLSError> for MLSCommitError {
 
 #[cfg(test)]
 mod decrypt_class_tests {
-    use super::MLSError;
+    use super::{ConversationSyncFailure, MLSCommitError, MLSError};
+    use crate::client::{PendingGroupCreationState, PendingGroupCreationStatus};
+    use crate::push::NotificationPreview;
 
     // The exact `{:?}` forms `map_process_message_error`'s catch-all arm
     // produces for OpenMLS `process_message` failures (see api.rs:297).
@@ -443,5 +494,203 @@ mod decrypt_class_tests {
                 .is_stale_coordinates()
         );
         assert!(!MLSError::Internal("HTTP 409: StaleCoordinates".into()).is_stale_coordinates());
+    }
+    fn append_lowered<T: uniffi::Lower<crate::UniFfiTag>>(bytes: &mut Vec<u8>, value: T) {
+        <T as uniffi::Lower<crate::UniFfiTag>>::write(value, bytes);
+    }
+
+    fn lower_bytes<T: uniffi::Lower<crate::UniFfiTag>>(value: T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_lowered(&mut bytes, value);
+        bytes
+    }
+
+    #[test]
+    fn exported_round4_record_field_order_is_append_only() {
+        let preview = NotificationPreview {
+            message_id: "message".into(),
+            conversation_id: "conversation".into(),
+            sender_did: "sender".into(),
+            sender_display_name: Some("display".into()),
+            group_title: Some("group".into()),
+            body: "body".into(),
+            epoch: 11,
+            seq: 12,
+            from_cache: true,
+            fallback_generic: false,
+            darwin_notification_name: "darwin".into(),
+            receipt_verified: true,
+        };
+        let mut expected_preview = Vec::new();
+        append_lowered(&mut expected_preview, preview.message_id.clone());
+        append_lowered(&mut expected_preview, preview.conversation_id.clone());
+        append_lowered(&mut expected_preview, preview.sender_did.clone());
+        append_lowered(&mut expected_preview, preview.sender_display_name.clone());
+        append_lowered(&mut expected_preview, preview.group_title.clone());
+        append_lowered(&mut expected_preview, preview.body.clone());
+        append_lowered(&mut expected_preview, preview.epoch);
+        append_lowered(&mut expected_preview, preview.seq);
+        append_lowered(&mut expected_preview, preview.from_cache);
+        append_lowered(&mut expected_preview, preview.fallback_generic);
+        append_lowered(
+            &mut expected_preview,
+            preview.darwin_notification_name.clone(),
+        );
+        append_lowered(&mut expected_preview, preview.receipt_verified);
+        assert_eq!(lower_bytes(preview), expected_preview);
+
+        let status = PendingGroupCreationStatus {
+            conversation_id: "conversation".into(),
+            state: PendingGroupCreationState::NeedsUserAction,
+            retry_at_ms: Some(13),
+            last_error_code: Some("error".into()),
+        };
+        let mut expected_status = Vec::new();
+        append_lowered(&mut expected_status, status.conversation_id.clone());
+        append_lowered(&mut expected_status, status.state.clone());
+        append_lowered(&mut expected_status, status.retry_at_ms);
+        append_lowered(&mut expected_status, status.last_error_code.clone());
+        assert_eq!(lower_bytes(status), expected_status);
+    }
+
+    fn uniffi_discriminant<T: uniffi::Lower<crate::UniFfiTag>>(value: T) -> i32 {
+        let mut bytes = Vec::new();
+        <T as uniffi::Lower<crate::UniFfiTag>>::write(value, &mut bytes);
+        i32::from_be_bytes(bytes[..4].try_into().expect("UniFFI enum discriminant"))
+    }
+
+    #[test]
+    fn exported_error_discriminants_are_append_only() {
+        let invalid_utf8 = vec![0xff];
+        let utf8 = std::str::from_utf8(&invalid_utf8).unwrap_err();
+        let json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let errors = [
+            MLSError::InvalidInput {
+                message: "x".into(),
+            },
+            MLSError::GroupNotFound {
+                message: "x".into(),
+            },
+            MLSError::RequestImportExpired,
+            MLSError::InvalidKeyPackage,
+            MLSError::AddMembersFailed {
+                message: "x".into(),
+            },
+            MLSError::EncryptionFailed,
+            MLSError::DecryptionFailed,
+            MLSError::SerializationError,
+            MLSError::OpenMLSError,
+            MLSError::InvalidGroupId,
+            MLSError::SecretExportFailed,
+            MLSError::CommitProcessingFailed {
+                message: "x".into(),
+            },
+            MLSError::InvalidCommit,
+            MLSError::InvalidData,
+            MLSError::ContextNotInitialized,
+            MLSError::ContextClosed,
+            MLSError::WireFormatPolicyViolation {
+                message: "x".into(),
+            },
+            MLSError::MergeFailed,
+            MLSError::NoMatchingKeyPackage {
+                message: "x".into(),
+            },
+            MLSError::KeyPackageDesyncDetected {
+                convo_id: "x".into(),
+                message: "x".into(),
+            },
+            MLSError::WelcomeConsumed,
+            MLSError::StorageError,
+            MLSError::StorageFailed,
+            MLSError::MemberNotFound {
+                member_id: "x".into(),
+            },
+            MLSError::CannotRemoveLastAdmin,
+            MLSError::InsufficientPermissions {
+                operation: "x".into(),
+            },
+            MLSError::InvalidProposalRef,
+            MLSError::LockPoisoned {
+                message: "x".into(),
+            },
+            MLSError::NullPointer("x"),
+            MLSError::InvalidContext,
+            MLSError::TlsCodec("x".into()),
+            MLSError::OpenMLS("x".into()),
+            MLSError::Internal("x".into()),
+            MLSError::InvalidUtf8(utf8),
+            MLSError::Serialization(json),
+            MLSError::ThreadSafety("x".into()),
+            MLSError::Panic("x".into()),
+            MLSError::OperationNotSupported { reason: "x".into() },
+            MLSError::InvalidArgument("x".into()),
+            MLSError::InvalidState("x".into()),
+            MLSError::Cryptography("x".into()),
+            MLSError::EpochMismatch {
+                local: 1,
+                remote: 2,
+            },
+            MLSError::ForkDetected {
+                conversation_id: "x".into(),
+                generation: 1,
+                epoch: 2,
+            },
+            MLSError::RosterUnverified {
+                conversation_id: "x".into(),
+            },
+            MLSError::SyncIncomplete {
+                applied: 0,
+                failures: vec![ConversationSyncFailure {
+                    conversation_id: "x".into(),
+                    error: Box::new(MLSError::InvalidState("x".into())),
+                }],
+            },
+            MLSError::AdmissionProofUnavailable {
+                conversation_id: "x".into(),
+                participant_did: "did:plc:x".into(),
+            },
+            MLSError::GroupCreationPending {
+                conversation_id: "x".into(),
+                retry_at_ms: 1,
+                last_error_code: "x".into(),
+            },
+            MLSError::GroupCreationNeedsUserAction {
+                conversation_id: "x".into(),
+                reason: "x".into(),
+            },
+            MLSError::GroupCreationRejected {
+                conversation_id: "x".into(),
+                code: "x".into(),
+            },
+            MLSError::GroupCreationCancellationUnproven {
+                conversation_id: "x".into(),
+                reason: "x".into(),
+            },
+            MLSError::LocalStateFormatUnsupported {
+                found: 0,
+                required: 1,
+            },
+        ];
+        for (index, error) in errors.into_iter().enumerate() {
+            assert_eq!(
+                uniffi_discriminant(error),
+                i32::try_from(index + 1).unwrap()
+            );
+        }
+
+        assert_eq!(
+            uniffi_discriminant(MLSCommitError::EpochMismatch {
+                local: 1,
+                remote: 2,
+            }),
+            1
+        );
+        assert_eq!(
+            uniffi_discriminant(MLSCommitError::Generic {
+                message: "x".into(),
+            }),
+            2
+        );
     }
 }

@@ -34,4 +34,6 @@ pub use queries::{
     ConversationRow, GroupMetadataRow, LabyrinthQueueRow, MessageRow, MutationJournalRow,
     RequestRow, RoutingCacheRow,
 };
-pub use schema::{UNIFIED_SCHEMA_DDL, UNIFIED_SCHEMA_TABLES};
+pub use schema::{
+    LOCAL_STATE_FORMAT_KEY, LOCAL_STATE_FORMAT_VERSION, UNIFIED_SCHEMA_DDL, UNIFIED_SCHEMA_TABLES,
+};

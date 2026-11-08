@@ -4,6 +4,8 @@
 //! instances can share the same mock server via `Arc`.
 
 #![allow(dead_code, clippy::too_many_arguments, clippy::type_complexity)]
+#[path = "fixtures/direct_request_i13.rs"]
+pub mod direct_request_i13;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -369,6 +371,52 @@ struct MockState {
     failures: FailureFlags,
 }
 
+fn attach_control_receipt(
+    state: &MockState,
+    entry: &mut serde_json::Value,
+    coordinate: &serde_json::Value,
+) {
+    let signed_request = &entry["signedRequest"];
+    let body = &signed_request["body"];
+    let actor = body["actorDid"].as_str().expect("control actor DID");
+    let device = body["actorDeviceId"]
+        .as_str()
+        .expect("control actor device");
+    let public_key = state
+        .devices
+        .get(actor)
+        .and_then(|devices| {
+            devices
+                .iter()
+                .find(|candidate| candidate.info.device_id == device)
+        })
+        .and_then(|candidate| candidate.info.signature_public_key.as_deref())
+        .expect("enrolled control actor key");
+    let kind = catbird_mls::chat_v2::transcript::SignedMutationKind::from_type_id(
+        body["$type"].as_str().expect("control body type"),
+    )
+    .expect("known control mutation kind");
+    let request_digest = catbird_mls::client::chat_wire::verify_signed_mutation_body_and_digest(
+        signed_request,
+        kind,
+        public_key,
+    )
+    .expect("valid signed control mutation")
+    .1;
+    entry["sequencerReceipt"] = direct_request_i13::control_receipt_at(
+        &direct_request_i13::fixture_authority_key(),
+        body,
+        coordinate,
+        entry["entryId"].as_str().expect("control entry ID"),
+        entry["seq"].as_u64().expect("control entry sequence"),
+        entry["receivedAt"]
+            .as_str()
+            .expect("control receipt timestamp"),
+        request_digest,
+        direct_request_i13::AUTHORITY_DID,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Public handle
 // ---------------------------------------------------------------------------
@@ -578,7 +626,11 @@ impl MockDeliveryService {
                         for (key, value) in fields {
                             if matches!(
                                 key.as_str(),
-                                "signature" | "groupId" | "confirmationTag" | "groupContextHash"
+                                "signature"
+                                    | "groupId"
+                                    | "confirmationTag"
+                                    | "groupContextHash"
+                                    | "archiveCommitment"
                             ) && value.is_string()
                             {
                                 *value = serde_json::json!({"$bytes":value.as_str().unwrap()});
@@ -3026,7 +3078,8 @@ impl MLSAPIClient for MockDeliveryService {
                     sender_did: inner_body["actorDid"].as_str().unwrap().into(), ciphertext: commit,
                     timestamp: Utc::now(), is_commit: true, epoch: inner_body["prior"]["epoch"].as_u64(),
                 });
-                let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leaveCommitFulfillmentEntry", "entryId":inner_body["transitionId"], "conversationId":cid, "seq":entry_seq, "signedRequest":body_val["signedRequest"], "receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                let mut entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leaveCommitFulfillmentEntry", "entryId":inner_body["transitionId"], "conversationId":cid, "seq":entry_seq, "signedRequest":body_val["signedRequest"], "receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                attach_control_receipt(&guard, &mut entry, &inner_body["next"]);
                 guard.entries.push(entry.clone());
                 for removed_device in expected {
                     guard.removal_tombstones.push(serde_json::json!({
@@ -3694,7 +3747,8 @@ impl MLSAPIClient for MockDeliveryService {
                     snapshot["coordinates"] = inner_body["next"].clone();
                     snapshot["participants"].as_array_mut().unwrap().retain(|p| p["userDid"] != inner_body["actorDid"]);
                     guard.lifecycle_state_overrides.insert(convo_id.into(), snapshot);
-                    let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#zeroLeafLeaveEntry", "entryId":uuid::Uuid::new_v4().to_string(),"conversationId":convo_id,"seq":seq,"signedRequest":body_val["signedRequest"],"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                    let mut entry = serde_json::json!({"$type":"blue.catbird.chat.defs#zeroLeafLeaveEntry", "entryId":uuid::Uuid::new_v4().to_string(),"conversationId":convo_id,"seq":seq,"signedRequest":body_val["signedRequest"],"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                    attach_control_receipt(&guard, &mut entry, &inner_body["next"]);
                     guard.entries.push(entry.clone());
                     serde_json::json!({"result": {
                         "$type": "blue.catbird.chat.defs#zeroLeafLeaveResult",
@@ -3719,7 +3773,8 @@ impl MLSAPIClient for MockDeliveryService {
                     let seq = snapshot["snapshotSeq"].as_u64().unwrap_or(1) + 1;
                     snapshot["snapshotSeq"] = serde_json::json!(seq);
                     guard.lifecycle_state_overrides.insert(convo_id.into(), snapshot);
-                    let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leaveRequestEntry", "conversationId":convo_id, "entryId":inner_body["leaveRequestId"], "seq":seq,"receivedAt":request["requestedAt"],"signedRequest":body_val["signedRequest"]});
+                    let mut entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leaveRequestEntry", "conversationId":convo_id, "entryId":inner_body["leaveRequestId"], "seq":seq,"receivedAt":request["requestedAt"],"signedRequest":body_val["signedRequest"]});
+                    attach_control_receipt(&guard, &mut entry, &inner_body["prior"]);
                     guard.entries.push(entry.clone());
                     serde_json::json!({"result": {
                         "$type": "blue.catbird.chat.defs#durableLeaveRequestResult",
@@ -3754,7 +3809,8 @@ impl MLSAPIClient for MockDeliveryService {
                     "closedAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 });
                 guard.closed_conversation_tombstones.insert(convo_id.into(), tombstone.clone());
-                let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry", "entryId":uuid::Uuid::new_v4().to_string(), "conversationId":convo_id, "seq":20, "signedRequest":body_val["signedRequest"], "receivedAt":tombstone["closedAt"],"tombstone":tombstone});
+                let mut entry = serde_json::json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry", "entryId":uuid::Uuid::new_v4().to_string(), "conversationId":convo_id, "seq":20, "signedRequest":body_val["signedRequest"], "receivedAt":tombstone["closedAt"],"tombstone":tombstone});
+                attach_control_receipt(&guard, &mut entry, &inner_body["retired"]);
                 guard.entries.push(entry.clone());
                 let output = serde_json::json!({"result": {
                     "tombstone": tombstone,

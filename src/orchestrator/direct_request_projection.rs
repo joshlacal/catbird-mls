@@ -9,6 +9,7 @@ use crate::orchestrator::{OrchestratorError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,8 +154,9 @@ impl DirectRequestProjection {
         let mut coordinate = body["next"].clone();
         match (&self.acceptance_proof, &self.recipient_public_key) {
             (Some(proof), Some(recipient_key)) => {
-                let value: Value = serde_json::from_slice(proof).map_err(|_| invalid())?;
-                let method = value["receipt"]["body"]["keyId"]
+                let proof: Value = serde_json::from_slice(proof).map_err(|_| invalid())?;
+                let (proof, sequencer_receipt) = normalize_acceptance_proof_with_i13(proof)?;
+                let method = proof["receipt"]["body"]["keyId"]
                     .as_str()
                     .ok_or_else(invalid)?;
                 let key = resolve_direct_request_receipt_key_for_authority(
@@ -163,14 +165,21 @@ impl DirectRequestProjection {
                     method,
                 )
                 .map_err(|_| invalid())?;
-                let verified =
-                    crate::chat_v2::transcript::direct_request::verify_received_direct_request_acceptance_proof_for_authority(
-                        &auth_did,
-                        proof,
-                        &key,
-                        recipient_key,
-                    )
-                    .map_err(|_| invalid())?;
+                let i13_kid =
+                    crate::client::chat_wire::sequencer_receipt_kid(&auth_did, &sequencer_receipt)?;
+                let i13_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                    &self.trusted_authority_document,
+                    &auth_did,
+                    i13_kid,
+                )?;
+                let verified = verify_acceptance_proof_with_i13(
+                    &auth_did,
+                    &proof,
+                    &sequencer_receipt,
+                    &key,
+                    &i13_key,
+                    recipient_key,
+                )?;
                 let accepted = &verified["entry"]["signedRequest"]["body"];
                 if accepted["prior"] != coordinate
                     || accepted["requestId"] != body["requestId"]
@@ -245,7 +254,91 @@ pub(crate) struct DirectRequestCloseProof {
     pub publication_digest: [u8; 32],
     pub verified_prior: Value,
 }
+pub(crate) fn normalize_control_sequencer_receipt(entry: &mut Value) -> Result<Value> {
+    let receipt = entry
+        .get("sequencerReceipt")
+        .filter(|receipt| receipt.is_object())
+        .ok_or_else(invalid)?;
+    let normalized = crate::chat_v2::transcript::direct_request::normalize_read_presentation(
+        &serde_json::to_vec(receipt).map_err(|_| invalid())?,
+        "sequencerReceipt",
+        false,
+    )
+    .map_err(|_| invalid())?;
+    entry["sequencerReceipt"] = normalized.clone();
+    Ok(normalized)
+}
+
+pub(crate) fn normalize_acceptance_proof_with_i13(mut proof: Value) -> Result<(Value, Value)> {
+    let entry = proof
+        .get_mut("entry")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(invalid)?;
+    let receipt = entry
+        .get("sequencerReceipt")
+        .filter(|receipt| receipt.is_object())
+        .cloned()
+        .ok_or_else(invalid)?;
+    entry.remove("sequencerReceipt");
+    let proof = crate::chat_v2::transcript::direct_request::normalize_read_presentation(
+        &serde_json::to_vec(&proof).map_err(|_| invalid())?,
+        "directRequestAcceptanceProof",
+        false,
+    )
+    .map_err(|_| invalid())?;
+    let receipt = crate::chat_v2::transcript::direct_request::normalize_read_presentation(
+        &serde_json::to_vec(&receipt).map_err(|_| invalid())?,
+        "sequencerReceipt",
+        false,
+    )
+    .map_err(|_| invalid())?;
+    Ok((proof, receipt))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_acceptance_proof_with_i13(
+    authority_did: &str,
+    proof: &Value,
+    receipt: &Value,
+    authority_key: &[u8],
+    i13_key: &[u8],
+    recipient_key: &[u8],
+) -> Result<Value> {
+    let proof = serde_json::to_vec(proof).map_err(|_| invalid())?;
+    let verified =
+        crate::chat_v2::transcript::direct_request::verify_received_direct_request_acceptance_proof_for_authority(
+            authority_did,
+            &proof,
+            authority_key,
+            recipient_key,
+        )
+        .map_err(|_| invalid())?;
+    let entry = &verified["entry"];
+    let body = &entry["signedRequest"]["body"];
+    let transcript = crate::chat_v2::transcript::direct_request::direct_request_signing_bytes(
+        DirectRequestKind::Accept,
+        &serde_json::to_vec(body).map_err(|_| invalid())?,
+    )
+    .map_err(|_| invalid())?;
+    let digest: [u8; 32] = Sha256::digest(transcript).into();
+    crate::client::chat_wire::verify_control_sequencer_receipt(
+        receipt,
+        i13_key,
+        authority_did,
+        entry["conversationId"].as_str().ok_or_else(invalid)?,
+        entry["entryId"].as_str().ok_or_else(invalid)?,
+        entry["seq"].as_i64().ok_or_else(invalid)?,
+        body["actorDid"].as_str().ok_or_else(invalid)?,
+        body["actorDeviceId"].as_str().ok_or_else(invalid)?,
+        &body["next"],
+        &digest,
+    )
+    .map_err(|_| invalid())?;
+    Ok(verified)
+}
+
 pub(crate) fn normalized_close_entry(mut entry: Value) -> Result<Value> {
+    normalize_control_sequencer_receipt(&mut entry)?;
     for (pointer, expected) in [
         ("/$type", "blue.catbird.chat.defs#conversationCloseEntry"),
         (
@@ -280,6 +373,11 @@ impl DirectRequestCloseProof {
         // schema references are untagged; validate each optional tag before
         // removing it for the canonical outer-entry projection.
         let mut plain = entry.clone();
+        plain
+            .as_object_mut()
+            .ok_or_else(invalid)?
+            .remove("sequencerReceipt")
+            .ok_or_else(invalid)?;
         for (pointer, expected) in [
             ("", "conversationCloseEntry"),
             ("/signedRequest", "signedConversationClose"),
@@ -610,6 +708,21 @@ mod tests {
                 "signature": STANDARD.encode([5u8; 64])
             },
             "receivedAt": "2026-07-22T12:34:56.000Z",
+            "sequencerReceipt": {
+                "sequencerDid": "did:web:chat.catbird.blue",
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "generation": 0,
+                "groupId": STANDARD.encode([2u8; 32]),
+                "epoch": 0,
+                "senderDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                "senderDeviceId": "72727272-7272-4272-b272-727272727272",
+                "entryId": "66666666-6666-4666-a666-666666666666",
+                "archiveCommitment": STANDARD.encode([6u8; 32]),
+                "seq": 10,
+                "issuedAtMs": 1,
+                "kid": "did:web:chat.catbird.blue#mls-receipt-1",
+                "signature": STANDARD.encode([7u8; 64])
+            },
             "tombstone": tombstone
         })
     }

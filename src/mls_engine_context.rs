@@ -6540,10 +6540,10 @@ impl MLSContext {
     }
 
     /// [`MlsCryptoContext::reserve_application_send`] on this context's account database: the
-    /// cached group encrypts through a provider bound to the very write transaction that
-    /// reserves the `sendCounter` and journals the send, so all three commit or none does. A
-    /// rolled-back write fires the cache-eviction hook, and the group reloads from storage
-    /// before any reuse of the ratchet it advanced in memory.
+    /// cached group encrypts through a provider bound to the write transaction that journals the
+    /// candidate `sendCounter` and send, so both commit or neither does. The accepted-counter
+    /// watermark advances only after a verified response or own echo. A rolled-back write fires
+    /// the cache-eviction hook, and the group reloads from storage before any ratchet reuse.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve_application_send(
         &self,
@@ -6603,7 +6603,6 @@ impl MLSContext {
                     .map_err(|_| MLSError::SerializationError)?;
                 let reserved = complete(send_counter, &ciphertext)?;
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                tx.put_account_meta(&counter_key, &send_counter.to_string(), now_ms)?;
                 tx.put_pending_op(
                     ORCHESTRATOR_APPLICATION_SEND_OP,
                     message_id,
@@ -6616,8 +6615,34 @@ impl MLSContext {
     }
 
     /// [`MlsCryptoContext::discard_application_send`].
-    pub fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
+    pub fn discard_application_send(
+        &self,
+        message_id: &str,
+        stale_send: bool,
+    ) -> Result<(), MLSError> {
         self.account_db()?.write_tx(|tx| {
+            if stale_send {
+                if let Some(raw) =
+                    tx.get_pending_op(ORCHESTRATOR_APPLICATION_SEND_OP, message_id)?
+                {
+                    let reserved: ReservedApplicationSend =
+                        serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+                    let send_counter = reserved.body["sendCounter"]
+                        .as_u64()
+                        .ok_or(MLSError::SerializationError)?;
+                    let counter_key =
+                        crate::client::chat_wire::send_counter_key(&reserved.conversation_id);
+                    let confirmed = crate::client::chat_wire::confirmed_send_counter(
+                        tx.get_account_meta(&counter_key)?.as_deref(),
+                        send_counter,
+                    )?;
+                    tx.put_account_meta(
+                        &counter_key,
+                        &confirmed.to_string(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                }
+            }
             tx.delete_pending_op(ORCHESTRATOR_APPLICATION_SEND_OP, message_id)
                 .map(drop)
         })
@@ -6631,6 +6656,24 @@ impl MLSContext {
     ) -> Result<(), MLSError> {
         let (key_hex, payload_json) = crate::mls_context::own_echo_proof_row(proof)?;
         self.account_db()?.write_tx(|tx| {
+            if let Some(raw) = tx.get_pending_op(ORCHESTRATOR_APPLICATION_SEND_OP, message_id)? {
+                let reserved: ReservedApplicationSend =
+                    serde_json::from_str(&raw).map_err(|_| MLSError::SerializationError)?;
+                let send_counter = reserved.body["sendCounter"]
+                    .as_u64()
+                    .ok_or(MLSError::SerializationError)?;
+                let counter_key =
+                    crate::client::chat_wire::send_counter_key(&reserved.conversation_id);
+                let confirmed = crate::client::chat_wire::confirmed_send_counter(
+                    tx.get_account_meta(&counter_key)?.as_deref(),
+                    send_counter,
+                )?;
+                tx.put_account_meta(
+                    &counter_key,
+                    &confirmed.to_string(),
+                    chrono::Utc::now().timestamp_millis(),
+                )?;
+            }
             tx.put_pending_op(
                 "own_echo_proof",
                 &key_hex,
@@ -8753,8 +8796,8 @@ impl MlsCryptoContext for MLSContext {
         )
     }
 
-    fn discard_application_send(&self, message_id: &str) -> Result<(), MLSError> {
-        MLSContext::discard_application_send(self, message_id)
+    fn discard_application_send(&self, message_id: &str, stale_send: bool) -> Result<(), MLSError> {
+        MLSContext::discard_application_send(self, message_id, stale_send)
     }
 
     fn spend_application_send(

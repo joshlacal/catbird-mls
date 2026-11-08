@@ -12,10 +12,13 @@ pub const INLINE_CIPHERTEXT_MAX_BYTES: usize = 2200;
 
 /// Darwin notification posted after NSE commits decrypted messages to `<did_hash>.db` (`Spec §5 I11`).
 pub const DARWIN_NSE_DID_COMMIT_NOTIFICATION: &str = "blue.catbird.mls.nseDidCommit";
+/// Durable pending-op kind written when the NSE cannot verify and apply a Commit/control locally.
+pub(crate) const NSE_DEFERRED_CONTROL_OP: &str = "nse_deferred_control";
 
 /// Returns `true` iff `ciphertext` fits within the `I12` 2,200-byte inline push ceiling.
 pub fn should_inline_push_ciphertext(ciphertext: &[u8]) -> bool {
     ciphertext.len() <= INLINE_CIPHERTEXT_MAX_BYTES
+        || crate::planted::is_planted_bug_active(crate::planted::PlantedBug::OversizedInlinePush)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

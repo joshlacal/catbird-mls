@@ -212,21 +212,32 @@ fn malicious_ds_recovery_views_never_add_a_device() {
         view
     };
 
-    for (case, view) in [
-        (
-            "an unsigned request",
-            edited(&|view| {
-                view.as_object_mut().unwrap().remove("signedRequest");
-            }),
-        ),
-        ("a stranger's signed add", stranger),
-    ] {
-        list(&ds, cid, vec![view]);
-        alice
-            .sync()
-            .unwrap_or_else(|error| panic!("{case} is no work: {error:?}"));
-        assert_eq!(local(), before, "{case}");
-    }
+    let unsigned = edited(&|view| {
+        view.as_object_mut().unwrap().remove("signedRequest");
+    });
+    list(&ds, cid, vec![unsigned]);
+    alice
+        .sync()
+        .expect("an unsigned listing is not this device's work");
+    assert_eq!(local(), before);
+
+    list(&ds, cid, vec![stranger]);
+    let error = alice
+        .sync()
+        .expect_err("a signed zero-leaf stranger lacks admission proof");
+    assert!(matches!(
+        error,
+        MLSError::SyncIncomplete { ref failures, .. }
+            if matches!(
+                failures.as_slice(),
+                [failure]
+                    if matches!(
+                        failure.error.as_ref(),
+                        MLSError::AdmissionProofUnavailable { .. }
+                    )
+            )
+    ));
+    assert_eq!(local(), before);
 
     let mut other_coordinate = genuine["boundCoordinate"].clone();
     other_coordinate["stateVersion"] =
@@ -431,7 +442,7 @@ fn signed_replace_removes_and_readds_the_exact_leaf() {
     assert_eq!(request["recoveryKind"], "replace", "{request}");
     let entries = ds.entry_count(cid);
     bob2.sync()
-        .expect("a replace of its own account is no work");
+        .expect("a same-account replace is another account's work");
     assert!(fulfillments(ds, &bob2_dev).is_empty());
     assert_eq!(ds.entry_count(cid), entries);
 

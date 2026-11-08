@@ -849,6 +849,8 @@ fn validate_existing_sqlite_storage(
         key_spec.as_str()
     ))
     .map_err(|e| MLSError::invalid_input(format!("SQLCipher 96-hex key init failed: {e}")))?;
+    crate::storage::driver_native::configure_apple_fullfsync(&conn)
+        .map_err(|e| MLSError::invalid_input(format!("Apple fullfsync pragmas failed: {e}")))?;
     let _ = conn.busy_timeout(NORMAL_BUSY_TIMEOUT);
 
     // 0. Full read-only database page integrity checks before inspecting tables

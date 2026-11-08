@@ -6,8 +6,8 @@ use std::sync::Arc;
 use crate::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, wipe_pre_cutover_local_artifacts,
     CatbirdMlsClient, CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus,
-    OtcPairingCompletion, OtcPairingOffer, PlatformChangeObserver, PlatformKeyStore,
-    PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload,
+    OtcPairingCompletion, OtcPairingOffer, PendingGroupCreationStatus, PlatformChangeObserver,
+    PlatformKeyStore, PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload,
     SignedPushGatewayRegistration, SpacesEligibilityInput, SpacesEligibilityStatus,
 };
 use crate::error::MLSError;
@@ -189,6 +189,30 @@ impl CatbirdMlsClient {
             title,
             description,
         )
+    }
+
+    #[uniffi::method(name = "pending_group_creation_status")]
+    pub fn ffi_pending_group_creation_status(
+        &self,
+        conversation_id: String,
+    ) -> Result<Option<PendingGroupCreationStatus>, MLSError> {
+        self.pending_group_creation_status(&conversation_id)
+    }
+
+    #[uniffi::method(name = "retry_pending_group_creation")]
+    pub fn ffi_retry_pending_group_creation(
+        &self,
+        conversation_id: String,
+    ) -> Result<Option<ConversationRow>, MLSError> {
+        self.retry_pending_group_creation(&conversation_id)
+    }
+
+    #[uniffi::method(name = "cancel_pending_group_creation")]
+    pub fn ffi_cancel_pending_group_creation(
+        &self,
+        conversation_id: String,
+    ) -> Result<bool, MLSError> {
+        self.cancel_pending_group_creation(&conversation_id)
     }
 
     #[uniffi::method(name = "add_group_members")]

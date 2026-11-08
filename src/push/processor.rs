@@ -3,8 +3,9 @@
 //! Enforces:
 //! - `G1`: Zero Tokio worker pool; `OpenMode::PushExtension` (`cache_size = -512`, `mmap_size = 0`);
 //!   lazy-loads **only** the target `MlsGroup` (never all groups or all KeyPackages).
-//! - `I4` (`F-02`): Every `Commit` leaf addition/update and every `ApplicationMessage` sender leaf
-//!   must match a DID-rooted authorized ATProto device signature key before merging or persisting.
+//! - `I4` (`F-02`): Every `ApplicationMessage` sender leaf and every NSE-applied Commit must match
+//!   a DID-rooted authorized ATProto device signature key before persisting. Unverified controls
+//!   remain for foreground sync.
 //! - `I6`: All network fetches (`fetch_missing_entries`, `get_authorized_device_keys`) execute
 //!   strictly **outside** `BEGIN IMMEDIATE`.
 //! - `I7`: `MlsAccountDb::write_tx` reconciles `PRAGMA data_version` inside `BEGIN IMMEDIATE`.
@@ -20,24 +21,31 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
 use openmls::prelude::*;
 use openmls_traits::OpenMlsProvider;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::client::chat_wire;
+use crate::chat_v2::transcript::SignedMutationKind;
+use crate::client::{
+    apply_verified_roster_effects, chat_wire, verify_control_entry_receipt_with_key,
+    CatbirdMlsClient,
+};
 use crate::error::MLSError;
 use crate::keychain::KeychainAccess;
 use crate::metadata::{decrypt_metadata_snapshot, derive_metadata_key_from_group};
 use crate::storage::{
-    ConversationRow, GroupMetadataRow, MessageRow, MlsAccountDb, OpenMlsKvStorage, OpenMode,
-    RusqliteKvBackend,
+    ConversationRow, GroupMetadataRow, KvWriteBatch, KvWriteOverlay, MessageRow, MlsAccountDb,
+    OpenMlsKvStorage, OpenMode, RusqliteKvBackend, SqlTx,
 };
 
 use super::{
     should_inline_push_ciphertext, DARWIN_NSE_DID_COMMIT_NOTIFICATION, INLINE_CIPHERTEXT_MAX_BYTES,
+    NSE_DEFERRED_CONTROL_OP,
 };
 
 pub(crate) const NATIVE_ARCHIVE_RECEIPT_OP: &str = "native_archive_receipt";
@@ -76,6 +84,12 @@ pub struct FetchedPushEntry {
     pub entry_kind: String,
     pub sender_did: String,
     pub mls_bytes: Vec<u8>,
+    /// JSON-encoded actor-signed request returned by `getEntries`.
+    #[serde(default)]
+    pub signed_request: Option<Vec<u8>>,
+    /// JSON-encoded sequencer receipt returned by `getEntries`.
+    #[serde(default)]
+    pub sequencer_receipt: Option<Vec<u8>>,
 }
 
 /// Encrypted `chat.metadata_snapshots` blob fetched on group metadata cache miss (`1A`).
@@ -112,6 +126,7 @@ pub struct NotificationPreview {
     pub from_cache: bool,
     pub fallback_generic: bool,
     pub darwin_notification_name: String,
+    pub receipt_verified: bool,
 }
 
 /// Synchronous keystore interface for NSE / FCM (`sha256(normalized_did)`-keyed, zero OAuth refresh).
@@ -239,16 +254,6 @@ pub(crate) fn parse_canonical_message_body(
     crate::messaging::receive::parse_canonical_message_body(payload_bytes)
 }
 
-fn extract_message_epoch_hint(mls_bytes: &[u8]) -> Option<u64> {
-    use openmls::prelude::tls_codec::Deserialize as TlsDeserialize;
-    let mls_in = MlsMessageIn::tls_deserialize_exact(mls_bytes).ok()?;
-    match mls_in.extract() {
-        MlsMessageBodyIn::PrivateMessage(pm) => Some(pm.epoch().as_u64()),
-        MlsMessageBodyIn::PublicMessage(pm) => Some(pm.epoch().as_u64()),
-        _ => None,
-    }
-}
-
 fn deserialize_cbor_bytes<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<u8>, D::Error> {
@@ -308,71 +313,6 @@ fn authenticated_application_message_id(
     Err(MLSError::Cryptography(
         "push application is missing canonical authenticated identity".into(),
     ))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CommitAadPrior {
-    #[serde(deserialize_with = "deserialize_cbor_bytes")]
-    conversation_id: Vec<u8>,
-    generation: i64,
-    state_version: i64,
-    #[serde(deserialize_with = "deserialize_cbor_bytes")]
-    group_id: Vec<u8>,
-    epoch: u64,
-    #[serde(deserialize_with = "deserialize_cbor_bytes")]
-    group_context_hash: Vec<u8>,
-    #[serde(deserialize_with = "deserialize_cbor_bytes")]
-    confirmation_tag: Vec<u8>,
-    lifecycle: String,
-}
-
-/// The MLS signature authenticates this prior even though the push ABI deliberately
-/// carries only MLS bytes, not the DS's unsigned `coordinates` presentation.
-fn authenticated_commit_prior<P: OpenMlsProvider>(
-    aad: &[u8],
-    convo: &ConversationRow,
-    group: &MlsGroup,
-    provider: &P,
-) -> Result<Option<Value>, MLSError> {
-    let Some(cbor) = aad.strip_prefix(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0") else {
-        return Ok(None);
-    };
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct CommitAad {
-        #[serde(deserialize_with = "deserialize_cbor_bytes")]
-        conversation_id: Vec<u8>,
-        generation: i64,
-        prior: CommitAadPrior,
-    }
-    let parsed: CommitAad = serde_ipld_dagcbor::from_slice(cbor)
-        .map_err(|e| MLSError::Cryptography(format!("invalid authenticated commitAad: {e}")))?;
-    let prior = parsed.prior;
-    let cid = uuid::Uuid::parse_str(&convo.conversation_id)
-        .map_err(|e| MLSError::Cryptography(format!("invalid commit conversation UUID: {e}")))?;
-    let (gch, tag) = chat_wire::compute_group_context_hash_and_tag(group, provider)?;
-    if parsed.conversation_id.as_slice() != cid.as_bytes()
-        || prior.conversation_id.as_slice() != cid.as_bytes()
-        || parsed.generation != convo.generation
-        || prior.generation != convo.generation
-        || prior.group_id != convo.group_id
-        || prior.epoch != group.epoch().as_u64()
-        || prior.group_context_hash.as_slice() != gch.as_slice()
-        || prior.confirmation_tag != tag
-        || prior.lifecycle != "active"
-        || prior.state_version < 0
-    {
-        return Err(MLSError::Cryptography(
-            "authenticated commitAad does not bind the local conversation prior".into(),
-        ));
-    }
-    Ok(Some(json!({
-        "conversationId": convo.conversation_id, "generation": prior.generation,
-        "stateVersion": prior.state_version, "groupId": { "$bytes": STANDARD.encode(prior.group_id) },
-        "epoch": prior.epoch, "groupContextHash": { "$bytes": STANDARD.encode(gch) },
-        "confirmationTag": { "$bytes": STANDARD.encode(tag) }, "lifecycle": "active",
-    })))
 }
 
 pub(crate) fn verify_leaf_binding_i4(
@@ -474,6 +414,355 @@ pub(crate) fn verify_staged_commit_i4(
     Ok(())
 }
 
+fn fetched_entry_kind_matches(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let fragment = expected.rsplit('#').next().unwrap_or(expected);
+    actual == fragment
+        || fragment.strip_suffix("Entry") == Some(actual)
+        || (expected == crate::chat_v2::wire::APPLICATION_ENTRY_KIND
+            && matches!(actual, "application_message" | "applicationMessage"))
+}
+
+struct VerifiedPushCommit {
+    kind: SignedMutationKind,
+    body: Value,
+    next: Value,
+    actor_is_own: bool,
+}
+
+const FOREGROUND_SYNC_REQUIRED: &str = "NseForegroundSyncRequired";
+
+fn foreground_sync_required() -> MLSError {
+    MLSError::InvalidState(FOREGROUND_SYNC_REQUIRED.into())
+}
+
+struct VerifiedPushApplicationReceipt {
+    receipt: Value,
+    key: Vec<u8>,
+    sender_did: String,
+    sender_device_id: String,
+}
+
+fn verify_push_application_receipt(
+    tx: &SqlTx<'_>,
+    entry: &FetchedPushEntry,
+    conversation: &ConversationRow,
+) -> Result<VerifiedPushApplicationReceipt, MLSError> {
+    let receipt: Value =
+        serde_json::from_slice(entry.sequencer_receipt.as_deref().ok_or_else(|| {
+            MLSError::Cryptography("push application missing sequencerReceipt".into())
+        })?)
+        .map_err(|error| {
+            MLSError::Cryptography(format!("push application sequencerReceipt JSON: {error}"))
+        })?;
+    let kid = chat_wire::sequencer_receipt_kid(&conversation.sequencer_did, &receipt)?;
+    let did_document = tx
+        .get_account_meta(&format!("did_doc:{}", conversation.sequencer_did))?
+        .ok_or_else(|| MLSError::Cryptography("push sequencer key is not stored locally".into()))?;
+    let key = chat_wire::decode_p256_sec1_from_did_doc(
+        did_document.as_bytes(),
+        &conversation.sequencer_did,
+        kid,
+    )?;
+    let verified = chat_wire::verify_pruned_application_receipt(
+        &receipt,
+        &key,
+        &conversation.sequencer_did,
+        &conversation.conversation_id,
+        &conversation.group_id,
+        &entry.entry_id,
+        entry.seq,
+    )?;
+    if verified.generation != conversation.generation
+        || (!entry.sender_did.is_empty() && entry.sender_did != verified.sender_did)
+    {
+        return Err(MLSError::Cryptography(
+            "push application receipt generation or sender mismatch".into(),
+        ));
+    }
+    Ok(VerifiedPushApplicationReceipt {
+        receipt,
+        key,
+        sender_did: verified.sender_did,
+        sender_device_id: verified.sender_device_id,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_push_commit_control<P: OpenMlsProvider>(
+    tx: &SqlTx<'_>,
+    entry: &FetchedPushEntry,
+    conversation: &ConversationRow,
+    group: &MlsGroup,
+    provider: &P,
+    owner_did: Option<&str>,
+    authorized_keys: &HashMap<String, Vec<AuthorizedPeerDeviceKey>>,
+) -> Result<VerifiedPushCommit, MLSError> {
+    let signed_request: Value = serde_json::from_slice(
+        entry
+            .signed_request
+            .as_deref()
+            .ok_or_else(|| MLSError::Cryptography("push control missing signedRequest".into()))?,
+    )
+    .map_err(|e| MLSError::Cryptography(format!("push control signedRequest JSON: {e}")))?;
+    let kind = signed_request
+        .pointer("/body/$type")
+        .and_then(Value::as_str)
+        .and_then(SignedMutationKind::from_type_id)
+        .filter(|kind| {
+            matches!(
+                kind,
+                SignedMutationKind::CommitTransition
+                    | SignedMutationKind::LeafRecoveryFulfillment
+                    | SignedMutationKind::LeaveCommitFulfillment
+            )
+        })
+        .ok_or_else(|| MLSError::Cryptography("push control is not a Commit transition".into()))?;
+    let expected_kind = chat_wire::entry_kind_of(kind)
+        .ok_or_else(|| MLSError::Cryptography("push control has no entry kind".into()))?;
+    if !fetched_entry_kind_matches(&entry.entry_kind, expected_kind) {
+        return Err(MLSError::Cryptography(
+            "push control entry kind differs from its signed body".into(),
+        ));
+    }
+
+    let unverified_body = &signed_request["body"];
+    let actor_did = unverified_body["actorDid"]
+        .as_str()
+        .ok_or_else(|| MLSError::Cryptography("push control missing actorDid".into()))?;
+    let actor_device_id = unverified_body["actorDeviceId"]
+        .as_str()
+        .ok_or_else(|| MLSError::Cryptography("push control missing actorDeviceId".into()))?;
+    let actor_member = group
+        .members()
+        .find(|member| {
+            root_did_from_credential_bytes(member.credential.serialized_content())
+                .is_ok_and(|(did, device)| did == actor_did && device == actor_device_id)
+        })
+        .ok_or_else(|| {
+            MLSError::insufficient_permissions(
+                "I4/F-02: push control actor is not a current MLS leaf",
+            )
+        })?;
+    verify_leaf_binding_i4(
+        actor_member.credential.serialized_content(),
+        &actor_member.signature_key,
+        owner_did,
+        authorized_keys,
+    )?;
+    let (body, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
+        &signed_request,
+        kind,
+        &actor_member.signature_key,
+    )?;
+    let commit_bytes = body
+        .pointer("/commit/bytes")
+        .ok_or_else(|| MLSError::Cryptography("push Commit body missing bytes".into()))
+        .and_then(chat_wire::json_bytes)?;
+    if commit_bytes != entry.mls_bytes {
+        return Err(MLSError::Cryptography(
+            "push Commit bytes differ from signedRequest".into(),
+        ));
+    }
+
+    let prior = chat_wire::canonicalize_wire_coordinate(
+        &body["prior"],
+        Some(&conversation.conversation_id),
+    )?;
+    let next = chat_wire::canonicalize_wire_coordinate(
+        &body["next"],
+        Some(&conversation.conversation_id),
+    )?;
+    let stepped_state_version = prior["stateVersion"]
+        .as_i64()
+        .and_then(|version| version.checked_add(1));
+    if prior["generation"].as_i64() != Some(conversation.generation)
+        || next["generation"].as_i64() != Some(conversation.generation)
+        || next["stateVersion"].as_i64() != stepped_state_version
+        || next["epoch"].as_u64() != group.epoch().as_u64().checked_add(1)
+        || prior["lifecycle"].as_str() != Some("active")
+        || next["lifecycle"].as_str() != Some("active")
+    {
+        return Err(MLSError::Cryptography(
+            "push Commit does not step the local conversation coordinate".into(),
+        ));
+    }
+    chat_wire::require_coordinate_names_group(&prior, group, provider)?;
+
+    let receipt: Value =
+        serde_json::from_slice(entry.sequencer_receipt.as_deref().ok_or_else(|| {
+            MLSError::Cryptography("push control missing sequencerReceipt".into())
+        })?)
+        .map_err(|e| MLSError::Cryptography(format!("push control sequencerReceipt JSON: {e}")))?;
+    let kid = chat_wire::sequencer_receipt_kid(&conversation.sequencer_did, &receipt)?;
+    let did_document = tx
+        .get_account_meta(&format!("did_doc:{}", conversation.sequencer_did))?
+        .ok_or_else(|| MLSError::Cryptography("push sequencer key is not stored locally".into()))?;
+    let receipt_key = chat_wire::decode_p256_sec1_from_did_doc(
+        did_document.as_bytes(),
+        &conversation.sequencer_did,
+        kid,
+    )?;
+    verify_control_entry_receipt_with_key(
+        &conversation.sequencer_did,
+        &conversation.conversation_id,
+        &entry.entry_id,
+        entry.seq,
+        &receipt,
+        &body,
+        &request_digest,
+        &receipt_key,
+        None,
+    )?;
+
+    let actor_is_own = group.own_leaf_node().is_some_and(|own| {
+        own.credential().serialized_content() == actor_member.credential.serialized_content()
+            && own.signature_key().as_slice() == actor_member.signature_key.as_slice()
+    });
+    Ok(VerifiedPushCommit {
+        kind,
+        body,
+        next,
+        actor_is_own,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_verified_push_commit(
+    tx: &SqlTx<'_>,
+    keychain: Arc<dyn KeychainAccess>,
+    hooks: &crate::sim_hooks::SimClientHooks,
+    conversation: &ConversationRow,
+    entry: &FetchedPushEntry,
+    verified: &VerifiedPushCommit,
+    owner_did: Option<&str>,
+    authorized_keys: &HashMap<String, Vec<AuthorizedPeerDeviceKey>>,
+) -> Result<(KvWriteBatch, bool, u64), MLSError> {
+    let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+    let storage = OpenMlsKvStorage::with_keychain(&overlay, keychain);
+    let provider = hooks.openmls_provider(storage);
+    if verified.actor_is_own {
+        let transition_id = verified.body["transitionId"]
+            .as_str()
+            .ok_or_else(|| MLSError::Cryptography("own push Commit missing transitionId".into()))?;
+        let raw = tx
+            .get_pending_op("commit_transition", transition_id)?
+            .ok_or_else(|| {
+                MLSError::Cryptography("own push Commit has no pending journal".into())
+            })?;
+        let pending: chat_wire::PendingCommitTransition = serde_json::from_str(&raw)
+            .map_err(|e| MLSError::Internal(format!("parse pending push Commit: {e}")))?;
+        let commit_sha256: [u8; 32] = Sha256::digest(&entry.mls_bytes).into();
+        let pending_prior = chat_wire::canonicalize_wire_coordinate(
+            &pending.prior,
+            Some(&conversation.conversation_id),
+        )?;
+        let pending_next = chat_wire::canonicalize_wire_coordinate(
+            &pending.next,
+            Some(&conversation.conversation_id),
+        )?;
+        if pending.conversation_id != conversation.conversation_id
+            || pending.transition_id != transition_id
+            || pending.commit_sha256 != commit_sha256
+            || pending_next != verified.next
+        {
+            return Err(MLSError::Cryptography(
+                "own push Commit differs from pending journal".into(),
+            ));
+        }
+        let current_group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&conversation.group_id),
+        )
+        .map_err(|e| MLSError::Internal(format!("load pending push group: {e:?}")))?
+        .ok_or_else(|| MLSError::GroupNotFound {
+            message: format!(
+                "MlsGroup missing for conversation {}",
+                conversation.conversation_id
+            ),
+        })?;
+        chat_wire::require_coordinate_names_group(&pending_prior, &current_group, &provider)?;
+        pending.kv_batch.apply(&overlay)?;
+        let group = MlsGroup::load(
+            provider.storage(),
+            &GroupId::from_slice(&conversation.group_id),
+        )
+        .map_err(|e| MLSError::Internal(format!("load applied pending push group: {e:?}")))?
+        .ok_or_else(|| MLSError::GroupNotFound {
+            message: format!(
+                "MlsGroup missing after pending Commit for conversation {}",
+                conversation.conversation_id
+            ),
+        })?;
+        chat_wire::require_coordinate_names_group(&verified.next, &group, &provider)?;
+        return Ok((pending.kv_batch, false, group.epoch().as_u64()));
+    }
+    let mut group = MlsGroup::load(
+        provider.storage(),
+        &GroupId::from_slice(&conversation.group_id),
+    )
+    .map_err(|e| MLSError::Internal(format!("load staged push group: {e:?}")))?
+    .ok_or_else(|| MLSError::GroupNotFound {
+        message: format!(
+            "MlsGroup missing for conversation {}",
+            conversation.conversation_id
+        ),
+    })?;
+    let protocol_message = MlsMessageIn::tls_deserialize_exact(&entry.mls_bytes)
+        .map_err(|e| MLSError::Cryptography(format!("deserialize push Commit: {e:?}")))?
+        .try_into_protocol_message()
+        .map_err(|e| MLSError::Cryptography(format!("push Commit protocol message: {e:?}")))?;
+    if protocol_message.epoch() != group.epoch() {
+        return Err(MLSError::Cryptography(
+            "push Commit is not for the local MLS epoch".into(),
+        ));
+    }
+    let processed = group
+        .process_message(&provider, protocol_message)
+        .map_err(|e| MLSError::Cryptography(format!("process push Commit: {e:?}")))?;
+    let sender = processed.sender().clone();
+    let actor_did = verified.body["actorDid"].as_str().unwrap_or_default();
+    let actor_device_id = verified.body["actorDeviceId"].as_str().unwrap_or_default();
+    let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+        return Err(MLSError::Cryptography(
+            "push control is not the authenticated Commit kind".into(),
+        ));
+    };
+    let Sender::Member(sender_index) = sender else {
+        return Err(MLSError::insufficient_permissions(
+            "I4/F-02: push Commit sender is not a member",
+        ));
+    };
+    let sender_member = group
+        .members()
+        .find(|member| member.index == sender_index)
+        .ok_or_else(|| {
+            MLSError::insufficient_permissions("I4/F-02: push Commit sender leaf is missing")
+        })?;
+    let (sender_did, sender_device_id) =
+        root_did_from_credential_bytes(sender_member.credential.serialized_content())?;
+    if sender_did != actor_did || sender_device_id != actor_device_id {
+        return Err(MLSError::Cryptography(
+            "push Commit MLS sender differs from signed actor".into(),
+        ));
+    }
+    verify_staged_commit_i4(
+        &group,
+        &Sender::Member(sender_index),
+        &staged,
+        owner_did,
+        authorized_keys,
+    )?;
+    let removed_self = staged.self_removed();
+    group
+        .merge_staged_commit(&provider, *staged)
+        .map_err(|e| MLSError::Cryptography(format!("merge push Commit: {e:?}")))?;
+    chat_wire::require_coordinate_names_group(&verified.next, &group, &provider)?;
+    Ok((overlay.into_batch(), removed_self, group.epoch().as_u64()))
+}
+
 #[cfg(target_vendor = "apple")]
 fn post_darwin_nse_commit_notification() {
     use std::ffi::CString;
@@ -506,6 +795,7 @@ fn build_generic_fallback_preview(
         seq: wake.entry_seq,
         from_cache: false,
         fallback_generic: true,
+        receipt_verified: false,
         darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
     }
 }
@@ -592,8 +882,8 @@ pub fn process_push_notification_with_hooks(
         convo: Option<ConversationRow>,
         cached_title: Option<String>,
         owner_did: Option<String>,
-        local_group_epoch: u64,
         authorized_keys: HashMap<String, Vec<AuthorizedPeerDeviceKey>>,
+        authorized_key_versions: HashMap<String, (String, i64)>,
         sender_display_name: Option<String>,
     }
 
@@ -660,44 +950,41 @@ pub fn process_push_notification_with_hooks(
                     seq,
                     from_cache: true,
                     fallback_generic: false,
+                    receipt_verified: true,
                     darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
                 }),
                 convo: None,
                 cached_title: None,
                 owner_did,
-                local_group_epoch: 0,
                 authorized_keys: HashMap::new(),
+                authorized_key_versions: HashMap::new(),
                 sender_display_name: None,
             });
         }
 
-        let mut local_group_epoch = 0u64;
-        if let Some(ref c) = convo {
-            let storage = OpenMlsKvStorage::with_keychain(
-                RusqliteKvBackend(tx.conn()),
-                Arc::clone(&keychain_adapter),
-            );
-            if let Some(group) = MlsGroup::load(&storage, &GroupId::from_slice(&c.group_id))
-                .map_err(|e| MLSError::Internal(format!("load single target MlsGroup: {e:?}")))?
-            {
-                local_group_epoch = group.epoch().as_u64();
-            }
-        }
-
         let mut authorized_keys = HashMap::new();
+        let mut authorized_key_versions = HashMap::new();
         {
             let mut stmt = tx
                 .conn()
                 .prepare(
-                    "SELECT key, value_json FROM account_meta WHERE key LIKE 'authorized_device_keys:%';",
+                    "SELECT key, value_json, updated_at_ms FROM account_meta \
+                     WHERE key LIKE 'authorized_device_keys:%';",
                 )
                 .map_err(|e| MLSError::Internal(format!("prepare authorized_device_keys: {e}")))?;
             let rows = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
                 .map_err(|e| MLSError::Internal(format!("query authorized_device_keys: {e}")))?;
             for row in rows {
-                let (k, v) = row.map_err(|e| MLSError::Internal(e.to_string()))?;
+                let (k, v, updated_at_ms) = row.map_err(|e| MLSError::Internal(e.to_string()))?;
                 if let Some(did) = k.strip_prefix("authorized_device_keys:") {
+                    authorized_key_versions.insert(did.to_string(), (v.clone(), updated_at_ms));
                     if let Ok(parsed) = serde_json::from_str::<Vec<AuthorizedPeerDeviceKey>>(&v) {
                         authorized_keys.insert(did.to_string(), parsed);
                     }
@@ -724,8 +1011,8 @@ pub fn process_push_notification_with_hooks(
             convo,
             cached_title,
             owner_did,
-            local_group_epoch,
             authorized_keys,
+            authorized_key_versions,
             sender_display_name,
         })
     })?;
@@ -740,75 +1027,101 @@ pub fn process_push_notification_with_hooks(
         return Ok(build_generic_fallback_preview(wake, None));
     };
 
-    let inline_epoch_behind = wake
-        .inline_ciphertext
-        .as_deref()
-        .and_then(extract_message_epoch_hint)
-        .is_some_and(|msg_epoch| msg_epoch > preflight.local_group_epoch);
-
-    let seq_gap = wake.entry_seq > convo.last_seq + 1;
-    let needs_network_fetch =
-        wake.fetch_required || wake.inline_ciphertext.is_none() || seq_gap || inline_epoch_behind;
-
+    // A wake carries no signed I13 receipt. Fetch the sequenced entry even when ciphertext was
+    // inlined so the NSE cannot advance a cursor from wake/server metadata alone. When offline,
+    // a contiguous inline application may still produce a verified preview, but its transaction
+    // is rolled back because the wake cannot authorize a durable sequence advance.
     // -------------------------------------------------------------------------
     // Phase 2: Network fetch STRICTLY OUTSIDE any SQLite write transaction (I6, I10).
     // -------------------------------------------------------------------------
-    let mut authorized_keys = preflight.authorized_keys;
-    let fetch_bundle = if needs_network_fetch {
-        let Some(ref net) = transport else {
-            let _ = db.prepare_for_background();
-            return Ok(build_generic_fallback_preview(wake, preflight.cached_title));
-        };
-        let Some(chat_dpop_token) = keystore
+    let chat_dpop_token = if transport.is_some() {
+        keystore
             .load_cached_chat_dpop_token(account_did_hash.to_ascii_lowercase())?
-            .filter(|t| !t.trim().is_empty())
-        else {
-            // I10: never refresh OAuth in NSE; render generic text cleanly.
-            let _ = db.prepare_for_background();
-            return Ok(build_generic_fallback_preview(wake, preflight.cached_title));
-        };
-
-        let bundle = net.fetch_missing_entries(
-            wake.conversation_id.clone(),
-            convo.last_seq,
-            chat_dpop_token.clone(),
-        )?;
-
-        for key in &bundle.authorized_device_keys {
-            authorized_keys
-                .entry(key.did.clone())
-                .or_default()
-                .push(key.clone());
+            .filter(|token| !token.trim().is_empty())
+    } else {
+        None
+    };
+    let network = transport.as_ref().zip(chat_dpop_token.as_ref());
+    let inline_preview = if !wake.fetch_required
+        && fetched_entry_kind_matches(&wake.kind, crate::chat_v2::wire::APPLICATION_ENTRY_KIND)
+    {
+        supplied_message_id.zip(wake.inline_ciphertext.as_ref())
+    } else {
+        None
+    };
+    let mut preview_only = false;
+    let inline_bundle = |message_id: &str, inline_ciphertext: &[u8]| PushFetchBundle {
+        entries: vec![FetchedPushEntry {
+            entry_id: message_id.to_owned(),
+            seq: wake.entry_seq,
+            epoch: convo.epoch,
+            entry_kind: crate::chat_v2::wire::APPLICATION_ENTRY_KIND.to_owned(),
+            sender_did: wake.sender_did.clone().unwrap_or_default(),
+            mls_bytes: inline_ciphertext.to_vec(),
+            signed_request: None,
+            sequencer_receipt: None,
+        }],
+        metadata_snapshot: None,
+        authorized_device_keys: Vec::new(),
+    };
+    let fetch_bundle = if let Some((net, token)) = network {
+        match net.fetch_missing_entries(wake.conversation_id.clone(), convo.last_seq, token.clone())
+        {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                let Some((message_id, inline_ciphertext)) = inline_preview else {
+                    return Err(error);
+                };
+                preview_only = true;
+                inline_bundle(message_id, inline_ciphertext)
+            }
         }
-
+    } else if let Some((message_id, inline_ciphertext)) = inline_preview {
+        preview_only = true;
+        inline_bundle(message_id, inline_ciphertext)
+    } else {
+        // I10: never refresh OAuth in NSE; render generic text cleanly.
+        let _ = db.prepare_for_background();
+        return Ok(build_generic_fallback_preview(wake, preflight.cached_title));
+    };
+    let mut authorized_keys = preflight.authorized_keys;
+    let authorized_key_versions = preflight.authorized_key_versions;
+    let mut dirty_authorized_keys = HashSet::new();
+    for key in &fetch_bundle.authorized_device_keys {
+        dirty_authorized_keys.insert(key.did.clone());
+        authorized_keys
+            .entry(key.did.clone())
+            .or_default()
+            .push(key.clone());
+    }
+    if let Some((net, token)) = network.filter(|_| !preview_only) {
         let mut candidate_dids: HashSet<String> = HashSet::new();
-        if let Some(ref s) = wake.sender_did {
-            candidate_dids.insert(s.clone());
+        if let Some(sender) = &wake.sender_did {
+            candidate_dids.insert(sender.clone());
         }
-        for entry in &bundle.entries {
+        for entry in &fetch_bundle.entries {
             if !entry.sender_did.is_empty() {
                 candidate_dids.insert(entry.sender_did.clone());
             }
         }
         for did in candidate_dids {
-            if let std::collections::hash_map::Entry::Vacant(e) = authorized_keys.entry(did) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = authorized_keys.entry(did) {
                 let fetched_keys =
-                    net.get_authorized_device_keys(e.key().clone(), Some(chat_dpop_token.clone()))?;
+                    net.get_authorized_device_keys(entry.key().clone(), Some(token.clone()))?;
                 if !fetched_keys.is_empty() {
-                    e.insert(fetched_keys);
+                    dirty_authorized_keys.insert(entry.key().clone());
+                    entry.insert(fetched_keys);
                 }
             }
         }
-
-        Some(bundle)
-    } else {
-        None
-    };
+    }
 
     // -------------------------------------------------------------------------
     // Phase 3: Atomic BEGIN IMMEDIATE write transaction (I7, I4, I13).
     // -------------------------------------------------------------------------
+    let mut unsequenced_preview = None;
     let preview_res = db.write_tx(|tx| {
+        let result = (|| {
         // Re-check inside BEGIN IMMEDIATE in case the foreground app already inserted this message.
         let concurrent_msg: Option<(String, String, String, i64, i64)> = tx
             .conn()
@@ -851,18 +1164,51 @@ pub fn process_push_notification_with_hooks(
                 seq,
                 from_cache: true,
                 fallback_generic: false,
+                receipt_verified: true,
                 darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
             });
         }
 
         let now_ms = hooks.now_ms();
 
-        // Persist any newly fetched authorized device keys in account_meta.
-        if fetch_bundle.is_some() {
-            for (did, keys) in &authorized_keys {
-                let json = serde_json::to_string(keys)
-                    .map_err(|e| MLSError::Internal(format!("serialize authorized keys: {e}")))?;
-                tx.put_account_meta(&format!("authorized_device_keys:{did}"), &json, now_ms)?;
+        // Write only fetched rows, and only if the row still matches preflight. A foreground
+        // invalidation or replacement wins the race; the NSE must never resurrect its stale copy.
+        for did in &dirty_authorized_keys {
+            let Some(keys) = authorized_keys.get(did) else {
+                continue;
+            };
+            let json = serde_json::to_string(keys)
+                .map_err(|e| MLSError::Internal(format!("serialize authorized keys: {e}")))?;
+            let key = format!("authorized_device_keys:{did}");
+            match authorized_key_versions.get(did) {
+                Some((expected_json, expected_updated_at_ms)) => {
+                    tx.conn()
+                        .execute(
+                            "UPDATE account_meta SET value_json = ?1, updated_at_ms = ?2 \
+                             WHERE key = ?3 AND value_json = ?4 AND updated_at_ms = ?5",
+                            rusqlite::params![
+                                json,
+                                now_ms,
+                                key,
+                                expected_json,
+                                expected_updated_at_ms
+                            ],
+                        )
+                        .map_err(|e| {
+                            MLSError::Internal(format!("CAS authorized device keys: {e}"))
+                        })?;
+                }
+                None => {
+                    tx.conn()
+                        .execute(
+                            "INSERT OR IGNORE INTO account_meta(key, value_json, updated_at_ms) \
+                             VALUES(?1, ?2, ?3)",
+                            rusqlite::params![key, json, now_ms],
+                        )
+                        .map_err(|e| {
+                            MLSError::Internal(format!("insert authorized device keys: {e}"))
+                        })?;
+                }
             }
         }
 
@@ -877,28 +1223,137 @@ pub fn process_push_notification_with_hooks(
                 message: format!("MlsGroup missing for conversation {}", wake.conversation_id),
             })?;
 
-        let entries_to_apply: Vec<FetchedPushEntry> = if let Some(ref bundle) = fetch_bundle {
-            let mut sorted = bundle.entries.clone();
-            sorted.sort_by_key(|e| e.seq);
-            sorted
-        } else {
-            let inline_bytes = wake.inline_ciphertext.clone().ok_or_else(|| {
-                MLSError::invalid_input("inline push wake missing inline_ciphertext")
-            })?;
-            vec![FetchedPushEntry {
-                entry_id: wake.message_id.clone(),
-                seq: wake.entry_seq,
-                epoch: group.epoch().as_u64() as i64,
-                entry_kind: wake.kind.clone(),
-                sender_did: wake.sender_did.clone().unwrap_or_default(),
-                mls_bytes: inline_bytes,
-            }]
-        };
+        let mut entries_to_apply = fetch_bundle.entries;
+        entries_to_apply.sort_by_key(|entry| entry.seq);
+        let fetched_metadata_snapshot = fetch_bundle.metadata_snapshot;
 
         let mut target_decrypted: Option<(String, String, String, i64, i64)> = None;
 
         for entry in entries_to_apply {
-            if entry.seq <= current_convo.last_seq && entry.seq != wake.entry_seq {
+            if entry.seq <= current_convo.last_seq {
+                continue;
+            }
+            if entry.seq != current_convo.last_seq.saturating_add(1) {
+                return Err(foreground_sync_required());
+            }
+            let is_application = fetched_entry_kind_matches(
+                &entry.entry_kind,
+                crate::chat_v2::wire::APPLICATION_ENTRY_KIND,
+            );
+            let verified_application_receipt = if is_application && !preview_only {
+                match verify_push_application_receipt(tx, &entry, &current_convo) {
+                    Ok(receipt) => Some(receipt),
+                    Err(_) => return Err(foreground_sync_required()),
+                }
+            } else {
+                None
+            };
+            if !is_application {
+                let verified = match verify_push_commit_control(
+                    tx,
+                    &entry,
+                    &current_convo,
+                    &group,
+                    &provider,
+                    preflight.owner_did.as_deref(),
+                    &authorized_keys,
+                ) {
+                    Ok(verified) => verified,
+                    Err(_) => {
+                        tx.put_pending_op(
+                            NSE_DEFERRED_CONTROL_OP,
+                            &wake.conversation_id,
+                            &entry.seq.to_string(),
+                            now_ms,
+                        )?;
+                        break;
+                    }
+                };
+                let (batch, removed_self, staged_epoch) = match stage_verified_push_commit(
+                    tx,
+                    Arc::clone(&keychain_adapter),
+                    hooks,
+                    &current_convo,
+                    &entry,
+                    &verified,
+                    preflight.owner_did.as_deref(),
+                    &authorized_keys,
+                ) {
+                    Ok(staged) => staged,
+                    Err(_) => {
+                        tx.put_pending_op(
+                            NSE_DEFERRED_CONTROL_OP,
+                            &wake.conversation_id,
+                            &entry.seq.to_string(),
+                            now_ms,
+                        )?;
+                        break;
+                    }
+                };
+                batch.apply(&RusqliteKvBackend(tx.conn()))?;
+                group = MlsGroup::load(
+                    provider.storage(),
+                    &GroupId::from_slice(&current_convo.group_id),
+                )
+                .map_err(|e| MLSError::Internal(format!("reload push Commit group: {e:?}")))?
+                .ok_or_else(|| MLSError::GroupNotFound {
+                    message: format!(
+                        "MlsGroup missing after Commit for conversation {}",
+                        wake.conversation_id
+                    ),
+                })?;
+                if group.epoch().as_u64() != staged_epoch {
+                    return Err(MLSError::Internal(
+                        "staged push Commit did not persist its MLS epoch".into(),
+                    ));
+                }
+                tx.put_account_meta(
+                    &format!("conversation_coords:{}", wake.conversation_id),
+                    &verified.next.to_string(),
+                    now_ms,
+                )?;
+                apply_verified_roster_effects(
+                    tx,
+                    &wake.conversation_id,
+                    verified.kind,
+                    &verified.body,
+                    now_ms,
+                )?;
+                tx.delete_account_meta(&chat_wire::leaf_recovery_authorization_key(
+                    &wake.conversation_id,
+                ))?;
+                for did in chat_wire::removed_participants(verified.kind, &verified.body) {
+                    tx.put_account_meta(
+                        &chat_wire::invitation_closed_key(&wake.conversation_id, &did),
+                        &entry.seq.to_string(),
+                        now_ms,
+                    )?;
+                }
+                current_convo.epoch = staged_epoch as i64;
+                current_convo.last_seq = current_convo.last_seq.max(entry.seq);
+                if verified.actor_is_own {
+                    tx.delete_pending_op(
+                        "commit_transition",
+                        verified.body["transitionId"].as_str().unwrap_or_default(),
+                    )?;
+                }
+                CatbirdMlsClient::prune_pending_commit_transitions(
+                    tx,
+                    &wake.conversation_id,
+                    current_convo.generation,
+                    current_convo.epoch,
+                    removed_self,
+                )?;
+                if tx
+                    .get_pending_op(NSE_DEFERRED_CONTROL_OP, &wake.conversation_id)?
+                    .and_then(|seq| seq.parse::<i64>().ok())
+                    .is_some_and(|seq| seq <= entry.seq)
+                {
+                    tx.delete_pending_op(NSE_DEFERRED_CONTROL_OP, &wake.conversation_id)?;
+                }
+                if removed_self {
+                    break;
+                }
                 continue;
             }
             if entry.mls_bytes.is_empty() {
@@ -924,26 +1379,16 @@ pub fn process_push_notification_with_hooks(
             let aad_bytes = processed.aad().to_vec();
             let msg_epoch = processed.epoch().as_u64() as i64;
             let sender = processed.sender().clone();
-            let previous_epoch = group.epoch().as_u64();
-            let commit_prior =
-                authenticated_commit_prior(&aad_bytes, &current_convo, &group, &provider)?;
 
             match processed.into_content() {
-                ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                    verify_staged_commit_i4(
-                        &group,
-                        &sender,
-                        &staged_commit,
-                        preflight.owner_did.as_deref(),
-                        &authorized_keys,
+                ProcessedMessageContent::StagedCommitMessage(_) => {
+                    tx.put_pending_op(
+                        NSE_DEFERRED_CONTROL_OP,
+                        &wake.conversation_id,
+                        &entry.seq.to_string(),
+                        now_ms,
                     )?;
-                    group
-                        .merge_staged_commit(&provider, *staged_commit)
-                        .map_err(|e| {
-                            MLSError::Cryptography(format!("merge_staged_commit failed: {e:?}"))
-                        })?;
-                    current_convo.epoch = group.epoch().as_u64() as i64;
-                    current_convo.last_seq = current_convo.last_seq.max(entry.seq);
+                    break;
                 }
                 ProcessedMessageContent::ApplicationMessage(app_msg) => {
                     let sender_member = match sender {
@@ -1022,6 +1467,46 @@ pub fn process_push_notification_with_hooks(
                         &message_id,
                         &commitment,
                     )?;
+                    if preview_only {
+                        target_decrypted = Some((
+                            message_id,
+                            verified_sender_did,
+                            body,
+                            msg_epoch,
+                            entry.seq,
+                        ));
+                        continue;
+                    }
+                    let Some(verified_receipt) = verified_application_receipt.as_ref() else {
+                        return Err(foreground_sync_required());
+                    };
+                    let Ok(bound_epoch) = u64::try_from(msg_epoch) else {
+                        return Err(foreground_sync_required());
+                    };
+                    let Ok((receipt_seq, receipt_generation, _)) =
+                        chat_wire::parse_and_verify_i13_sequencer_receipt(
+                            &verified_receipt.receipt,
+                            &verified_receipt.key,
+                            &current_convo.sequencer_did,
+                            &wake.conversation_id,
+                            &current_convo.group_id,
+                            bound_epoch,
+                            &entry.entry_id,
+                            &message_id,
+                            &commitment,
+                            Some(&original_sender_attestation),
+                        )
+                    else {
+                        return Err(foreground_sync_required());
+                    };
+                    if i64::try_from(receipt_seq).ok() != Some(entry.seq)
+                        || i64::try_from(receipt_generation).ok()
+                            != Some(current_convo.generation)
+                        || verified_receipt.sender_did != verified_sender_did
+                        || verified_receipt.sender_device_id != verified_device_id
+                    {
+                        return Err(foreground_sync_required());
+                    }
                     // The full archive payload with the authenticated receive-time roster; the
                     // app enqueues it once the entry's I13 receipt verifies.
                     let evidence = crate::client::QueuedLabyrinthArchivePayload {
@@ -1064,11 +1549,14 @@ pub fn process_push_notification_with_hooks(
                         &format!("native.message:{}:{message_id}", wake.conversation_id),
                         &serde_json::to_vec(&evidence)?, now_ms,
                     )?;
+                    // `entryId` is sequencer-local and federation may rebind it. The authenticated
+                    // message ID is the cross-sequencer identity; foreground sync verifies the
+                    // canonical sequencer's I13 receipt before archiving.
                     tx.put_pending_op(
                         NATIVE_ARCHIVE_RECEIPT_OP, &message_id,
                         &json!({
                             "conversation_id": wake.conversation_id, "seq": entry.seq,
-                            "entry_id": fetch_bundle.as_ref().map(|_| entry.entry_id.as_str()),
+                            "entry_id": null,
                         }).to_string(),
                         now_ms,
                     )?;
@@ -1118,67 +1606,24 @@ pub fn process_push_notification_with_hooks(
                         ));
                     }
                 }
-                ProcessedMessageContent::ProposalMessage(queued_prop) => {
-                    group
-                        .store_pending_proposal(provider.storage(), *queued_prop)
-                        .map_err(|e| {
-                            MLSError::Internal(format!("store_pending_proposal failed: {e:?}"))
-                        })?;
-                    current_convo.last_seq = current_convo.last_seq.max(entry.seq);
-                }
-                ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-                    return Err(MLSError::insufficient_permissions(
-                        "I3/I4: external join proposals are forbidden",
-                    ));
-                }
-                ProcessedMessageContent::OwnPendingCommit => {
-                    group.merge_pending_commit(&provider).map_err(|e| {
-                        MLSError::Cryptography(format!("merge_pending_commit failed: {e:?}"))
-                    })?;
-                    current_convo.epoch = group.epoch().as_u64() as i64;
-                    current_convo.last_seq = current_convo.last_seq.max(entry.seq);
-                }
-                ProcessedMessageContent::OwnPrivateMessage => {
-                    // This device's own private message never decrypts here, so nothing
-                    // authenticates it: stop catching up below it for foreground sync.
-                    break;
-                }
-                ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
-                    return Err(MLSError::InvalidInput {
-                        message: "unexpected UnresolvedAppDataCommit in push processor".to_string(),
-                    });
-                }
-            }
-            if group.epoch().as_u64() != previous_epoch {
-                if let Some(mut next) = commit_prior {
-                    if group.epoch().as_u64() != previous_epoch + 1 {
-                        return Err(MLSError::Cryptography("push Commit skipped an MLS epoch".into()));
-                    }
-                    let (gch, tag) =
-                        chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                    let state_version = next["stateVersion"].as_i64()
-                        .and_then(|version| version.checked_add(1))
-                        .ok_or_else(|| MLSError::Cryptography("commit stateVersion overflow".into()))?;
-                    next["stateVersion"] = json!(state_version);
-                    next["epoch"] = json!(group.epoch().as_u64());
-                    next["groupContextHash"] = json!({ "$bytes": STANDARD.encode(gch) });
-                    next["confirmationTag"] = json!({ "$bytes": STANDARD.encode(tag) });
-                    tx.put_account_meta(
-                        &format!("conversation_coords:{}", current_convo.conversation_id),
-                        &serde_json::to_string(&next)?, now_ms,
+                ProcessedMessageContent::ProposalMessage(_)
+                | ProcessedMessageContent::ExternalJoinProposalMessage(_)
+                | ProcessedMessageContent::OwnPendingCommit
+                | ProcessedMessageContent::OwnPrivateMessage
+                | ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                    tx.put_pending_op(
+                        NSE_DEFERRED_CONTROL_OP,
+                        &wake.conversation_id,
+                        &entry.seq.to_string(),
+                        now_ms,
                     )?;
-                } else {
-                    #[cfg(not(any(test, feature = "sim", feature = "test-utils")))]
-                    return Err(MLSError::Cryptography(
-                        "push Commit is missing a canonical authenticated prior".into(),
-                    ));
-                    // Raw MLS-only commits are supported exclusively by standalone crypto fixtures.
+                    break;
                 }
             }
         }
 
         // Decrypt and cache fetched metadata_snapshots (1A) once group reaches target epoch.
-        if let Some(snapshot) = fetch_bundle.as_ref().and_then(|b| b.metadata_snapshot.as_ref()) {
+        if let Some(snapshot) = fetched_metadata_snapshot.as_ref() {
             if group.epoch().as_u64() == snapshot.epoch as u64 {
                 let nonce_12: [u8; 12] =
                     snapshot.nonce.as_slice().try_into().map_err(|_| {
@@ -1266,16 +1711,31 @@ pub fn process_push_notification_with_hooks(
             seq: msg_seq,
             from_cache: false,
             fallback_generic: false,
+            receipt_verified: !preview_only,
             darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
         })
+        })();
+        match (preview_only, result) {
+            (true, Ok(preview)) => {
+                unsequenced_preview = Some(preview);
+                Err(foreground_sync_required())
+            }
+            (_, result) => result,
+        }
     });
 
     // Phase 4: Always checkpoint passively and close the SQLite handle before returning (`I9`, `I11`).
     let _ = db.prepare_for_background();
     drop(db);
 
-    let preview = preview_res?;
-    if !preview.from_cache && !preview.fallback_generic {
+    let preview = match preview_res {
+        Err(MLSError::InvalidState(code)) if code == FOREGROUND_SYNC_REQUIRED => {
+            unsequenced_preview
+                .unwrap_or_else(|| build_generic_fallback_preview(wake, preflight.cached_title))
+        }
+        result => result?,
+    };
+    if preview.receipt_verified && !preview.from_cache && !preview.fallback_generic {
         post_darwin_nse_commit_notification();
     }
     Ok(preview)

@@ -3,8 +3,8 @@
 //! Executes strictly outside `MlsAccountDb::write_tx` (`I6`) in three phases:
 //! 1. `getConversations` -> `C33` direct-request Welcome/introduction import + pending group invite acceptance; an active
 //!    participant's conversation this device holds nothing of owes its own `requestLeafRecovery`, sent after phase 2.
-//! 2. `getPendingWelcomes` -> `StagedWelcome` join (a reset-retired row rejoins in place) as the Welcome of its verified
-//!    `leafRecoveryFulfillmentEntry`, adopting its fulfiller's roster attestation + `acknowledgeWelcome`.
+//! 2. `getPendingWelcomes` -> `StagedWelcome` join (a reset-retired row rejoins in place) as the
+//!    receipt-verified `leafRecoveryFulfillmentEntry`'s Welcome, then `acknowledgeWelcome`.
 //! 3. Per conversation: `getEntries` -> `I2`-ordered entries, each verified under its kind's authority before any effect +
 //!    `I14` `acknowledge_entries_up_to`; then at most one leaf recovery this device authorizes itself (a verified
 //!    acceptance's authorization or the requester's verified `signedRequest`), as
@@ -45,7 +45,9 @@ use crate::orchestrator::direct_request_bootstrap::{
 };
 use crate::orchestrator::direct_request_shared_crypto::decrypt_introduction_with_provider;
 use crate::push::processor::NATIVE_ARCHIVE_RECEIPT_OP;
-use crate::push::{root_did_from_credential_bytes, AuthorizedPeerDeviceKey};
+use crate::push::{
+    root_did_from_credential_bytes, AuthorizedPeerDeviceKey, NSE_DEFERRED_CONTROL_OP,
+};
 use crate::storage::driver_native::map_rusqlite_err;
 use crate::storage::{
     ConversationRow, KvWriteOverlay, MessageRow, OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
@@ -119,25 +121,54 @@ pub(super) fn stored_roster(
         .transpose()
 }
 
-/// Records `roster` as `cid`'s verified roster, replacing any.
+fn clear_roster_baseline(tx: &crate::storage::SqlTx<'_>, cid: &str) -> Result<(), MLSError> {
+    if let Some(previous) = stored_roster(tx, cid)? {
+        for did in previous
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(did, _)| did)
+        {
+            tx.delete_account_meta(&chat_wire::verified_participant_admission_key(cid, did))?;
+        }
+    }
+    tx.delete_account_meta(&chat_wire::conversation_roster_key(cid))
+}
+
+/// Records a member-authenticated roster baseline for `cid`, replacing any. Active rows carry
+/// admission authority to this device; pending rows carry only their immutable invitation
+/// provenance. Old baseline markers are removed before the replacement is installed.
 pub(super) fn store_roster(
     tx: &crate::storage::SqlTx<'_>,
     cid: &str,
     roster: &Value,
     now_ms: i64,
 ) -> Result<(), MLSError> {
+    clear_roster_baseline(tx, cid)?;
     tx.put_account_meta(
         &chat_wire::conversation_roster_key(cid),
         &roster.to_string(),
         now_ms,
-    )
+    )?;
+    for (did, row) in roster.as_object().into_iter().flatten() {
+        if row["status"] == "active" {
+            tx.put_account_meta(
+                &chat_wire::verified_participant_admission_key(cid, did),
+                "true",
+                now_ms,
+            )?;
+        } else if row["status"] == "pending" {
+            tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, did))?;
+        }
+    }
+    Ok(())
 }
 
 /// The participant effects of a verified `kind` body on `cid`'s verified roster
 /// ([`chat_wire::apply_roster_effects`]), in the transaction that applies that body's
 /// transition, once per transition. Without a verified roster there is nothing to keep current;
 /// a body without participant effects writes nothing.
-pub(super) fn apply_verified_roster_effects(
+pub(crate) fn apply_verified_roster_effects(
     tx: &crate::storage::SqlTx<'_>,
     cid: &str,
     kind: SignedMutationKind,
@@ -145,16 +176,85 @@ pub(super) fn apply_verified_roster_effects(
     now_ms: i64,
 ) -> Result<(), MLSError> {
     let key = chat_wire::conversation_roster_key(cid);
+    let acceptance_did = (kind == SignedMutationKind::ParticipantAcceptance)
+        .then(|| body["actorDid"].as_str())
+        .flatten();
     let Some(stored) = tx.get_account_meta(&key)? else {
-        return Ok(());
+        return if acceptance_did.is_some() {
+            Err(MLSError::Cryptography(
+                "invitation chain: no locally verified pending invitation".into(),
+            ))
+        } else {
+            Ok(())
+        };
     };
     let mut roster: Value = serde_json::from_str(&stored)?;
-    chat_wire::apply_roster_effects(&mut roster, kind, body);
-    let updated = roster.to_string();
-    if updated == stored {
-        return Ok(());
+    if acceptance_did.is_some_and(|did| roster[did]["status"] != "pending") {
+        return Err(MLSError::Cryptography(
+            "invitation chain: actor has no locally verified pending invitation".into(),
+        ));
     }
-    tx.put_account_meta(&key, &updated, now_ms)
+    let removed = chat_wire::removed_participants(kind, body);
+    chat_wire::apply_roster_effects(&mut roster, kind, body);
+    for (did, row) in roster.as_object().into_iter().flatten() {
+        if row["status"] == "pending" {
+            tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, did))?;
+        }
+    }
+    if let Some(did) = acceptance_did {
+        tx.put_account_meta(
+            &chat_wire::verified_participant_admission_key(cid, did),
+            "true",
+            now_ms,
+        )?;
+    }
+    for did in removed {
+        tx.delete_account_meta(&chat_wire::verified_participant_admission_key(cid, &did))?;
+    }
+    let updated = roster.to_string();
+    if updated != stored {
+        tx.put_account_meta(&key, &updated, now_ms)?;
+    }
+    Ok(())
+}
+
+/// Shared receipt check for an already authenticated control body. Foreground sync resolves the
+/// key normally; the NSE supplies only the matching key retained in local account state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_control_entry_receipt_with_key(
+    sequencer_did: &str,
+    cid: &str,
+    entry_id: &str,
+    entry_seq: i64,
+    receipt: &Value,
+    verified_body: &Value,
+    request_digest: &[u8; 32],
+    receipt_key: &[u8],
+    fallback_coordinate: Option<&Value>,
+) -> Result<(), MLSError> {
+    let coordinate = ["next", "successor", "retired", "prior"]
+        .iter()
+        .find_map(|field| verified_body.get(field))
+        .or(fallback_coordinate)
+        .ok_or_else(|| MLSError::Cryptography("control entry has no receipt coordinate".into()))?;
+    let actor_did = verified_body["actorDid"]
+        .as_str()
+        .ok_or_else(|| MLSError::Cryptography("control body missing actorDid".into()))?;
+    let actor_device_id = verified_body["actorDeviceId"]
+        .as_str()
+        .ok_or_else(|| MLSError::Cryptography("control body missing actorDeviceId".into()))?;
+    chat_wire::verify_control_sequencer_receipt(
+        receipt,
+        receipt_key,
+        sequencer_did,
+        cid,
+        entry_id,
+        entry_seq,
+        actor_did,
+        actor_device_id,
+        coordinate,
+        request_digest,
+    )
 }
 
 impl CatbirdMlsClient {
@@ -205,7 +305,7 @@ impl CatbirdMlsClient {
         let now_ms = self.hooks.now_ms();
         self.db
             .write_tx(|tx| record_account_deletion(tx, cid, deleted_did, seq, now_ms))?;
-        handle_account_deleted_event(&self.db, deleted_did)?;
+        handle_account_deleted_event(&self.db, cid, deleted_did)?;
         self.clear_cached_groups();
         Ok(())
     }
@@ -408,32 +508,30 @@ impl CatbirdMlsClient {
                 now_ms,
             )?;
             store_roster(tx, cid, roster, now_ms)?;
+            tx.delete_account_meta(&chat_wire::verified_reset_request_key(cid))?;
             tx.delete_account_meta(&chat_wire::leaf_recovery_authorization_key(cid))
         })
     }
 
     /// `did` takes part in `cid`. Without `provenance`, a DID holding a current leaf of the local
     /// group does; any other DID must be the invitee of a `creationEntry` or `policyEntry`. With
-    /// `provenance` (a participant acceptance's signed `invitationProvenance`) that invitation
-    /// is always required and must be the transition it names.
+    /// `provenance` (a participant acceptance's signed `invitationProvenance`), the invitation is
+    /// proven by either its signed, receipted entry in this device's contiguous post-join batch or
+    /// the exact pending row in this device's member-authenticated roster baseline.
     ///
-    /// The invitation is searched first among `earlier` entries of this sync batch, then by
-    /// paging `getEntries` from seq 1 up to `before_seq`. It must verify under the
-    /// PDS-authorized key of exactly its signer (with `provenance`, the `invitedBy` device that
-    /// names), and its pending row of `did` must carry exactly `provenance`. A found invitation
-    /// that does not verify or match is an error, and so is a missing one while this device
-    /// reads seq 1. Otherwise it predates this device's readable history (mls-ds never makes a
-    /// device that joins later a recipient of earlier control entries), and the caller's
-    /// device signature and coordinate step stand alone: a residual of the protocol.
+    /// Historical lookup is retained only for no-provenance participant controls. An acceptance
+    /// never asks the sequencer for unreadable pre-join history. Its own entry still arrives at
+    /// exactly `last_seq + 1`, and any post-join gap has already stopped the entry pass.
     ///
-    /// Returns the seq of the invitation it verified: `None` when `did` holds a current leaf
-    /// (without `provenance`) or the invitation predates this device's history.
+    /// Returns the verified invitation seq, `0` for a member-attested pending baseline, or `None`
+    /// only for a current leaf or the no-provenance later-device case.
     #[allow(clippy::too_many_arguments)]
     fn require_participant(
         &self,
         canonical_dev_id: &str,
         signer: &SignatureKeyPair,
         cid: &str,
+        sequencer_did: &str,
         did: &str,
         provenance: Option<&Value>,
         before_seq: i64,
@@ -441,6 +539,12 @@ impl CatbirdMlsClient {
         keys_by_did: &BTreeMap<String, Vec<AuthorizedPeerDeviceKey>>,
     ) -> Result<Option<i64>, MLSError> {
         let refused = |what: &str| MLSError::Cryptography(format!("invitation chain: {what}"));
+        if let Some(provenance) = provenance {
+            let roster = self.db.read_tx(|tx| stored_roster(tx, cid))?;
+            if chat_wire::roster_has_pending_invitation(roster.as_ref(), did, provenance) {
+                return Ok(Some(0));
+            }
+        }
         if provenance.is_none()
             && self
                 .current_leaves(cid)?
@@ -448,6 +552,17 @@ impl CatbirdMlsClient {
                 .any(|(leaf_did, _, _)| leaf_did == did)
         {
             return Ok(None);
+        }
+        if provenance.is_none() {
+            let (roster, admission) = self.db.read_tx(|tx| {
+                Ok((
+                    stored_roster(tx, cid)?,
+                    tx.get_account_meta(&chat_wire::verified_participant_admission_key(cid, did))?,
+                ))
+            })?;
+            if admission.is_some() && chat_wire::roster_active(roster.as_ref(), did) {
+                return Ok(None);
+            }
         }
         let invites = |entry: &Value| {
             let body = &entry["signedRequest"]["body"];
@@ -463,6 +578,11 @@ impl CatbirdMlsClient {
             })
         };
         let mut found = earlier.iter().find(|entry| invites(entry)).cloned();
+        if provenance.is_some() && found.is_none() {
+            return Err(refused(
+                "no invitation in this device's contiguous history or member-attested baseline",
+            ));
+        }
         let mut reads_seq_one = false;
         let mut after_seq = 0i64;
         while found.is_none() {
@@ -483,15 +603,24 @@ impl CatbirdMlsClient {
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            for entry in entries {
-                let seq = entry["seq"].as_i64().unwrap_or(0);
-                if seq <= after_seq || seq >= before_seq {
-                    continue;
-                }
+            let mut prior: Vec<&Value> = entries
+                .iter()
+                .filter(|entry| {
+                    entry["seq"]
+                        .as_i64()
+                        .is_some_and(|seq| seq > after_seq && seq < before_seq)
+                })
+                .collect();
+            prior.sort_by_key(|entry| entry["seq"].as_i64().unwrap_or_default());
+            for entry in prior {
+                let seq = entry["seq"].as_i64().unwrap_or_default();
                 reads_seq_one |= seq == 1;
                 if found.is_none() && invites(entry) {
                     found = Some(entry.clone());
                 }
+            }
+            if found.is_some() {
+                break;
             }
             let last = entries
                 .iter()
@@ -505,7 +634,7 @@ impl CatbirdMlsClient {
         }
         let Some(invitation) = found else {
             return if reads_seq_one {
-                Err(refused("no invitation in history that includes seq 1"))
+                Err(refused("no invitation in readable history"))
             } else {
                 Ok(None)
             };
@@ -524,16 +653,25 @@ impl CatbirdMlsClient {
         else {
             return Err(refused("no inviter device"));
         };
-        let verified = verify_signed_mutation_body(
+        let (verified, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
             &invitation["signedRequest"],
             kind,
             &self.pds_device_key(inviter_did, inviter_device, keys_by_did)?,
         )?;
+        let invitation_seq = invitation["seq"]
+            .as_i64()
+            .ok_or_else(|| refused("the verified invitation has no seq"))?;
+        self.verify_control_entry_receipt(
+            sequencer_did,
+            cid,
+            &invitation,
+            invitation_seq,
+            &verified,
+            &request_digest,
+        )?;
         match chat_wire::invitation_provenance(kind, &verified, cid, did) {
             Some(invited) if provenance.is_none_or(|provenance| *provenance == invited) => {
-                Ok(Some(invitation["seq"].as_i64().ok_or_else(|| {
-                    refused("the verified invitation has no seq")
-                })?))
+                Ok(Some(invitation_seq))
             }
             _ => Err(refused(
                 "the verified invitation does not invite this participant",
@@ -544,9 +682,8 @@ impl CatbirdMlsClient {
     /// A sequenced `directRequestAcceptanceEntry` verifies before any effect: the exact entry for
     /// this conversation at `seq`; its signer a current leaf ([`Self::participant_leaf_key`]);
     /// its `Accept`-domain signature under that leaf key; a `next` that only advances
-    /// `prior.stateVersion`; the local request's recipient accepting that request; and an
-    /// attached coordinator receipt, if any, under the exact method it names. Returns the
-    /// verified next coordinates.
+    /// `prior.stateVersion`; the local request's recipient accepting that request; and its required
+    /// coordinator receipt under the exact method it names. Returns the verified next coordinates.
     fn verify_direct_request_acceptance_entry(
         &self,
         convo: &ConversationRow,
@@ -611,37 +748,24 @@ impl CatbirdMlsClient {
         if !requested {
             return Err(refused("not the local request's recipient accepting it"));
         }
-        let next = match receipt {
-            None => body["next"].clone(),
-            Some(receipt) => {
-                let authority = convo.sequencer_did.split('#').next().unwrap_or_default();
-                let document = self
-                    .resolve_did_document(authority)?
-                    .ok_or_else(|| refused("coordinator document unavailable"))?;
-                let method = receipt
-                    .pointer("/body/keyId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| refused("receipt keyId"))?;
-                let key = dr_transcript::resolve_direct_request_receipt_key_for_authority(
-                    authority, &document, method,
-                )
-                .map_err(|e| refused(&e.to_string()))?;
-                let proof =
-                    dr_transcript::verify_received_direct_request_acceptance_proof_for_authority(
-                        authority,
-                        &serde_json::to_vec(&json!({ "entry": entry, "receipt": receipt }))?,
-                        &key,
-                        &actor_key,
-                    )
-                    .map_err(|e| refused(&e.to_string()))?;
-                proof["receipt"]["body"]["next"].clone()
-            }
-        };
-        chat_wire::canonicalize_wire_coordinate(&next, Some(cid))
+        let receipt = receipt
+            .filter(Value::is_object)
+            .ok_or_else(|| refused("missing I13 sequencerReceipt"))?;
+        let mut receipt_entry = entry;
+        receipt_entry["sequencerReceipt"] = receipt;
+        self.verify_control_entry_receipt(
+            &convo.sequencer_did,
+            cid,
+            &receipt_entry,
+            seq,
+            body,
+            accepted.request_digest(),
+        )?;
+        chat_wire::canonicalize_wire_coordinate(&body["next"], Some(cid))
     }
 
-    /// Complete NSE-retained plaintext proof without replaying its consumed MLS ratchet.
-    /// Payload pruning is safe here: the retained frame/nonce and signed I13 receipt suffice.
+    /// Complete NSE-retained plaintext proof without replaying its consumed MLS ratchet. The
+    /// verified outer sender, retained frame/nonce and signed I13 receipt bind the completion.
     fn finish_received_archive_evidence(
         &self,
         cid: &str,
@@ -649,6 +773,9 @@ impl CatbirdMlsClient {
         entry_seq: i64,
         entry_id: &str,
         receipt: &Value,
+        outer_sender: Option<(&str, &str)>,
+        send_counter: Option<u64>,
+        canonical_device_id: &str,
     ) -> Result<(), MLSError> {
         let authority = self.db.read_tx(|tx| {
             tx.get_conversation(cid)?
@@ -671,6 +798,13 @@ impl CatbirdMlsClient {
                     "cached message disappeared before receipt validation".into(),
                 )
             })?;
+            if outer_sender.is_some_and(|(did, device)| {
+                message.sender_did != did || message.sender_device_id != device
+            }) {
+                return Err(MLSError::Cryptography(
+                    "cached application outer sender mismatch".into(),
+                ));
+            }
             let state_key = format!("native.message:{cid}:{message_id}");
             let raw = tx.get_labyrinth_state(&state_key)?.ok_or_else(|| {
                 MLSError::Cryptography(
@@ -765,6 +899,27 @@ impl CatbirdMlsClient {
             }
             // NSE-retained evidence becomes archivable only once its I13 receipt verifies.
             let completes = evidence["sequencer_receipt_json"].is_null();
+            if completes
+                && (message.sender_did != self.normalized_did
+                    || message.sender_device_id != canonical_device_id)
+            {
+                let key = chat_wire::peer_send_counter_key(
+                    cid,
+                    convo.generation,
+                    bound_epoch as i64,
+                    &message.sender_did,
+                    &message.sender_device_id,
+                );
+                let last = tx.get_account_meta(&key)?;
+                if let Some(send_counter) = send_counter {
+                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
+                    tx.put_account_meta(&key, &send_counter.to_string(), now_ms)?;
+                } else if entry_seq > convo.last_seq || last.is_none() {
+                    return Err(MLSError::Cryptography(
+                        "applicationSendBody missing sendCounter".into(),
+                    ));
+                }
+            }
             evidence["sequencer_receipt_json"] = json!(stored_receipt);
             if completes {
                 evidence["seq"] = json!(entry_seq);
@@ -877,6 +1032,22 @@ impl CatbirdMlsClient {
                     "I13: receipt generation mismatch".into(),
                 ));
             }
+            if evidence.sender_did != self.normalized_did
+                || evidence.sender_device_id != self.config.device_id
+            {
+                if let Some(send_counter) = evidence.send_counter {
+                    let key = chat_wire::peer_send_counter_key(
+                        cid,
+                        convo.generation,
+                        evidence.epoch,
+                        &evidence.sender_did,
+                        &evidence.sender_device_id,
+                    );
+                    let last = tx.get_account_meta(&key)?;
+                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
+                    tx.put_account_meta(&key, &send_counter.to_string(), evidence.recorded_at_ms)?;
+                }
+            }
             if tx.get_message(&evidence.message_id)?.is_none() {
                 let is_own = evidence.sender_did == self.normalized_did;
                 tx.insert_message(&evidence.gap_row(&convo.group_id, is_own)?)?;
@@ -911,12 +1082,27 @@ impl CatbirdMlsClient {
         let Some(canonical_dev_id) = self.canonical_uuid_v4_device_id() else {
             return Ok(0);
         };
+        // Attempt each exact creation before inventory. Retained failures remain scoped to their
+        // conversation, and suppress impossible leaf recovery while every healthy group proceeds.
+        let (mut total_applied, pending_creations, creation_failures) =
+            self.complete_pending_group_creations()?;
+        let mut failures = creation_failures
+            .into_iter()
+            .map(|(conversation_id, error)| ConversationSyncFailure {
+                conversation_id,
+                error: Box::new(error),
+            })
+            .collect::<Vec<_>>();
         let Ok((signer, auth_generation)) = self.load_enrolled_signer_and_auth_gen() else {
-            return Ok(0);
+            return if failures.is_empty() {
+                Ok(total_applied)
+            } else {
+                Err(MLSError::SyncIncomplete {
+                    applied: total_applied,
+                    failures,
+                })
+            };
         };
-
-        let mut total_applied: u32 = 0;
-        let mut failures = Vec::new();
 
         // Phase 1: `getConversations` -> C33 incoming direct requests + group invitation
         // acceptance, and the conversations whose leaf recovery this device owes.
@@ -944,7 +1130,7 @@ impl CatbirdMlsClient {
         // Owed leaf recoveries, once the Welcomes are in: a conversation with a Welcome pending
         // for this device requests nothing (a just-fulfilled device already holds a leaf).
         for (cid, state) in owed {
-            if welcomed.contains(&cid) {
+            if pending_creations.contains(&cid) || welcomed.contains(&cid) {
                 continue;
             }
             if let Err(error) = self.ensure_own_leaf_recovery(
@@ -962,8 +1148,14 @@ impl CatbirdMlsClient {
         }
 
         // Journaled own closes whose answer was lost, refused or unverifiable: exact replay.
-        total_applied = total_applied.saturating_add(self.complete_pending_closes()?);
-
+        let (closed, close_failures) = self.complete_pending_closes()?;
+        total_applied = total_applied.saturating_add(closed);
+        failures.extend(close_failures.into_iter().map(|(conversation_id, error)| {
+            ConversationSyncFailure {
+                conversation_id,
+                error: Box::new(error),
+            }
+        }));
         // Phase 3: every known conversation's entries, then its owed and authorized work.
         let convos = self.db.read_tx(|tx| tx.list_conversations(None, 200))?;
         for convo in convos {
@@ -1025,12 +1217,14 @@ impl CatbirdMlsClient {
             };
             if !retired {
                 self.complete_participant_removals(cid, canonical_dev_id, signer)?;
-                return Ok(applied.saturating_add(self.fulfill_leaf_recovery(
+                let applied = applied.saturating_add(self.fulfill_leaf_recovery(
                     cid,
                     canonical_dev_id,
                     signer,
                     auth_generation,
-                )?));
+                )?);
+                self.maybe_auto_self_update(cid)?;
+                return Ok(applied);
             }
         }
         if welcome_pending {
@@ -1147,6 +1341,13 @@ impl CatbirdMlsClient {
             .or_else(|| state.get("kind"))
             .and_then(|v| v.as_str())
             .unwrap_or("group");
+        self.db.write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("conversation_kind:{cid}"),
+                kind,
+                self.hooks.now_ms(),
+            )
+        })?;
 
         let local = self.db.read_tx(|tx| tx.get_conversation(cid))?;
         let has_local = local.is_some();
@@ -1191,6 +1392,7 @@ impl CatbirdMlsClient {
                         signer,
                         auth_generation,
                         cid,
+                        state_view_sequencer_did(state),
                         coords,
                         prov,
                     ) {
@@ -1253,6 +1455,7 @@ impl CatbirdMlsClient {
         signer: &SignatureKeyPair,
         auth_generation: i64,
         cid: &str,
+        state_sequencer_did: Option<&str>,
         coords: &Value,
         invitation_provenance: &Value,
     ) -> Result<(), MLSError> {
@@ -1280,12 +1483,20 @@ impl CatbirdMlsClient {
             "next": next,
             "invitationProvenance": invitation_provenance,
         });
-        let answer = self.submit_signed_chat_op(
+        let sequencer_did = self
+            .db
+            .read_tx(|tx| tx.get_conversation(cid))?
+            .map(|conversation| conversation.sequencer_did)
+            .filter(|authority| !authority.is_empty())
+            .or_else(|| state_sequencer_did.map(|authority| authority.to_owned()))
+            .unwrap_or_else(|| self.config.home_ds_did.clone());
+        let (answer, _) = self.submit_own_control_for_authority(
             canonical_dev_id,
-            Some(auth_generation),
+            auth_generation,
             CanonicalOperation::AcceptConversation,
             &body,
             signer,
+            Some(&sequencer_did),
         )?;
         let record = self.own_request_record(
             &answer["recovery"],
@@ -2142,10 +2353,10 @@ impl CatbirdMlsClient {
             return Ok(false);
         };
 
-        // A generic Welcome joins only as the Welcome of the signed
-        // `leafRecoveryFulfillmentEntry` at its `transitionSeq`, which the added device can
-        // read. A `C33` opening's Welcome has none. A missing or unverifiable one is neither
-        // joined nor acknowledged, and is no sync error: a later sync retries it.
+        // A generic Welcome joins only as the Welcome of the receipt-verified, signed
+        // `leafRecoveryFulfillmentEntry` at its `transitionSeq`, which the added device can read.
+        // A `C33` opening's Welcome has none. A missing fulfillment stays pending; an invalid
+        // fulfillment or receipt fails sync before installing or acknowledging the Welcome.
         let after_seq = transition_seq.saturating_sub(1).to_string();
         let fulfillment = self
             .query_signed_chat_ds(
@@ -2241,7 +2452,7 @@ impl CatbirdMlsClient {
             }) else {
                 return Ok(None);
             };
-            let Ok(body) = verify_signed_mutation_body(
+            let Ok((body, request_digest)) = chat_wire::verify_signed_mutation_body_and_digest(
                 signed_fulfillment,
                 SignedMutationKind::LeafRecoveryFulfillment,
                 &key,
@@ -2291,9 +2502,9 @@ impl CatbirdMlsClient {
             if chat_wire::require_coordinate_names_group(&next, &group, &provider).is_err() {
                 return Ok(None);
             }
-            Ok(Some((member_dids, body, next, roster)))
+            Ok(Some((member_dids, body, request_digest, next, roster)))
         })?;
-        let Some((member_dids, fulfillment_body, next, roster)) = verified else {
+        let Some((member_dids, fulfillment_body, request_digest, next, roster)) = verified else {
             tracing::warn!(
                 cid,
                 transition_seq,
@@ -2310,6 +2521,22 @@ impl CatbirdMlsClient {
                 all_auth_keys.extend(keys);
             }
         }
+        // A retired row's pinned authority remains the I13 trust anchor; an unsigned inventory
+        // view cannot replace it.
+        let sequencer = retired
+            .as_ref()
+            .map(|row| row.sequencer_did.as_str())
+            .filter(|pinned| !pinned.is_empty())
+            .unwrap_or(&sequencer_did)
+            .to_owned();
+        self.verify_control_entry_receipt(
+            &sequencer,
+            cid,
+            &fulfillment,
+            transition_seq,
+            &fulfillment_body,
+            &request_digest,
+        )?;
         let meta_snap_opt = fulfillment_body.get("metadataSnapshot");
         let next_str =
             serde_json::to_string(&next).map_err(|e| MLSError::Internal(e.to_string()))?;
@@ -2367,14 +2594,8 @@ impl CatbirdMlsClient {
             }
 
             let generation = next["generation"].as_i64().unwrap_or(0);
-            // A retired row keeps its history, title, unread count and pinned sequencer (the
-            // `I13` trust anchor no state view replaces).
-            let sequencer = retired
-                .as_ref()
-                .map(|row| row.sequencer_did.as_str())
-                .filter(|pinned| !pinned.is_empty())
-                .unwrap_or(&sequencer_did)
-                .to_owned();
+            // A retired row keeps its history, title, unread count and pinned sequencer.
+            let sequencer = sequencer.clone();
             let row = ConversationRow {
                 conversation_id: cid.to_string(),
                 group_id: group.group_id().as_slice().to_vec(),
@@ -2391,7 +2612,7 @@ impl CatbirdMlsClient {
             Self::prune_pending_commit_transitions(tx, cid, row.generation, row.epoch, false)?;
             match &roster {
                 Some(roster) => store_roster(tx, cid, roster, now_ms)?,
-                None => tx.delete_account_meta(&chat_wire::conversation_roster_key(cid))?,
+                None => clear_roster_baseline(tx, cid)?,
             }
             // The fulfillment answered this device's own request.
             tx.delete_account_meta(&chat_wire::own_leaf_recovery_key(cid))?;
@@ -2435,9 +2656,11 @@ impl CatbirdMlsClient {
     ///   verified coordinate by a requester entitled to it there
     ///   ([`chat_wire::recovery_request_entitled`]).
     ///
-    /// Any other request, one signed at another coordinate, and one whose requester is not
-    /// entitled are skipped: no delivery service can make this device add a device. A
-    /// `signedRequest` that does not verify, or a listed request, reservation or KeyPackage that
+    /// A request signed at another coordinate, an unsigned listing, or a valid request that this
+    /// account is not eligible to fulfill is skipped. A valid, coordinate-bound `add` whose
+    /// zero-leaf participant lacks member-authenticated admission proof returns
+    /// [`MLSError::AdmissionProofUnavailable`].
+    /// A `signedRequest` that does not verify, or a listed request, reservation or KeyPackage that
     /// is not exactly the authorized one ([`chat_wire::authorized_recovery_reservation`],
     /// [`chat_wire::require_recovery_key_package`]), is an error before any effect.
     ///
@@ -2539,6 +2762,7 @@ impl CatbirdMlsClient {
             .map(|requests| requests.iter().collect())
             .unwrap_or_default();
         requests.sort_by_key(|request| request["requestedAt"].as_str());
+        let mut unentitled = None;
         let found = 'found: {
             for request in requests {
                 let accepted = acceptance.as_ref().filter(|authorization| {
@@ -2547,7 +2771,7 @@ impl CatbirdMlsClient {
                 let (authorization, verified_key) = match accepted {
                     Some(authorization) => (authorization.clone(), None),
                     None if request["signedRequest"].is_null() => {
-                        tracing::info!(cid, "leaf recovery: skipping a request nobody signed");
+                        tracing::info!(cid, "leaf recovery: skipping an unsigned request");
                         continue;
                     }
                     None => {
@@ -2573,17 +2797,29 @@ impl CatbirdMlsClient {
                             );
                             continue;
                         }
+                        let verified_admission = self.db.read_tx(|tx| {
+                            tx.get_account_meta(&chat_wire::verified_participant_admission_key(
+                                cid, did,
+                            ))
+                        })?;
                         if !chat_wire::recovery_request_entitled(
                             &authorization,
                             &leaves,
                             roster.as_ref(),
+                            verified_admission.is_some(),
                             &self.normalized_did,
                             canonical_dev_id,
                         ) {
-                            tracing::info!(
-                                cid,
-                                "leaf recovery: skipping a request this device cannot entitle"
-                            );
+                            let has_account_leaf =
+                                leaves.iter().any(|(leaf_did, _)| leaf_did == did);
+                            if authorization["recoveryKind"] == "add"
+                                && !has_account_leaf
+                                && !(verified_admission.is_some()
+                                    && chat_wire::roster_active(roster.as_ref(), did))
+                            {
+                                unentitled = Some(did.to_owned());
+                            }
+                            tracing::info!(cid, "leaf recovery: request is not eligible");
                             continue;
                         }
                         (authorization, Some(key))
@@ -2601,7 +2837,13 @@ impl CatbirdMlsClient {
             None
         };
         let Some((authorization, verified_key, kp_bytes, kp_ref)) = found else {
-            return Ok(0);
+            return match unentitled {
+                Some(participant_did) => Err(MLSError::AdmissionProofUnavailable {
+                    conversation_id: cid.to_owned(),
+                    participant_did,
+                }),
+                None => Ok(0),
+            };
         };
         let (Some(recovery_request_id), Some(target_did), Some(target_device_id)) = (
             authorization["recoveryRequestId"].as_str(),
@@ -3023,6 +3265,163 @@ impl CatbirdMlsClient {
         Ok(0)
     }
 
+    /// Advance PCS after a deterministic age or durable-message threshold in one active group
+    /// epoch. A missing epoch marker is initialized without treating pre-install wall time as age.
+    fn maybe_auto_self_update(&self, cid: &str) -> Result<(), MLSError> {
+        if self.hooks.pcs_max_age_ms == 0 && self.hooks.pcs_max_messages == 0 {
+            return Ok(());
+        }
+        let Some(convo) = self.db.read_tx(|tx| tx.get_conversation(cid))? else {
+            return Ok(());
+        };
+        let is_group = self.db.read_tx(|tx| {
+            Ok(tx
+                .get_account_meta(&format!("conversation_kind:{cid}"))?
+                .is_some_and(|kind| kind == "group"))
+        })?;
+        if !is_group || self.is_retired(&convo)? || self.is_conversation_closed(cid)? {
+            return Ok(());
+        }
+        let now_ms = self.hooks.now_ms();
+        let marker = format!(
+            "pcs_epoch_started_at:{cid}:{}:{}",
+            convo.generation, convo.epoch
+        );
+        let (started_at, message_count) = self.db.write_tx(|tx| {
+            let started = tx
+                .get_account_meta(&marker)?
+                .and_then(|raw| raw.parse::<i64>().ok());
+            if started.is_none() {
+                tx.put_account_meta(&marker, &now_ms.to_string(), now_ms)?;
+            }
+            let count: i64 = tx
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM messages \
+                     WHERE conversation_id = ?1 AND group_id = ?2 AND epoch = ?3",
+                    rusqlite::params![cid, &convo.group_id, convo.epoch],
+                    |row| row.get(0),
+                )
+                .map_err(|e| map_rusqlite_err("count PCS epoch messages", &e))?;
+            Ok((started.unwrap_or(now_ms), count.max(0) as u64))
+        })?;
+        let due_to_age = self.hooks.pcs_max_age_ms > 0
+            && now_ms.saturating_sub(started_at) > self.hooks.pcs_max_age_ms;
+        let due_to_messages =
+            self.hooks.pcs_max_messages > 0 && message_count > self.hooks.pcs_max_messages;
+        if due_to_age || due_to_messages {
+            self.self_update(cid)?;
+        }
+        Ok(())
+    }
+
+    /// Verify a generic control entry's I13 receipt against its signed request and post-entry
+    /// coordinate. This runs before every transition effect.
+    pub(super) fn verify_control_entry_receipt(
+        &self,
+        sequencer_did: &str,
+        cid: &str,
+        entry: &Value,
+        entry_seq: i64,
+        verified_body: &Value,
+        request_digest: &[u8; 32],
+    ) -> Result<(), MLSError> {
+        let receipt = entry
+            .get("sequencerReceipt")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "I13: control entry at seq {entry_seq} missing sequencerReceipt"
+                ))
+            })?;
+        let entry_id = entry
+            .get("entryId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MLSError::Cryptography("control entry missing entryId".into()))?;
+        let kid = chat_wire::sequencer_receipt_kid(sequencer_did, receipt)?;
+        let key = self
+            .resolve_sequencer_receipt_key(sequencer_did, kid)?
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "I13: unable to resolve `{sequencer_did}` receipt method {kid}"
+                ))
+            })?;
+        let fallback_coordinate = self.local_coordinates(cid)?;
+        verify_control_entry_receipt_with_key(
+            sequencer_did,
+            cid,
+            entry_id,
+            entry_seq,
+            receipt,
+            verified_body,
+            request_digest,
+            &key,
+            fallback_coordinate.as_ref(),
+        )
+    }
+    /// A valid current leaf signature over a different prior at our current epoch proves a fork,
+    /// but durable evidence is written only after `authenticate` verifies this entry's exact I13
+    /// receipt, sender and archive commitment. The application receipt does not currently sign the
+    /// signed-request digest or prior hash/tag; this check deliberately does not claim otherwise.
+    fn verify_application_prior_or_flag_fork(
+        &self,
+        cid: &str,
+        entry_seq: i64,
+        body: &Value,
+        authenticate: impl FnOnce() -> Result<(), MLSError>,
+    ) -> Result<(), MLSError> {
+        let Some(local) = self.local_coordinates(cid)? else {
+            return Ok(());
+        };
+        let prior = chat_wire::canonicalize_wire_coordinate(&body["prior"], Some(cid))?;
+        let local_epoch = local["epoch"]
+            .as_i64()
+            .ok_or_else(|| MLSError::Internal("local coordinate missing epoch".into()))?;
+        let prior_epoch = prior["epoch"]
+            .as_i64()
+            .ok_or_else(|| MLSError::Cryptography("application prior missing epoch".into()))?;
+        if prior_epoch < local_epoch {
+            // An own Commit answer can put MLS ahead of its still-unread application prefix.
+            return Ok(());
+        }
+        if prior_epoch > local_epoch || prior["generation"] != local["generation"] {
+            return Err(MLSError::Cryptography(format!(
+                "WrongEpoch: signed application prior is generation {}, epoch {}, local is generation {}, epoch {}",
+                prior["generation"], prior_epoch, local["generation"], local_epoch
+            )));
+        }
+        let prior_hash = chat_wire::json_bytes(&prior["groupContextHash"])?;
+        let local_hash = chat_wire::json_bytes(&local["groupContextHash"])?;
+        let prior_tag = chat_wire::json_bytes(&prior["confirmationTag"])?;
+        let local_tag = chat_wire::json_bytes(&local["confirmationTag"])?;
+        if prior_hash == local_hash && prior_tag == local_tag {
+            return Ok(());
+        }
+        authenticate()?;
+        let generation = local["generation"].as_i64().unwrap_or_default();
+        let evidence = json!({
+            "entrySeq": entry_seq,
+            "generation": generation,
+            "epoch": local_epoch,
+            "localGroupContextHash": local["groupContextHash"],
+            "localConfirmationTag": local["confirmationTag"],
+            "signedPrior": prior,
+        });
+        let now_ms = self.hooks.now_ms();
+        self.db.write_tx(|tx| {
+            tx.put_account_meta(
+                &chat_wire::fork_detected_key(cid),
+                &evidence.to_string(),
+                now_ms,
+            )
+        })?;
+        Err(MLSError::ForkDetected {
+            conversation_id: cid.to_owned(),
+            generation,
+            epoch: local_epoch,
+        })
+    }
+
     /// Applies `convo`'s ordered entries past its cursor ([`Self::apply_conversation_entries`]).
     /// An entry that does not verify or apply stops the pass with its error after the applied
     /// prefix is finished as any pass is ([`Self::finish_entry_pass`]): the cursor and the
@@ -3039,7 +3438,34 @@ impl CatbirdMlsClient {
         };
         let outcome = self.apply_conversation_entries(canonical_dev_id, signer, convo, &mut pass);
         let finished = self.finish_entry_pass(&convo.conversation_id, &pass);
-        outcome.and(finished).map(|()| pass.applied)
+        outcome.and(finished)?;
+
+        // Only a completely successful foreground pass may retire the NSE's reason marker.
+        // A missing/invalid receipt leaves both the cursor and marker below the control.
+        self.db.write_tx(|tx| {
+            let Some(raw_seq) =
+                tx.get_pending_op(NSE_DEFERRED_CONTROL_OP, &convo.conversation_id)?
+            else {
+                return Ok(());
+            };
+            let deferred_seq = raw_seq.parse::<i64>().map_err(|error| {
+                MLSError::InvalidState(format!(
+                    "invalid NSE deferred-control marker for {}: {error}",
+                    convo.conversation_id
+                ))
+            })?;
+            if deferred_seq < 1 {
+                return Err(MLSError::InvalidState(format!(
+                    "invalid NSE deferred-control seq {deferred_seq} for {}",
+                    convo.conversation_id
+                )));
+            }
+            if pass.max_seq >= deferred_seq {
+                tx.delete_pending_op(NSE_DEFERRED_CONTROL_OP, &convo.conversation_id)?;
+            }
+            Ok(())
+        })?;
+        Ok(pass.applied)
     }
 
     /// The end of an entry pass, over the entries it applied: the accepted opening's archive, the
@@ -3160,7 +3586,12 @@ impl CatbirdMlsClient {
         }
 
         sorted_entries.sort_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
-        sorted_entries.dedup_by_key(|e| e.get("seq").and_then(|s| s.as_i64()).unwrap_or(0));
+
+        let mut expected_next_seq = convo
+            .last_seq
+            .max(0)
+            .checked_add(1)
+            .ok_or_else(|| MLSError::Cryptography("conversation sequence exhausted".into()))?;
 
         // Pre-fetch PDS `blue.catbird.chat.device` keys (`I4`) for all DIDs referenced in batch
         // plus all current local `MlsGroup` members.
@@ -3208,7 +3639,10 @@ impl CatbirdMlsClient {
             let entry_seq = entry
                 .get("seq")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(pass.max_seq);
+                .filter(|seq| *seq >= 1)
+                .ok_or_else(|| {
+                    MLSError::Cryptography("conversation entry missing a positive seq".into())
+                })?;
             let label = entry.get("$type").and_then(Value::as_str);
             let signed_req = entry.get("signedRequest").unwrap_or(entry);
             let body = signed_req.get("body").unwrap_or(signed_req);
@@ -3219,14 +3653,25 @@ impl CatbirdMlsClient {
                 body_type == SignedMutationKind::ApplicationSend.type_id(),
                 |label| label == crate::chat_v2::wire::APPLICATION_ENTRY_KIND,
             );
+            if entry_seq <= convo.last_seq {
+                if !is_application {
+                    // A control already below the durable cursor has already had its effects.
+                    continue;
+                }
+            } else {
+                if entry_seq != expected_next_seq {
+                    return Err(MLSError::Cryptography(format!(
+                        "non-contiguous conversation sequence: expected {expected_next_seq}, received {entry_seq}"
+                    )));
+                }
+                expected_next_seq = expected_next_seq.checked_add(1).ok_or_else(|| {
+                    MLSError::Cryptography("conversation sequence exhausted".into())
+                })?;
+            }
             if pending_receipts.contains_key(&entry_seq) && !is_application {
                 return Err(MLSError::Cryptography(
                     "pending archive receipt was replaced by a non-application entry".into(),
                 ));
-            }
-            if entry_seq <= convo.last_seq && !is_application {
-                // Receipt-only replay must not reapply already accepted control effects.
-                continue;
             }
 
             // Every entry below verifies before any effect. One that does not stops this
@@ -3277,6 +3722,13 @@ impl CatbirdMlsClient {
                         }
                     }
                     tx.put_account_meta(&format!("conversation_coords:{cid}"), &next, now_ms)?;
+                    if let Some(did) = body["actorDid"].as_str() {
+                        tx.put_account_meta(
+                            &chat_wire::verified_participant_admission_key(cid, did),
+                            "true",
+                            now_ms,
+                        )?;
+                    }
                     if let Some(mut c) = tx.get_conversation(cid)? {
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = now_ms;
@@ -3342,7 +3794,16 @@ impl CatbirdMlsClient {
                 } else {
                     self.pds_device_key(actor_did, actor_dev, &auth_keys_by_did)?
                 };
-                let verified = verify_signed_mutation_body(signed_req, kind, &key)?;
+                let (verified, request_digest) =
+                    chat_wire::verify_signed_mutation_body_and_digest(signed_req, kind, &key)?;
+                self.verify_control_entry_receipt(
+                    &convo.sequencer_did,
+                    cid,
+                    entry,
+                    entry_seq,
+                    &verified,
+                    &request_digest,
+                )?;
                 let is_acceptance = kind == SignedMutationKind::ParticipantAcceptance;
                 let invitation_seq = if leaf_signed {
                     None
@@ -3351,6 +3812,7 @@ impl CatbirdMlsClient {
                         canonical_dev_id,
                         signer,
                         cid,
+                        &convo.sequencer_did,
                         actor_did,
                         is_acceptance.then(|| &verified["invitationProvenance"]),
                         entry_seq,
@@ -3484,16 +3946,25 @@ impl CatbirdMlsClient {
                             .into(),
                     ));
                 };
-                let verified = verify_signed_mutation_body(
+                let (verified, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
                     signed_req,
                     SignedMutationKind::ConversationClose,
                     &key,
+                )?;
+                self.verify_control_entry_receipt(
+                    &convo.sequencer_did,
+                    cid,
+                    entry,
+                    entry_seq,
+                    &verified,
+                    &request_digest,
                 )?;
                 if !is_leaf {
                     self.require_participant(
                         canonical_dev_id,
                         signer,
                         cid,
+                        &convo.sequencer_did,
                         actor_did,
                         None,
                         entry_seq,
@@ -3547,10 +4018,18 @@ impl CatbirdMlsClient {
                 } else {
                     self.pds_device_key(actor_did, actor_dev, &auth_keys_by_did)?
                 };
-                let verified = verify_signed_mutation_body(
+                let (verified, request_digest) = chat_wire::verify_signed_mutation_body_and_digest(
                     signed_req,
                     SignedMutationKind::ResetActivation,
                     &key,
+                )?;
+                self.verify_control_entry_receipt(
+                    &convo.sequencer_did,
+                    cid,
+                    entry,
+                    entry_seq,
+                    &verified,
+                    &request_digest,
                 )?;
                 let successor = chat_wire::reset_successor(&verified, cid)?;
                 let roster = self.db.read_tx(|tx| stored_roster(tx, cid))?;
@@ -3635,6 +4114,7 @@ impl CatbirdMlsClient {
                     canonical_dev_id,
                     signer,
                     cid,
+                    &convo.sequencer_did,
                     actor_did,
                     None,
                     entry_seq,
@@ -3663,7 +4143,7 @@ impl CatbirdMlsClient {
             {
                 // Verified and bound to this conversation, these move only the cursor: a leave
                 // request is signed by a current leaf, the others by a participant device.
-                let verified = if kind == SignedMutationKind::LeaveRequest {
+                let (verified, request_digest) = if kind == SignedMutationKind::LeaveRequest {
                     let key = self.participant_leaf_key(
                         cid,
                         signed_req,
@@ -3671,14 +4151,16 @@ impl CatbirdMlsClient {
                         canonical_dev_id,
                         signer,
                     )?;
-                    verify_signed_mutation_body(signed_req, kind, &key)?
+                    chat_wire::verify_signed_mutation_body_and_digest(signed_req, kind, &key)?
                 } else {
                     let key = self.pds_device_key(actor_did, actor_dev, &auth_keys_by_did)?;
-                    let verified = verify_signed_mutation_body(signed_req, kind, &key)?;
+                    let verified =
+                        chat_wire::verify_signed_mutation_body_and_digest(signed_req, kind, &key)?;
                     self.require_participant(
                         canonical_dev_id,
                         signer,
                         cid,
+                        &convo.sequencer_did,
                         actor_did,
                         None,
                         entry_seq,
@@ -3687,6 +4169,14 @@ impl CatbirdMlsClient {
                     )?;
                     verified
                 };
+                self.verify_control_entry_receipt(
+                    &convo.sequencer_did,
+                    cid,
+                    entry,
+                    entry_seq,
+                    &verified,
+                    &request_digest,
+                )?;
                 let conversation = match kind {
                     SignedMutationKind::Creation | SignedMutationKind::LeaveCancellation => {
                         &verified["conversationId"]
@@ -3705,6 +4195,16 @@ impl CatbirdMlsClient {
                     ));
                 }
                 self.db.write_tx(|tx| {
+                    if kind == SignedMutationKind::ResetRequest
+                        && actor_did == self.normalized_did
+                        && actor_dev == canonical_dev_id
+                    {
+                        tx.put_account_meta(
+                            &chat_wire::verified_reset_request_key(cid),
+                            &verified.to_string(),
+                            now_ms,
+                        )?;
+                    }
                     if let Some(mut c) = tx.get_conversation(cid)? {
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = now_ms;
@@ -3726,8 +4226,8 @@ impl CatbirdMlsClient {
                 // Actor labels are only a routing hint. The complete body, manifest and metadata
                 // included, verifies first: an own echo under this device's signer, a peer's
                 // under its signer's current leaf key. Nothing is read from the entry around it.
-                let verified_body = if is_own_echo {
-                    chat_wire::verify_own_commit_body(signed_req, signer.public())?
+                let (verified_body, request_digest) = if is_own_echo {
+                    chat_wire::verify_own_commit_body_and_digest(signed_req, signer.public())?
                 } else {
                     let key = self.participant_leaf_key(
                         cid,
@@ -3736,8 +4236,16 @@ impl CatbirdMlsClient {
                         canonical_dev_id,
                         signer,
                     )?;
-                    verify_signed_mutation_body(signed_req, kind, &key)?
+                    chat_wire::verify_signed_mutation_body_and_digest(signed_req, kind, &key)?
                 };
+                self.verify_control_entry_receipt(
+                    &convo.sequencer_did,
+                    cid,
+                    entry,
+                    entry_seq,
+                    &verified_body,
+                    &request_digest,
+                )?;
                 let body = &verified_body;
                 if body["prior"]["conversationId"].as_str() != Some(cid)
                     || body["next"]["conversationId"].as_str() != Some(cid)
@@ -4150,6 +4658,12 @@ impl CatbirdMlsClient {
                         }
                         Some(verified)
                     };
+                let outer_sender = verified_application_body.as_ref().and_then(|verified| {
+                    Some((
+                        verified["actorDid"].as_str()?,
+                        verified["actorDeviceId"].as_str()?,
+                    ))
+                });
                 let body = verified_application_body.as_ref().unwrap_or(body);
 
                 let already_have = self.db.read_tx(|tx| tx.get_message(msg_id))?.is_some();
@@ -4178,7 +4692,14 @@ impl CatbirdMlsClient {
                         .and_then(Value::as_str)
                         .unwrap_or(msg_id);
                     self.finish_received_archive_evidence(
-                        cid, msg_id, entry_seq, entry_id, receipt,
+                        cid,
+                        msg_id,
+                        entry_seq,
+                        entry_id,
+                        receipt,
+                        outer_sender,
+                        body.get("sendCounter").and_then(Value::as_u64),
+                        canonical_dev_id,
                     )?;
                     pass.max_seq = pass.max_seq.max(entry_seq);
                     pass.applied = pass.applied.saturating_add(1);
@@ -4215,7 +4736,7 @@ impl CatbirdMlsClient {
                         let mut c = tx
                             .get_conversation(cid)?
                             .ok_or_else(|| MLSError::group_not_found(cid))?;
-                        chat_wire::verify_pruned_application_receipt(
+                        let pruned = chat_wire::verify_pruned_application_receipt(
                             rcpt_val,
                             &rcpt_sec1,
                             &c.sequencer_did,
@@ -4224,6 +4745,35 @@ impl CatbirdMlsClient {
                             expected_rcpt_entry_id,
                             entry_seq,
                         )?;
+                        if pruned.generation != c.generation {
+                            return Err(MLSError::Cryptography(
+                                "I13: pruned receipt generation mismatch".into(),
+                            ));
+                        }
+                        if pruned.sender_did != self.normalized_did
+                            || pruned.sender_device_id != canonical_dev_id
+                        {
+                            let key = chat_wire::peer_send_counter_key(
+                                cid,
+                                pruned.generation,
+                                pruned.epoch,
+                                &pruned.sender_did,
+                                &pruned.sender_device_id,
+                            );
+                            if let Some(last) = tx.get_account_meta(&key)? {
+                                let next = last
+                                    .parse::<u64>()
+                                    .ok()
+                                    .and_then(|counter| counter.checked_add(1))
+                                    .ok_or_else(|| {
+                                        MLSError::Cryptography(
+                                            "peer sendCounter exhausted at pruned entry".into(),
+                                        )
+                                    })?;
+                                chat_wire::verify_next_peer_send_counter(Some(&last), next)?;
+                                tx.put_account_meta(&key, &next.to_string(), now_ms)?;
+                            }
+                        }
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = now_ms;
                         tx.upsert_conversation(&c)
@@ -4232,6 +4782,114 @@ impl CatbirdMlsClient {
                     pass.applied = pass.applied.saturating_add(1);
                     continue;
                 }
+
+                let current = self
+                    .db
+                    .read_tx(|tx| tx.get_conversation(cid))?
+                    .ok_or_else(|| MLSError::group_not_found(cid))?;
+                let peer_counter = if entry_seq > current.last_seq {
+                    self.verify_application_prior_or_flag_fork(cid, entry_seq, body, || {
+                        let leaf_key = self.participant_leaf_key(
+                            cid,
+                            signed_req,
+                            &flat_auth_keys,
+                            canonical_dev_id,
+                            signer,
+                        )?;
+                        let aad =
+                            canonical_application_aad_bytes(body.get("aad").ok_or_else(|| {
+                                MLSError::Cryptography(
+                                    "signed application body missing MLS AAD".into(),
+                                )
+                            })?)
+                            .map_err(|error| {
+                                MLSError::Cryptography(format!(
+                                    "invalid signed application AAD: {error}"
+                                ))
+                            })?;
+                        let (commitment, attestation) =
+                            verify_application_aad_archive_evidence(&aad, cid, msg_id)?;
+                        let sender_did = body["actorDid"].as_str().ok_or_else(|| {
+                            MLSError::Cryptography("applicationSendBody missing actorDid".into())
+                        })?;
+                        let sender_device_id = body["actorDeviceId"].as_str().ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "applicationSendBody missing actorDeviceId".into(),
+                            )
+                        })?;
+                        if attestation.sender_did != sender_did
+                            || attestation.sender_device_id != sender_device_id
+                            || attestation.sender_transport_public_key.as_slice()
+                                != leaf_key.as_slice()
+                        {
+                            return Err(MLSError::Cryptography(
+                                "fork evidence sender is not the signed current leaf".into(),
+                            ));
+                        }
+                        let epoch = body["prior"]["epoch"]
+                            .as_i64()
+                            .and_then(|epoch| u64::try_from(epoch).ok())
+                            .ok_or_else(|| {
+                                MLSError::Cryptography(
+                                    "applicationSendBody prior epoch is invalid".into(),
+                                )
+                            })?;
+                        let rcpt_sec1 = receipt_key()?;
+                        let (receipt_seq, receipt_generation, _) =
+                            chat_wire::parse_and_verify_i13_sequencer_receipt(
+                                rcpt_val,
+                                &rcpt_sec1,
+                                &current.sequencer_did,
+                                cid,
+                                &current.group_id,
+                                epoch,
+                                expected_rcpt_entry_id,
+                                msg_id,
+                                &commitment,
+                                Some(&attestation),
+                            )?;
+                        if i64::try_from(receipt_seq).ok() != Some(entry_seq) {
+                            return Err(MLSError::Cryptography(format!(
+                                "I13: receipt seq {receipt_seq} != entry seq {entry_seq}"
+                            )));
+                        }
+                        if receipt_generation != current.generation.max(0) as u64 {
+                            return Err(MLSError::Cryptography(
+                                "I13: receipt generation mismatch".into(),
+                            ));
+                        }
+                        Ok(())
+                    })?;
+                    let sender_did = body["actorDid"].as_str().unwrap_or_default();
+                    let sender_device_id = body["actorDeviceId"].as_str().unwrap_or_default();
+                    if sender_did == self.normalized_did && sender_device_id == canonical_dev_id {
+                        None
+                    } else {
+                        let send_counter = body["sendCounter"].as_u64().ok_or_else(|| {
+                            MLSError::Cryptography("applicationSendBody missing sendCounter".into())
+                        })?;
+                        let generation = body["prior"]["generation"].as_i64().ok_or_else(|| {
+                            MLSError::Cryptography(
+                                "applicationSendBody prior missing generation".into(),
+                            )
+                        })?;
+                        let epoch = body["prior"]["epoch"].as_i64().ok_or_else(|| {
+                            MLSError::Cryptography("applicationSendBody prior missing epoch".into())
+                        })?;
+                        let key = chat_wire::peer_send_counter_key(
+                            cid,
+                            generation,
+                            epoch,
+                            sender_did,
+                            sender_device_id,
+                        );
+                        let last = self.db.read_tx(|tx| tx.get_account_meta(&key))?;
+                        chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
+                        Some((key, send_counter))
+                    }
+                } else {
+                    None
+                };
 
                 let app_obj = body
                     .get("applicationMessage")
@@ -4305,6 +4963,11 @@ impl CatbirdMlsClient {
                     let mut c = tx
                         .get_conversation(cid)?
                         .ok_or_else(|| MLSError::group_not_found(cid))?;
+                    if let Some((key, send_counter)) = &peer_counter {
+                        let last = tx.get_account_meta(key)?;
+                        chat_wire::verify_next_peer_send_counter(last.as_deref(), *send_counter)?;
+                        tx.put_account_meta(key, &send_counter.to_string(), now_ms)?;
+                    }
                     let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
                     let provider = self.hooks.openmls_provider(storage);
                     // No group, no roster to authenticate against: never store, advance or ACK.
@@ -4551,6 +5214,9 @@ impl CatbirdMlsClient {
                                 .as_str()
                                 .unwrap_or_default()
                                 .to_owned(),
+                            send_counter: peer_counter
+                                .as_ref()
+                                .map(|(_, send_counter)| *send_counter),
                             reason: reason.to_owned(),
                             recorded_at_ms: now_ms,
                         },
@@ -4799,8 +5465,13 @@ impl CatbirdMlsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::record_account_deletion;
+    use super::{
+        apply_verified_roster_effects, clear_roster_baseline, record_account_deletion, store_roster,
+    };
+    use crate::chat_v2::transcript::SignedMutationKind;
+    use crate::client::chat_wire;
     use crate::storage::{LabyrinthQueueRow, MessageRow, MlsAccountDb, OpenMode};
+    use serde_json::json;
 
     #[test]
     fn account_deletion_retains_queued_witness_copies_and_evidence() {
@@ -4851,6 +5522,117 @@ mod tests {
             assert!(tx
                 .get_labyrinth_state(&format!("native.message:{CID}:m-bob"))?
                 .is_some());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn replacing_roster_baseline_clears_stale_admission_markers() {
+        const CID: &str = "baseline-replacement";
+        const ALICE: &str = "did:plc:alice";
+        const BOB: &str = "did:plc:bob";
+        let dir = tempfile::tempdir().unwrap();
+        let db = MlsAccountDb::open_native(dir.path().join("roster.db"), &[8; 32], OpenMode::App)
+            .unwrap();
+        db.write_tx(|tx| {
+            store_roster(
+                tx,
+                CID,
+                &json!({
+                    "did:plc:alice": {"role": "admin", "status": "active"},
+                    "did:plc:bob": {"role": "member", "status": "active"},
+                }),
+                1,
+            )?;
+            store_roster(
+                tx,
+                CID,
+                &json!({"did:plc:alice": {"role": "admin", "status": "active"}}),
+                2,
+            )
+        })
+        .unwrap();
+        db.read_tx(|tx| {
+            assert!(tx
+                .get_account_meta(&chat_wire::verified_participant_admission_key(CID, ALICE))?
+                .is_some());
+            assert!(tx
+                .get_account_meta(&chat_wire::verified_participant_admission_key(CID, BOB))?
+                .is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn clearing_roster_baseline_clears_admission_markers() {
+        const CID: &str = "baseline-cleared";
+        const ALICE: &str = "did:plc:alice";
+        let dir = tempfile::tempdir().unwrap();
+        let db = MlsAccountDb::open_native(dir.path().join("clear.db"), &[7; 32], OpenMode::App)
+            .unwrap();
+        db.write_tx(|tx| {
+            store_roster(
+                tx,
+                CID,
+                &json!({"did:plc:alice": {"role": "admin", "status": "active"}}),
+                1,
+            )?;
+            clear_roster_baseline(tx, CID)
+        })
+        .unwrap();
+        db.read_tx(|tx| {
+            assert!(tx
+                .get_account_meta(&chat_wire::conversation_roster_key(CID))?
+                .is_none());
+            assert!(tx
+                .get_account_meta(&chat_wire::verified_participant_admission_key(CID, ALICE))?
+                .is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn verified_removal_clears_participant_admission_marker() {
+        const CID: &str = "participant-removal";
+        const ALICE: &str = "did:plc:alice";
+        const BOB: &str = "did:plc:bob";
+        let dir = tempfile::tempdir().unwrap();
+        let db = MlsAccountDb::open_native(dir.path().join("removal.db"), &[9; 32], OpenMode::App)
+            .unwrap();
+        db.write_tx(|tx| {
+            store_roster(
+                tx,
+                CID,
+                &json!({
+                    "did:plc:alice": {"role": "admin", "status": "active"},
+                    "did:plc:bob": {"role": "member", "status": "active"},
+                }),
+                1,
+            )?;
+            apply_verified_roster_effects(
+                tx,
+                CID,
+                SignedMutationKind::PolicyTransition,
+                &json!({"participantChanges": [{
+                    "$type": "blue.catbird.chat.defs#removeParticipant",
+                    "userDid": BOB,
+                }]}),
+                2,
+            )
+        })
+        .unwrap();
+        db.read_tx(|tx| {
+            let roster = tx
+                .get_account_meta(&chat_wire::conversation_roster_key(CID))?
+                .unwrap();
+            let roster: serde_json::Value = serde_json::from_str(&roster)?;
+            assert!(roster.get(BOB).is_none());
+            assert!(tx
+                .get_account_meta(&chat_wire::verified_participant_admission_key(CID, BOB))?
+                .is_none());
             Ok(())
         })
         .unwrap();

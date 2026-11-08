@@ -32,7 +32,9 @@ use super::queries::{
     ConversationRow, GroupMetadataRow, LabyrinthQueueRow, MessageRow, MutationJournalRow,
     RequestRow, RoutingCacheRow,
 };
-use super::schema::{UNIFIED_SCHEMA_DDL, UNIFIED_SCHEMA_TABLES};
+use super::schema::{
+    LOCAL_STATE_FORMAT_KEY, LOCAL_STATE_FORMAT_VERSION, UNIFIED_SCHEMA_DDL, UNIFIED_SCHEMA_TABLES,
+};
 
 const SQLCIPHER_SALT_HKDF_INFO: &[u8] = b"catbird-mls-sqlcipher-salt-v1";
 const APP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -121,6 +123,95 @@ pub(crate) fn open_sqlite_connection(path: &Path) -> Result<Connection, rusqlite
     Connection::open(path)
 }
 
+/// On Darwin, `synchronous=FULL` controls when SQLite calls `xSync`; these flags select
+/// `fcntl(F_FULLFSYNC)` instead of ordinary `fsync` for transactions and WAL checkpoints.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn configure_apple_fullfsync(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA fullfsync = ON;\n\
+         PRAGMA checkpoint_fullfsync = ON;",
+    )
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn configure_apple_fullfsync(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let _ = conn;
+    Ok(())
+}
+
+fn enforce_local_state_format(
+    conn: &mut Connection,
+    existing_unified_tables: usize,
+) -> Result<(), MLSError> {
+    if existing_unified_tables == 0 {
+        let user_tables: usize = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_rusqlite_err("sqlite_master format check", &error))?;
+        if user_tables == 0 {
+            let version = LOCAL_STATE_FORMAT_VERSION.to_string();
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| map_rusqlite_err("storage format BEGIN", &error))?;
+            transaction
+                .execute_batch(UNIFIED_SCHEMA_DDL)
+                .map_err(|error| map_rusqlite_err("UNIFIED_SCHEMA_DDL", &error))?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO account_meta(key, value_json, updated_at_ms) \
+                     VALUES(?1, ?2, 0)",
+                    [LOCAL_STATE_FORMAT_KEY, version.as_str()],
+                )
+                .map_err(|error| map_rusqlite_err("storage format INSERT", &error))?;
+            let found = transaction
+                .query_row(
+                    "SELECT value_json FROM account_meta WHERE key = ?1",
+                    [LOCAL_STATE_FORMAT_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| map_rusqlite_err("storage format SELECT", &error))?
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            if found != LOCAL_STATE_FORMAT_VERSION {
+                return Err(MLSError::LocalStateFormatUnsupported {
+                    found,
+                    required: LOCAL_STATE_FORMAT_VERSION,
+                });
+            }
+            transaction
+                .commit()
+                .map_err(|error| map_rusqlite_err("storage format COMMIT", &error))?;
+            return Ok(());
+        }
+    }
+
+    let found = if existing_unified_tables == UNIFIED_SCHEMA_TABLES.len() {
+        conn.query_row(
+            "SELECT value_json FROM account_meta WHERE key = ?1",
+            [LOCAL_STATE_FORMAT_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| map_rusqlite_err("storage format SELECT", &error))?
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    if found != LOCAL_STATE_FORMAT_VERSION {
+        return Err(MLSError::LocalStateFormatUnsupported {
+            found,
+            required: LOCAL_STATE_FORMAT_VERSION,
+        });
+    }
+    Ok(())
+}
+
 fn open_configured_connection(
     path: &Path,
     db_key_32: &[u8; 32],
@@ -138,7 +229,7 @@ fn open_configured_connection(
         }
     }
 
-    let conn =
+    let mut conn =
         open_sqlite_connection(path).map_err(|e| map_rusqlite_err("Connection::open", &e))?;
 
     let key_spec = Zeroizing::new(derive_sqlcipher_96hex_key_spec(db_key_32));
@@ -158,7 +249,7 @@ fn open_configured_connection(
 
     match mode {
         OpenMode::App => {
-            conn.execute_batch("PRAGMA synchronous = NORMAL;")
+            conn.execute_batch("PRAGMA synchronous = FULL;")
                 .map_err(|e| map_rusqlite_err("App pragmas", &e))?;
             conn.busy_timeout(APP_BUSY_TIMEOUT)
                 .map_err(|e| map_rusqlite_err("App busy_timeout", &e))?;
@@ -167,13 +258,15 @@ fn open_configured_connection(
             conn.execute_batch(
                 "PRAGMA cache_size = -512;\n\
                  PRAGMA mmap_size = 0;\n\
-                 PRAGMA synchronous = NORMAL;",
+                 PRAGMA synchronous = FULL;",
             )
             .map_err(|e| map_rusqlite_err("PushExtension pragmas", &e))?;
             conn.busy_timeout(EXTENSION_BUSY_TIMEOUT)
                 .map_err(|e| map_rusqlite_err("PushExtension busy_timeout", &e))?;
         }
     }
+    configure_apple_fullfsync(&conn)
+        .map_err(|e| map_rusqlite_err("Apple fullfsync pragmas", &e))?;
 
     // Read-only key verification & schema presence check:
     // Fails immediately with SQLITE_NOTADB on wrong key without issuing writes on already-initialized DBs.
@@ -190,10 +283,7 @@ fn open_configured_connection(
         )
         .map_err(|e| map_rusqlite_err("sqlite_master schema check", &e))?;
 
-    if existing_unified_tables < UNIFIED_SCHEMA_TABLES.len() {
-        conn.execute_batch(UNIFIED_SCHEMA_DDL)
-            .map_err(|e| map_rusqlite_err("UNIFIED_SCHEMA_DDL", &e))?;
-    }
+    enforce_local_state_format(&mut conn, existing_unified_tables)?;
 
     let initial_dv: i64 = conn
         .query_row("PRAGMA data_version;", [], |row| row.get(0))
@@ -1876,13 +1966,17 @@ impl<'a> SqlTx<'a> {
         Ok(())
     }
 
-    pub fn purge_labyrinth_queue_from_sender(&self, sender_did: &str) -> Result<usize, MLSError> {
+    pub fn purge_labyrinth_queue_from_sender(
+        &self,
+        conversation_id: &str,
+        sender_did: &str,
+    ) -> Result<usize, MLSError> {
         self.read
             .conn
             .execute(
-                "DELETE FROM labyrinth_queue \
-                 WHERE json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?1",
-                [sender_did],
+                "DELETE FROM labyrinth_queue WHERE conversation_id = ?1 \
+                 AND json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?2",
+                rusqlite::params![conversation_id, sender_did],
             )
             .map_err(|e| map_rusqlite_err("purge_labyrinth_queue_from_sender", &e))
     }

@@ -4,6 +4,11 @@
 //! `sqlite3mc` (`sqlite-wasm-rs`). Consolidates all OpenMLS state into `openmls_kv`
 //! alongside app-facing tables in one Rust-owned database per account.
 
+/// `account_meta` key gating the encrypted client database as one indivisible format.
+pub const LOCAL_STATE_FORMAT_KEY: &str = "local_state_format_version";
+/// First storage format carrying every Round 4 invariant. Version 0 means the pre-gate schema.
+pub const LOCAL_STATE_FORMAT_VERSION: u32 = 1;
+
 /// Canonical 15 tables in every per-account Catbird MLS database (`Spec §6.1`).
 pub const UNIFIED_SCHEMA_TABLES: &[&str; 15] = &[
     "openmls_kv",

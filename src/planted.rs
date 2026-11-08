@@ -16,6 +16,8 @@ pub enum PlantedBug {
     /// Distribute a conversation MEK to a self-signed but unauthorized device epoch.
     P5WrapMekToUnverifiedDevice,
     P6OrderTimelineByEpochSeq,
+    /// Accept an otherwise well-bound I13 receipt without checking its ES256 signature.
+    P7SkipSequencerReceiptSignatureCheck,
     /// Server/simulator hook: keep application payload bytes after ack and archive flush.
     P8RetainServerCiphertextAfterAckAndFlush,
     /// Replace local MLS state with an external join after an application decrypt error.
@@ -34,8 +36,18 @@ pub enum PlantedBug {
     /// Re-decrypt a persisted message replay after reopening the account database.
     P12SkipMessageIdDedupeAfterCrashRestart,
     P13AdvanceSeqCursorBeforeDurableStore,
+    /// Treat a 503 device-directory response as TOFU and accept the first observed leaf key.
+    P14TofuOnDeviceDirectory503,
     /// Retire an uncertain commit's recovery journal and rebuild a fresh commit transition.
     P15NonIdempotentCommitSubmitRetry,
+    /// Restore the unsafe member-repository `SpaceNotFound` -> `Forbidden` classification.
+    P16MemberRepoSpaceNotFoundAsNotFound,
+    /// Drop `Atproto-Space-Mac` while adapting a platform response for Labyrinth.
+    P17OmitSpaceMacHeaderForwarding,
+    /// Skip replay of an incomplete Gate 4 mailbox-rotation mutation journal.
+    MutationJournalRollForward,
+    /// Allow ciphertext larger than the 2,200-byte inline-push limit.
+    OversizedInlinePush,
 }
 
 #[cfg(feature = "sim")]
@@ -48,7 +60,13 @@ thread_local! {
 #[inline]
 pub fn set_planted_bug(bug: Option<PlantedBug>) {
     #[cfg(feature = "sim")]
-    ACTIVE_BUG.with(|active| active.set(bug));
+    {
+        ACTIVE_BUG.with(|active| active.set(bug));
+        #[cfg(feature = "labyrinth")]
+        labyrinth::store::space::set_sim_member_repo_space_not_found_as_forbidden(
+            bug == Some(PlantedBug::P16MemberRepoSpaceNotFoundAsNotFound),
+        );
+    }
     #[cfg(not(feature = "sim"))]
     let _ = bug;
 }
@@ -82,6 +100,7 @@ pub fn is_planted_bug_active(bug: PlantedBug) -> bool {
             PlantedBug::P4SkipLabyrinthEnqueueAfterSendRetry => cfg!(feature = "plant_p4"),
             PlantedBug::P5WrapMekToUnverifiedDevice => cfg!(feature = "plant_p5"),
             PlantedBug::P6OrderTimelineByEpochSeq => cfg!(feature = "plant_p6"),
+            PlantedBug::P7SkipSequencerReceiptSignatureCheck => cfg!(feature = "plant_p7"),
             PlantedBug::P8RetainServerCiphertextAfterAckAndFlush => cfg!(feature = "plant_p8"),
             PlantedBug::P9AutomatedForcedRejoinOnDecryptFailure => cfg!(feature = "plant_p9"),
             PlantedBug::P10SkipDataVersionCheckAfterNseAdvance => cfg!(feature = "plant_p10"),
@@ -90,7 +109,14 @@ pub fn is_planted_bug_active(bug: PlantedBug) -> bool {
             }
             PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart => cfg!(feature = "plant_p12"),
             PlantedBug::P13AdvanceSeqCursorBeforeDurableStore => cfg!(feature = "plant_p13"),
+            PlantedBug::P14TofuOnDeviceDirectory503 => cfg!(feature = "plant_p14"),
             PlantedBug::P15NonIdempotentCommitSubmitRetry => cfg!(feature = "plant_p15"),
+            PlantedBug::P16MemberRepoSpaceNotFoundAsNotFound => cfg!(feature = "plant_p16"),
+            PlantedBug::P17OmitSpaceMacHeaderForwarding => cfg!(feature = "plant_p17"),
+            PlantedBug::MutationJournalRollForward => {
+                cfg!(feature = "plant_mutation_journal_roll_forward")
+            }
+            PlantedBug::OversizedInlinePush => cfg!(feature = "plant_oversized_inline_push"),
         }
     }
     #[cfg(not(feature = "sim"))]
@@ -111,7 +137,8 @@ pub fn with_planted_bug<R>(bug: Option<PlantedBug>, operation: impl FnOnce() -> 
                 set_planted_bug(self.0);
             }
         }
-        let _restore = Restore(ACTIVE_BUG.with(|active| active.replace(bug)));
+        let _restore = Restore(active_planted_bug());
+        set_planted_bug(bug);
         operation()
     }
     #[cfg(not(feature = "sim"))]
@@ -128,6 +155,8 @@ pub struct SimGroupState {
     pub group_id: Vec<u8>,
     pub epoch: u64,
     pub tree_hash: Vec<u8>,
+    /// SHA-256 of peer application-ratchet state, excluding this device's sender slot.
+    pub peer_application_ratchets_hash: Vec<u8>,
     /// Sorted scoped `did#device` leaf credentials; no synthetic fallback member.
     pub members: Vec<String>,
     pub has_pending_commit: bool,
@@ -181,6 +210,12 @@ mod tests {
             PlantedBug::P11RevokeSpaceAccessBeforeKickedMemberFlushes,
             PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart,
             PlantedBug::P15NonIdempotentCommitSubmitRetry,
+            PlantedBug::P7SkipSequencerReceiptSignatureCheck,
+            PlantedBug::P14TofuOnDeviceDirectory503,
+            PlantedBug::P16MemberRepoSpaceNotFoundAsNotFound,
+            PlantedBug::P17OmitSpaceMacHeaderForwarding,
+            PlantedBug::MutationJournalRollForward,
+            PlantedBug::OversizedInlinePush,
         ] {
             assert!(!is_planted_bug_active(phase2));
             with_planted_bug(Some(phase2), || assert!(is_planted_bug_active(phase2)));

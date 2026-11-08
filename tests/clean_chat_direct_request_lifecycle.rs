@@ -1,10 +1,9 @@
 //! Native sender preflight checks. These are not delivery-service publication tests.
 #![allow(dead_code)]
-#[path = "fixtures/direct_request_i13.rs"]
-mod direct_request_i13;
 mod e2e_harness;
 use catbird_mls::orchestrator::{MLSStorageBackend, MlsCryptoContext, OrchestratorError};
 use catbird_mls::{DirectRequestInput, MLSError};
+use e2e_harness::mock_api_client::direct_request_i13;
 use e2e_harness::TestWorld;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -446,7 +445,25 @@ fn read_bytes(mode: bool, name: &str, tagged: bool, value: &Value) -> Value {
     presented
 }
 
-async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
+fn read_conversation_state_with_i13(mode: bool, value: &Value) -> Value {
+    let mut legacy = value.clone();
+    let receipt = legacy
+        .pointer_mut("/directRequest/acceptanceProof/entry")
+        .and_then(Value::as_object_mut)
+        .and_then(|entry| entry.remove("sequencerReceipt"));
+    let mut presented = read_bytes(mode, "conversationState", false, &legacy);
+    if let Some(receipt) = receipt {
+        presented["directRequest"]["acceptanceProof"]["entry"]["sequencerReceipt"] =
+            read_bytes(mode, "sequencerReceipt", false, &receipt);
+    }
+    presented
+}
+
+async fn seed_pending_origin(
+    world: &TestWorld,
+    group: bool,
+    authority: &p256::ecdsa::SigningKey,
+) -> (Value, Value) {
     let alice = world.client("Alice");
     let mut members = vec![world.client("Bob").did.clone()];
     if group {
@@ -463,7 +480,7 @@ async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
     for p in participants.as_array_mut().unwrap() {
         p["leafCount"] = json!(if p["status"] == "active" { 1 } else { 0 });
     }
-    let state = json!({"conversationKind":b["conversationKind"],"coordinates":b["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":participants,"leaves":[{"userDid":b["actorDid"],"deviceId":b["actorDeviceId"],"deviceStatus":"active","leafOrigin":"genesis","keyId":b["keyId"]}],"metadataSnapshot":b["metadataSnapshot"],"snapshotSeq":1});
+    let state = json!({"conversationKind":b["conversationKind"],"sequencerDid":"did:web:chat.catbird.blue","coordinates":b["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":participants,"leaves":[{"userDid":b["actorDid"],"deviceId":b["actorDeviceId"],"deviceStatus":"active","leafOrigin":"genesis","keyId":b["keyId"]}],"metadataSnapshot":b["metadataSnapshot"],"snapshotSeq":1});
     view.canonical_state = Some(
         catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
             &serde_json::to_vec(&state).unwrap(),
@@ -477,7 +494,27 @@ async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
     world
         .delivery_service()
         .set_lifecycle_state_for_test(&cid, state.clone());
-    let entry = json!({"$type":"blue.catbird.chat.defs#creationEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":wrapper["signedRequest"],"receivedAt":utc(0)});
+    use catbird_mls::chat_v2::transcript::{
+        decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+    };
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let received_at = utc(0);
+    let strict = decode_strict_json(&serde_json::to_vec(b).unwrap()).unwrap();
+    let transcript = SigningTranscript::build_for(
+        SignedMutationKind::Creation,
+        &project_signed_body(SignedMutationKind::Creation, &strict).unwrap(),
+    )
+    .unwrap();
+    let mut entry = json!({"$type":"blue.catbird.chat.defs#creationEntry","entryId":entry_id,"conversationId":cid,"seq":1,"signedRequest":wrapper["signedRequest"],"receivedAt":received_at});
+    entry["sequencerReceipt"] = direct_request_i13::control_receipt(
+        authority,
+        b,
+        entry["entryId"].as_str().unwrap(),
+        1,
+        entry["receivedAt"].as_str().unwrap(),
+        *transcript.request_digest(),
+        "did:web:chat.catbird.blue",
+    );
     (state, entry)
 }
 /// State carried between the [`sender_fixture`] phases. Each phase is its own
@@ -533,7 +570,7 @@ async fn sender_publishes(
             .credentials
             .set_request_authority_document(doc.clone());
     }
-    let (invitation_state, invitation_entry) = seed_pending_origin(&world, true).await;
+    let (invitation_state, invitation_entry) = seed_pending_origin(&world, true, &authority).await;
     let invitation_provenance = invitation_state["participants"]
         .as_array()
         .unwrap()
@@ -542,7 +579,7 @@ async fn sender_publishes(
         .unwrap()["invitationProvenance"]
         .clone();
     let legacy_state = if legacy {
-        Some(seed_pending_origin(&world, false).await.0)
+        Some(seed_pending_origin(&world, false, &authority).await.0)
     } else {
         None
     };
@@ -1055,11 +1092,24 @@ async fn recipient_accepts(
     .unwrap();
     let entry = json!({"entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":2,"signedRequest":pending_accept["directRequest"],"receivedAt":utc(0)});
     let acceptance_receipt = json!({"$type":"blue.catbird.chat.defs#directRequestAcceptanceCommitReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\0","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":method,"requestId":accepted["requestId"],"acceptanceDigest":STANDARD.encode(acceptance.request_digest()),"entryHash":STANDARD.encode(protocol::direct_request_acceptance_entry_hash(&serde_json::to_vec(&entry).unwrap()).unwrap()),"prior":accepted["prior"],"next":accepted["next"],"recordedAt":utc(0)});
-    let proof = json!({"entry":entry,"receipt":{"body":acceptance_receipt,"signature":es256(&authority,&protocol::direct_request_signing_bytes(protocol::DirectRequestKind::AcceptanceCommit,&serde_json::to_vec(&acceptance_receipt).unwrap()).unwrap())}});
+    let mut proof = json!({"entry":entry,"receipt":{"body":acceptance_receipt,"signature":es256(&authority,&protocol::direct_request_signing_bytes(protocol::DirectRequestKind::AcceptanceCommit,&serde_json::to_vec(&acceptance_receipt).unwrap()).unwrap())}});
+    let sequencer_receipt = direct_request_i13::control_receipt(
+        &authority,
+        accepted,
+        proof["entry"]["entryId"].as_str().unwrap(),
+        2,
+        proof["entry"]["receivedAt"].as_str().unwrap(),
+        *acceptance.request_digest(),
+        "did:web:chat.catbird.blue",
+    );
+    let mut presented_proof = read_bytes(dag_json, "directRequestAcceptanceProof", false, &proof);
+    presented_proof["entry"]["sequencerReceipt"] =
+        read_bytes(dag_json, "sequencerReceipt", false, &sequencer_receipt);
+    proof["entry"]["sequencerReceipt"] = sequencer_receipt;
     world.delivery_service().queue_request_operation_response(
         Op::AcceptConversation,
         200,
-        json!({"coordinates":read_bytes(dag_json, "conversationCoordinates", false, &accepted["next"]),"acceptanceProof":read_bytes(dag_json, "directRequestAcceptanceProof", false, &proof)}),
+        json!({"coordinates":read_bytes(dag_json, "conversationCoordinates", false, &accepted["next"]),"acceptanceProof":presented_proof}),
     );
     world
         .client("Bob")
@@ -1157,9 +1207,14 @@ async fn sender_observes_acceptance(
     let cid = p["conversationId"].as_str().unwrap().to_owned();
     let accepted = &pending_accept["directRequest"]["body"];
     assert_eq!(accepted["prior"]["epoch"], accepted["next"]["epoch"]);
-    let state = json!({"conversationKind":"direct","coordinates":accepted["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":[{"userDid":p["actorDid"],"role":"admin","status":"active","leafCount":1},{"userDid":p["recipientDid"],"role":"admin","status":"active","leafCount":1,"invitationProvenance":{"invitationTransitionId":p["requestId"],"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]}}],"leaves":[{"userDid":p["actorDid"],"deviceId":p["actorDeviceId"],"leafOrigin":"genesis","keyId":p["keyId"],"deviceStatus":"active"},{"userDid":p["recipientDid"],"deviceId":bob_device,"leafOrigin":"keyPackage","joinKeyPackageRef":STANDARD.encode(&package.hash_ref),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"deviceStatus":"active"}],"metadataSnapshot":p["artifacts"]["metadataSnapshot"],"snapshotSeq":2,"directRequest":{"requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"senderDid":p["actorDid"],"recipientDid":p["recipientDid"],"consent":"accepted","importUntil":p["importUntil"],"contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],"acceptanceProof":proof}});
+    let state = json!({"conversationKind":"direct","sequencerDid":"did:web:chat.catbird.blue","coordinates":accepted["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":[{"userDid":p["actorDid"],"role":"admin","status":"active","leafCount":1},{"userDid":p["recipientDid"],"role":"admin","status":"active","leafCount":1,"invitationProvenance":{"invitationTransitionId":p["requestId"],"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]}}],"leaves":[{"userDid":p["actorDid"],"deviceId":p["actorDeviceId"],"leafOrigin":"genesis","keyId":p["keyId"],"deviceStatus":"active"},{"userDid":p["recipientDid"],"deviceId":bob_device,"leafOrigin":"keyPackage","joinKeyPackageRef":STANDARD.encode(&package.hash_ref),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"deviceStatus":"active"}],"metadataSnapshot":p["artifacts"]["metadataSnapshot"],"snapshotSeq":2,"directRequest":{"requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"senderDid":p["actorDid"],"recipientDid":p["recipientDid"],"consent":"accepted","importUntil":p["importUntil"],"contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],"acceptanceProof":proof}});
+    let mut legacy_state = state.clone();
+    legacy_state["directRequest"]["acceptanceProof"]["entry"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
     let typed = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
-        &serde_json::to_vec(&state).unwrap(),
+        &serde_json::to_vec(&legacy_state).unwrap(),
     )
     .unwrap();
     let encoded =
@@ -1172,7 +1227,7 @@ async fn sender_observes_acceptance(
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
-        json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
+        json!({"state":read_conversation_state_with_i13(dag_json, &state)}),
     );
     world
         .client("Alice")
@@ -1198,7 +1253,7 @@ async fn sender_observes_acceptance(
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
-        json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
+        json!({"state":read_conversation_state_with_i13(dag_json, &state)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetDeviceKey, 200,
@@ -1261,7 +1316,16 @@ async fn sender_observes_acceptance(
     author
         .credentials
         .set_authorized_device_keys(&author.did, vec![pubkey.clone()]);
-    let invitation_entry = json!({"$type":"blue.catbird.chat.defs#policyEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":3,"signedRequest":{"body":invitation_body,"signature":STANDARD.encode(signature)},"receivedAt":utc(0)});
+    let mut invitation_entry = json!({"$type":"blue.catbird.chat.defs#policyEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":3,"signedRequest":{"body":invitation_body,"signature":STANDARD.encode(signature)},"receivedAt":utc(0)});
+    invitation_entry["sequencerReceipt"] = direct_request_i13::control_receipt(
+        &authority,
+        &invitation_entry["signedRequest"]["body"],
+        invitation_entry["entryId"].as_str().unwrap(),
+        3,
+        invitation_entry["receivedAt"].as_str().unwrap(),
+        *transcript.request_digest(),
+        "did:web:chat.catbird.blue",
+    );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
@@ -1339,13 +1403,20 @@ async fn sender_observes_acceptance(
         .unwrap()
         .is_none());
     let mut acceptance_entry = proof["entry"].clone();
+    let sequencer_receipt = acceptance_entry
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt")
+        .unwrap();
     acceptance_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
-    let acceptance_entry = read_bytes(
+    let mut acceptance_entry = read_bytes(
         dag_json,
         "directRequestAcceptanceEntry",
         true,
         &acceptance_entry,
     );
+    acceptance_entry["sequencerReceipt"] =
+        read_bytes(dag_json, "sequencerReceipt", false, &sequencer_receipt);
     let acceptance_envelope =
         catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&acceptance_entry, &cid)
             .unwrap()
@@ -1422,6 +1493,8 @@ async fn sender_closes(f: SenderFixture, state: Value) {
         mut world,
         dag_json,
         authorization_checks,
+        authority,
+        method,
         pubkey,
         input,
         publication,
@@ -1445,7 +1518,7 @@ async fn sender_closes(f: SenderFixture, state: Value) {
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
-        json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
+        json!({"state":read_conversation_state_with_i13(dag_json, &state)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::CloseConversation,
@@ -1465,7 +1538,124 @@ async fn sender_closes(f: SenderFixture, state: Value) {
     let close = last_request(&world, Op::CloseConversation);
     let body = &close["signedRequest"]["body"];
     let tombstone = json!({"$type":"blue.catbird.chat.defs#conversationCloseTombstone","conversationId":cid,"conversationKind":"direct","retired":body["retired"],"closedByDid":body["actorDid"],"closedByDeviceId":body["actorDeviceId"],"terminalSeq":3,"closedAt":utc(0)});
-    let entry = json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":3,"signedRequest":close["signedRequest"],"receivedAt":tombstone["closedAt"],"tombstone":tombstone});
+    use catbird_mls::chat_v2::transcript::{
+        decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+    };
+    let strict = decode_strict_json(&serde_json::to_vec(body).unwrap()).unwrap();
+    let transcript = SigningTranscript::build_for(
+        SignedMutationKind::ConversationClose,
+        &project_signed_body(SignedMutationKind::ConversationClose, &strict).unwrap(),
+    )
+    .unwrap();
+    let mut entry = json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":3,"signedRequest":close["signedRequest"],"receivedAt":tombstone["closedAt"],"tombstone":tombstone});
+    let authority_did = "did:web:chat.catbird.blue";
+    let rotated = p256::ecdsa::SigningKey::from_slice(&[42; 32]).unwrap();
+    let rotated_kid = format!("{authority_did}#mls-receipt-2");
+    let rotated_request_method = protocol::direct_request_receipt_key_id(
+        rotated.verifying_key().to_encoded_point(true).as_bytes(),
+    )
+    .unwrap();
+    let rotated_doc: Value = serde_json::from_slice(&direct_request_i13::authority_document(
+        &rotated,
+        &rotated_request_method,
+        authority_did,
+    ))
+    .unwrap();
+    let mut current_doc: Value = serde_json::from_slice(&direct_request_i13::authority_document(
+        &authority,
+        &method,
+        authority_did,
+    ))
+    .unwrap();
+    let mut rotated_method = rotated_doc["verificationMethod"][1].clone();
+    rotated_method["id"] = json!(rotated_kid.clone());
+    current_doc["verificationMethod"]
+        .as_array_mut()
+        .unwrap()
+        .push(rotated_method);
+    alice
+        .credentials
+        .set_request_authority_document(serde_json::to_vec(&current_doc).unwrap());
+    entry["sequencerReceipt"] = direct_request_i13::control_receipt_at_with_key_id(
+        &rotated,
+        body,
+        &body["retired"],
+        entry["entryId"].as_str().unwrap(),
+        3,
+        entry["receivedAt"].as_str().unwrap(),
+        *transcript.request_digest(),
+        authority_did,
+        &rotated_kid,
+    );
+    let mut missing_receipt = entry.clone();
+    missing_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    let missing_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&missing_receipt, &cid)
+            .unwrap()
+            .unwrap();
+    assert!(alice
+        .orchestrator
+        .process_incoming_message(&missing_envelope)
+        .await
+        .is_err());
+
+    let unpublished = p256::ecdsa::SigningKey::from_slice(&[43; 32]).unwrap();
+    let mut unpublished_receipt = entry.clone();
+    unpublished_receipt["sequencerReceipt"] = direct_request_i13::control_receipt_at_with_key_id(
+        &unpublished,
+        body,
+        &body["retired"],
+        entry["entryId"].as_str().unwrap(),
+        3,
+        entry["receivedAt"].as_str().unwrap(),
+        *transcript.request_digest(),
+        authority_did,
+        &format!("{authority_did}#mls-receipt-3"),
+    );
+    world
+        .delivery_service()
+        .set_terminal_entries_for_test(vec![unpublished_receipt.clone()]);
+    let unpublished_envelope = catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(
+        &unpublished_receipt,
+        &cid,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(alice
+        .orchestrator
+        .process_incoming_message(&unpublished_envelope)
+        .await
+        .is_err());
+
+    let mut forged_receipt = entry.clone();
+    forged_receipt["sequencerReceipt"]["signature"] = json!(STANDARD.encode([0u8; 64]));
+    world
+        .delivery_service()
+        .set_terminal_entries_for_test(vec![forged_receipt.clone()]);
+    let forged_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&forged_receipt, &cid)
+            .unwrap()
+            .unwrap();
+    assert!(alice
+        .orchestrator
+        .process_incoming_message(&forged_envelope)
+        .await
+        .is_err());
+    world
+        .delivery_service()
+        .set_terminal_entries_for_test(Vec::new());
+    assert_ne!(
+        alice
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .unwrap()[0]
+            .consent,
+        RequestConsent::Closed
+    );
     world.delivery_service().queue_request_operation_response(
         Op::CloseConversation,
         200,
@@ -1473,8 +1663,13 @@ async fn sender_closes(f: SenderFixture, state: Value) {
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
-        404,
-        json!({"error":"ConversationNotFound"}),
+        200,
+        json!({"state":read_conversation_state_with_i13(dag_json, &state)}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state":read_conversation_state_with_i13(dag_json, &state)}),
     );
     let closed = alice.orchestrator.close_direct_request(&cid).await.unwrap();
     assert_eq!(closed.consent, RequestConsent::Closed);

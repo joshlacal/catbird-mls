@@ -15,6 +15,8 @@ pub mod traits;
 
 use serde::{Deserialize, Serialize};
 
+pub use chat_wire::{PendingGroupCreationState, PendingGroupCreationStatus};
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use config::wipe_pre_cutover_local_artifacts;
 pub use config::{
@@ -526,7 +528,7 @@ pub(crate) mod native_client {
                 Ok(())
             })?;
 
-            Ok(Arc::new(Self {
+            let client = Arc::new(Self {
                 config,
                 normalized_did,
                 account_did_hash,
@@ -544,7 +546,8 @@ pub(crate) mod native_client {
                 wipe_report,
                 #[cfg(any(test, feature = "test-utils", feature = "sim"))]
                 offline_archive_for_test,
-            }))
+            });
+            Ok(client)
         }
 
         fn notify(&self, event: PlatformChangeEvent) {
@@ -1797,7 +1800,26 @@ pub(crate) mod native_client {
                             "history message conversation_id mismatch",
                         ));
                     }
+                    let gap_key = super::chat_wire::undecryptable_evidence_key(
+                        conversation_id,
+                        &msg.message_id,
+                    );
+                    let local = tx.get_message(&msg.message_id)?;
+                    let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
+                    if local.is_some() && !gap {
+                        continue;
+                    }
                     tx.insert_message(msg)?;
+                    if gap {
+                        tx.conn()
+                            .execute(
+                                "DELETE FROM labyrinth_state WHERE state_key = ?1",
+                                [&gap_key],
+                            )
+                            .map_err(|error| {
+                                MLSError::Internal(format!("clear undecryptable evidence: {error}"))
+                            })?;
+                    }
                     imported = imported.saturating_add(1);
                 }
                 Ok(imported)
@@ -1878,4 +1900,9 @@ pub(crate) mod native_client {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) use live_sync::{apply_verified_roster_effects, verify_control_entry_receipt_with_key};
+#[cfg(not(target_arch = "wasm32"))]
 pub use native_client::CatbirdMlsClient;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "labyrinth", feature = "sim"))]
+pub use native_client::convert_platform_space_response_for_sim;

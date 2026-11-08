@@ -106,9 +106,9 @@ where
             .authorize_direct_request_projection(&mut raw, &owner, &device)
             .await?;
         let kind = entry["$type"].as_str().ok_or_else(invalid)?.to_owned();
-        let entry = request_control_entry(entry)?;
         match kind.as_str() {
             "blue.catbird.chat.defs#directRequestEntry" => {
+                let entry = request_control_entry(entry)?;
                 let receipt: Value = serde_json::from_slice(&projection.publication_receipt)
                     .map_err(|_| invalid())?;
                 let hash = verify_request_publication_entry(
@@ -142,8 +142,53 @@ where
                 }
             }
             "blue.catbird.chat.defs#directRequestAcceptanceEntry" => {
+                let mut control = entry;
+                let receipt = super::projection::normalize_control_sequencer_receipt(&mut control)?;
+                let _ = control
+                    .as_object_mut()
+                    .ok_or_else(invalid)?
+                    .remove("sequencerReceipt");
+                let entry = request_control_entry(control)?;
                 let proof: Value = serde_json::from_slice(
                     projection.acceptance_proof.as_ref().ok_or_else(invalid)?,
+                )
+                .map_err(|_| invalid())?;
+                let (proof, _) = super::projection::normalize_acceptance_proof_with_i13(proof)?;
+                let recipient_key = projection
+                    .recipient_public_key
+                    .as_ref()
+                    .ok_or_else(invalid)?;
+                let accepted = transcript::verify_received_signed_request(
+                    transcript::DirectRequestKind::Accept,
+                    &serde_json::to_vec(&entry["signedRequest"]).map_err(|_| invalid())?,
+                    recipient_key,
+                )
+                .map_err(|_| invalid())?;
+                let authority: Value =
+                    serde_json::from_slice(&projection.trusted_authority_document)
+                        .map_err(|_| invalid())?;
+                let authority_did = authority["id"].as_str().ok_or_else(invalid)?;
+                let kid = crate::client::chat_wire::sequencer_receipt_kid(authority_did, &receipt)
+                    .map_err(|_| invalid())?;
+                let key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                    &projection.trusted_authority_document,
+                    authority_did,
+                    kid,
+                )
+                .map_err(|_| invalid())?;
+                crate::client::chat_wire::verify_control_sequencer_receipt(
+                    &receipt,
+                    &key,
+                    authority_did,
+                    cid,
+                    entry["entryId"].as_str().ok_or_else(invalid)?,
+                    entry["seq"].as_i64().ok_or_else(invalid)?,
+                    accepted.body()["actorDid"].as_str().ok_or_else(invalid)?,
+                    accepted.body()["actorDeviceId"]
+                        .as_str()
+                        .ok_or_else(invalid)?,
+                    &accepted.body()["next"],
+                    accepted.request_digest(),
                 )
                 .map_err(|_| invalid())?;
                 let hash = transcript::direct_request_acceptance_entry_hash(

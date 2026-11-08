@@ -55,6 +55,10 @@ pub async fn recover_pending_labyrinth_rotations(
     db: &MlsAccountDb,
     transport: &dyn RotationCommitTransport,
 ) -> Result<usize, MLSError> {
+    if crate::planted::is_planted_bug_active(crate::planted::PlantedBug::MutationJournalRollForward)
+    {
+        return Ok(0);
+    }
     let pending: Vec<MutationJournalRow> = db
         .read_tx(|rx| rx.list_mutation_journal_pending())?
         .into_iter()

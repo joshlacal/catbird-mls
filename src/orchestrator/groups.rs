@@ -5182,8 +5182,14 @@ where
             &key,
         )?;
         let authorization = chat_wire::leaf_recovery_request_authorization(&body, conversation_id)?;
-        if !chat_wire::recovery_request_entitled(&authorization, leaves, None, own_did, own_device)
-        {
+        if !chat_wire::recovery_request_entitled(
+            &authorization,
+            leaves,
+            None,
+            false,
+            own_did,
+            own_device,
+        ) {
             return Err(OrchestratorError::Mls(MLSError::InsufficientPermissions {
                 operation:
                     "fulfill a leaf recovery whose requester this group's leaves do not entitle"

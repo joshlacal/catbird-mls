@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use catbird_mls::chat_v2::transcript::{
+    decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+};
 use catbird_mls::client::REQUIRED_LABYRINTH_OAUTH_SCOPES;
 use catbird_mls::sim_hooks::{
     build_staged_welcome_at, validate_key_package_at, ChaChaSimEntropy, FixedStepClock,
@@ -312,6 +315,62 @@ impl DeterministicMockTransport {
                 .get("next")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            let kind = SignedMutationKind::Creation;
+            let strict =
+                decode_strict_json(&serde_json::to_vec(sbody).unwrap()).expect("creation body");
+            let projected = project_signed_body(kind, &strict).expect("creation projection");
+            let request_digest = *SigningTranscript::build_for(kind, &projected)
+                .expect("creation transcript")
+                .request_digest();
+            let group_id_b64 = next_coords["groupId"]["$bytes"]
+                .as_str()
+                .or_else(|| next_coords["groupId"].as_str())
+                .expect("creation groupId");
+            let group_id = BASE64.decode(group_id_b64).expect("creation groupId bytes");
+            let generation = next_coords["generation"]
+                .as_u64()
+                .expect("creation generation");
+            let epoch = next_coords["epoch"].as_u64().expect("creation epoch");
+            let actor_did = sbody["actorDid"].as_str().expect("creation actor DID");
+            let actor_device_id = sbody["actorDeviceId"]
+                .as_str()
+                .expect("creation actor device");
+            let entry_id = sbody["transitionId"].as_str().expect("creation transition");
+            let receipt_kid = "did:web:mls.catbird.test#mls-receipt-1";
+            let signed = labyrinth_protocol::receipt::sign_sequencer_receipt(
+                &self.sequencer_signing_key,
+                receipt_kid,
+                &labyrinth_protocol::receipt::SequencerReceiptPayload {
+                    sequencer_did: "did:web:mls.catbird.test".to_string(),
+                    conversation_id: sbody["conversationId"]
+                        .as_str()
+                        .expect("creation conversation")
+                        .to_string(),
+                    group_id,
+                    epoch,
+                    sender_device_did_url: format!("{actor_did}#{actor_device_id}"),
+                    entry_id: entry_id.to_string(),
+                    archive_commitment: request_digest,
+                    seq: 1,
+                    issued_at_ms: PINNED_RECEIPT_ISSUED_AT_MS,
+                },
+            )
+            .expect("sign creation receipt");
+            let control_receipt = serde_json::json!({
+                "sequencerDid": "did:web:mls.catbird.test",
+                "kid": receipt_kid,
+                "conversationId": sbody["conversationId"],
+                "generation": generation,
+                "groupId": { "$bytes": group_id_b64 },
+                "epoch": epoch,
+                "seq": 1,
+                "senderDid": actor_did,
+                "senderDeviceId": actor_device_id,
+                "entryId": entry_id,
+                "archiveCommitment": { "$bytes": BASE64.encode(request_digest) },
+                "issuedAtMs": PINNED_RECEIPT_ISSUED_AT_MS,
+                "signature": { "$bytes": BASE64.encode(signed.signature) }
+            });
             if let Some(cid) = sbody["conversationId"].as_str() {
                 let mut parts = sbody["manifest"]["participants"].clone();
                 let creator_did = sbody["manifest"]["actorLeaf"]["userDid"].as_str();
@@ -344,6 +403,7 @@ impl DeterministicMockTransport {
                     "seq": 1,
                     "signedRequest": req_json["signedRequest"],
                     "receivedAt": sbody["signedAt"],
+                    "sequencerReceipt": control_receipt,
                 },
             }})));
         }
@@ -801,9 +861,12 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // Moved again in R4 (two separate processes agree): enrollment checks the `enrollDevice`
     // answer before any PDS write, so the device and declaration `putRecord`s now follow
     // `enrollDevice` on the wire instead of preceding it.
+    // Moved in Task 5: creation now verifies its mandatory I13 control receipt, including the
+    // receipt authority lookup, before accepting the sequenced transition.
+    // Moved again in Task 5: confirmed sendCounter persistence adds a clock tick before Labyrinth flush.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "7a1856748d1703c488022b26a70c44e94ecacc9b8769a3fb034a2f44fa5eefab",
+        "ab6d8d6471804c0cfa1e33f3b616460cf00fc8fcd3a9955eb504437eba85a235",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }

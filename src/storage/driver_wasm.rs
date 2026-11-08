@@ -2,7 +2,7 @@
 //!
 //! Enforces:
 //! - Exact pragma order: `PRAGMA cipher = 'chacha20';` BEFORE `PRAGMA key = "x'<64-hex>'";`
-//! - Default rollback journal (NEVER `WAL` on `opfs-sahpool`, which lacks shared memory `-shm`)
+//! - `DELETE` rollback journal (NEVER `WAL` on `opfs-sahpool`, which lacks shared memory `-shm`)
 //! - Unified 15-table schema (`UNIFIED_SCHEMA_DDL`) + single-table `openmls_kv` `StorageProvider<1>`
 
 use crate::error::MLSError;
@@ -17,7 +17,7 @@ use super::queries::{
 /// 1. `PRAGMA cipher = 'chacha20';` (MUST run before `PRAGMA key`)
 /// 2. `PRAGMA key = "x'<64-hex>'";`
 /// 3. `PRAGMA page_size = 4096;`
-/// 4. `PRAGMA journal_mode = DELETE;` (rollback journal — NEVER `WAL` on `opfs-sahpool`)
+/// 4. `PRAGMA journal_mode = DELETE;` (the pinned VFS corrupts rollback in retained-journal modes)
 /// 5. `PRAGMA synchronous = FULL;`
 pub fn wasm_sqlite3mc_init_pragmas(db_key_32: &[u8; 32]) -> String {
     let hex_key = hex::encode(db_key_32);

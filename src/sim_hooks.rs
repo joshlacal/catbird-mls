@@ -232,11 +232,16 @@ pub fn sim_signature_keypair(
 // SimClientHooks & TxAutocommitProbe (`I6`)
 // ---------------------------------------------------------------------------
 
-/// Clock + entropy bundle injected into [`crate::client::CatbirdMlsClient::open_with_hooks`].
+/// Clock, entropy, and deterministic automatic-PCS policy injected into
+/// [`crate::client::CatbirdMlsClient::open_with_hooks`].
 #[derive(Clone)]
 pub struct SimClientHooks {
     pub clock: Arc<dyn SimClock>,
     pub entropy: Arc<dyn SimEntropy>,
+    /// Maximum time in one MLS epoch before an automatic sender self-update.
+    pub pcs_max_age_ms: i64,
+    /// Maximum durable application messages in one MLS epoch before an automatic self-update.
+    pub pcs_max_messages: u64,
 }
 
 impl fmt::Debug for SimClientHooks {
@@ -252,15 +257,32 @@ impl Default for SimClientHooks {
 }
 
 impl SimClientHooks {
+    pub const DEFAULT_PCS_MAX_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
+    pub const DEFAULT_PCS_MAX_MESSAGES: u64 = 100;
+
     pub fn system_default() -> Self {
         Self {
             clock: Arc::new(SystemClock),
             entropy: Arc::new(OsSimEntropy),
+            pcs_max_age_ms: Self::DEFAULT_PCS_MAX_AGE_MS,
+            pcs_max_messages: Self::DEFAULT_PCS_MAX_MESSAGES,
         }
     }
 
     pub fn new(clock: Arc<dyn SimClock>, entropy: Arc<dyn SimEntropy>) -> Self {
-        Self { clock, entropy }
+        Self {
+            clock,
+            entropy,
+            pcs_max_age_ms: Self::DEFAULT_PCS_MAX_AGE_MS,
+            pcs_max_messages: Self::DEFAULT_PCS_MAX_MESSAGES,
+        }
+    }
+
+    /// Override automatic-PCS thresholds. Zero disables that threshold.
+    pub fn with_pcs_policy(mut self, max_age_ms: i64, max_messages: u64) -> Self {
+        self.pcs_max_age_ms = max_age_ms.max(0);
+        self.pcs_max_messages = max_messages;
+        self
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -1143,6 +1165,16 @@ impl BuggifyController {
             slot.borrow()
                 .as_ref()
                 .map(|c| c.hit_counts.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Drain hit counts recorded on the current thread's active controller.
+    pub fn take_hits() -> BTreeMap<String, u64> {
+        BUGGIFY_CONTROLLER.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .map(|controller| std::mem::take(&mut controller.hit_counts))
                 .unwrap_or_default()
         })
     }

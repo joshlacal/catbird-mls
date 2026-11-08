@@ -13,6 +13,7 @@ use catbird_mls::orchestrator::{
     canonical_transport::CanonicalOperation as Op, MlsCryptoContext, OrchestratorError,
 };
 use catbird_mls::{RequestConsent, RequestCrypto, RequestPreview};
+use e2e_harness::mock_api_client::direct_request_i13;
 use e2e_harness::TestWorld;
 use serde_json::{json, Value};
 
@@ -136,9 +137,6 @@ async fn unaddressed_view_requires_the_reader_to_be_a_request_party() {
         "a non-party must not get a request view: {result:?}"
     );
 }
-
-#[path = "fixtures/direct_request_i13.rs"]
-mod direct_request_i13;
 
 const AUTHORITY: &str = "did:web:chat.catbird.blue";
 

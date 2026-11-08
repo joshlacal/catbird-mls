@@ -1967,7 +1967,12 @@ mod native_restore_tests {
     fn a_sequenced_account_deletion_hides_every_published_copy_of_its_messages() {
         use super::CatbirdMlsClient;
         use crate::storage::{MlsAccountDb, OpenMode};
-        fn visible(db: &MlsAccountDb, lab: &mut Labyrinth, owner: bool) -> Vec<String> {
+        fn visible(
+            db: &MlsAccountDb,
+            lab: &mut Labyrinth,
+            deletion_cid: &str,
+            owner: bool,
+        ) -> Vec<String> {
             let history = if owner {
                 block_on_sync(lab.load_owner_thread(CONVERSATION))
             } else {
@@ -1976,7 +1981,7 @@ mod native_restore_tests {
             .unwrap();
             assert!(history.undecryptable.is_empty(), "{:?}", history.undecryptable);
             let mut messages = history.messages;
-            CatbirdMlsClient::hide_deleted_accounts(db, CONVERSATION, &mut messages).unwrap();
+            CatbirdMlsClient::hide_deleted_accounts(db, deletion_cid, &mut messages).unwrap();
             messages.into_iter().map(|m| m.message_id).collect()
         }
         let w = World::new();
@@ -1994,14 +1999,19 @@ mod native_restore_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = MlsAccountDb::open_native(dir.path().join("deleted.db"), &[7; 32], OpenMode::App).unwrap();
         // Published copies stay visible until this device holds the deletion entry.
-        assert_eq!(visible(&db, &mut bob, false), ["a1", "a2", "b1"]);
-        assert_eq!(visible(&db, &mut bob, true), ["a1", "a2", "b1"]);
+        assert_eq!(visible(&db, &mut bob, CONVERSATION, false), ["a1", "a2", "b1"]);
+        assert_eq!(visible(&db, &mut bob, CONVERSATION, true), ["a1", "a2", "b1"]);
 
         let deleted_at = i64::try_from(w.net.append_chat_entry(CONVERSATION)).unwrap();
         db.write_tx(|tx| super::super::live_sync::record_account_deletion(tx, CONVERSATION, ALICE, deleted_at, 1)).unwrap();
         let a3 = w.sequence(ALICE, "a3", "after the deletion");
         archive(&mut alice, "a3", &a3, 200);
-        assert_eq!(visible(&db, &mut bob, false), ["b1", "a3"]);
-        assert_eq!(visible(&db, &mut bob, true), ["b1"]);
+        assert_eq!(
+            visible(&db, &mut bob, "00000000-0000-4000-8000-00000000ffff", false),
+            ["a1", "a2", "b1", "a3"],
+            "another conversation's authority hides no archive copy"
+        );
+        assert_eq!(visible(&db, &mut bob, CONVERSATION, false), ["b1", "a3"]);
+        assert_eq!(visible(&db, &mut bob, CONVERSATION, true), ["b1"]);
     }
 }

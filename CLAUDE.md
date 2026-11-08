@@ -139,6 +139,9 @@ On WASM/CLI: Rust implementations used directly.
 
 **Send order (seed 2323/3966 contract).** Every application send signs `(generation, epoch, sendCounter)`. Every send path (`CatbirdMlsClient`, `MLSOrchestrator`, web `WasmMlsClient`) reserves the per-conversation `sendCounter`, advances the OpenMLS sender ratchet and writes the immutable pre-HTTP send journal in `pending_ops`, all in one storage transaction. A timeout may still publish that ciphertext. On the first `StaleSend` the refused journal is deleted and the message is re-encrypted once at a fresh counter. On any further `StaleSend`, or a failed reservation, the refused journal is deleted immediately; refused bytes are never resubmitted. `GroupConfig` uses a sender-ratchet window of 10 out of order / 2,000 forward on every live create/join path.
 
+**Creation order (seed 297 contract).** Before its first `createConversation` HTTP call, group creation durably journals one staged epoch-zero `KvWriteBatch`, the sequencer DID, and the exact first signed attempt. Attempts are append-only: the resolver replays every byte-identical request that could have committed and adopts any verified answer or own sequenced creation in one transaction with journal deletion. Client open is storage-only; `create_group`, `sync`, and explicit `retry_pending_group_creation` drive resolution, with only the explicit retry bypassing the bounded exponential/`Retry-After` delay (capped at 300 seconds). The current endpoint is resolved for the journaled sequencer DID rather than persisted. A refusal, timeout, malformed answer, unavailable state read, or unverifiable entry proof retains the journal and is visible through `pending_group_creation_status`. Authenticated server time must put every attempt beyond the 300-second freshness window plus 60-second skew before verified absence/foreign ownership can permit deletion, permanent rejection, cancellation, or a new signed attempt around the same staged group. `cancel_pending_group_creation` also shares the in-flight guard; an own existing creation is adopted, and any possibly executable or unproved attempt returns `GroupCreationCancellationUnproven`.
+
+
 **Cursor rule.** `sync()` advances `last_seq` or acknowledges an entry only after verifying the entry's I13 receipt under the exact key ID it names, the original-sender attestation, and active-roster membership. This applies to every entry kind: an undecryptable current-epoch tombstone, `payloadPruned`, `already_have`, an own echo and a control entry. A missing local group is an error. `sync()` recovers an own echo's plaintext and archive queue from the journal only after matching the exact ciphertext and verifying the receipt; it never decrypts or blindly skips an own-message echo. Imported history does not advance the live entry cursor.
 
 Joined clients discover fulfillable leaf-recovery requests through
@@ -285,10 +288,10 @@ Rows are dequeued only after their page is written, so a retry can republish ide
 **Close.** `apply_terminal_close` erases the MLS group, caches and epoch secrets. It also erases the conversation's pending-op journals, archive queue, retained evidence and staged C33 opening. Local message rows stay. Nothing is archived or rescued for that conversation afterwards. Closing requires an authorized, cid-bound signed wrapper.
 
 **NSE.** `process_push_notification` opens the same `<storage_root>/catbird-mls/<sha256(did)>.db` with `OpenMode::PushExtension`.
-- It stores messages and their archive evidence without a receipt, plus a `native_archive_receipt` pending op.
-- It writes `conversation_coords:{cid}` from the authenticated commit-AAD prior. Production refuses a Commit without one.
-- The app's `write_tx` reconciles `PRAGMA data_version` inside `BEGIN IMMEDIATE` and evicts cached groups before mutating (`I7`).
-- `sync()` later verifies the entry's I13 receipt against the epoch the retained evidence names, not the display row, which a history import may hold at epoch 0. Only then does it queue the witness copy.
+- A fetched batch must be contiguous from `last_seq + 1`; every application entry's I13 receipt must bind that outer seq, generation, sender, message and archive commitment before any durable write.
+- With no network transport, or after a bounded fetch failure, an in-order inline application up to 2,200 bytes may still produce a preview after MLS decryption, the current cached PDS-authorized sender leaf-key (`I4`), AAD message ID/archive commitment, and original-sender attestation all authenticate its content. `receipt_verified = false` means exactly that this content has **no sequencer receipt**: it does not prove the sequencer accepted the entry, its sequence, or its order. Until foreground sync consumes the entry, an inline wake still inside the retained sender-ratchet window can therefore be replayed, reordered, or previewed even if it was never sequenced. The app must label this preview as unsequenced. The outer write transaction rolls every such exit back, and Rust and the Swift adapter do not post a did-commit notification for it.
+- A gap, receipt mismatch or unverifiable entry returns the generic foreground-sync preview and rolls the transaction back.
+- A verified Commit writes `conversation_coords:{cid}` from its authenticated commit-AAD prior. The app's `write_tx` reconciles `PRAGMA data_version` inside `BEGIN IMMEDIATE` and evicts cached groups before mutating (`I7`).
 
 OAuth requests must use `REQUIRED_LABYRINTH_OAUTH_SCOPES` with explicitly stated
 `read/create/update/delete` actions and the declared record collections. The old
@@ -410,6 +413,8 @@ camelCase fields (matches iOS Codable). Fallback: raw bytes as UTF-8 (legacy). E
 ### SQLCipher Configuration
 
 32-byte plaintext header (iOS WAL compat), 256K KDF iterations, 4096 page size, deterministic salt = `SHA-256(key)[..16]` hex. Must match exactly across restarts or database is unreadable.
+
+Every native and web per-account database carries `account_meta.local_state_format_version`. Open creates the row only in a completely empty database; any non-empty database with a missing, older, or newer version is refused before schema or owner metadata writes with `LocalStateFormatUnsupported { found, required }`. There is intentionally no Round 4 migration: the app must wipe local MLS state and re-enrol.
 
 ### Traffic-Analysis-Resistant Padding
 

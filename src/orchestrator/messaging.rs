@@ -2631,8 +2631,8 @@ where
             OrchestratorError::InvalidInput(format!("message payload is not UTF-8: {e}"))
         })?;
         self.validate_send_actor(actor).await?;
-        // One storage transaction reserves the next `sendCounter`, advances the sender ratchet
-        // and journals the exact body before any HTTP. A journal already reserved for this
+        // One storage transaction journals the candidate after the last confirmed `sendCounter`
+        // and advances the sender ratchet before any HTTP. A journal already reserved for this
         // message id is the only frame ever resubmitted for it.
         let reserved = self.mls_context().reserve_application_send(
             group_id_bytes.clone(),
@@ -2694,9 +2694,15 @@ where
                 status: response.status,
                 body: String::from_utf8_lossy(&response.body).to_string(),
             };
-            // Refused for good before publication: those exact bytes never go out again.
-            if is_refusal(&error, "StaleSend") || is_refusal(&error, "StaleCoordinates") {
-                self.mls_context().discard_application_send(message_id)?;
+            // Refused for good before publication: those exact bytes never go out again. A
+            // `StaleSend` also proves this counter is already covered by the sequencer's
+            // accepted watermark; `StaleCoordinates` proves no such thing.
+            if is_refusal(&error, "StaleSend") {
+                self.mls_context()
+                    .discard_application_send(message_id, true)?;
+            } else if is_refusal(&error, "StaleCoordinates") {
+                self.mls_context()
+                    .discard_application_send(message_id, false)?;
             }
             return Err(error);
         }

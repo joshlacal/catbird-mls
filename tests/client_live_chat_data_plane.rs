@@ -1,11 +1,13 @@
 //! Deep live data-plane & sync engine tests for `CatbirdMlsClient` (`Spec §6.3`, `I2`, `I4`, `I6`, `I13`, `I14`, `C33`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
+use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::client::chat_wire;
 use catbird_mls::orchestrator::canonical_transport::{derive_key_id, CanonicalOperation};
 use openmls::prelude::*;
@@ -31,10 +33,15 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use catbird_mls::client::{
-    CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpHeader, PlatformHttpRequest,
-    PlatformHttpResponse, PlatformKeyStore, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+    account_did_hash_hex, CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpHeader,
+    PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+    REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
 use catbird_mls::groups::lifecycle::MemberRole;
+use catbird_mls::push::{
+    process_push_notification, AuthorizedPeerDeviceKey, FetchedPushEntry, PushFetchBundle,
+    PushFetchTransport, PushKeystore, PushWakePayload,
+};
 use catbird_mls::MLSError;
 use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayload};
 
@@ -105,12 +112,39 @@ impl PlatformKeyStore for MemKeyStore {
     }
 }
 
+struct NsePushKeystore(Arc<MemKeyStore>);
+
+impl PushKeystore for NsePushKeystore {
+    fn load_db_key(&self, account_did_hash: String) -> Result<Vec<u8>, MLSError> {
+        self.0
+            .map
+            .lock()
+            .unwrap()
+            .get(&format!("db:{account_did_hash}"))
+            .cloned()
+            .ok_or_else(|| MLSError::Internal("push test DB key missing".into()))
+    }
+
+    fn load_signature_keypair(&self, key_id: String) -> Result<Option<Vec<u8>>, MLSError> {
+        Ok(self.0.map.lock().unwrap().get(&key_id).cloned())
+    }
+
+    fn load_cached_chat_dpop_token(
+        &self,
+        _account_did_hash: String,
+    ) -> Result<Option<String>, MLSError> {
+        Ok(Some("cached-push-test-token".into()))
+    }
+}
+
 struct MockDsState {
     receipt_sk: P256SigningKey,
     // Retained receipt generation 2; generation 1 remains `receipt_sk`.
     historical_receipt_sk: Option<P256SigningKey>,
     rotated_outcome_sk: Option<P256SigningKey>,
     rotate_outcome_key_on_next_publish: bool,
+    tamper_next_publication_coordinates: bool,
+    after_next_publish: Option<Arc<dyn Fn() + Send + Sync>>,
     tamper_next_receipt: bool,
     omit_next_receipt: bool,
     empty_stub_next_send: bool,
@@ -124,6 +158,10 @@ struct MockDsState {
     next_ack_error: Option<(u16, String)>,
     // PDS records: (repo, collection, rkey) -> value
     pds_records: BTreeMap<(String, String, String), Value>,
+    refuse_next_pds_directory_for: Option<String>,
+    transport_error_next_resolve_for: Option<String>,
+    transport_error_next_pds_directory_for: Option<String>,
+    malformed_next_pds_directory_for: Option<String>,
     // Direct request published keys: actor_did -> (device_id, key_package_val, grant_val)
     dr_keys: BTreeMap<String, Vec<(String, Value, Value)>>,
     // Conversation KPs: (actor_did, device_id) -> Vec<Value>
@@ -149,6 +187,10 @@ struct MockDsState {
     // Apply the next `enrollDevice` / `publishDirectRequestKeys`, then lose its response.
     lose_next_enroll_response: bool,
     lose_next_dr_keys_response: bool,
+    // Apply the next `createConversation`, then lose its response.
+    lose_next_create_response: bool,
+    // Completed create by conversation: exact request bytes and recorded byte-identical answer.
+    creates: BTreeMap<String, (Vec<u8>, Value)>,
     // Signed `getConversationState.accountDeletions`: cid -> `#accountDeletedEntry`s.
     account_deletions: BTreeMap<String, Vec<Value>>,
     // Persistent authenticated state denials: (session DID, conversation) -> (status, code).
@@ -181,12 +223,18 @@ struct MockDsState {
     // Present this key for the enrolling device in `enrollDevice` and `getOwnDevices` answers
     // (reads still verify under the registered key): a DS reporting another key.
     enroll_answer_key: Option<[u8; 32]>,
-    // Answer the next `acceptConversation(directRequest)` with a 2xx the coordinator did not
-    // sign (receipt by another key, unsigned coordinates) and sequence nothing.
-    forge_next_acceptance: bool,
+    // Refuse the next otherwise-valid acceptance answer as either a missing outer I13 receipt or
+    // an invalid legacy acceptance proof; neither fault is sequenced.
+    next_acceptance_fault: Option<&'static str>,
+    // Sign only the next group acceptance receipt as another sequencer.
+    next_group_acceptance_receipt_sequencer: Option<String>,
+    // Return this older genuine entry beside the next acceptance's fresh recovery view.
+    next_group_acceptance_answer_entry: Option<Value>,
     // Sequence the next `submitTransition` but forge its answer: "entry" carries another
     // signed request, "coordinates" are not the signed `next`.
     forge_next_transition_answer: Option<&'static str>,
+    // Forge the I13 receipt only in the next policy-transition answer.
+    forge_next_policy_answer_receipt: bool,
     // `getEntries` serves `actorDeviceId` only entries from this seq on: the device joined there,
     // and mls-ds never makes a device a recipient of control entries sequenced before it joined.
     readable_from: BTreeMap<String, i64>,
@@ -200,6 +248,8 @@ struct MockDsState {
     lose_next_close_response: bool,
     // Sequence the next `closeConversation` but answer with an entry carrying another request.
     forge_next_close_answer: bool,
+    // Forge the I13 receipt only in the next exact replayed close answer.
+    forge_next_close_replay_receipt: bool,
     // Closed conversation -> (exact request bytes, recorded answer): mls-ds answers an exact
     // replay with the recorded result and refuses any other close.
     closes: BTreeMap<String, (Vec<u8>, Value)>,
@@ -207,6 +257,13 @@ struct MockDsState {
     reset_requests: BTreeMap<String, Vec<Value>>,
     // Sequence the next `activateReset`, then lose its response.
     lose_next_reset_response: bool,
+    // Forge the I13 receipt only in the next reset-activation answer.
+    forge_next_reset_activation_receipt: bool,
+    // Corrupt only the next successful `requestReset` answer: "missingReceipt" or
+    // "forgedReceipt". The stored entry remains the genuine sequenced row.
+    next_reset_request_fault: Option<&'static str>,
+    // Advertise an own pending request and matching `getEntries` row that were never sequenced.
+    fake_pending_reset_seq: Option<i64>,
 }
 
 struct SharedMockDs {
@@ -222,6 +279,8 @@ impl SharedMockDs {
                 historical_receipt_sk: None,
                 rotated_outcome_sk: None,
                 rotate_outcome_key_on_next_publish: false,
+                tamper_next_publication_coordinates: false,
+                after_next_publish: None,
                 tamper_next_receipt: false,
                 omit_next_receipt: false,
                 empty_stub_next_send: false,
@@ -234,6 +293,10 @@ impl SharedMockDs {
                 fail_next_commit_status: None,
                 next_ack_error: None,
                 pds_records: BTreeMap::new(),
+                refuse_next_pds_directory_for: None,
+                transport_error_next_resolve_for: None,
+                transport_error_next_pds_directory_for: None,
+                malformed_next_pds_directory_for: None,
                 dr_keys: BTreeMap::new(),
                 convo_kps: BTreeMap::new(),
                 conversations: BTreeMap::new(),
@@ -247,6 +310,8 @@ impl SharedMockDs {
                 dr_revisions: BTreeMap::new(),
                 lose_next_enroll_response: false,
                 lose_next_dr_keys_response: false,
+                lose_next_create_response: false,
+                creates: BTreeMap::new(),
                 account_deletions: BTreeMap::new(),
                 conversation_state_errors: BTreeMap::new(),
                 http_log: Vec::new(),
@@ -261,16 +326,23 @@ impl SharedMockDs {
                 rotated_sequencer_receipts: false,
                 member_devices_override: None,
                 enroll_answer_key: None,
-                forge_next_acceptance: false,
+                next_acceptance_fault: None,
+                next_group_acceptance_receipt_sequencer: None,
+                next_group_acceptance_answer_entry: None,
                 forge_next_transition_answer: None,
+                forge_next_policy_answer_receipt: false,
                 readable_from: BTreeMap::new(),
                 readable_until: BTreeMap::new(),
                 select_sender_siblings: false,
                 lose_next_close_response: false,
                 forge_next_close_answer: false,
+                forge_next_close_replay_receipt: false,
                 closes: BTreeMap::new(),
                 reset_requests: BTreeMap::new(),
                 lose_next_reset_response: false,
+                forge_next_reset_activation_receipt: false,
+                next_reset_request_fault: None,
+                fake_pending_reset_seq: None,
             }),
             archive_auth: NativeArchiveAuthFixture::new(
                 ALICE_DID,
@@ -279,10 +351,10 @@ impl SharedMockDs {
         })
     }
 
-    fn receipt_did_doc(&self) -> Value {
+    fn receipt_did_doc_for(&self, authority_did: &str) -> Value {
         let g = self.inner.lock().unwrap();
         let method = dr_transcript::direct_request_receipt_key_id_for_authority(
-            DS_DID,
+            authority_did,
             g.receipt_sk
                 .verifying_key()
                 .to_encoded_point(true)
@@ -292,42 +364,48 @@ impl SharedMockDs {
         let mut document: Value = serde_json::from_slice(&direct_request_i13::authority_document(
             &g.receipt_sk,
             &method,
-            DS_DID,
+            authority_did,
         ))
         .unwrap();
-        if let Some(rotated) = &g.rotated_outcome_sk {
-            let rotated_method = dr_transcript::direct_request_receipt_key_id_for_authority(
-                DS_DID,
-                rotated.verifying_key().to_encoded_point(true).as_bytes(),
-            )
-            .unwrap();
-            let rotated_document: Value = serde_json::from_slice(
-                &direct_request_i13::authority_document(rotated, &rotated_method, DS_DID),
-            )
-            .unwrap();
-            document["verificationMethod"]
-                .as_array_mut()
-                .unwrap()
-                .push(rotated_document["verificationMethod"][0].clone());
-        }
-        if let Some(historical) = &g.historical_receipt_sk {
-            let request_method = dr_transcript::direct_request_receipt_key_id_for_authority(
-                DS_DID,
-                historical.verifying_key().to_encoded_point(true).as_bytes(),
-            )
-            .unwrap();
-            let historical_document: Value = serde_json::from_slice(
-                &direct_request_i13::authority_document(historical, &request_method, DS_DID),
-            )
-            .unwrap();
-            let mut receipt_method = historical_document["verificationMethod"][1].clone();
-            receipt_method["id"] = json!(format!("{DS_DID}#mls-receipt-2"));
-            document["verificationMethod"]
-                .as_array_mut()
-                .unwrap()
-                .push(receipt_method);
+        if authority_did == DS_DID {
+            if let Some(rotated) = &g.rotated_outcome_sk {
+                let rotated_method = dr_transcript::direct_request_receipt_key_id_for_authority(
+                    DS_DID,
+                    rotated.verifying_key().to_encoded_point(true).as_bytes(),
+                )
+                .unwrap();
+                let rotated_document: Value = serde_json::from_slice(
+                    &direct_request_i13::authority_document(rotated, &rotated_method, DS_DID),
+                )
+                .unwrap();
+                document["verificationMethod"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(rotated_document["verificationMethod"][0].clone());
+            }
+            if let Some(historical) = &g.historical_receipt_sk {
+                let request_method = dr_transcript::direct_request_receipt_key_id_for_authority(
+                    DS_DID,
+                    historical.verifying_key().to_encoded_point(true).as_bytes(),
+                )
+                .unwrap();
+                let historical_document: Value = serde_json::from_slice(
+                    &direct_request_i13::authority_document(historical, &request_method, DS_DID),
+                )
+                .unwrap();
+                let mut receipt_method = historical_document["verificationMethod"][1].clone();
+                receipt_method["id"] = json!(format!("{DS_DID}#mls-receipt-2"));
+                document["verificationMethod"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(receipt_method);
+            }
         }
         document
+    }
+
+    fn receipt_did_doc(&self) -> Value {
+        self.receipt_did_doc_for(DS_DID)
     }
 
     fn for_account(self: &Arc<Self>, account_did: &str) -> Arc<dyn PlatformTransport> {
@@ -540,11 +618,25 @@ impl SharedMockDs {
             .and_then(|b| serde_json::from_slice(b).ok())
             .unwrap_or_else(|| json!({}));
 
-        if url.ends_with("/.well-known/did.json")
-            || (url.contains("/xrpc/com.atproto.identity.resolveDid")
-                && q.get("did").map(String::as_str) == Some(DS_DID))
-        {
+        if url.ends_with("/.well-known/did.json") {
             return ok_json(self.receipt_did_doc());
+        }
+        if url.contains("/xrpc/com.atproto.identity.resolveDid") {
+            let did = q.get("did").cloned().unwrap_or_default();
+            let mut state = self.inner.lock().unwrap();
+            if state.transport_error_next_resolve_for.as_deref() == Some(did.as_str()) {
+                state.transport_error_next_resolve_for = None;
+                return Err(MLSError::Internal(
+                    "injected DID resolution transport error".into(),
+                ));
+            }
+        }
+
+        if url.contains("/xrpc/com.atproto.identity.resolveDid")
+            && q.get("did")
+                .is_some_and(|did| matches!(did.as_str(), DS_DID | CROSS_HOME_DS_DID))
+        {
+            return ok_json(self.receipt_did_doc_for(q.get("did").unwrap()));
         }
 
         if url.contains("/xrpc/com.atproto.identity.resolveDid") {
@@ -590,6 +682,29 @@ impl SharedMockDs {
                 "uri": format!("at://{repo}/{coll}/{rkey}"),
                 "cid": "bafyreimock"
             }));
+        }
+
+        if url.contains("/xrpc/com.atproto.repo.listRecords")
+            && g.transport_error_next_pds_directory_for.as_deref()
+                == q.get("repo").map(String::as_str)
+        {
+            g.transport_error_next_pds_directory_for = None;
+            return Err(MLSError::Internal(
+                "injected PDS directory transport error".into(),
+            ));
+        }
+        if url.contains("/xrpc/com.atproto.repo.listRecords")
+            && g.malformed_next_pds_directory_for.as_deref() == q.get("repo").map(String::as_str)
+        {
+            g.malformed_next_pds_directory_for = None;
+            return ok_json(json!({ "records": "not-an-array" }));
+        }
+
+        if url.contains("/xrpc/com.atproto.repo.listRecords")
+            && g.refuse_next_pds_directory_for.as_deref() == q.get("repo").map(String::as_str)
+        {
+            g.refuse_next_pds_directory_for = None;
+            return xrpc_error(503, "CapacityUnavailable", "injected PDS refusal");
         }
 
         if url.contains("/xrpc/com.atproto.repo.listRecords") {
@@ -1013,7 +1128,7 @@ impl SharedMockDs {
                 &serde_json::to_vec(b).unwrap(),
             )
             .unwrap();
-            let outcome_body = json!({
+            let mut outcome_body = json!({
                 "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
                 "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
                 "protocolVersion": "2", "authorityDid": DS_DID,
@@ -1032,6 +1147,9 @@ impl SharedMockDs {
                     "sequencerReceipt": opening_receipt,
                 },
             });
+            if std::mem::take(&mut g.tamper_next_publication_coordinates) {
+                outcome_body["receipt"]["coordinates"]["stateVersion"] = json!(99);
+            }
             let transcript = dr_transcript::direct_request_signing_bytes(
                 DirectRequestKind::Outcome,
                 &serde_json::to_vec(&outcome_body).unwrap(),
@@ -1073,6 +1191,9 @@ impl SharedMockDs {
                 "sequencerDid": DS_DID,
                 "signedRequest": sr,
             }));
+            if let Some(callback) = g.after_next_publish.take() {
+                callback();
+            }
             return ok_json(json!({ "outcome": outcome }));
         }
 
@@ -1080,6 +1201,14 @@ impl SharedMockDs {
             let sr = body_json["signedRequest"].clone();
             let b = &sr["body"];
             let cid = b["conversationId"].as_str().unwrap().to_string();
+            let request_bytes = req.body.clone().unwrap_or_default();
+            if let Some((recorded_request, recorded_answer)) = g.creates.get(&cid) {
+                return if recorded_request == &request_bytes {
+                    ok_json(recorded_answer.clone())
+                } else {
+                    xrpc_error(400, "IdempotencyConflict", "creation bytes changed")
+                };
+            }
             let coords = b["next"].clone();
             let mut parts = b["manifest"]["participants"].clone();
             let creator_did = b["manifest"]["actorLeaf"]["userDid"].as_str();
@@ -1101,28 +1230,36 @@ impl SharedMockDs {
                     "snapshotSeq": 1,
                 }),
             );
-            g.entries.entry(cid.clone()).or_default().push(json!({
+            let mut entry = json!({
                 "$type": "blue.catbird.chat.defs#creationEntry",
-                "seq": 1,
-                "coordinates": coords.clone(),
-                "signedRequest": sr,
-            }));
-            return ok_json(json!({ "result": {
+                "entryId": b["transitionId"], "conversationId": cid, "seq": 1,
+                "signedRequest": sr, "receivedAt": b["signedAt"],
+            });
+            entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &coords);
+            g.entries
+                .entry(cid.clone())
+                .or_default()
+                .push(entry.clone());
+            let answer = json!({ "result": {
                 "$type": "blue.catbird.chat.defs#conversationCreatedResult",
                 "coordinates": coords,
-                "entry": {
-                    "entryId": b["transitionId"], "conversationId": cid, "seq": 1,
-                    "signedRequest": sr, "receivedAt": b["signedAt"],
-                },
-            }}));
+                "entry": entry,
+            }});
+            g.creates.insert(cid, (request_bytes, answer.clone()));
+            if std::mem::take(&mut g.lose_next_create_response) {
+                return Err(MLSError::Internal(
+                    "createConversation response lost after commit".into(),
+                ));
+            }
+            return ok_json(answer);
         }
 
         if url.contains("/xrpc/blue.catbird.chat.acceptConversation") {
             if let Some(dr) = body_json.get("directRequest") {
                 let b = &dr["body"];
                 let cid = b["next"]["conversationId"].as_str().unwrap().to_string();
-                let mut next_coords = b["next"].clone();
-                let entry = json!({
+                let next_coords = b["next"].clone();
+                let mut entry = json!({
                     "$type": "blue.catbird.chat.defs#directRequestAcceptanceEntry",
                     "entryId": uuid::Uuid::new_v4().to_string(),
                     "conversationId": cid,
@@ -1133,11 +1270,18 @@ impl SharedMockDs {
                 let mut receipt = acceptance_commit_receipt(&g.receipt_sk, &entry);
                 let mut proof_entry = entry.clone();
                 proof_entry.as_object_mut().unwrap().remove("$type");
-                if std::mem::take(&mut g.forge_next_acceptance) {
-                    // Coordinates the coordinator never signed; nothing is sequenced.
-                    next_coords["stateVersion"] =
-                        json!(next_coords["stateVersion"].as_i64().unwrap() + 5);
-                    receipt["body"]["next"] = next_coords.clone();
+                let fault = g.next_acceptance_fault.take();
+                if fault == Some("missingI13") {
+                    return ok_json(json!({
+                        "coordinates": next_coords,
+                        "acceptanceProof": { "entry": proof_entry, "receipt": receipt },
+                    }));
+                }
+                let control_receipt = control_sequencer_receipt(&g, &entry, &next_coords);
+                entry["sequencerReceipt"] = control_receipt.clone();
+                proof_entry["sequencerReceipt"] = control_receipt;
+                if fault == Some("legacyProof") {
+                    receipt["signature"] = json!(STANDARD.encode([7u8; 64]));
                     return ok_json(json!({
                         "coordinates": next_coords,
                         "acceptanceProof": { "entry": proof_entry, "receipt": receipt },
@@ -1159,7 +1303,10 @@ impl SharedMockDs {
                 }));
             }
             // Acceptance creates a post-acceptance-coordinate request, not an inviter inbox row.
-            let sr = body_json["signedRequest"].clone();
+            let mut sr = body_json["signedRequest"].clone();
+            if sr["signature"].is_string() {
+                sr["signature"] = json!({ "$bytes": sr["signature"].take() });
+            }
             let b = &sr["body"];
             let cid = b["next"]["conversationId"].as_str().unwrap().to_string();
             let next_coords = b["next"].clone();
@@ -1181,14 +1328,27 @@ impl SharedMockDs {
                     }
                 }
             }
-            let entries = g.entries.entry(cid.clone()).or_default();
-            let next_seq = (entries.len() as i64) + 1;
-            entries.push(json!({
+            let next_seq = g.entries.get(&cid).map_or(0, Vec::len) as i64 + 1;
+            let mut entry = json!({
                 "$type": "blue.catbird.chat.defs#participantAcceptanceEntry",
-                "seq": next_seq,
-                "coordinates": next_coords.clone(),
-                "signedRequest": sr,
-            }));
+                "entryId": b["transitionId"], "conversationId": cid, "seq": next_seq,
+                "coordinates": next_coords.clone(), "signedRequest": sr,
+                "receivedAt": b["signedAt"],
+            });
+            let receipt_sequencer = g
+                .next_group_acceptance_receipt_sequencer
+                .take()
+                .unwrap_or_else(|| DS_DID.to_owned());
+            entry["sequencerReceipt"] =
+                control_sequencer_receipt_for(&g, &entry, &next_coords, &receipt_sequencer);
+            g.entries
+                .entry(cid.clone())
+                .or_default()
+                .push(entry.clone());
+            let answer_entry = g
+                .next_group_acceptance_answer_entry
+                .take()
+                .unwrap_or_else(|| entry.clone());
             g.conversations.get_mut(&cid).unwrap()["snapshotSeq"] = json!(next_seq);
             let expires_at =
                 (chrono::DateTime::parse_from_rfc3339(b["signedAt"].as_str().unwrap()).unwrap()
@@ -1230,9 +1390,9 @@ impl SharedMockDs {
                 },
             });
             requests.push(view.clone());
-            // `mls-ds` `acceptance_response`: the acceptance's coordinate and recovery view.
+            // `mls-ds` `acceptance_response`: the acceptance's entry, coordinate and recovery.
             return ok_json(json!({
-                "seq": next_seq, "coordinates": next_coords, "recovery": view,
+                "seq": next_seq, "coordinates": next_coords, "entry": answer_entry, "recovery": view,
             }));
         }
 
@@ -1360,6 +1520,13 @@ impl SharedMockDs {
                 g.conversations[&cid]["coordinates"], b["prior"],
                 "fixture rejects transitions built against a superseded coordinate"
             );
+            let entry_kind = match btype.trim_start_matches("blue.catbird.chat.defs#") {
+                "commitTransitionBody" => "commitEntry",
+                "leafRecoveryFulfillmentBody" => "leafRecoveryFulfillmentEntry",
+                "policyTransitionBody" => "policyEntry",
+                "metadataTransitionBody" => "metadataEntry",
+                other => panic!("fixture has no entry kind for {other}"),
+            };
 
             if btype.ends_with("leafRecoveryFulfillmentBody") {
                 let wb = &b["manifest"]["welcomeBundle"];
@@ -1384,11 +1551,19 @@ impl SharedMockDs {
                 }
             }
 
-            g.entries.entry(cid.clone()).or_default().push(json!({
+            let mut entry = json!({
+                "$type": format!("blue.catbird.chat.defs#{entry_kind}"),
+                "entryId": b["transitionId"],
+                "conversationId": cid,
                 "seq": next_seq,
-                "coordinates": next_coords.clone(),
                 "signedRequest": sr,
-            }));
+                "receivedAt": b["signedAt"],
+            });
+            entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &next_coords);
+            g.entries
+                .entry(cid.clone())
+                .or_default()
+                .push(entry.clone());
             if let Some(st) = g.conversations.get_mut(&cid) {
                 st["coordinates"] = next_coords.clone();
                 st["snapshotSeq"] = json!(next_seq);
@@ -1445,20 +1620,9 @@ impl SharedMockDs {
                     "transition response lost after acceptance".into(),
                 ));
             }
-            let entry_kind = match btype.trim_start_matches("blue.catbird.chat.defs#") {
-                "commitTransitionBody" => "commitEntry",
-                "leafRecoveryFulfillmentBody" => "leafRecoveryFulfillmentEntry",
-                "policyTransitionBody" => "policyEntry",
-                "metadataTransitionBody" => "metadataEntry",
-                other => panic!("fixture has no entry kind for {other}"),
-            };
             let mut answer = json!({
                 "coordinates": next_coords,
-                "entry": {
-                    "$type": format!("blue.catbird.chat.defs#{entry_kind}"),
-                    "entryId": b["transitionId"], "conversationId": cid, "seq": next_seq,
-                    "signedRequest": sr, "receivedAt": b["signedAt"],
-                },
+                "entry": entry,
                 "welcomes": [],
             });
             match g.forge_next_transition_answer.take() {
@@ -1472,23 +1636,34 @@ impl SharedMockDs {
                 }
                 _ => {}
             }
+            if !is_commit && std::mem::take(&mut g.forge_next_policy_answer_receipt) {
+                answer["entry"]["sequencerReceipt"]["signature"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+            }
             return ok_json(answer);
         }
 
         if url.contains("/xrpc/blue.catbird.chat.sendMessage") {
-            if g.empty_stub_next_send {
-                g.empty_stub_next_send = false;
-                return ok_json(json!({ "ok": true }));
-            }
             if std::mem::take(&mut g.hold_next_send) {
                 let attempt = send_attempt(&body_json, "held");
                 g.send_attempts.push(attempt);
                 g.held_sends.push(body_json);
                 return Err(MLSError::Internal("sendMessage held by the network".into()));
             }
-            let lose_response = std::mem::take(&mut g.lose_next_send_response);
-            let response = sequence_send(&mut g, &body_json)?;
-            if lose_response && response.status == 200 {
+            let mut response = sequence_send(&mut g, &body_json)?;
+            if response.status == 200 && std::mem::take(&mut g.empty_stub_next_send) {
+                return ok_json(json!({ "ok": true }));
+            }
+            if response.status == 200 && std::mem::take(&mut g.omit_next_receipt) {
+                let mut answer: Value = serde_json::from_slice(&response.body).unwrap();
+                answer.as_object_mut().unwrap().remove("sequencerReceipt");
+                answer["entry"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sequencerReceipt");
+                response.body = serde_json::to_vec(&answer).unwrap();
+            }
+            if response.status == 200 && std::mem::take(&mut g.lose_next_send_response) {
                 return Err(MLSError::Internal(
                     "send response lost after publication".into(),
                 ));
@@ -1525,15 +1700,26 @@ impl SharedMockDs {
                 "requestedAt": b["signedAt"], "expiresAt": "2099-01-01T00:00:00.000Z",
             });
             requests.push(view.clone());
-            let entries = g.entries.entry(cid.clone()).or_default();
+            let seq = g.entries.get(&cid).map_or(0, Vec::len) as i64 + 1;
             let mut entry = json!({
                 "$type": "blue.catbird.chat.defs#resetRequestEntry",
                 "entryId": b["resetRequestId"], "conversationId": cid,
-                "seq": entries.len() as i64 + 1, "receivedAt": b["signedAt"], "signedRequest": sr,
+                "seq": seq, "receivedAt": b["signedAt"], "signedRequest": sr,
             });
-            entries.push(entry.clone());
+            entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &b["prior"]);
+            g.entries.entry(cid).or_default().push(entry.clone());
             // A `ref` output carries no `$type`.
             entry.as_object_mut().unwrap().remove("$type");
+            match g.next_reset_request_fault.take() {
+                Some("missingReceipt") => {
+                    entry.as_object_mut().unwrap().remove("sequencerReceipt");
+                }
+                Some("forgedReceipt") => {
+                    entry["sequencerReceipt"]["signature"] =
+                        json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+                }
+                _ => {}
+            }
             return ok_json(json!({ "resetRequest": view, "entry": entry }));
         }
 
@@ -1577,6 +1763,7 @@ impl SharedMockDs {
                 "entryId": b["transitionId"], "conversationId": cid, "seq": seq,
                 "receivedAt": b["signedAt"], "signedRequest": sr,
             });
+            entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &b["successor"]);
             g.entries
                 .entry(cid.clone())
                 .or_default()
@@ -1602,6 +1789,10 @@ impl SharedMockDs {
                 ));
             }
             entry.as_object_mut().unwrap().remove("$type");
+            if std::mem::take(&mut g.forge_next_reset_activation_receipt) {
+                entry["sequencerReceipt"]["signature"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+            }
             return ok_json(json!({
                 "retiredCoordinates": b["retired"],
                 "successorCoordinates": b["successor"],
@@ -1666,11 +1857,31 @@ impl SharedMockDs {
                 })
                 .cloned()
                 .collect();
+            let mut pending_reset_requests = g
+                .reset_requests
+                .get(cid)
+                .into_iter()
+                .flatten()
+                .filter(|request| request["status"] == "pending")
+                .cloned()
+                .collect::<Vec<_>>();
+            if g.fake_pending_reset_seq.is_some() {
+                pending_reset_requests.push(json!({
+                    "resetRequestId": "00000000-0000-4000-8000-0000000000f1",
+                    "conversationId": cid,
+                    "requesterDid": account,
+                    "requesterDeviceId": dev,
+                    "prior": state["coordinates"],
+                    "reason": "manualRecovery",
+                    "status": "pending",
+                    "requestedAt": "2026-11-10T00:00:00.000Z",
+                    "expiresAt": "2099-01-01T00:00:00.000Z",
+                }));
+            }
             return ok_json(json!({
                 "state": state,
                 "pendingLeafRecoveryRequests": requests,
-                "pendingResetRequests": g.reset_requests.get(cid).into_iter().flatten()
-                    .filter(|request| request["status"] == "pending").cloned().collect::<Vec<_>>(),
+                "pendingResetRequests": pending_reset_requests,
                 "pendingLeaveRequests": [],
                 // Plain `#accountDeletedEntry` refs: the state list carries no `$type`.
                 "accountDeletions": g.account_deletions.get(cid).into_iter().flatten().map(|entry| {
@@ -1704,6 +1915,7 @@ impl SharedMockDs {
                 return Err(MLSError::Internal("entries response unavailable".into()));
             }
             let cid = q.get("conversationId").cloned().unwrap_or_default();
+            synthesize_missing_control_receipts(&mut g, &cid);
             let after: i64 = q.get("afterSeq").and_then(|s| s.parse().ok()).unwrap_or(0);
             let device = q.get("actorDeviceId");
             let readable_until = device
@@ -1721,7 +1933,7 @@ impl SharedMockDs {
                 .and_then(|device| g.readable_from.get(device))
                 .copied()
                 .unwrap_or(0);
-            let list: Vec<Value> = g
+            let mut list: Vec<Value> = g
                 .entries
                 .get(&cid)
                 .cloned()
@@ -1732,6 +1944,25 @@ impl SharedMockDs {
                     seq > after && seq >= readable_from && seq <= readable_until
                 })
                 .collect();
+            if let Some(seq) = g.fake_pending_reset_seq.filter(|seq| *seq > after) {
+                let prior = g.conversations[&cid]["coordinates"].clone();
+                list.push(json!({
+                    "$type": "blue.catbird.chat.defs#resetRequestEntry",
+                    "entryId": "00000000-0000-4000-8000-0000000000f1",
+                    "conversationId": cid,
+                    "seq": seq,
+                    "receivedAt": "2026-11-10T00:00:00.000Z",
+                    "signedRequest": {
+                        "body": {
+                            "$type": "blue.catbird.chat.defs#resetRequestBody",
+                            "actorDid": account,
+                            "actorDeviceId": device,
+                            "prior": prior,
+                        }
+                    },
+                    "sequencerReceipt": {},
+                }));
+            }
             return ok_json(json!({ "entries": list }));
         }
 
@@ -1766,12 +1997,27 @@ impl SharedMockDs {
             assert_eq!(b["signatureDomain"], "CATBIRD-CHAT-CLOSE\0");
             let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
             let raw = req.body.clone().unwrap_or_default();
-            if let Some((recorded, answer)) = g.closes.get(&cid) {
-                return if *recorded == raw {
-                    ok_json(answer.clone())
+            if let Some((recorded, mut answer)) = g.closes.get(&cid).cloned() {
+                return if recorded == raw {
+                    if std::mem::take(&mut g.forge_next_close_replay_receipt) {
+                        answer["result"]["entry"]["sequencerReceipt"]["signature"] =
+                            json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+                    }
+                    ok_json(answer)
                 } else {
                     xrpc_error(409, "ConversationClosed", "conversation is closed")
                 };
+            }
+            if let Some(expected_kind) = g
+                .conversations
+                .get(&cid)
+                .and_then(|conversation| conversation["conversationKind"].as_str())
+            {
+                assert_eq!(
+                    b["conversationKind"].as_str(),
+                    Some(expected_kind),
+                    "close must bind the authoritative conversation kind"
+                );
             }
             let next_seq = (g.entries.get(&cid).map(Vec::len).unwrap_or(0) as i64) + 1;
             // A `ref`, not a union member: `mls-ds` presents it without `$type`.
@@ -1784,7 +2030,7 @@ impl SharedMockDs {
                 "closedByDeviceId": b["actorDeviceId"],
                 "closedAt": b["signedAt"],
             });
-            let entry = json!({
+            let mut entry = json!({
                 "$type": "blue.catbird.chat.defs#conversationCloseEntry",
                 "entryId": b["transitionId"],
                 "conversationId": cid,
@@ -1793,6 +2039,7 @@ impl SharedMockDs {
                 "signedRequest": sr,
                 "tombstone": tombstone,
             });
+            entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &b["retired"]);
             // The close wipe: `getEntries` serves nothing new for it, so no echo arrives.
             g.conversations.remove(&cid);
             g.entries.remove(&cid);
@@ -1885,6 +2132,17 @@ impl PlatformTransport for AccountTransport {
 
 #[test]
 fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
+    run_live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync(false);
+}
+
+#[test]
+fn nse_completion_binds_retained_sender_counter_and_exact_replay() {
+    run_live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync(true);
+}
+
+fn run_live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync(
+    stop_after_nse_completion_controls: bool,
+) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
     let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
@@ -2112,6 +2370,26 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
     let bob_applied = bob.sync().expect("bob sync message");
     assert!(bob_applied >= 1);
 
+    let (peer_counter_key, peer_send_counter) = {
+        let state = ds.inner.lock().unwrap();
+        let body = &state
+            .entries
+            .get(&dm_cid)
+            .unwrap()
+            .iter()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == msg1_id)
+            .unwrap()["signedRequest"]["body"];
+        (
+            chat_wire::peer_send_counter_key(
+                &dm_cid,
+                body["prior"]["generation"].as_i64().unwrap(),
+                body["prior"]["epoch"].as_i64().unwrap(),
+                body["actorDid"].as_str().unwrap(),
+                body["actorDeviceId"].as_str().unwrap(),
+            ),
+            body["sendCounter"].as_u64().unwrap(),
+        )
+    };
     // NSE already consumed this message's MLS ratchet. Retain its genuine authenticated
     // frame/nonce, require the real I13 receipt even after payload pruning, and do not replay MLS.
     let archive_key = format!("native.message:{dm_cid}:{msg1_id}");
@@ -2137,6 +2415,14 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
                 })
                 .to_string(),
                 1,
+            )?;
+            let mut convo = tx.get_conversation(&dm_cid)?.unwrap();
+            convo.last_seq = sent1.seq - 1;
+            tx.upsert_conversation(&convo)?;
+            tx.put_account_meta(
+                &peer_counter_key,
+                &peer_send_counter.saturating_sub(1).to_string(),
+                1,
             )
         })
         .unwrap();
@@ -2158,7 +2444,217 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
             })
             .unwrap()
     };
+    // A different authorized actor cannot lend its counter to Alice's retained message. The
+    // receipt and retained frame remain genuine; only the outer signed body is Bob's.
+    let genuine_signed_request = {
+        let bob_signer = enrolled_signer(&bob);
+        let mut state = ds.inner.lock().unwrap();
+        let entry = state
+            .entries
+            .get_mut(&dm_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == msg1_id)
+            .unwrap();
+        let genuine = entry["signedRequest"].clone();
+        let mut body = genuine["body"].clone();
+        body["actorDid"] = json!(BOB_DID);
+        body["actorDeviceId"] = json!(bob_dev);
+        body["sendCounter"] = json!(peer_send_counter + 100);
+        entry["signedRequest"] = signed_by(
+            &bob_signer,
+            BOB_DID,
+            &bob_dev,
+            CanonicalOperation::SendMessage,
+            &body,
+        );
+        genuine
+    };
+    let error = bob
+        .sync()
+        .expect_err("cached completion must bind the outer actor to the retained sender");
+    assert!(
+        error
+            .to_string()
+            .contains("cached application outer sender mismatch"),
+        "{error:?}"
+    );
+    bob.db()
+        .read_tx(|tx| {
+            assert_eq!(
+                tx.get_account_meta(&peer_counter_key)?,
+                Some(peer_send_counter.saturating_sub(1).to_string())
+            );
+            assert!(tx
+                .get_pending_op("native_archive_receipt", &msg1_id)?
+                .is_some());
+            Ok(())
+        })
+        .unwrap();
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state
+            .entries
+            .get_mut(&dm_cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == msg1_id)
+            .unwrap()["signedRequest"] = genuine_signed_request;
+    }
     let before_receipt_replay = mls_snapshot();
+    bob.sync()
+        .expect("foreground sync completes the NSE message and its peer send counter");
+    assert_eq!(
+        mls_snapshot(),
+        before_receipt_replay,
+        "NSE receipt completion must not consume another ratchet"
+    );
+    bob.db()
+        .read_tx(|tx| {
+            assert_eq!(
+                tx.get_account_meta(&peer_counter_key)?,
+                Some(peer_send_counter.to_string()),
+                "foreground completion must persist the NSE-decrypted peer send counter"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let queued_before_replay = bob
+        .db()
+        .read_tx(|tx| tx.list_labyrinth_queue(None, 100))
+        .unwrap()
+        .len();
+    bob.db()
+        .write_tx(|tx| {
+            let mut convo = tx.get_conversation(&dm_cid)?.unwrap();
+            convo.last_seq = sent1.seq - 1;
+            tx.upsert_conversation(&convo)
+        })
+        .unwrap();
+    bob.sync()
+        .expect("the exact completed entry replay is idempotent");
+    bob.db()
+        .read_tx(|tx| {
+            assert_eq!(
+                tx.get_account_meta(&peer_counter_key)?,
+                Some(peer_send_counter.to_string())
+            );
+            assert_eq!(
+                tx.list_labyrinth_queue(None, 100)?.len(),
+                queued_before_replay,
+                "exact replay must not queue the same archive evidence again"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let duplicate_id = uuid::Uuid::new_v4().to_string();
+    let duplicate_send = alice
+        .send_message(&dm_cid, &duplicate_id, "distinct retained message")
+        .expect("sequence a distinct message");
+    bob.sync().expect("receive the distinct message once");
+    let duplicate_archive_key = format!("native.message:{dm_cid}:{duplicate_id}");
+    let mut duplicate_evidence: Value = bob
+        .db()
+        .read_tx(|tx| {
+            Ok(
+                serde_json::from_slice(&tx.get_labyrinth_state(&duplicate_archive_key)?.unwrap())
+                    .unwrap(),
+            )
+        })
+        .unwrap();
+    duplicate_evidence["sequencer_receipt_json"] = Value::Null;
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &duplicate_archive_key,
+                &serde_json::to_vec(&duplicate_evidence).unwrap(),
+                1,
+            )?;
+            tx.put_pending_op(
+                "native_archive_receipt",
+                &duplicate_id,
+                &json!({
+                    "conversation_id": dm_cid, "seq": duplicate_send.seq,
+                })
+                .to_string(),
+                1,
+            )?;
+            tx.dequeue_labyrinth_item(&duplicate_id)?;
+            let mut convo = tx.get_conversation(&dm_cid)?.unwrap();
+            convo.last_seq = duplicate_send.seq - 1;
+            tx.upsert_conversation(&convo)?;
+            tx.put_account_meta(&peer_counter_key, &peer_send_counter.to_string(), 1)
+        })
+        .unwrap();
+    rebind_application_send_counter(
+        &ds,
+        &dm_cid,
+        &duplicate_id,
+        &enrolled_signer(&alice),
+        ALICE_DID,
+        &alice_dev,
+        peer_send_counter,
+    );
+    let queued_before_duplicate = bob
+        .db()
+        .read_tx(|tx| tx.list_labyrinth_queue(None, 100))
+        .unwrap()
+        .len();
+    let error = bob
+        .sync()
+        .expect_err("an equal counter on a distinct retained message is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("non-increasing peer sendCounter"),
+        "{error:?}"
+    );
+    bob.db()
+        .read_tx(|tx| {
+            assert_eq!(
+                tx.get_account_meta(&peer_counter_key)?,
+                Some(peer_send_counter.to_string())
+            );
+            assert!(tx
+                .get_pending_op("native_archive_receipt", &duplicate_id)?
+                .is_some());
+            assert_eq!(
+                tx.list_labyrinth_queue(None, 100)?.len(),
+                queued_before_duplicate
+            );
+            Ok(())
+        })
+        .unwrap();
+    rebind_application_send_counter(
+        &ds,
+        &dm_cid,
+        &duplicate_id,
+        &enrolled_signer(&alice),
+        ALICE_DID,
+        &alice_dev,
+        peer_send_counter + 1,
+    );
+    bob.sync()
+        .expect("the distinct message completes under its genuine greater counter");
+    let before_receipt_replay = mls_snapshot();
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &archive_key,
+                &serde_json::to_vec(&pending_evidence).unwrap(),
+                1,
+            )?;
+            tx.put_pending_op(
+                "native_archive_receipt",
+                &msg1_id,
+                &json!({
+                    "conversation_id": dm_cid, "seq": sent1.seq,
+                })
+                .to_string(),
+                1,
+            )
+        })
+        .unwrap();
     let receipt = {
         let mut state = ds.inner.lock().unwrap();
         let entry = state
@@ -2228,6 +2724,9 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
             .contains_key(&(dm_cid.clone(), bob_dev.clone())),
         "I14: bob.sync() must submit signed acknowledgeEntries watermark"
     );
+    if stop_after_nse_completion_controls {
+        return;
+    }
 
     // 8. Multi-member group flow: createGroup(title) -> Bob accepts invite -> Alice fulfills leaf recovery -> Bob joins via Welcome -> metadata update + D3 check
     let grp_cid = uuid::Uuid::new_v4().to_string();
@@ -2285,6 +2784,309 @@ fn live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync() {
     alice
         .remove_group_member(MemberRole::Admin, &grp_cid, BOB_DID)
         .expect("admin remove bob");
+}
+
+/// A DID named by create/add must resolve to at least one valid 32-byte PDS device key. An
+/// all-invalid response is never cached and fails without a server effect; restoring the record
+/// makes the exact operation retryable.
+#[test]
+fn zero_valid_pds_device_keys_fail_closed_without_caching_and_clean_retry_succeeds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect();
+    let alice_device = uuid::Uuid::new_v4().to_string();
+    let bob_device = uuid::Uuid::new_v4().to_string();
+    let carol_device = uuid::Uuid::new_v4().to_string();
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "alice",
+        ALICE_DID,
+        &alice_device,
+        &Arc::new(MemKeyStore::new()),
+    );
+    let bob = live_client(
+        tmp.path(),
+        &ds,
+        "bob",
+        BOB_DID,
+        &bob_device,
+        &Arc::new(MemKeyStore::new()),
+    );
+    let carol = live_client(
+        tmp.path(),
+        &ds,
+        "carol",
+        CAROL_DID,
+        &carol_device,
+        &Arc::new(MemKeyStore::new()),
+    );
+    alice.enroll_device(&scopes).expect("enroll alice");
+    bob.enroll_device(&scopes).expect("enroll bob");
+    carol.enroll_device(&scopes).expect("enroll carol");
+
+    let cache = |did: &str| {
+        alice
+            .db()
+            .read_tx(|tx| tx.get_account_meta(&format!("authorized_device_keys:{did}")))
+            .unwrap()
+    };
+    let collection = "blue.catbird.chat.device".to_string();
+    let bob_record_key = (BOB_DID.to_string(), collection.clone(), bob_device);
+    let bob_key = {
+        let mut state = ds.inner.lock().unwrap();
+        let record = state
+            .pds_records
+            .get_mut(&bob_record_key)
+            .expect("Bob PDS device record");
+        std::mem::replace(
+            &mut record["mlsSignaturePublicKey"],
+            json!({ "$bytes": "" }),
+        )
+    };
+
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    let create_error = alice
+        .create_group(
+            &conversation_id,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("PDS key control".into()),
+            None,
+        )
+        .expect_err("create must reject a DID with zero valid PDS device keys");
+    assert!(
+        create_error.to_string().contains("zero valid"),
+        "{create_error}"
+    );
+    assert_eq!(
+        cache(BOB_DID),
+        None,
+        "an invalid response must not be cached"
+    );
+    assert!(
+        !ds.inner
+            .lock()
+            .unwrap()
+            .conversations
+            .contains_key(&conversation_id),
+        "PDS validation must precede the create effect"
+    );
+
+    ds.inner
+        .lock()
+        .unwrap()
+        .pds_records
+        .get_mut(&bob_record_key)
+        .unwrap()["mlsSignaturePublicKey"] = bob_key;
+    alice
+        .create_group(
+            &conversation_id,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("PDS key control".into()),
+            None,
+        )
+        .expect("create succeeds after the clean PDS retry");
+    let cached_bob: Vec<AuthorizedPeerDeviceKey> =
+        serde_json::from_str(&cache(BOB_DID).expect("clean Bob key cached")).unwrap();
+    assert!(!cached_bob.is_empty());
+
+    let carol_record_key = (CAROL_DID.to_string(), collection, carol_device);
+    let carol_record = ds
+        .inner
+        .lock()
+        .unwrap()
+        .pds_records
+        .remove(&carol_record_key)
+        .expect("Carol PDS device record");
+    let entries_before_add = ds.entry_count(&conversation_id);
+    let add_error = alice
+        .add_group_members(&conversation_id, vec![CAROL_DID.to_string()])
+        .expect_err("add must reject a DID with zero valid PDS device keys");
+    assert!(add_error.to_string().contains("zero valid"), "{add_error}");
+    assert_eq!(
+        cache(CAROL_DID),
+        None,
+        "an invalid add preflight response must not be cached"
+    );
+    assert_eq!(
+        ds.entry_count(&conversation_id),
+        entries_before_add,
+        "PDS validation must precede the add effect"
+    );
+
+    ds.inner
+        .lock()
+        .unwrap()
+        .pds_records
+        .insert(carol_record_key.clone(), carol_record.clone());
+    alice
+        .add_group_members(&conversation_id, vec![CAROL_DID.to_string()])
+        .expect("add succeeds after the clean PDS retry");
+    let cached_carol: Vec<AuthorizedPeerDeviceKey> =
+        serde_json::from_str(&cache(CAROL_DID).expect("clean Carol key cached")).unwrap();
+    assert!(!cached_carol.is_empty());
+}
+
+/// A DID's unsupported device record cannot hide another usable device. A refused or empty
+/// refresh invalidates the stale cache; after a clean retry, an admin can remove the account.
+#[test]
+fn one_unusable_pds_device_record_does_not_hide_usable_siblings() {
+    let f = send_order_fixture(false);
+    let extra = (
+        BOB_DID.to_string(),
+        "blue.catbird.chat.device".to_string(),
+        new_id(),
+    );
+    f.ds.inner.lock().unwrap().pds_records.insert(
+        extra.clone(),
+        json!({
+            "$type": "blue.catbird.chat.device",
+            "mlsSignaturePublicKey": { "$bytes": STANDARD.encode([7u8; 33]) },
+            "algorithm": "p256",
+            "createdAt": "2026-11-07T00:00:00.000Z",
+        }),
+    );
+
+    let message_id = new_id();
+    f.bob
+        .send_message(&f.cid, &message_id, "after one unsupported record")
+        .expect("Bob sends");
+    f.alice
+        .sync()
+        .expect("Alice ignores Bob's unusable sibling record");
+    assert!(f
+        .alice
+        .list_messages(&f.cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|message| message.message_id == message_id));
+
+    let cache_key = format!("authorized_device_keys:{BOB_DID}");
+    let cached_bob = || {
+        f.alice
+            .db()
+            .read_tx(|tx| tx.get_account_meta(&cache_key))
+            .unwrap()
+    };
+    assert!(
+        cached_bob().is_some(),
+        "the clean mixed directory is cached"
+    );
+
+    for (case, expected) in [
+        ("resolution", "DID resolution transport error"),
+        ("transport", "PDS directory transport error"),
+        ("parse", "no records array"),
+    ] {
+        let message_id = new_id();
+        f.bob
+            .send_message(&f.cid, &message_id, &format!("{case} directory failure"))
+            .unwrap();
+        match case {
+            "resolution" => {
+                f.alice
+                    .db()
+                    .write_tx(|tx| tx.delete_account_meta(&format!("did_doc:{BOB_DID}")))
+                    .unwrap();
+                f.ds.inner.lock().unwrap().transport_error_next_resolve_for =
+                    Some(BOB_DID.to_string());
+            }
+            "transport" => {
+                f.ds.inner
+                    .lock()
+                    .unwrap()
+                    .transport_error_next_pds_directory_for = Some(BOB_DID.to_string());
+            }
+            "parse" => {
+                f.ds.inner.lock().unwrap().malformed_next_pds_directory_for =
+                    Some(BOB_DID.to_string());
+            }
+            _ => unreachable!(),
+        }
+        let before = last_seq(&f.alice, &f.cid);
+        let error = f
+            .alice
+            .sync()
+            .expect_err("directory failure must fail closed");
+        assert!(error.to_string().contains(expected), "{case}: {error}");
+        assert_eq!(last_seq(&f.alice, &f.cid), before, "{case}");
+        assert_eq!(
+            cached_bob(),
+            None,
+            "{case} failure must invalidate the stale device-key cache"
+        );
+        f.alice.sync().expect("clean retry applies the held entry");
+        assert!(
+            cached_bob().is_some(),
+            "{case} clean retry repopulates the cache"
+        );
+    }
+
+    f.ds.inner.lock().unwrap().refuse_next_pds_directory_for = Some(BOB_DID.to_string());
+    let refused_message = new_id();
+    f.bob
+        .send_message(&f.cid, &refused_message, "refused directory refresh")
+        .unwrap();
+    let before_refusal = last_seq(&f.alice, &f.cid);
+    let refusal = f.alice.sync().expect_err("a refused refresh fails closed");
+    assert!(refusal.to_string().contains("HTTP 503"), "{refusal}");
+    assert_eq!(last_seq(&f.alice, &f.cid), before_refusal);
+    assert_eq!(
+        cached_bob(),
+        None,
+        "a refused refresh invalidates the stale NSE directory cache"
+    );
+    f.alice
+        .sync()
+        .expect("the clean retry applies the held entry");
+    assert!(
+        cached_bob().is_some(),
+        "the clean retry repopulates the cache"
+    );
+
+    let removed_records = {
+        let mut state = f.ds.inner.lock().unwrap();
+        let keys: Vec<_> = state
+            .pds_records
+            .keys()
+            .filter(|(repo, _, _)| repo == BOB_DID)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .map(|key| {
+                let value = state.pds_records.remove(&key).unwrap();
+                (key, value)
+            })
+            .collect::<Vec<_>>()
+    };
+    let empty_message = new_id();
+    f.bob
+        .send_message(&f.cid, &empty_message, "empty directory refresh")
+        .unwrap();
+    let before_empty = last_seq(&f.alice, &f.cid);
+    let empty = f.alice.sync().expect_err("an empty refresh fails closed");
+    assert!(empty.to_string().contains("zero valid"), "{empty}");
+    assert_eq!(last_seq(&f.alice, &f.cid), before_empty);
+    assert_eq!(
+        cached_bob(),
+        None,
+        "an empty refresh invalidates the stale NSE directory cache"
+    );
+    f.ds.inner
+        .lock()
+        .unwrap()
+        .pds_records
+        .extend(removed_records);
+    f.alice.sync().expect("restored directory unblocks sync");
+    assert!(cached_bob().is_some(), "the restored directory is cached");
+    f.alice
+        .remove_group_member(MemberRole::Admin, &f.cid, BOB_DID)
+        .expect("the unusable sibling record cannot block Bob's removal");
 }
 
 #[test]
@@ -2716,19 +3518,29 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
             .is_err(),
         "the follow-up gap fetch fails after the later send is durable"
     );
-    // Restored history rows are historical frames at epoch 0 (as the Phase 1 simulator's
-    // restore imports them); the next sync verifies the cached row's receipt against its
-    // retained archive evidence, not the row, and must not wedge on it.
-    let mut historical = alice
+    // A history import must never downgrade an already-verified live row.
+    let verified = alice
         .list_messages(&clean_cid, None, 100)
         .unwrap()
         .into_iter()
         .find(|m| m.message_id == later_mid)
         .expect("later send was durably accepted");
+    let mut historical = verified.clone();
     historical.epoch = 0;
-    alice
-        .import_conversation_history(&clean_cid, vec![historical])
-        .expect("import ahead-of-cursor history");
+    assert_eq!(
+        alice
+            .import_conversation_history(&clean_cid, vec![historical])
+            .expect("skip verified ahead-of-cursor row"),
+        0
+    );
+    assert_eq!(
+        alice
+            .db()
+            .read_tx(|tx| tx.get_message(&later_mid))
+            .unwrap()
+            .unwrap(),
+        verified
+    );
     assert_eq!(
         alice
             .db()
@@ -3247,10 +4059,11 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
         }
     }
 
-    // An authenticated own echo superseded by later Commits closes only its cursor gap on Alice.
-    // To Bob the same replayed Commit is a peer's for an epoch long past, and it is refused.
+    // Replaying an old own echo under a new seq cannot close even a cursor-only gap: I13 binds
+    // the original seq, so both the actor and its peer reject the relabelled row.
     let controls = control_state(&alice);
     let state = mls_state(&alice);
+    let alice_cursor = local_row(&alice).last_seq;
     let mut old_echo = add_echo.expect("the add round's accepted Commit");
     let echo_seq = {
         let mut server = ds.inner.lock().unwrap();
@@ -3260,17 +4073,15 @@ fn staged_commit_journal_recovers_deferred_add_and_accepted_remove_after_restart
         entries.push(old_echo);
         seq
     };
-    alice
-        .sync()
-        .expect("authenticated superseded own echo closes only its cursor gap");
+    let error = alice.sync().expect_err("I13 rejects a relabelled own echo");
+    assert!(error.to_string().contains("I13"), "{error}");
     assert_eq!(mls_state(&alice), state);
-    assert_eq!(
-        control_state(&alice),
-        controls,
-        "older echoes must not regress control state"
-    );
-    let error = bob.sync().expect_err("a replayed peer Commit is refused");
-    assert!(error.to_string().contains("local MLS epoch"), "{error}");
+    assert_eq!(control_state(&alice), controls);
+    assert_eq!(local_row(&alice).last_seq, alice_cursor);
+    let error = bob
+        .sync()
+        .expect_err("I13 rejects the relabelled peer Commit");
+    assert!(error.to_string().contains("I13"), "{error}");
     assert!(local_row(&bob).last_seq < echo_seq);
 }
 
@@ -3767,6 +4578,22 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
     let bob = open("bob", BOB_DID);
     alice.enroll_device(&scopes).expect("enroll alice");
     bob.enroll_device(&scopes).expect("enroll bob");
+    let service_device = "service-method-fixture";
+    ds.inner.lock().unwrap().pds_records.insert(
+        (
+            DS_DID.to_string(),
+            "blue.catbird.chat.device".to_string(),
+            service_device.to_string(),
+        ),
+        json!({
+            "$type": "blue.catbird.chat.device",
+            "mlsSignaturePublicKey": {
+                "$bytes": STANDARD.encode(enrolled_signer(&alice).public())
+            },
+            "algorithm": "ed25519",
+            "createdAt": "2026-11-13T00:00:00.000Z",
+        }),
+    );
 
     let cid = uuid::Uuid::new_v4().to_string();
     alice
@@ -3867,6 +4694,30 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
         }),
         "native archive must never connect directly to a peer PDS record endpoint"
     );
+    // An unsigned missing-Space response after the member's write reaches the real
+    // conversation-Space boundary proves no removal. It must neither owner-back up nor dequeue.
+    for status in [400, 404] {
+        ds.archive_auth
+            .set_unsigned_space_not_found(Some("com.atproto.space.applyWrites"), status);
+        let writes_before = ds.archive_auth.committed_space_write_count();
+        let error = bob
+            .flush_labyrinth_queue()
+            .expect_err("unsigned SpaceNotFound leaves shared archive work pending");
+        assert!(error.to_string().contains("not found: space"), "{error:?}");
+        assert_eq!(
+            ds.archive_auth.committed_space_write_count(),
+            writes_before,
+            "HTTP {status}: owner fallback published"
+        );
+        assert!(
+            bob.list_pending_labyrinth_queue(Some(&cid), 100)
+                .unwrap()
+                .iter()
+                .any(|item| item.message_id == a2),
+            "HTTP {status}: shared archive work was dequeued"
+        );
+    }
+    ds.archive_auth.set_unsigned_space_not_found(None, 0);
     let d_messages: Vec<String> = bob
         .list_messages(&cid, None, 100)
         .unwrap()
@@ -4228,6 +5079,36 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         (BOB_DID.to_owned(), cid.clone()),
         (400, "NotEntitled".into()),
     );
+    // A granted credential followed by an unsigned 400/404 SpaceNotFound at the relayed
+    // member-repository inventory boundary is not an authority denial.
+    for status in [400, 404] {
+        ds.archive_auth
+            .set_unsigned_space_not_found(Some("com.atproto.space.listRepos"), status);
+        let keys = Arc::new(MemKeyStore::new());
+        let client = live_client(
+            tmp.path(),
+            &ds,
+            &format!("unsigned-space-not-found-{status}"),
+            BOB_DID,
+            &uuid::Uuid::new_v4().to_string(),
+            &keys,
+        );
+        client
+            .restore_with_recovery_code(&code)
+            .expect("recover archive keys");
+        let error = client
+            .restore_conversation_from_owner_mailbox(&cid)
+            .expect_err("unsigned SpaceNotFound cannot unlock owner history");
+        assert!(
+            error.to_string().contains("ArchiveRestorePending"),
+            "HTTP {status}: {error:?}"
+        );
+        assert!(
+            client.list_messages(&cid, None, 10).unwrap().is_empty(),
+            "HTTP {status}: imported owner history"
+        );
+    }
+    ds.archive_auth.set_unsigned_space_not_found(None, 0);
 
     // A signed denial binding another MLS group than the owner receipts pinned (the Space a wrong,
     // unsigned generation names) proves no removal, through any home.
@@ -4403,6 +5284,1312 @@ fn live_client_homed(
         None,
     )
     .expect("open client")
+}
+
+fn assert_creator_holds_server_genesis(client: &CatbirdMlsClient, ds: &SharedMockDs, cid: &str) {
+    let server = ds.inner.lock().unwrap().conversations[cid]["coordinates"].clone();
+    client
+        .db()
+        .write_tx(|tx| {
+            let row = tx.get_conversation(cid)?.expect("creator conversation");
+            assert_eq!(row.last_seq, 1);
+            assert_eq!(row.epoch, 0);
+            assert_eq!(row.group_id, chat_wire::json_bytes(&server["groupId"])?);
+            let provider = tx.openmls_provider();
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&row.group_id))
+                .map_err(|error| MLSError::Internal(format!("load creator genesis: {error:?}")))?
+                .expect("creator genesis group");
+            let (context_hash, confirmation_tag) =
+                chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+            assert_eq!(
+                context_hash.as_slice(),
+                chat_wire::json_bytes(&server["groupContextHash"])?
+            );
+            assert_eq!(
+                confirmation_tag,
+                chat_wire::json_bytes(&server["confirmationTag"])?
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn assert_create_replayed_exactly(ds: &SharedMockDs, cid: &str) {
+    let state = ds.inner.lock().unwrap();
+    assert_eq!(state.conversations.len(), 1);
+    assert_eq!(state.entries[cid].len(), 1);
+    let requests: Vec<_> = state
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| url.ends_with("/blue.catbird.chat.createConversation"))
+        .map(|(_, _, body)| body)
+        .collect();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1], "creation replay changed bytes");
+}
+
+fn group_creation_journal_count(client: &CatbirdMlsClient) -> i64 {
+    client
+        .db()
+        .read_tx(|tx| {
+            tx.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_ops WHERE op_kind = 'group_creation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| MLSError::Internal(error.to_string()))
+        })
+        .unwrap()
+}
+
+fn allow_group_creation_retry_now(client: &CatbirdMlsClient) {
+    client
+        .db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute(
+                    "UPDATE pending_ops SET payload_json = json_set(payload_json, '$.retry_at_ms', 0) \
+                     WHERE op_kind = 'group_creation'",
+                    [],
+                )
+                .map_err(|error| MLSError::Internal(error.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[cfg(feature = "sim")]
+struct StagedCreationFingerprint {
+    operation_id: String,
+    request: Vec<u8>,
+    group_id: Vec<u8>,
+    epoch_authenticator: Vec<u8>,
+    next: Value,
+    attempts: Vec<(String, Vec<u8>)>,
+}
+
+#[cfg(feature = "sim")]
+fn staged_creation_fingerprint(
+    client: &CatbirdMlsClient,
+    conversation_id: &str,
+) -> StagedCreationFingerprint {
+    use catbird_mls::storage::{
+        KvWriteOverlay, OpenMlsKvProvider, OpenMlsKvStorage, RusqliteKvBackend,
+    };
+
+    client
+        .db()
+        .read_tx(|tx| {
+            let raw: String = tx
+                .conn()
+                .query_row(
+                    "SELECT payload_json FROM pending_ops WHERE op_kind = 'group_creation' \
+                     AND json_extract(payload_json, '$.conversation_id') = ?1",
+                    [conversation_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| MLSError::Internal(error.to_string()))?;
+            let pending: chat_wire::PendingGroupCreation = serde_json::from_str(&raw)?;
+            let attempts = pending
+                .attempts
+                .iter()
+                .map(|attempt| (attempt.operation_id.clone(), attempt.request.clone()))
+                .collect();
+            let latest = pending
+                .attempts
+                .last()
+                .expect("pending creation has an attempt");
+            let request: Value = serde_json::from_slice(&latest.request)?;
+            let operation_id = latest.operation_id.clone();
+            let request_bytes = latest.request.clone();
+            let next = request["signedRequest"]["body"]["next"].clone();
+            let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
+            pending.kv_batch.apply(&overlay)?;
+            let provider = OpenMlsKvProvider::new(OpenMlsKvStorage::new(&overlay))?;
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&pending.group_id))
+                .map_err(|error| MLSError::Internal(format!("load staged genesis: {error:?}")))?
+                .expect("staged genesis");
+            Ok(StagedCreationFingerprint {
+                operation_id,
+                request: request_bytes,
+                group_id: pending.group_id,
+                epoch_authenticator: group.epoch_authenticator().as_slice().to_vec(),
+                next,
+                attempts,
+            })
+        })
+        .unwrap()
+}
+
+#[cfg(feature = "sim")]
+fn adopted_epoch_authenticator(client: &CatbirdMlsClient, conversation_id: &str) -> Vec<u8> {
+    use catbird_mls::storage::{OpenMlsKvProvider, OpenMlsKvStorage, RusqliteKvBackend};
+
+    client
+        .db()
+        .read_tx(|tx| {
+            let row = tx
+                .get_conversation(conversation_id)?
+                .expect("adopted conversation");
+            let provider =
+                OpenMlsKvProvider::new(OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn())))?;
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&row.group_id))
+                .map_err(|error| MLSError::Internal(format!("load adopted genesis: {error:?}")))?
+                .expect("adopted genesis");
+            Ok(group.epoch_authenticator().as_slice().to_vec())
+        })
+        .unwrap()
+}
+
+#[cfg(feature = "sim")]
+fn creation_requests_for(ds: &SharedMockDs, conversation_id: &str) -> Vec<Vec<u8>> {
+    ds.inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, body)| {
+            url.ends_with("/blue.catbird.chat.createConversation")
+                && serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|request| {
+                        request
+                            .pointer("/signedRequest/body/conversationId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(conversation_id)
+        })
+        .map(|(_, _, body)| body.clone())
+        .collect()
+}
+
+fn create_request_count(ds: &SharedMockDs) -> usize {
+    ds.inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| url.ends_with("/blue.catbird.chat.createConversation"))
+        .count()
+}
+
+fn finish_resumed_group(alice: &CatbirdMlsClient, bob: &CatbirdMlsClient, cid: &str) {
+    bob.sync().expect("invitee accepts");
+    alice.sync().expect("creator fulfills recovery");
+    bob.sync().expect("invitee joins");
+    let message_id = uuid::Uuid::new_v4().to_string();
+    alice
+        .send_message(cid, &message_id, "resumed genesis")
+        .expect("creator sends");
+    bob.sync().expect("invitee decrypts");
+    assert!(bob
+        .list_messages(cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|message| message.message_id == message_id
+            && message.plaintext_json.contains("resumed genesis")));
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn group_creation_resumes_after_verified_2xx_before_local_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let bob_keys = Arc::new(MemKeyStore::new());
+    let alice_device = uuid::Uuid::new_v4().to_string();
+    let bob_device = uuid::Uuid::new_v4().to_string();
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "alice-create-resume",
+        ALICE_DID,
+        &alice_device,
+        &alice_keys,
+    );
+    let bob = live_client(
+        tmp.path(),
+        &ds,
+        "bob-create-resume",
+        BOB_DID,
+        &bob_device,
+        &bob_keys,
+    );
+    let scopes = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    alice.enroll_device(&scopes).unwrap();
+    bob.enroll_device(&scopes).unwrap();
+    let cid = uuid::Uuid::new_v4().to_string();
+    let create = || {
+        alice.create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("Resumable genesis".into()),
+            None,
+        )
+    };
+    let error = catbird_mls::sim_hooks::BuggifyController::with_enabled_sites(
+        &["after_http_2xx_before_db_commit"],
+        create,
+    )
+    .expect_err("the injected crash boundary fires");
+    assert!(
+        error
+            .to_string()
+            .contains("after_http_2xx_before_db_commit"),
+        "{error:?}"
+    );
+    assert!(alice.list_conversations(None, 20).unwrap().is_empty());
+
+    allow_group_creation_retry_now(&alice);
+    create().expect("retry adopts the journaled genesis");
+    assert_create_replayed_exactly(&ds, &cid);
+    assert_creator_holds_server_genesis(&alice, &ds, &cid);
+    create().expect("a completed logical retry returns the existing group");
+    assert_create_replayed_exactly(&ds, &cid);
+    finish_resumed_group(&alice, &bob, &cid);
+
+    assert!(chat_wire::group_creation_refusal_is_exists_evidence(
+        400,
+        Some("ConversationAlreadyExists")
+    ));
+    for not_exists in [
+        "BlockedRelationship",
+        "InvalidMlsArtifact",
+        "MetadataNonceReuse",
+    ] {
+        assert!(!chat_wire::group_creation_refusal_is_exists_evidence(
+            400,
+            Some(not_exists)
+        ));
+    }
+}
+
+#[test]
+fn group_creation_lost_response_replays_on_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let bob_keys = Arc::new(MemKeyStore::new());
+    let alice_device = uuid::Uuid::new_v4().to_string();
+    let bob_device = uuid::Uuid::new_v4().to_string();
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "alice-create-reopen",
+        ALICE_DID,
+        &alice_device,
+        &alice_keys,
+    );
+    let bob = live_client(
+        tmp.path(),
+        &ds,
+        "bob-create-reopen",
+        BOB_DID,
+        &bob_device,
+        &bob_keys,
+    );
+    let scopes = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    alice.enroll_device(&scopes).unwrap();
+    bob.enroll_device(&scopes).unwrap();
+    let cid = uuid::Uuid::new_v4().to_string();
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.lose_next_create_response = true;
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.getConversationState",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+    }
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("Reopened genesis".into()),
+            None,
+        )
+        .expect_err("the committed response is lost");
+    assert!(alice.list_conversations(None, 20).unwrap().is_empty());
+
+    let calls_before_open = create_request_count(&ds);
+    drop(alice);
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "alice-create-reopen",
+        ALICE_DID,
+        &alice_device,
+        &alice_keys,
+    );
+    assert_eq!(
+        create_request_count(&ds),
+        calls_before_open,
+        "open must never perform creation replay network I/O"
+    );
+    assert_eq!(group_creation_journal_count(&alice), 1);
+    allow_group_creation_retry_now(&alice);
+    alice
+        .sync()
+        .expect("the explicit sync replays the creation journal");
+    assert_create_replayed_exactly(&ds, &cid);
+    assert_creator_holds_server_genesis(&alice, &ds, &cid);
+    finish_resumed_group(&alice, &bob, &cid);
+}
+
+/// Permanent pre-lookup refusals retain the only genesis until authenticated server time proves
+/// every exact attempt too old to commit, then exit as a typed terminal failure.
+#[cfg(feature = "sim")]
+#[test]
+fn group_creation_permanent_refusal_becomes_terminal_only_after_expiry() {
+    let (_tmp, ds, clock, alice, _bob) = r4fix3_clocked_creation_fixture();
+    let conversation_id = new_id();
+    let refuse = |ds: &SharedMockDs| {
+        ds.inner.lock().unwrap().xrpc_failures.push((
+            "/blue.catbird.chat.createConversation",
+            401,
+            "NotAuthorized",
+            None,
+        ));
+    };
+    refuse(&ds);
+    alice
+        .create_group(
+            &conversation_id,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("Refused".into()),
+            None,
+        )
+        .expect_err("fresh permanent refusal retains the journal");
+    assert_eq!(group_creation_journal_count(&alice), 1);
+    assert_eq!(
+        alice
+            .pending_group_creation_status(&conversation_id)
+            .unwrap()
+            .expect("pending refusal")
+            .state,
+        chat_wire::PendingGroupCreationState::PendingRetry
+    );
+
+    r4fix3_advance_server_and_client(&ds, &clock, 361_000);
+    refuse(&ds);
+    let error = alice
+        .sync()
+        .expect_err("expired permanent refusal is terminal");
+    assert!(
+        matches!(&error, MLSError::SyncIncomplete { failures, .. }
+            if matches!(failures.as_slice(), [failure]
+                if failure.conversation_id == conversation_id
+                    && matches!(&*failure.error, MLSError::GroupCreationRejected {
+                        conversation_id: actual,
+                        code,
+                    } if actual == &conversation_id && code == "NotAuthorized"))),
+        "{error:?}"
+    );
+    assert_eq!(group_creation_journal_count(&alice), 0);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn group_creation_expiry_appends_attempt_over_the_same_genesis_and_provenance() {
+    let (_tmp, ds, clock, alice, bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Expired creation".into()),
+            None,
+        )
+        .expect_err("first execution is unavailable");
+    let before = staged_creation_fingerprint(&alice, &cid);
+    assert_eq!(before.attempts.len(), 1);
+
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        401,
+        "InvalidSignature",
+        None,
+    ));
+    let expired_error = alice
+        .sync()
+        .expect_err("expired exact replay appends a signed attempt");
+    assert!(
+        matches!(&expired_error, MLSError::SyncIncomplete { failures, .. }
+            if matches!(failures.as_slice(), [failure]
+                if failure.conversation_id == cid
+                    && matches!(&*failure.error, MLSError::GroupCreationPending {
+                        last_error_code, ..
+                    } if last_error_code == "GroupCreationResigned"))),
+        "{expired_error:?}"
+    );
+    let after = staged_creation_fingerprint(&alice, &cid);
+    assert_eq!(after.attempts.len(), 2);
+    assert_eq!(after.attempts[0].0, before.operation_id);
+    assert_eq!(after.attempts[0].1, before.request);
+    assert_ne!(after.operation_id, before.operation_id);
+    assert_eq!(after.group_id, before.group_id, "re-sign minted a group");
+    assert_eq!(
+        after.epoch_authenticator, before.epoch_authenticator,
+        "re-sign minted an epoch-zero state"
+    );
+    assert_eq!(after.next, before.next, "genesis coordinates changed");
+
+    let fresh: Value = serde_json::from_slice(&after.request).unwrap();
+    let fresh_body = &fresh["signedRequest"]["body"];
+    assert_eq!(
+        fresh_body
+            .pointer("/metadataSnapshot/originTransitionId")
+            .and_then(Value::as_str),
+        Some(after.operation_id.as_str())
+    );
+    assert_eq!(
+        fresh_body
+            .pointer("/metadataSnapshot/authorProof/originTransitionId")
+            .and_then(Value::as_str),
+        Some(after.operation_id.as_str())
+    );
+    assert!(fresh_body["manifest"]["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|participant| participant["status"] == "pending")
+        .all(|participant| participant
+            .pointer("/invitationProvenance/invitationTransitionId")
+            .and_then(Value::as_str)
+            == Some(after.operation_id.as_str())));
+    let old: Value = serde_json::from_slice(&before.request).unwrap();
+    for pointer in [
+        "/signedRequest/body/next/groupId",
+        "/signedRequest/body/next/groupContextHash",
+        "/signedRequest/body/next/confirmationTag",
+        "/signedRequest/body/genesisGroupInfo",
+    ] {
+        assert_eq!(old.pointer(pointer), fresh.pointer(pointer), "{pointer}");
+    }
+
+    // The server refuses A again, then accepts B. Both exact A copies remain byte-identical.
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        401,
+        "InvalidSignature",
+        None,
+    ));
+    alice
+        .sync()
+        .expect("fresh attempt creates the staged genesis");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+    assert_eq!(
+        adopted_epoch_authenticator(&alice, &cid),
+        before.epoch_authenticator
+    );
+    let requests = creation_requests_for(&ds, &cid);
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0], requests[2]);
+    assert_eq!(requests[3], after.request);
+    finish_resumed_group(&alice, &bob, &cid);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn group_creation_cancel_waits_for_expiry_and_backward_clock_is_bounded() {
+    let (_tmp, ds, clock, alice, _bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Cancelable".into()),
+            None,
+        )
+        .expect_err("initial post unavailable");
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    let cancel = alice
+        .cancel_pending_group_creation(&cid)
+        .expect_err("fresh exact bytes may still commit");
+    assert!(
+        matches!(&cancel, MLSError::GroupCreationCancellationUnproven {
+            conversation_id,
+            reason,
+        } if conversation_id == &cid && reason == "CreationAttemptsMayStillCommit"),
+        "{cancel:?}"
+    );
+    assert_eq!(group_creation_journal_count(&alice), 1);
+
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        401,
+        "InvalidSignature",
+        None,
+    ));
+    assert!(alice.cancel_pending_group_creation(&cid).unwrap());
+    assert_eq!(group_creation_journal_count(&alice), 0);
+    let occupied = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        400,
+        "ConversationAlreadyExists",
+        None,
+    ));
+    alice
+        .create_group(
+            &occupied,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Occupied".into()),
+            None,
+        )
+        .expect_err("exists evidence alone does not delete");
+    assert_eq!(group_creation_journal_count(&alice), 1);
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        400,
+        "ConversationAlreadyExists",
+        None,
+    ));
+    assert!(alice.cancel_pending_group_creation(&occupied).unwrap());
+    assert_eq!(group_creation_journal_count(&alice), 0);
+
+    let rollback = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        Some("300"),
+    ));
+    alice
+        .create_group(
+            &rollback,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Rollback".into()),
+            None,
+        )
+        .expect_err("retry is deferred");
+    clock.advance_ms(-1_000_000);
+    let now = catbird_mls::sim_hooks::SimClock::now_ms(clock.as_ref());
+    let status = alice
+        .pending_group_creation_status(&rollback)
+        .unwrap()
+        .expect("rollback journal");
+    assert!(
+        status.retry_at_ms.unwrap() <= now + chat_wire::GROUP_CREATION_MAX_RETRY_MS,
+        "backward jump exposed an unbounded deadline"
+    );
+    let posts = create_request_count(&ds);
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .sync()
+        .expect_err("the retry runs despite the stale far-future deadline");
+    assert_eq!(create_request_count(&ds), posts + 1);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn committed_expired_creation_replays_at_the_current_endpoint() {
+    use catbird_mls::sim_hooks::{FixedStepClock, OsSimEntropy, SimClientHooks};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let clock = Arc::new(FixedStepClock::new(
+        chrono::Utc::now().timestamp_millis(),
+        0,
+    ));
+    let device_id = new_id();
+    let keys = Arc::new(MemKeyStore::new());
+    let open = |endpoint: &str| {
+        CatbirdMlsClient::open_with_hooks(
+            CatbirdMlsClientConfig {
+                storage_root: tmp.path().join("alice-endpoint").to_string_lossy().into(),
+                account_did: ALICE_DID.into(),
+                device_id: device_id.clone(),
+                home_ds_did: DS_DID.into(),
+                home_ds_endpoint: endpoint.into(),
+                pds_endpoint: PDS_URL.into(),
+            },
+            keys.clone(),
+            ds.for_account(ALICE_DID),
+            None,
+            SimClientHooks::new(clock.clone(), Arc::new(OsSimEntropy)),
+        )
+        .unwrap()
+    };
+    let alice = open(DS_URL);
+    let bob = live_client(
+        tmp.path(),
+        &ds,
+        "bob-endpoint",
+        BOB_DID,
+        &new_id(),
+        &Arc::new(MemKeyStore::new()),
+    );
+    alice.enroll_device(&oauth_scopes()).unwrap();
+    bob.enroll_device(&oauth_scopes()).unwrap();
+    let cid = new_id();
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.lose_next_create_response = true;
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.getConversationState",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+    }
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Moved endpoint".into()),
+            None,
+        )
+        .expect_err("lost answer and state failure retain the journal");
+    let staged = staged_creation_fingerprint(&alice, &cid);
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    drop(alice);
+
+    let alice = open("https://moved-home.invalid");
+    alice
+        .retry_pending_group_creation(&cid)
+        .expect("explicit retry resolves the current URL")
+        .expect("completed creation");
+    assert_eq!(
+        adopted_epoch_authenticator(&alice, &cid),
+        staged.epoch_authenticator
+    );
+    let urls = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, body)| {
+            url.ends_with("/blue.catbird.chat.createConversation")
+                && serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|request| {
+                        request
+                            .pointer("/signedRequest/body/conversationId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(cid.as_str())
+        })
+        .map(|(_, url, _)| url.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(urls.len(), 2);
+    assert!(urls[0].starts_with(DS_URL));
+    assert!(urls[1].starts_with("https://moved-home.invalid"));
+}
+
+// Round-4 review regressions: these were first landed before the fix and captured in the
+// R4ClientFix3Create-*-fail-before logs.
+#[cfg(feature = "sim")]
+fn r4fix3_clocked_creation_fixture() -> (
+    tempfile::TempDir,
+    Arc<SharedMockDs>,
+    Arc<catbird_mls::sim_hooks::FixedStepClock>,
+    Arc<CatbirdMlsClient>,
+    Arc<CatbirdMlsClient>,
+) {
+    use catbird_mls::sim_hooks::{FixedStepClock, OsSimEntropy, SimClientHooks};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let clock = Arc::new(FixedStepClock::new(
+        chrono::Utc::now().timestamp_millis(),
+        0,
+    ));
+    let alice = CatbirdMlsClient::open_with_hooks(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("alice-r4fix3").to_string_lossy().into(),
+            account_did: ALICE_DID.into(),
+            device_id: new_id(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(ALICE_DID),
+        None,
+        SimClientHooks::new(clock.clone(), Arc::new(OsSimEntropy)),
+    )
+    .unwrap();
+    let bob = live_client(
+        tmp.path(),
+        &ds,
+        "bob-r4fix3",
+        BOB_DID,
+        &new_id(),
+        &Arc::new(MemKeyStore::new()),
+    );
+    alice.enroll_device(&oauth_scopes()).unwrap();
+    bob.enroll_device(&oauth_scopes()).unwrap();
+    (tmp, ds, clock, alice, bob)
+}
+
+#[cfg(feature = "sim")]
+fn r4fix3_advance_server_and_client(
+    _ds: &SharedMockDs,
+    clock: &catbird_mls::sim_hooks::FixedStepClock,
+    millis: i64,
+) {
+    clock.advance_ms(millis);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn r4fix3_reviewer_mj1a_exists_after_401_remains_retryable() {
+    let (_tmp, ds, _clock, alice, _bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.lose_next_create_response = true;
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.getConversationState",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+    }
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("MJ-1a".into()),
+            None,
+        )
+        .expect_err("the lost answer and failed state read retain the journal");
+    let staged = staged_creation_fingerprint(&alice, &cid);
+    allow_group_creation_retry_now(&alice);
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        401,
+        "InvalidSignature",
+        None,
+    ));
+    alice
+        .sync()
+        .expect("exists after 401 adopts the verified creation entry");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+    assert_eq!(
+        adopted_epoch_authenticator(&alice, &cid),
+        staged.epoch_authenticator
+    );
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn r4fix3_reviewer_mj1b_one_failed_state_read_remains_retryable() {
+    let (_tmp, ds, clock, alice, _bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("MJ-1b".into()),
+            None,
+        )
+        .expect_err("initial post unavailable");
+    r4fix3_advance_server_and_client(&ds, &clock, 361_000);
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.createConversation",
+            401,
+            "InvalidSignature",
+            None,
+        ));
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.getConversationState",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+    }
+    alice.sync().expect_err("one state read is unavailable");
+    assert_eq!(
+        alice
+            .pending_group_creation_status(&cid)
+            .unwrap()
+            .expect("journal retained")
+            .state,
+        chat_wire::PendingGroupCreationState::PendingRetry
+    );
+    allow_group_creation_retry_now(&alice);
+    alice
+        .sync()
+        .expect("the next exact replay must recover from one state-read failure");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn r4fix3_reviewer_mj1c_server_ahead_expiry_remains_retryable() {
+    let (_tmp, ds, clock, alice, _bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("MJ-1c".into()),
+            None,
+        )
+        .expect_err("initial post unavailable");
+    r4fix3_advance_server_and_client(&ds, &clock, 297_000);
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        401,
+        "InvalidSignature",
+        None,
+    ));
+    alice
+        .sync()
+        .expect_err("server-ahead expiry is ambiguous and retryable");
+    assert_eq!(
+        alice
+            .pending_group_creation_status(&cid)
+            .unwrap()
+            .expect("journal retained")
+            .state,
+        chat_wire::PendingGroupCreationState::PendingRetry
+    );
+    allow_group_creation_retry_now(&alice);
+    alice
+        .sync()
+        .expect("the ambiguous expiry cannot latch the journal");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+}
+
+struct R4Fix3CancelDuringCreate {
+    inner: Arc<dyn PlatformTransport>,
+    client: Mutex<Option<std::sync::Weak<CatbirdMlsClient>>>,
+    armed: std::sync::atomic::AtomicBool,
+    outcome: Mutex<Option<Result<bool, MLSError>>>,
+}
+
+impl PlatformTransport for R4Fix3CancelDuringCreate {
+    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+        if request
+            .url
+            .ends_with("/xrpc/blue.catbird.chat.createConversation")
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            let cid = request
+                .body
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                .and_then(|body| {
+                    body.pointer("/signedRequest/body/conversationId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap();
+            let client = self
+                .client
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(client) = client {
+                let cancel = std::thread::spawn(move || client.cancel_pending_group_creation(&cid))
+                    .join()
+                    .expect("cancel thread");
+                *self.outcome.lock().unwrap() = Some(cancel);
+            }
+        }
+        self.inner.execute_http(request)
+    }
+
+    fn connect_realtime_stream(&self, _url: String, _cursor: Option<i64>) -> Result<(), MLSError> {
+        Ok(())
+    }
+
+    fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn r4fix3_reviewer_mj2a_cancel_during_post_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let transport = Arc::new(R4Fix3CancelDuringCreate {
+        inner: ds.for_account(ALICE_DID),
+        client: Mutex::new(None),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        outcome: Mutex::new(None),
+    });
+    let alice = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("alice-race").to_string_lossy().into(),
+            account_did: ALICE_DID.into(),
+            device_id: new_id(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        transport.clone(),
+        None,
+    )
+    .unwrap();
+    *transport.client.lock().unwrap() = Some(Arc::downgrade(&alice));
+    let bob = enrolled(&tmp, &ds, "bob-race", BOB_DID, &new_id());
+    alice.enroll_device(&oauth_scopes()).unwrap();
+    let cid = new_id();
+    transport.armed.store(true, Ordering::SeqCst);
+    let created = alice.create_group(
+        &cid,
+        DS_DID,
+        vec![BOB_DID.into()],
+        Some("Raced".into()),
+        None,
+    );
+    let cancel = transport
+        .outcome
+        .lock()
+        .unwrap()
+        .take()
+        .expect("cancel callback ran");
+    assert!(
+        matches!(&cancel, Err(MLSError::GroupCreationCancellationUnproven {
+            conversation_id,
+            reason,
+        }) if conversation_id == &cid && reason == "CreationRequestInFlight"),
+        "{cancel:?}"
+    );
+    created.expect("the in-flight create retains and adopts its genesis");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+    finish_resumed_group(&alice, &bob, &cid);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn r4fix3_reviewer_mj2b_original_commits_after_resign() {
+    let (_tmp, ds, clock, alice, bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("MJ-2b".into()),
+            None,
+        )
+        .expect_err("initial post unavailable");
+    let original = staged_creation_fingerprint(&alice, &cid);
+    r4fix3_advance_server_and_client(&ds, &clock, 361_000);
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        401,
+        "InvalidSignature",
+        None,
+    ));
+    alice
+        .sync()
+        .expect_err("expired attempt appends a fresh signed attempt");
+    let resigned = staged_creation_fingerprint(&alice, &cid);
+    assert_ne!(resigned.operation_id, original.operation_id);
+    assert_eq!(resigned.group_id, original.group_id);
+    assert_eq!(resigned.epoch_authenticator, original.epoch_authenticator);
+
+    ds.for_account(ALICE_DID)
+        .execute_http(PlatformHttpRequest {
+            method: "POST".into(),
+            url: format!("{DS_URL}/xrpc/blue.catbird.chat.createConversation"),
+            headers: vec![PlatformHttpHeader {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            }],
+            body: Some(original.request.clone()),
+        })
+        .expect("the delayed original commits");
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.createConversation",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.createConversation",
+            400,
+            "ConversationAlreadyExists",
+            None,
+        ));
+    }
+    allow_group_creation_retry_now(&alice);
+    alice
+        .sync()
+        .expect("state proof adopts the original attempt's journaled genesis");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+    assert_eq!(
+        adopted_epoch_authenticator(&alice, &cid),
+        original.epoch_authenticator
+    );
+    assert_creator_holds_server_genesis(&alice, &ds, &cid);
+    finish_resumed_group(&alice, &bob, &cid);
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn group_creation_absence_and_foreign_guards_are_controlled() {
+    let (_tmp, ds, clock, alice, bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Guards".into()),
+            None,
+        )
+        .expect_err("initial create retained");
+    let before = staged_creation_fingerprint(&alice, &cid);
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    for (status, code) in [(503, "CapacityUnavailable"), (401, "AccountSessionExpired")] {
+        {
+            let mut state = ds.inner.lock().unwrap();
+            state.xrpc_failures.push((
+                "/blue.catbird.chat.createConversation",
+                401,
+                "InvalidSignature",
+                None,
+            ));
+            state.xrpc_failures.push((
+                "/blue.catbird.chat.getConversationState",
+                status,
+                code,
+                None,
+            ));
+        }
+        alice
+            .cancel_pending_group_creation(&cid)
+            .expect_err("a non-404 state refusal is never absence");
+        {
+            let mut state = ds.inner.lock().unwrap();
+            state.xrpc_failures.push((
+                "/blue.catbird.chat.createConversation",
+                401,
+                "InvalidSignature",
+                None,
+            ));
+            state.xrpc_failures.push((
+                "/blue.catbird.chat.getConversationState",
+                status,
+                code,
+                None,
+            ));
+        }
+        alice
+            .retry_pending_group_creation(&cid)
+            .expect_err("expired retry cannot re-sign without ConversationNotFound");
+        let current = staged_creation_fingerprint(&alice, &cid);
+        assert_eq!(current.attempts.len(), 1);
+        assert_eq!(current.operation_id, before.operation_id);
+    }
+
+    let existing = new_id();
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.lose_next_create_response = true;
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.getConversationState",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+    }
+    alice
+        .create_group(
+            &existing,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Existing".into()),
+            None,
+        )
+        .expect_err("committed response and state read lost");
+    let existing_before = staged_creation_fingerprint(&alice, &existing);
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.createConversation",
+            401,
+            "InvalidSignature",
+            None,
+        ));
+        state.xrpc_failures.push((
+            "/blue.catbird.chat.getEntries",
+            503,
+            "CapacityUnavailable",
+            None,
+        ));
+    }
+    alice
+        .retry_pending_group_creation(&existing)
+        .expect_err("existing conversation with unavailable entry proof retains");
+    let existing_after = staged_creation_fingerprint(&alice, &existing);
+    assert_eq!(existing_after.attempts.len(), 1);
+    assert_eq!(existing_after.operation_id, existing_before.operation_id);
+
+    let foreign = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &foreign,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Foreign".into()),
+            None,
+        )
+        .expect_err("alice retains foreign candidate");
+    bob.create_group(
+        &foreign,
+        DS_DID,
+        vec![ALICE_DID.into()],
+        Some("Bob owns it".into()),
+        None,
+    )
+    .expect("bob creates the conversation");
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        400,
+        "ConversationAlreadyExists",
+        None,
+    ));
+    alice
+        .retry_pending_group_creation(&foreign)
+        .expect_err("foreign creation while alice's attempt is fresh retains");
+    assert_eq!(
+        staged_creation_fingerprint(&alice, &foreign).attempts.len(),
+        1
+    );
+    r4fix3_advance_server_and_client(
+        &ds,
+        &clock,
+        chat_wire::GROUP_CREATION_ABANDON_AFTER_MS + 1_000,
+    );
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        400,
+        "ConversationAlreadyExists",
+        None,
+    ));
+    let rejected = alice
+        .retry_pending_group_creation(&foreign)
+        .expect_err("receipted foreign creation after expiry is terminal");
+    assert!(
+        matches!(&rejected, MLSError::GroupCreationRejected {
+            conversation_id,
+            code,
+        } if conversation_id == &foreign && code == "ForeignConversationCreation"),
+        "{rejected:?}"
+    );
+    assert!(alice
+        .pending_group_creation_status(&foreign)
+        .unwrap()
+        .is_none());
 }
 
 /// Catbird re-enrolls on every MLS init (`AppState.initializeMLS`). After a cold relaunch the
@@ -4711,17 +6898,18 @@ fn a_key_mismatch_refuses_before_any_pds_write() {
     );
 }
 
-/// Accepting moves the cursor only over its own verified entry: the coordinator's
-/// acceptance-commit receipt over the sequenced entry carrying Bob's signed acceptance, and only
-/// when that entry is the next one. An answer the coordinator did not sign is refused with
+/// Accepting moves the cursor only over its own verified entry: the coordinator's legacy
+/// acceptance-commit receipt over the sequenced entry carrying Bob's signed acceptance and the
+/// mandatory I13 receipt over that actor digest, entry coordinate and seq, and only when that
+/// entry is the next one. An answer the coordinator did not sign or receipt is refused with
 /// nothing changed and the signed acceptance still journaled; its exact replay, verified at seq
 /// 2, moves the cursor from 1 to 2 onto the signed coordinates. An acceptance verified at seq 3,
 /// behind Alice's seq-2 message Bob has not seen, leaves the cursor to sync, which applies that
 /// message first.
 ///
-/// Fail-before: accepting trusted any 2xx answer: the forged one moved the cursor to 2, stored
-/// its unsigned coordinates and spent the journal; an answer without a top-level `seq` moved the
-/// cursor to 2 over Alice's unseen message.
+/// Fail-before: accepting trusted any 2xx answer: the forged receipt-free one moved the cursor to
+/// 2, stored its unsigned coordinates and spent the journal; an answer without a top-level `seq`
+/// moved the cursor to 2 over Alice's unseen message.
 #[test]
 fn accepting_moves_the_cursor_only_over_its_verified_entry() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4770,18 +6958,31 @@ fn accepting_moves_the_cursor_only_over_its_verified_entry() {
 
     let request_id = request(&next).request_id;
     let coords_before = coords(&next);
-    ds.inner.lock().unwrap().forge_next_acceptance = true;
-    let error = bob
-        .accept_direct_request(&request_id)
-        .expect_err("an answer the coordinator did not sign is refused");
-    assert!(error.to_string().contains("C33 acceptance"), "{error}");
-    assert_eq!(last_seq(&bob, &next), 1);
-    assert_eq!(coords(&next), coords_before);
-    assert_eq!(request(&next).consent, "incomingPending");
-    assert!(
-        journal(&request_id).is_some(),
-        "the signed acceptance stays journaled"
-    );
+    for (fault, expectation, reason) in [
+        (
+            "missingI13",
+            "an answer without I13 is refused",
+            "missing I13 sequencerReceipt",
+        ),
+        (
+            "legacyProof",
+            "an answer with an invalid legacy acceptanceProof is refused",
+            "C33 acceptance",
+        ),
+    ] {
+        ds.inner.lock().unwrap().next_acceptance_fault = Some(fault);
+        let error = bob
+            .accept_direct_request(&request_id)
+            .expect_err(expectation);
+        assert!(error.to_string().contains(reason), "{error}");
+        assert_eq!(last_seq(&bob, &next), 1);
+        assert_eq!(coords(&next), coords_before);
+        assert_eq!(request(&next).consent, "incomingPending");
+        assert!(
+            journal(&request_id).is_some(),
+            "the signed acceptance stays journaled"
+        );
+    }
 
     bob.accept_direct_request(&request_id)
         .expect("the verified acceptance is accepted");
@@ -4790,24 +6991,23 @@ fn accepting_moves_the_cursor_only_over_its_verified_entry() {
     assert!(journal(&request_id).is_none());
     let (bodies, signed_next) = {
         let g = ds.inner.lock().unwrap();
-        let bodies: Vec<&Vec<u8>> = g
+        let bodies: Vec<Vec<u8>> = g
             .http_log
             .iter()
             .filter(|(account, url, _)| {
                 account == BOB_DID && url.ends_with("/xrpc/blue.catbird.chat.acceptConversation")
             })
-            .map(|(_, _, body)| body)
+            .map(|(_, _, body)| body.clone())
             .collect();
-        assert_eq!(bodies.len(), 2);
-        let bodies = (bodies[0].clone(), bodies[1].clone());
+        assert_eq!(bodies.len(), 3);
         (
             bodies,
             g.entries[&next][1]["signedRequest"]["body"]["next"].clone(),
         )
     };
-    assert_eq!(
-        bodies.0, bodies.1,
-        "the retry replays the journaled acceptance"
+    assert!(
+        bodies.windows(2).all(|pair| pair[0] == pair[1]),
+        "each retry replays the journaled acceptance"
     );
     let stored: Value = serde_json::from_str(&coords(&next).unwrap()).unwrap();
     assert_eq!(
@@ -4940,6 +7140,53 @@ fn forged_own_transition_answers_move_neither_cursor_nor_coordinates() {
     assert!(after.last_seq > row.last_seq);
     assert!(!alice
         .list_members(&cid)
+        .unwrap()
+        .contains(&BOB_DID.to_string()));
+}
+
+/// A policy-transition answer is not authority until its I13 receipt verifies. A forged answer
+/// leaves the removal intent pending; the genuine sequenced echo then completes the same removal.
+#[test]
+fn participant_removal_policy_answer_requires_its_i13_receipt() {
+    let f = send_order_fixture(false);
+    let (alice, ds, cid) = (&f.alice, &f.ds, f.cid.as_str());
+    let pending = || {
+        alice
+            .db()
+            .read_tx(|tx| {
+                tx.conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM pending_ops \
+                         WHERE op_kind = 'participant_removal' \
+                         AND json_extract(payload_json, '$.conversation_id') = ?1",
+                        [cid],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| MLSError::Internal(error.to_string()))
+            })
+            .unwrap()
+    };
+
+    ds.inner.lock().unwrap().forge_next_policy_answer_receipt = true;
+    let error = alice
+        .remove_group_member(MemberRole::Admin, cid, BOB_DID)
+        .expect_err("a policy answer with a forged receipt is refused");
+    assert!(
+        error.to_string().contains("I13") || error.to_string().contains("receipt"),
+        "{error}"
+    );
+    assert_eq!(
+        pending(),
+        1,
+        "the unverified answer cannot consume the intent"
+    );
+
+    alice
+        .sync()
+        .expect("the genuine policy echo completes removal");
+    assert_eq!(pending(), 0);
+    assert!(!alice
+        .list_members(cid)
         .unwrap()
         .contains(&BOB_DID.to_string()));
 }
@@ -5520,6 +7767,65 @@ fn c33_prepare_stage_terminal_receipt_must_verify_before_the_journal_is_dropped(
     );
 }
 
+/// Older fixture cases build control entries by hand. Model the DS boundary by adding the same
+/// I13 receipt production would issue, while preserving explicit `null`/forged receipt cases.
+fn synthesize_missing_control_receipts(g: &mut MockDsState, cid: &str) {
+    let candidates: Vec<(usize, Value)> = g
+        .entries
+        .get(cid)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let body_type = entry
+                .pointer("/signedRequest/body/$type")
+                .and_then(Value::as_str)?;
+            if entry.get("sequencerReceipt").is_some()
+                || body_type.ends_with("#applicationSendBody")
+                || body_type.ends_with("#directRequestAcceptanceBody")
+                || body_type.ends_with("#accountDeletedBody")
+            {
+                return None;
+            }
+            let kind = SignedMutationKind::from_type_id(body_type)?;
+            let actor = entry.pointer("/signedRequest/body/actorDid")?.as_str()?;
+            let device = entry
+                .pointer("/signedRequest/body/actorDeviceId")?
+                .as_str()?;
+            let key = g.device_keys.get(&(actor.to_owned(), device.to_owned()))?;
+            let (verified_body, _) = chat_wire::verify_signed_mutation_body_and_digest(
+                &entry["signedRequest"],
+                kind,
+                key,
+            )
+            .ok()?;
+            let mut entry = entry.clone();
+            if entry.get("conversationId").is_none() {
+                entry["conversationId"] = json!(cid);
+            }
+            if entry.get("entryId").is_none() {
+                entry["entryId"] = verified_body.get("transitionId")?.clone();
+            }
+            if entry.get("receivedAt").is_none() {
+                entry["receivedAt"] = entry["signedRequest"]["body"]["signedAt"].clone();
+            }
+            Some((index, entry))
+        })
+        .collect();
+    for (index, mut entry) in candidates {
+        let body = &entry["signedRequest"]["body"];
+        let Some(coordinate) = ["next", "successor", "retired", "prior"]
+            .iter()
+            .find_map(|field| body.get(field))
+            .cloned()
+        else {
+            continue;
+        };
+        entry["sequencerReceipt"] = control_sequencer_receipt(g, &entry, &coordinate);
+        g.entries.get_mut(cid).unwrap()[index] = entry;
+    }
+}
+
 /// `(messageId, sendCounter, ciphertext, outcome)` of one `sendMessage` the mock DS saw.
 fn send_attempt(body_json: &Value, outcome: &'static str) -> (String, u64, String, &'static str) {
     let b = &body_json["signedRequest"]["body"];
@@ -5535,6 +7841,100 @@ fn send_attempt(body_json: &Value, outcome: &'static str) -> (String, u64, Strin
 /// outcome; a first-seen send is sequenced only if its signed (`prior.generation`,
 /// `prior.epoch`, `sendCounter`) exceeds the device's last accepted send, otherwise it is
 /// refused `StaleSend` and nothing is written.
+fn control_sequencer_receipt(g: &MockDsState, entry: &Value, coordinate: &Value) -> Value {
+    control_sequencer_receipt_for(g, entry, coordinate, DS_DID)
+}
+
+fn control_sequencer_receipt_for(
+    g: &MockDsState,
+    entry: &Value,
+    coordinate: &Value,
+    sequencer_did: &str,
+) -> Value {
+    let signed_request = &entry["signedRequest"];
+    let body = &signed_request["body"];
+    let actor_did = body["actorDid"].as_str().expect("control actor DID");
+    let actor_device_id = body["actorDeviceId"]
+        .as_str()
+        .expect("control actor device");
+    let body_type = body["$type"].as_str().expect("control body type");
+    let public_key = g
+        .device_keys
+        .get(&(actor_did.to_owned(), actor_device_id.to_owned()))
+        .expect("enrolled control actor key");
+    let request_digest = if let Some(kind) = SignedMutationKind::from_type_id(body_type) {
+        chat_wire::verify_signed_mutation_body_and_digest(signed_request, kind, public_key)
+            .expect("valid control mutation")
+            .1
+    } else if body_type == "blue.catbird.chat.defs#directRequestAcceptanceBody" {
+        *dr_transcript::verify_received_signed_request(
+            DirectRequestKind::Accept,
+            &serde_json::to_vec(signed_request).unwrap(),
+            public_key,
+        )
+        .expect("valid direct-request acceptance")
+        .request_digest()
+    } else {
+        panic!("known control mutation kind");
+    };
+    let conversation_id = entry["conversationId"]
+        .as_str()
+        .expect("control conversation");
+    let entry_id = entry["entryId"].as_str().expect("control entry ID");
+    let seq = entry["seq"].as_u64().expect("control seq");
+    let generation = coordinate["generation"]
+        .as_u64()
+        .expect("control generation");
+    let group_id = chat_wire::json_bytes(&coordinate["groupId"]).expect("control group ID");
+    let epoch = coordinate["epoch"].as_u64().expect("control epoch");
+    let issued_at_ms = chrono::DateTime::parse_from_rfc3339(
+        entry["receivedAt"].as_str().expect("control receivedAt"),
+    )
+    .expect("control timestamp")
+    .timestamp_millis();
+    let payload = SequencerReceiptPayload {
+        sequencer_did: sequencer_did.to_owned(),
+        conversation_id: conversation_id.to_string(),
+        group_id,
+        epoch,
+        sender_device_did_url: format!("{actor_did}#{actor_device_id}"),
+        entry_id: entry_id.to_string(),
+        archive_commitment: request_digest,
+        seq,
+        issued_at_ms,
+    };
+    let signed = match (
+        sequencer_did == DS_DID,
+        &g.historical_receipt_sk,
+        g.rotated_sequencer_receipts,
+    ) {
+        (true, Some(current), true) => {
+            sign_sequencer_receipt(current, &format!("{DS_DID}#mls-receipt-2"), &payload)
+        }
+        _ => sign_sequencer_receipt(
+            &g.receipt_sk,
+            &format!("{sequencer_did}#mls-receipt-1"),
+            &payload,
+        ),
+    }
+    .expect("sign control receipt");
+    json!({
+        "kid": signed.key_id,
+        "sequencerDid": signed.payload.sequencer_did,
+        "conversationId": signed.payload.conversation_id,
+        "generation": generation,
+        "groupId": { "$bytes": STANDARD.encode(&signed.payload.group_id) },
+        "epoch": signed.payload.epoch,
+        "seq": signed.payload.seq,
+        "entryId": signed.payload.entry_id,
+        "senderDid": actor_did,
+        "senderDeviceId": actor_device_id,
+        "archiveCommitment": { "$bytes": STANDARD.encode(signed.payload.archive_commitment) },
+        "issuedAtMs": signed.payload.issued_at_ms,
+        "signature": { "$bytes": STANDARD.encode(signed.signature) },
+    })
+}
+
 fn sequence_send(g: &mut MockDsState, body_json: &Value) -> Result<PlatformHttpResponse, MLSError> {
     let sr = body_json["signedRequest"].clone();
     let b = &sr["body"];
@@ -5570,12 +7970,6 @@ fn sequence_send(g: &mut MockDsState, body_json: &Value) -> Result<PlatformHttpR
         .unwrap()
         .try_into()
         .unwrap();
-
-    if g.omit_next_receipt {
-        g.omit_next_receipt = false;
-        let seq = (g.entries.get(&cid).map(|v| v.len()).unwrap_or(0) as u64) + 1;
-        return ok_json(json!({ "seq": seq }));
-    }
 
     let device = (cid.clone(), actor_did.clone(), actor_dev.clone());
     let position = (
@@ -5707,8 +8101,9 @@ struct SendOrderFixture {
     eve: Arc<CatbirdMlsClient>,
 }
 
-/// Alice creates a live group with Bob and both complete the join. With `invite_eve`, Eve is
-/// invited too but accepts only when the test syncs her, so Alice's add Commit comes later.
+/// Alice creates a live group with Bob and both complete the join. Eve's home is the other DS;
+/// with `invite_eve`, she is invited too but accepts only when the test syncs her, so Alice's
+/// add Commit comes later.
 fn send_order_fixture(invite_eve: bool) -> SendOrderFixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
@@ -5732,13 +8127,14 @@ fn send_order_fixture(invite_eve: bool) -> SendOrderFixture {
     let bob = live_client(tmp.path(), &ds, "bob", BOB_DID, &bob_dev, &bob_keys);
     alice.enroll_device(&scopes).expect("enroll alice");
     bob.enroll_device(&scopes).expect("enroll bob");
-    let eve = live_client(
+    let eve = live_client_homed(
         tmp.path(),
         &ds,
         "eve",
         EVE_DID,
         &uuid::Uuid::new_v4().to_string(),
         &Arc::new(MemKeyStore::new()),
+        CROSS_HOME_DS_DID,
     );
     eve.enroll_device(&scopes).expect("enroll eve");
     let mut members = vec![BOB_DID.to_string()];
@@ -5856,7 +8252,7 @@ fn seed_2323_shrunk_six_action_repro_never_sequences_a_held_send_behind_newer_se
             .iter()
             .map(|(counter, outcome, _)| (*counter, *outcome))
             .collect::<Vec<_>>(),
-        [(1, "held"), (1, "stale"), (1, "stale"), (7, "accepted")],
+        [(1, "held"), (1, "stale"), (1, "stale"), (6, "accepted")],
         "the refused bytes are resubmitted once from the journal, then replaced"
     );
     assert_eq!(attempts[0].2, attempts[2].2);
@@ -5891,7 +8287,7 @@ fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
             .iter()
             .map(|(counter, outcome, _)| (*counter, *outcome))
             .collect::<Vec<_>>(),
-        [(1, "held"), (1, "stale"), (3, "accepted")]
+        [(1, "held"), (1, "stale"), (2, "accepted")]
     );
     assert_eq!(
         attempts[0].2, attempts[1].2,
@@ -5922,7 +8318,7 @@ fn stale_send_reencrypts_once_and_never_resubmits_refused_bytes() {
             .iter()
             .map(|(counter, outcome, _)| (*counter, *outcome))
             .collect::<Vec<_>>(),
-        [(4, "stale"), (5, "stale")],
+        [(3, "stale"), (4, "stale")],
         "exactly one fresh re-encryption"
     );
 }
@@ -5945,6 +8341,15 @@ fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_applies() 
             .unwrap();
     }
     ds.deliver_held_sends();
+    rebind_application_send_counter(
+        ds,
+        cid,
+        &late,
+        &enrolled_signer(alice),
+        ALICE_DID,
+        &f.alice_dev,
+        11,
+    );
     let late_seq = baseline + 11;
     let epoch_before = bob
         .db()
@@ -6016,6 +8421,35 @@ fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_applies() 
             f.alice_dev.as_str()
         )
     );
+}
+
+/// Re-sign a fixture application body with a chosen peer counter without touching its MLS
+/// ciphertext or I13 receipt (the latter binds the unchanged archive commitment).
+fn rebind_application_send_counter(
+    ds: &SharedMockDs,
+    cid: &str,
+    message_id: &str,
+    signer: &SignatureKeyPair,
+    did: &str,
+    device: &str,
+    send_counter: u64,
+) {
+    let mut g = ds.inner.lock().unwrap();
+    let entry = g
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .iter_mut()
+        .find(|entry| {
+            entry
+                .pointer("/signedRequest/body/messageId")
+                .and_then(Value::as_str)
+                == Some(message_id)
+        })
+        .unwrap();
+    let mut body = entry["signedRequest"]["body"].clone();
+    body["sendCounter"] = json!(send_counter);
+    entry["signedRequest"] = signed_by(signer, did, device, CanonicalOperation::SendMessage, &body);
 }
 
 /// Re-sign the I13 receipt of the entry at `entry_seq` with the DS key, now naming `seq`.
@@ -6106,6 +8540,15 @@ fn undecryptable_entry_without_its_exact_receipt_never_advances_the_cursor() {
             .unwrap();
     }
     ds.deliver_held_sends();
+    rebind_application_send_counter(
+        ds,
+        cid,
+        &late,
+        &enrolled_signer(alice),
+        ALICE_DID,
+        &f.alice_dev,
+        11,
+    );
     let late_seq = baseline + 11;
     resign_receipt_seq(ds, cid, late_seq, late_seq as u64 + 1);
     bob.sync()
@@ -6290,6 +8733,15 @@ fn live_create_and_join_apply_the_group_config_sender_ratchet_window() {
             .unwrap();
     }
     ds.deliver_held_sends();
+    rebind_application_send_counter(
+        ds,
+        cid,
+        &late,
+        &enrolled_signer(&f.alice),
+        ALICE_DID,
+        &f.alice_dev,
+        10,
+    );
     f.bob.sync().unwrap();
     assert_eq!(
         timeline_after(&f.bob, cid, baseline).last().unwrap(),
@@ -6411,6 +8863,15 @@ fn restore_heals_an_undecryptable_gap_only_from_the_copy_at_its_coordinates() {
             .unwrap();
     }
     ds.deliver_held_sends();
+    rebind_application_send_counter(
+        ds,
+        cid,
+        &late,
+        &enrolled_signer(alice),
+        ALICE_DID,
+        &f.alice_dev,
+        11,
+    );
     let late_seq = baseline + 11;
     bob.sync().expect("bob records the gap");
     alice
@@ -6662,7 +9123,109 @@ fn c33_direct_request_welcome_joins_only_through_the_checked_import() {
         )
         .expect("alice creates a group");
     bob.sync().expect("bob accepts the invitation");
+    let pending_recoveries = ds
+        .inner
+        .lock()
+        .unwrap()
+        .leaf_recoveries
+        .remove(&gcid)
+        .expect("bob recovery request");
+    r.alice
+        .sync()
+        .expect("alice records bob's acceptance before fulfillment");
+    ds.inner
+        .lock()
+        .unwrap()
+        .leaf_recoveries
+        .insert(gcid.clone(), pending_recoveries);
+    // The fulfiller has no verified roster, so this genuine recovery Welcome carries no roster
+    // attestation. The joiner must clear any older baseline and every admission marker.
+    r.alice
+        .db()
+        .write_tx(|tx| {
+            let roster_key = chat_wire::conversation_roster_key(&gcid);
+            if let Some(raw) = tx.get_account_meta(&roster_key)? {
+                let roster: Value = serde_json::from_str(&raw)?;
+                for did in roster.as_object().into_iter().flatten().map(|(did, _)| did) {
+                    tx.delete_account_meta(&chat_wire::verified_participant_admission_key(
+                        &gcid, did,
+                    ))?;
+                }
+            }
+            tx.delete_account_meta(&roster_key)
+        })
+        .unwrap();
     r.alice.sync().expect("alice fulfills bob's recovery");
+    let recovery_key = chat_wire::own_leaf_recovery_key(&gcid);
+    let recovery_before = bob
+        .db()
+        .read_tx(|tx| tx.get_account_meta(&recovery_key))
+        .unwrap();
+    let (genuine_fulfillment, genuine_welcomes) = {
+        let g = ds.inner.lock().unwrap();
+        (
+            g.entries[&gcid].last().unwrap().clone(),
+            g.pending_welcomes[&(BOB_DID.to_string(), r.bob_dev.clone())].clone(),
+        )
+    };
+    let genuine_seq = genuine_fulfillment["seq"].as_i64().unwrap();
+    let acks_before = ds.inner.lock().unwrap().acked_welcomes.len();
+    for fault in ["absent", "forged", "relabelled"] {
+        let mut fulfillment = genuine_fulfillment.clone();
+        let mut welcomes = genuine_welcomes.clone();
+        match fault {
+            "absent" => fulfillment["sequencerReceipt"] = Value::Null,
+            "forged" => {
+                fulfillment["sequencerReceipt"]["signature"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+            }
+            "relabelled" => {
+                fulfillment["seq"] = json!(genuine_seq + 1);
+                for welcome in &mut welcomes {
+                    welcome["transitionSeq"] = json!(genuine_seq + 1);
+                }
+            }
+            _ => unreachable!(),
+        }
+        {
+            let mut g = ds.inner.lock().unwrap();
+            *g.entries.get_mut(&gcid).unwrap().last_mut().unwrap() = fulfillment;
+            g.pending_welcomes
+                .insert((BOB_DID.to_string(), r.bob_dev.clone()), welcomes);
+        }
+        let error = bob
+            .sync()
+            .expect_err("an unverified fulfillment receipt cannot install its Welcome");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("receipt"),
+            "{fault}: unexpected error: {error:?}"
+        );
+        assert!(
+            bob.list_conversations(None, 20)
+                .unwrap()
+                .iter()
+                .all(|row| row.conversation_id != gcid),
+            "{fault}: installed the group"
+        );
+        assert_eq!(
+            bob.db()
+                .read_tx(|tx| tx.get_account_meta(&recovery_key))
+                .unwrap(),
+            recovery_before,
+            "{fault}: consumed the pending recovery"
+        );
+        assert_eq!(
+            ds.inner.lock().unwrap().acked_welcomes.len(),
+            acks_before,
+            "{fault}: acknowledged the refused Welcome"
+        );
+    }
+    {
+        let mut g = ds.inner.lock().unwrap();
+        *g.entries.get_mut(&gcid).unwrap().last_mut().unwrap() = genuine_fulfillment;
+        g.pending_welcomes
+            .insert((BOB_DID.to_string(), r.bob_dev.clone()), genuine_welcomes);
+    }
     let signed_next = {
         let mut g = ds.inner.lock().unwrap();
         let next = g.entries[&gcid].last().unwrap()["signedRequest"]["body"]["next"].clone();
@@ -6676,6 +9239,18 @@ fn c33_direct_request_welcome_joins_only_through_the_checked_import() {
         }
         chat_wire::canonicalize_wire_coordinate(&next, None).unwrap()
     };
+    let stale_roster_key = chat_wire::conversation_roster_key(&gcid);
+    let stale_marker_key = chat_wire::verified_participant_admission_key(&gcid, EVE_DID);
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &stale_roster_key,
+                &json!({ (EVE_DID): { "role": "member", "status": "active" } }).to_string(),
+                0,
+            )?;
+            tx.put_account_meta(&stale_marker_key, "true", 0)
+        })
+        .unwrap();
     bob.sync()
         .expect("bob joins from the fulfillment's Welcome");
     let stored = bob
@@ -6684,6 +9259,19 @@ fn c33_direct_request_welcome_joins_only_through_the_checked_import() {
         .unwrap()
         .expect("joined coordinates");
     assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), signed_next);
+    bob.db()
+        .read_tx(|tx| {
+            assert!(
+                tx.get_account_meta(&stale_roster_key)?.is_none(),
+                "a no-roster Welcome must clear the stale roster"
+            );
+            assert!(
+                tx.get_account_meta(&stale_marker_key)?.is_none(),
+                "a no-roster Welcome must clear stale admission markers"
+            );
+            Ok(())
+        })
+        .unwrap();
     let acknowledged = ds
         .inner
         .lock()
@@ -6794,11 +9382,11 @@ fn enrolled_signer(client: &CatbirdMlsClient) -> SignatureKeyPair {
 /// A sequenced `directRequestAcceptanceEntry` takes effect only once it verifies: its exact
 /// shape; a signer that is a current leaf of the local group under its PDS-authorized key; its
 /// `Accept` signature; a `next` that only advances `prior.stateVersion`; the local request's
-/// recipient accepting that request; and an attached coordinator receipt, if any, under the
-/// method it names. Each forged, unsigned, untyped, wrong-roster, wrong-request,
-/// wrong-transition or forged-receipt variant of Bob's acceptance fails Alice's sync and leaves
-/// her request's consent, her coordinates and her cursor as they were. The genuine entry, here
-/// with the coordinator's receipt, then advances her cursor exactly to its seq.
+/// recipient accepting that request; and a mandatory I13 receipt under the coordinator method it
+/// names, binding this seq, signed-request digest and successor coordinate. Each forged, unsigned,
+/// untyped, wrong-roster, wrong-request, wrong-transition or wrong-receipt variant of Bob's
+/// acceptance fails Alice's sync and leaves her request's consent, coordinates and cursor as they
+/// were. The genuine receipted entry then advances her cursor exactly to its seq.
 ///
 /// Fail-before: sync applied any entry labeled an acceptance: the first forged one marked
 /// Alice's request accepted and moved her cursor and coordinates to its unsigned `next`.
@@ -6847,9 +9435,31 @@ fn c33_acceptance_entry_takes_effect_only_once_it_verifies() {
     unsigned.as_object_mut().unwrap().remove("signedRequest");
     let mut untyped = genuine.clone();
     untyped.as_object_mut().unwrap().remove("$type");
-    let mut forged_receipt = genuine.clone();
-    forged_receipt["sequencerReceipt"] =
-        acceptance_commit_receipt(&P256SigningKey::random(&mut rand::rngs::OsRng), &genuine);
+    let mut missing_receipt = genuine.clone();
+    missing_receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    let mut wrong_seq_receipt = genuine.clone();
+    let mut other_seq = genuine.clone();
+    other_seq["seq"] = json!(seq + 1);
+    wrong_seq_receipt["sequencerReceipt"] = {
+        let g = ds.inner.lock().unwrap();
+        control_sequencer_receipt(&g, &other_seq, &genuine["signedRequest"]["body"]["next"])
+    };
+    let other_digest = resigned(&bob_signer, &|body: &mut Value| {
+        body["requestId"] = json!(new_id())
+    });
+    let mut wrong_digest_receipt = genuine.clone();
+    wrong_digest_receipt["sequencerReceipt"] = {
+        let g = ds.inner.lock().unwrap();
+        control_sequencer_receipt(&g, &other_digest, &genuine["signedRequest"]["body"]["next"])
+    };
+    let mut wrong_kid_receipt = genuine.clone();
+    wrong_kid_receipt["sequencerReceipt"]["kid"] = json!(format!("{DS_DID}#never-published"));
+    let mut wrong_authority_receipt = genuine.clone();
+    wrong_authority_receipt["sequencerReceipt"]["sequencerDid"] =
+        json!("did:web:other-sequencer.test");
     let variants = [
         ("forged signature", forged, "C33 acceptance entry"),
         ("unsigned", unsigned, "C33 acceptance entry"),
@@ -6877,9 +9487,25 @@ fn c33_acceptance_entry_takes_effect_only_once_it_verifies() {
             "must only advance",
         ),
         (
-            "a receipt under a key the coordinator never published",
-            forged_receipt,
-            "C33 acceptance entry",
+            "missing I13 receipt",
+            missing_receipt,
+            "missing I13 sequencerReceipt",
+        ),
+        ("receipt for another seq", wrong_seq_receipt, "I13"),
+        (
+            "receipt for another signed-request digest",
+            wrong_digest_receipt,
+            "I13",
+        ),
+        (
+            "receipt naming an unpublished kid",
+            wrong_kid_receipt,
+            "sequencerReceipt kid",
+        ),
+        (
+            "receipt naming another sequencerDid",
+            wrong_authority_receipt,
+            "I13 sequencerReceipt verify failed",
         ),
     ];
     let coords = || {
@@ -6907,10 +9533,7 @@ fn c33_acceptance_entry_takes_effect_only_once_it_verifies() {
         assert_eq!(last_seq(alice, cid), seq - 1, "{name}");
     }
 
-    let mut receipted = genuine.clone();
-    receipted["sequencerReceipt"] =
-        acceptance_commit_receipt(&ds.inner.lock().unwrap().receipt_sk, &genuine);
-    serve(receipted);
+    serve(genuine.clone());
     alice.sync().expect("the genuine acceptance verifies");
     assert_eq!(consent(), "accepted");
     assert_eq!(last_seq(alice, cid), seq);
@@ -7065,20 +9688,19 @@ fn stored_coordinates(client: &CatbirdMlsClient, cid: &str) -> Option<String> {
         .unwrap()
 }
 
-/// A `participantAcceptanceEntry` takes effect only once it verifies: signed by a PDS-authorized
-/// device of its actor, whose invitation (the creation or policy entry its signed provenance
-/// names) verifies under exactly the inviter device and invites exactly that actor with exactly
-/// that provenance, stepping only `stateVersion`. Eve's acceptance with a forged signature,
-/// naming an unknown invitation or another inviter device, signed by never-invited Carol, or
-/// stepping `stateVersion` twice fails Alice's sync with her cursor and coordinates unchanged;
-/// the genuine one applies its signed `next`. Bob joined after the creation entry, which mls-ds
-/// never serves him: there Eve's device signature and coordinate step stand alone.
-///
-/// Fail-before: sync moved the cursor and coordinates to any acceptance's unsigned `next`.
+/// A cross-home `participantAcceptanceEntry` takes effect only once it verifies: its own
+/// sequencing receipt, PDS-authorized actor signature, and either the exact pending provenance
+/// in the member-authenticated baseline or the signed historical invitation. Historical
+/// invitations must retain their own valid receipt, original sequence, and exact invitee
+/// provenance. Closed, forged, unknown, misattributed, never-invited, and skipping acceptances
+/// leave cursor, coordinates, roster, and recovery authorization unchanged. The genuine pending
+/// invitation and acceptance then apply, including on a later joiner with only the attested
+/// pending baseline.
 #[test]
 fn participant_acceptance_takes_effect_only_with_its_verified_invitation() {
     let f = send_order_fixture(true);
     let (ds, cid, alice, bob) = (&f.ds, f.cid.as_str(), &f.alice, &f.bob);
+    assert_ne!(CROSS_HOME_DS_DID, DS_DID);
     f.eve.sync().expect("eve accepts");
     // Only the acceptance is under test: nobody fulfills Eve's recovery.
     ds.inner.lock().unwrap().leaf_recoveries.remove(cid);
@@ -7090,6 +9712,7 @@ fn participant_acceptance_takes_effect_only_with_its_verified_invitation() {
         genuine["$type"],
         "blue.catbird.chat.defs#participantAcceptanceEntry"
     );
+    assert_eq!(genuine["sequencerReceipt"]["sequencerDid"], DS_DID);
     let seq = genuine["seq"].as_i64().unwrap();
     let serve = |entry: Value| {
         *ds.inner
@@ -7120,6 +9743,7 @@ fn participant_acceptance_takes_effect_only_with_its_verified_invitation() {
                 CanonicalOperation::AcceptConversation,
                 &body,
             );
+            entry.as_object_mut().unwrap().remove("sequencerReceipt");
             entry
         };
     let mut forged = genuine.clone();
@@ -7139,12 +9763,12 @@ fn participant_acceptance_takes_effect_only_with_its_verified_invitation() {
                 body["invitationProvenance"]["invitedByDid"] = json!(BOB_DID);
                 body["invitationProvenance"]["invitedByDeviceId"] = json!(f.bob_dev);
             }),
-            "verify signed transition",
+            "invitation chain: no invitation",
         ),
         (
             "never-invited actor",
             resigned(&carol_signer, CAROL_DID, &carol_dev, &|_| {}),
-            "does not invite this participant",
+            "invitation chain: no invitation",
         ),
         (
             "stateVersion stepped twice",
@@ -7156,6 +9780,152 @@ fn participant_acceptance_takes_effect_only_with_its_verified_invitation() {
         ),
     ];
     let before = stored_coordinates(alice, cid);
+    let state = || {
+        (
+            last_seq(alice, cid),
+            stored_coordinates(alice, cid),
+            serde_json::to_value(alice.list_members(cid).unwrap()).unwrap(),
+            alice
+                .db()
+                .read_tx(|tx| tx.get_account_meta(&chat_wire::leaf_recovery_authorization_key(cid)))
+                .unwrap(),
+        )
+    };
+    let invitation_transition =
+        genuine["signedRequest"]["body"]["invitationProvenance"]["invitationTransitionId"].clone();
+    let invitation = ds.inner.lock().unwrap().entries[cid]
+        .iter()
+        .find(|entry| {
+            entry["signedRequest"]["body"]["transitionId"] == invitation_transition
+                && matches!(
+                    chat_wire::signed_entry_kind(entry),
+                    Ok(SignedMutationKind::Creation | SignedMutationKind::PolicyTransition)
+                )
+        })
+        .unwrap()
+        .clone();
+    let invitation_seq = invitation["seq"].as_i64().unwrap();
+    let serve_invitation = |replacement: Value| {
+        let mut state = ds.inner.lock().unwrap();
+        let slot = state
+            .entries
+            .get_mut(cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["signedRequest"]["body"]["transitionId"] == invitation_transition)
+            .unwrap();
+        *slot = replacement;
+    };
+    let mut missing_invitation_receipt = invitation.clone();
+    missing_invitation_receipt["sequencerReceipt"] = Value::Null;
+    let mut forged_invitation_receipt = invitation.clone();
+    forged_invitation_receipt["sequencerReceipt"]["signature"] = json!(STANDARD.encode([9u8; 64]));
+    let mut relabelled_after_closure = invitation.clone();
+    relabelled_after_closure["seq"] = json!(invitation_seq + 1);
+    // A pending participant's no-provenance control must authenticate through the historical
+    // invitation branch; unlike an acceptance, it cannot use the pending roster row directly.
+    let historical_control = {
+        let request_id = new_id();
+        let prior: Value = serde_json::from_str(before.as_deref().unwrap()).unwrap();
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
+            "resetRequestId": request_id,
+            "idempotencyKey": request_id,
+            "authGeneration": 1,
+            "prior": prior,
+            "reason": "manualRecovery",
+            "signedAt": "2026-11-07T00:00:00.000Z",
+        });
+        let mut entry = json!({
+            "$type": "blue.catbird.chat.defs#resetRequestEntry",
+            "entryId": request_id,
+            "conversationId": cid,
+            "seq": seq,
+            "receivedAt": body["signedAt"],
+            "signedRequest": signed_by(
+                &eve_signer,
+                EVE_DID,
+                &eve_dev,
+                CanonicalOperation::RequestReset,
+                &body,
+            ),
+        });
+        entry["sequencerReceipt"] = {
+            let state = ds.inner.lock().unwrap();
+            control_sequencer_receipt(&state, &entry, &body["prior"])
+        };
+        entry
+    };
+    let historical_before = state();
+    for (name, historical, closed, reason) in [
+        (
+            "missing historical invitation receipt",
+            missing_invitation_receipt,
+            false,
+            "I13",
+        ),
+        (
+            "forged historical invitation receipt",
+            forged_invitation_receipt,
+            false,
+            "I13",
+        ),
+        (
+            "invitation relabelled after its closure",
+            relabelled_after_closure,
+            true,
+            "I13",
+        ),
+    ] {
+        serve(historical_control.clone());
+        serve_invitation(historical);
+        if closed {
+            alice
+                .db()
+                .write_tx(|tx| {
+                    tx.put_account_meta(
+                        &chat_wire::invitation_closed_key(cid, EVE_DID),
+                        &invitation_seq.to_string(),
+                        0,
+                    )
+                })
+                .unwrap();
+        }
+        let error = alice.sync().expect_err(name).to_string();
+        assert!(error.contains(reason), "{name}: {error}");
+        assert_eq!(state(), historical_before, "{name}");
+        serve_invitation(invitation.clone());
+        alice
+            .db()
+            .write_tx(|tx| tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, EVE_DID)))
+            .unwrap();
+    }
+    let historical_before = state();
+    serve(genuine.clone());
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &chat_wire::invitation_closed_key(cid, EVE_DID),
+                &(seq - 1).to_string(),
+                0,
+            )
+        })
+        .unwrap();
+    let error = alice
+        .sync()
+        .expect_err("a closed invitation cannot be accepted")
+        .to_string();
+    assert!(
+        error.contains("the invitation is no longer pending"),
+        "{error}"
+    );
+    assert_eq!(state(), historical_before);
+    alice
+        .db()
+        .write_tx(|tx| tx.delete_account_meta(&chat_wire::invitation_closed_key(cid, EVE_DID)))
+        .unwrap();
     for (name, entry, reason) in variants {
         serve(entry);
         let error = alice.sync().expect_err(name).to_string();
@@ -7177,18 +9947,238 @@ fn participant_acceptance_takes_effect_only_with_its_verified_invitation() {
         (seq, Some(next.clone()))
     );
 
-    // Bob's readable history starts at the fulfillment that added him.
+    // Bob joined after the invitation and applies the acceptance from his member-authenticated
+    // pending baseline, without reading the invitation entry.
     ds.inner
         .lock()
         .unwrap()
         .readable_from
         .insert(f.bob_dev.clone(), seq - 1);
     bob.sync()
-        .expect("a later joiner applies the acceptance on its device signature");
+        .expect("the attested pending invitation verifies the acceptance");
     assert_eq!(
         (last_seq(bob, cid), stored_coordinates(bob, cid)),
         (seq, Some(next))
     );
+}
+
+/// Even when an invitation with the claimed transition ID is in the same verified batch, its
+/// signed participant row must name the accepting actor. A transition-ID-only match is not proof.
+#[test]
+fn participant_acceptance_matches_the_found_invitation_provenance() {
+    let f = send_order_fixture(true);
+    let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+    f.eve.sync().expect("Eve publishes her acceptance");
+    ds.inner.lock().unwrap().leaf_recoveries.remove(cid);
+    let genuine = ds.inner.lock().unwrap().entries[cid]
+        .last()
+        .unwrap()
+        .clone();
+    let acceptance_seq = genuine["seq"].as_i64().unwrap();
+    let eve_device = genuine["signedRequest"]["body"]["actorDeviceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let original_transition =
+        genuine["signedRequest"]["body"]["invitationProvenance"]["invitationTransitionId"].clone();
+    let original_invitation = ds.inner.lock().unwrap().entries[cid]
+        .iter()
+        .find(|entry| entry["signedRequest"]["body"]["transitionId"] == original_transition)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        chat_wire::signed_entry_kind(&original_invitation).unwrap(),
+        SignedMutationKind::Creation
+    );
+    let carol_device = new_id();
+    let _carol = enrolled(&f.tmp, ds, "provenance-carol", CAROL_DID, &carol_device);
+
+    let claimed_transition = new_id();
+    let false_invitation = {
+        let mut entry = original_invitation;
+        let mut body = entry["signedRequest"]["body"].clone();
+        body["transitionId"] = json!(claimed_transition);
+        body["idempotencyKey"] = json!(claimed_transition);
+        let invitee = body["manifest"]["participants"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["userDid"] == EVE_DID)
+            .unwrap();
+        invitee["userDid"] = json!(CAROL_DID);
+        invitee["invitationProvenance"]["invitationTransitionId"] = json!(claimed_transition);
+        entry["entryId"] = json!(claimed_transition);
+        entry["seq"] = json!(acceptance_seq);
+        entry["signedRequest"] = signed_by(
+            &enrolled_signer(alice),
+            ALICE_DID,
+            &f.alice_dev,
+            CanonicalOperation::CreateConversation,
+            &body,
+        );
+        entry["sequencerReceipt"] = {
+            let state = ds.inner.lock().unwrap();
+            control_sequencer_receipt(&state, &entry, &body["next"])
+        };
+        entry
+    };
+    let false_acceptance = {
+        let mut entry = genuine;
+        let mut body = entry["signedRequest"]["body"].clone();
+        body["invitationProvenance"]["invitationTransitionId"] = json!(claimed_transition);
+        entry["seq"] = json!(acceptance_seq + 1);
+        entry["signedRequest"] = signed_by(
+            &enrolled_signer(&f.eve),
+            EVE_DID,
+            &eve_device,
+            CanonicalOperation::AcceptConversation,
+            &body,
+        );
+        entry["sequencerReceipt"] = {
+            let state = ds.inner.lock().unwrap();
+            control_sequencer_receipt(&state, &entry, &body["next"])
+        };
+        entry
+    };
+    {
+        let mut state = ds.inner.lock().unwrap();
+        *state.entries.get_mut(cid).unwrap().last_mut().unwrap() = false_invitation;
+        state.entries.get_mut(cid).unwrap().push(false_acceptance);
+    }
+
+    let error = alice
+        .sync()
+        .expect_err("the found invitation names another invitee")
+        .to_string();
+    assert!(
+        error.contains("does not invite this participant"),
+        "{error}"
+    );
+    assert_eq!(
+        last_seq(alice, cid),
+        acceptance_seq,
+        "only the preceding valid control moved the cursor"
+    );
+}
+
+#[test]
+fn forged_participant_acceptance_on_rosterless_c33_is_a_protocol_violation() {
+    let request = C33Request::new();
+    let (ds, alice, bob, cid) = (
+        &request.ds,
+        &request.alice,
+        &request.bob,
+        request.cid.as_str(),
+    );
+    bob.sync().expect("honest C33 opening imports");
+    let request_id = bob
+        .list_requests(Some("incomingPending"))
+        .unwrap()
+        .remove(0)
+        .request_id;
+    bob.accept_direct_request(&request_id)
+        .expect("honest C33 acceptance succeeds");
+    alice.sync().expect("honest C33 acceptance syncs");
+    assert_eq!(alice.list_requests(None).unwrap()[0].consent, "accepted");
+
+    let (prior, inviter_device, next_seq) = {
+        let state = ds.inner.lock().unwrap();
+        let entries = &state.entries[cid];
+        let opening = &entries[0]["signedRequest"]["body"];
+        let acceptance = entries
+            .iter()
+            .find(|entry| entry["$type"] == "blue.catbird.chat.defs#directRequestAcceptanceEntry")
+            .expect("honest direct acceptance");
+        (
+            acceptance["signedRequest"]["body"]["next"].clone(),
+            opening["actorDeviceId"].as_str().unwrap().to_owned(),
+            acceptance["seq"].as_i64().unwrap() + 1,
+        )
+    };
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(prior["stateVersion"].as_u64().unwrap() + 1);
+
+    // Reuse the complete generated participant-acceptance shape, then bind it to this C33
+    // conversation. A sequencer can carry this validly signed/receipted but protocol-invalid row.
+    let template = send_order_fixture(true);
+    template.eve.sync().expect("template acceptance");
+    let mut body = template.ds.inner.lock().unwrap().entries[&template.cid]
+        .last()
+        .unwrap()["signedRequest"]["body"]
+        .clone();
+    let transition_id = new_id();
+    body["transitionId"] = json!(transition_id);
+    body["idempotencyKey"] = json!(transition_id);
+    body["recoveryRequestId"] = json!(new_id());
+    body["prior"] = prior;
+    body["next"] = next.clone();
+    body["invitationProvenance"] = json!({
+        "invitationTransitionId": ds.inner.lock().unwrap().entries[cid][0]["entryId"],
+        "invitedByDid": ALICE_DID,
+        "invitedByDeviceId": inviter_device,
+    });
+    let mut forged = json!({
+        "$type": "blue.catbird.chat.defs#participantAcceptanceEntry",
+        "entryId": transition_id,
+        "conversationId": cid,
+        "seq": next_seq,
+        "signedRequest": signed_by(
+            &enrolled_signer(bob),
+            BOB_DID,
+            &request.bob_dev,
+            CanonicalOperation::AcceptConversation,
+            &body,
+        ),
+        "receivedAt": body["signedAt"],
+    });
+    forged["sequencerReceipt"] = {
+        let state = ds.inner.lock().unwrap();
+        control_sequencer_receipt(&state, &forged, &next)
+    };
+
+    let local = || {
+        alice
+            .db()
+            .read_tx(|tx| {
+                Ok((
+                    tx.get_conversation(cid)?.expect("conversation"),
+                    tx.get_account_meta(&format!("conversation_coords:{cid}"))?,
+                    tx.get_account_meta(&chat_wire::conversation_roster_key(cid))?,
+                    tx.list_messages(cid, None, 100)?,
+                ))
+            })
+            .unwrap()
+    };
+    let before = local();
+    assert!(
+        before.2.is_none(),
+        "C33 legitimately has no verified roster"
+    );
+    ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .push(forged);
+
+    match alice
+        .sync()
+        .expect_err("participant acceptance is invalid C33 traffic")
+    {
+        MLSError::SyncIncomplete { applied, failures } => {
+            assert_eq!(applied, 0);
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].conversation_id, cid);
+            assert!(matches!(
+                failures[0].error.as_ref(),
+                MLSError::Cryptography(message) if message.contains("invitation chain")
+            ));
+        }
+        error => panic!("expected typed per-conversation failure, got {error:?}"),
+    }
+    assert_eq!(local(), before, "the invalid entry changes no local state");
+    assert_eq!(alice.list_requests(None).unwrap()[0].consent, "accepted");
 }
 
 /// A `metadataEntry` takes effect only once it verifies under its signer's current leaf, and
@@ -7408,6 +10398,238 @@ fn peer_commit_takes_effect_only_from_its_verified_body() {
         .unwrap()
         .iter()
         .any(|did| did == EVE_DID));
+}
+
+fn missing_metadata_receipt_control() {
+    let f = send_order_fixture(false);
+    let (ds, cid, alice, bob) = (&f.ds, f.cid.as_str(), &f.alice, &f.bob);
+    alice
+        .update_group_metadata(cid, "Receipt gate".into(), String::new(), None)
+        .expect("metadata transition");
+    let genuine = ds.inner.lock().unwrap().entries[cid]
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(genuine["$type"], "blue.catbird.chat.defs#metadataEntry");
+    let seq = genuine["seq"].as_i64().unwrap();
+    let before = (
+        bob.get_group_metadata(cid).unwrap(),
+        stored_coordinates(bob, cid),
+        last_seq(bob, cid),
+        ds.inner.lock().unwrap().acked_watermarks.clone(),
+    );
+    let mut missing = genuine.clone();
+    missing["sequencerReceipt"] = Value::Null;
+    *ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .last_mut()
+        .unwrap() = missing;
+    let error = bob.sync().expect_err("metadata without I13").to_string();
+    assert!(error.contains("missing sequencerReceipt"), "{error}");
+    assert_eq!(
+        (
+            bob.get_group_metadata(cid).unwrap(),
+            stored_coordinates(bob, cid),
+            last_seq(bob, cid),
+            ds.inner.lock().unwrap().acked_watermarks.clone(),
+        ),
+        before
+    );
+    *ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .last_mut()
+        .unwrap() = genuine;
+    bob.sync().expect("receipted metadata applies");
+    assert_eq!(last_seq(bob, cid), seq);
+}
+
+fn missing_zero_leaf_leave_receipt_control() {
+    let f = send_order_fixture(true);
+    let (ds, cid, bob) = (&f.ds, f.cid.as_str(), &f.bob);
+    let prior: Value = serde_json::from_str(&stored_coordinates(bob, cid).unwrap()).unwrap();
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(prior["stateVersion"].as_i64().unwrap() + 1);
+    let transition_id = new_id();
+    let eve_device = enrolled_device(ds, EVE_DID);
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#zeroLeafLeaveBody",
+        "signatureDomain": "CATBIRD-CHAT-LEAVE-ZERO-LEAF\0",
+        "transitionId": transition_id,
+        "idempotencyKey": transition_id,
+        "authGeneration": 1,
+        "prior": prior,
+        "next": next,
+        "signedAt": "2026-11-10T00:00:00.000Z",
+    });
+    let seq = ds.entry_count(cid) + 1;
+    let mut genuine = json!({
+        "$type": "blue.catbird.chat.defs#zeroLeafLeaveEntry",
+        "entryId": transition_id,
+        "conversationId": cid,
+        "seq": seq,
+        "receivedAt": body["signedAt"],
+        "signedRequest": signed_by(
+            &enrolled_signer(&f.eve),
+            EVE_DID,
+            &eve_device,
+            CanonicalOperation::RequestLeave,
+            &body,
+        ),
+    });
+    genuine["sequencerReceipt"] = {
+        let g = ds.inner.lock().unwrap();
+        control_sequencer_receipt(&g, &genuine, &next)
+    };
+    let before = (
+        stored_coordinates(bob, cid),
+        last_seq(bob, cid),
+        bob.list_members(cid).unwrap(),
+        ds.inner.lock().unwrap().acked_watermarks.clone(),
+    );
+    let mut missing = genuine.clone();
+    missing["sequencerReceipt"] = Value::Null;
+    ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .push(missing);
+    let error = bob
+        .sync()
+        .expect_err("zero-leaf leave without I13")
+        .to_string();
+    assert!(error.contains("missing sequencerReceipt"), "{error}");
+    assert_eq!(
+        (
+            stored_coordinates(bob, cid),
+            last_seq(bob, cid),
+            bob.list_members(cid).unwrap(),
+            ds.inner.lock().unwrap().acked_watermarks.clone(),
+        ),
+        before
+    );
+    *ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .last_mut()
+        .unwrap() = genuine;
+    bob.sync().expect("receipted zero-leaf leave applies");
+    assert_eq!(last_seq(bob, cid), seq);
+}
+
+fn missing_leave_commit_fulfillment_receipt_control() {
+    let f = send_order_fixture(true);
+    let (ds, cid, alice, bob, eve) = (&f.ds, f.cid.as_str(), &f.alice, &f.bob, &f.eve);
+    eve.sync().expect("eve accepts");
+    alice.sync().expect("alice adds eve");
+    eve.sync().expect("eve joins");
+    bob.sync().expect("bob applies eve's addition");
+    ds.inner.lock().unwrap().defer_next_commit_transition = true;
+    assert!(alice
+        .remove_group_member(MemberRole::Admin, cid, EVE_DID)
+        .is_err());
+    let removal = {
+        let request = ds
+            .inner
+            .lock()
+            .unwrap()
+            .deferred_commit_transition
+            .take()
+            .expect("removal Commit");
+        serde_json::from_slice::<Value>(request.body.as_deref().unwrap()).unwrap()["signedRequest"]
+            ["body"]
+            .clone()
+    };
+    let mut body = removal.clone();
+    body["$type"] = json!("blue.catbird.chat.defs#leaveCommitFulfillmentBody");
+    body["signatureDomain"] = json!("CATBIRD-CHAT-LEAVE-FULFILL-COMMIT\0");
+    body["leaveRequestId"] = json!(new_id());
+    let seq = ds.entry_count(cid) + 1;
+    let mut genuine = json!({
+        "$type": "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+        "entryId": body["transitionId"],
+        "conversationId": cid,
+        "seq": seq,
+        "receivedAt": body["signedAt"],
+        "signedRequest": signed_by(
+            &enrolled_signer(alice),
+            ALICE_DID,
+            &f.alice_dev,
+            CanonicalOperation::SubmitTransition,
+            &body,
+        ),
+    });
+    genuine["sequencerReceipt"] = {
+        let g = ds.inner.lock().unwrap();
+        control_sequencer_receipt(&g, &genuine, &body["next"])
+    };
+    let state = || {
+        let row = bob
+            .db()
+            .read_tx(|tx| tx.get_conversation(cid))
+            .unwrap()
+            .unwrap();
+        (
+            row.epoch,
+            row.last_seq,
+            stored_coordinates(bob, cid),
+            bob.list_members(cid).unwrap(),
+            ds.inner.lock().unwrap().acked_watermarks.clone(),
+        )
+    };
+    let before = state();
+    let mut missing = genuine.clone();
+    missing["sequencerReceipt"] = Value::Null;
+    ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .push(missing);
+    let error = bob
+        .sync()
+        .expect_err("leave fulfillment without I13")
+        .to_string();
+    assert!(error.contains("missing sequencerReceipt"), "{error}");
+    assert_eq!(state(), before);
+    *ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .last_mut()
+        .unwrap() = genuine;
+    bob.sync().expect("receipted leave fulfillment applies");
+    assert_eq!(last_seq(bob, cid), seq);
+}
+
+#[test]
+fn metadata_entry_requires_its_sequencer_receipt() {
+    missing_metadata_receipt_control();
+}
+
+#[test]
+fn zero_leaf_leave_entry_requires_its_sequencer_receipt() {
+    missing_zero_leaf_leave_receipt_control();
+}
+
+#[test]
+fn leave_commit_fulfillment_requires_its_sequencer_receipt() {
+    missing_leave_commit_fulfillment_receipt_control();
 }
 
 /// A `resetRequestEntry` moves only the cursor, and only once a participant device signed it for
@@ -7732,6 +10954,65 @@ fn one_conversations_failing_entry_never_stops_another() {
         );
         assert!(has(&second, &other));
     }
+
+    // A transiently refused creation is another conversation-scoped failure: it must not starve
+    // this account's established conversation, and Retry-After suppresses an immediate resend.
+    let pending = send_order_fixture(false);
+    let stuck = new_id();
+    pending.ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        Some("5"),
+    ));
+    pending
+        .alice
+        .create_group(
+            &stuck,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("Stuck creation".into()),
+            None,
+        )
+        .expect_err("the creation is transiently refused");
+    let incoming = new_id();
+    pending
+        .bob
+        .send_message(&pending.cid, &incoming, "healthy conversation")
+        .unwrap();
+    let error = pending
+        .alice
+        .sync()
+        .expect_err("the pending creation remains a typed failure");
+    assert!(
+        matches!(&error, MLSError::SyncIncomplete { failures, .. }
+            if matches!(failures.as_slice(), [failure] if failure.conversation_id == stuck)),
+        "{error:?}"
+    );
+    assert!(
+        pending
+            .alice
+            .list_messages(&pending.cid, None, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.message_id == incoming),
+        "the healthy conversation still syncs"
+    );
+    let requests_after_first_sync = create_request_count(&pending.ds);
+    let error = pending
+        .alice
+        .sync()
+        .expect_err("Retry-After remains a typed pending-creation status");
+    assert!(
+        matches!(&error, MLSError::SyncIncomplete { failures, .. }
+            if matches!(failures.as_slice(), [failure] if failure.conversation_id == stuck)),
+        "{error:?}"
+    );
+    assert_eq!(
+        create_request_count(&pending.ds),
+        requests_after_first_sync,
+        "the pending creation must not hot-loop before Retry-After"
+    );
 }
 
 /// A direct conversation's pending invitee may close it from any PDS-authorized device, leaf or
@@ -7999,6 +11280,15 @@ fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
             .leaf_recoveries
             .insert(cid.to_owned(), requests);
     };
+    let has_leaf = |did: &str, device: &str| {
+        ds.inner.lock().unwrap().conversations[cid]["leaves"]
+            .as_array()
+            .is_some_and(|leaves| {
+                leaves
+                    .iter()
+                    .any(|leaf| leaf["userDid"] == did && leaf["deviceId"] == device)
+            })
+    };
     let carol_dev = new_id();
     let _carol = enrolled(&f.tmp, ds, "carol", CAROL_DID, &carol_dev);
     let carol_package = ds
@@ -8010,7 +11300,8 @@ fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
         .and_then(Vec::pop)
         .expect("carol's KeyPackage");
 
-    // A request for a device nobody invited is no work: nothing is sent or moves.
+    // An unsigned sequencer-only inventory row for a never-invited device is not this device's
+    // work: nothing is sent or moves.
     let current = ds.inner.lock().unwrap().conversations[cid]["coordinates"].clone();
     let injected_id = new_id();
     list(vec![json!({
@@ -8032,8 +11323,12 @@ fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
     let before = local();
     alice
         .sync()
-        .expect("a request this device cannot authorize is no error");
+        .expect("an unsigned listing is not this device's work");
     assert_eq!(local(), before, "nobody invited Carol");
+    assert!(
+        !has_leaf(CAROL_DID, &carol_dev),
+        "the never-invited account gets no leaf"
+    );
 
     // Eve accepts; mls-ds lists her request with any field the acceptance did not authorize.
     f.eve.sync().expect("eve accepts her invitation");
@@ -8100,15 +11395,1381 @@ fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
     list(vec![genuine.clone()]);
     alice.sync().expect("the authorized add");
     assert_eq!((fulfillments(), epoch()), (before.0 + 1, before.1 + 1));
-    // Listed again at the new coordinate, the consumed request adds nothing.
+    let eve_dev = genuine["requesterDeviceId"].as_str().unwrap();
+    assert!(
+        has_leaf(EVE_DID, eve_dev),
+        "the honestly invited and accepted account gets its leaf"
+    );
+    // Listed again at the new coordinate, the consumed unsigned authorization is no work.
     let mut again = genuine;
     let current = ds.inner.lock().unwrap().conversations[cid]["coordinates"].clone();
     again["status"] = json!("open");
     again["boundCoordinate"] = current.clone();
     again["reservation"]["boundCoordinate"] = current;
     list(vec![again]);
-    alice.sync().expect("a consumed request is no work");
+    alice
+        .sync()
+        .expect("a consumed unsigned authorization grants nothing");
     assert_eq!((fulfillments(), epoch()), (before.0 + 1, before.1 + 1));
+}
+
+fn synced_group_pair() -> (
+    tempfile::TempDir,
+    Arc<SharedMockDs>,
+    Arc<CatbirdMlsClient>,
+    Arc<CatbirdMlsClient>,
+    String,
+    String,
+    String,
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice_device = new_id();
+    let bob_device = new_id();
+    let alice = enrolled(&tmp, &ds, "gap-alice", ALICE_DID, &alice_device);
+    let bob = enrolled(&tmp, &ds, "gap-bob", BOB_DID, &bob_device);
+    let cid = new_id();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("Four gaps".into()),
+            Some("group".into()),
+        )
+        .expect("create group");
+    bob.sync().expect("bob imports the group");
+    alice.sync().expect("alice reaches the DS head");
+    bob.sync().expect("bob reaches the DS head");
+    (tmp, ds, alice, bob, cid, alice_device, bob_device)
+}
+
+#[test]
+fn c33_publication_rejects_a_signed_receipt_with_wrong_coordinates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "u02-alice", ALICE_DID, &new_id());
+    let _bob = enrolled(&tmp, &ds, "u02-bob", BOB_DID, &new_id());
+    ds.inner.lock().unwrap().tamper_next_publication_coordinates = true;
+
+    let error = alice
+        .create_group(
+            &new_id(),
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            None,
+            Some("opening".into()),
+        )
+        .expect_err("receipt coordinates must bind the published bootstrap");
+    assert!(
+        matches!(&error, MLSError::Cryptography(message)
+            if message == "C33 publication outcome binding mismatch"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn adding_a_member_gap_syncs_an_unsynced_application_entry() {
+    let (tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let _carol = enrolled(&tmp, &ds, "u06-carol", CAROL_DID, &new_id());
+    let initial_seq = last_seq(&alice, &cid);
+    bob.send_message(&cid, &new_id(), "gap-before-add")
+        .expect("peer application");
+
+    alice
+        .add_group_members(&cid, vec![CAROL_DID.to_string()])
+        .expect("policy transition gap sync");
+    assert_eq!(last_seq(&alice, &cid), initial_seq + 2);
+    assert!(alice
+        .list_messages(&cid, None, 10)
+        .unwrap()
+        .iter()
+        .any(|message| message.plaintext_json.contains("gap-before-add")));
+}
+
+#[test]
+fn application_send_rejects_confirmation_tag_only_coordinate_drift_locally() {
+    let (_tmp, ds, alice, _bob, cid, _, _) = synced_group_pair();
+    let key = format!("conversation_coords:{cid}");
+    let raw = alice
+        .db()
+        .read_tx(|tx| tx.get_account_meta(&key))
+        .unwrap()
+        .unwrap();
+    let mut coordinates: Value = serde_json::from_str(&raw).unwrap();
+    let mut tag = chat_wire::json_bytes(&coordinates["confirmationTag"]).unwrap();
+    tag[0] ^= 0x80;
+    coordinates["confirmationTag"] = if coordinates["confirmationTag"].is_object() {
+        json!({ "$bytes": STANDARD.encode(tag) })
+    } else {
+        json!(STANDARD.encode(tag))
+    };
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &key,
+                &serde_json::to_string(&coordinates)
+                    .map_err(|error| MLSError::Internal(error.to_string()))?,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        })
+        .unwrap();
+    let before = ds.inner.lock().unwrap().http_log.len();
+
+    let error = alice
+        .send_message(&cid, &new_id(), "tampered-ctag")
+        .expect_err("one coordinate component drifting must fail closed");
+    assert!(matches!(error, MLSError::InvalidState(code) if code == "StaleCoordinates"));
+    assert_eq!(ds.inner.lock().unwrap().http_log.len(), before);
+}
+
+#[test]
+fn decline_closes_when_only_the_coordinate_half_of_local_state_exists() {
+    let request = C33Request::new();
+    let request_id = request
+        .alice
+        .list_requests(None)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.conversation_id == request.cid)
+        .unwrap()
+        .request_id;
+    request
+        .alice
+        .db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute(
+                    "DELETE FROM conversations WHERE conversation_id = ?1",
+                    [&request.cid],
+                )
+                .map(|_| ())
+                .map_err(|error| MLSError::Internal(error.to_string()))
+        })
+        .unwrap();
+    let close_count = || {
+        request
+            .ds
+            .inner
+            .lock()
+            .unwrap()
+            .http_log
+            .iter()
+            .filter(|(_, url, _)| url.contains("blue.catbird.chat.closeConversation"))
+            .count()
+    };
+    let before = close_count();
+
+    request
+        .alice
+        .decline_direct_request(&request_id)
+        .expect("decline closes the partial direct conversation");
+    assert_eq!(close_count(), before + 1);
+}
+
+#[test]
+fn closing_a_c33_request_binds_direct_conversation_kind() {
+    let request = C33Request::new();
+    request
+        .alice
+        .close_conversation(&request.cid)
+        .expect("close direct request");
+    let state = request.ds.inner.lock().unwrap();
+    let body: Value = serde_json::from_slice(
+        &state
+            .http_log
+            .iter()
+            .rev()
+            .find(|(_, url, _)| url.contains("blue.catbird.chat.closeConversation"))
+            .unwrap()
+            .2,
+    )
+    .unwrap();
+    assert_eq!(body["signedRequest"]["body"]["conversationKind"], "direct");
+}
+
+#[test]
+fn direct_request_publication_detects_journal_ownership_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "ownership-alice", ALICE_DID, &new_id());
+    let _bob = enrolled(&tmp, &ds, "ownership-bob", BOB_DID, &new_id());
+    let weak = Arc::downgrade(&alice);
+    ds.inner.lock().unwrap().after_next_publish = Some(Arc::new(move || {
+        let client = weak.upgrade().expect("client remains live");
+        client
+            .db()
+            .write_tx(|tx| {
+                let raw = tx
+                    .get_pending_op("direct_request_creation", BOB_DID)?
+                    .expect("publication journal");
+                let mut changed: Value = serde_json::from_str(&raw)
+                    .map_err(|error| MLSError::Internal(error.to_string()))?;
+                changed["publish"] = Value::Null;
+                tx.put_pending_op(
+                    "direct_request_creation",
+                    BOB_DID,
+                    &serde_json::to_string(&changed)
+                        .map_err(|error| MLSError::Internal(error.to_string()))?,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .unwrap();
+    }));
+
+    let error = alice
+        .create_group(
+            &new_id(),
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            None,
+            Some("opening".into()),
+        )
+        .expect_err("changed journal must not be committed");
+    assert!(
+        matches!(error, MLSError::InvalidState(code) if code == "DirectRequestOwnershipChanged")
+    );
+}
+
+#[test]
+fn legacy_enrollment_marker_rebinds_the_same_signer_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let client = enrolled(&tmp, &ds, "legacy-enroll", ALICE_DID, &new_id());
+    let expected_key = derive_key_id(enrolled_signer(&client).public());
+    client
+        .db()
+        .write_tx(|tx| tx.delete_account_meta("enrolled_signer_key_id"))
+        .unwrap();
+
+    client
+        .enroll_device(&oauth_scopes())
+        .expect("migrate legacy enrollment marker");
+    assert_eq!(
+        client
+            .db()
+            .read_tx(|tx| tx.get_account_meta("enrolled_signer_key_id"))
+            .unwrap()
+            .as_deref(),
+        Some(expected_key.as_str())
+    );
+}
+
+/// Gap 1 regression. `getEntries` cannot omit an accepted tail row, while peer counters need only
+/// increase within an epoch: reservations may leave holes, but duplicates and rewinds are refused.
+/// Both failures leave the durable cursor and ACK watermark at the verified prefix; restoring a
+/// contiguous row or increasing counter lets the same sync path advance.
+///
+/// Fail-before: sync rejected a valid counter jump that the sequencer accepts.
+#[test]
+fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
+    let (_tmp, ds, alice, bob, cid, alice_device, _) = synced_group_pair();
+    let baseline = last_seq(&bob, &cid);
+    let first = new_id();
+    let second = new_id();
+    alice.send_message(&cid, &first, "first").unwrap();
+    alice.send_message(&cid, &second, "second").unwrap();
+    let (at, removed, ack_before) = {
+        let mut g = ds.inner.lock().unwrap();
+        let at = g.entries[&cid]
+            .iter()
+            .position(|entry| {
+                entry
+                    .pointer("/signedRequest/body/messageId")
+                    .and_then(Value::as_str)
+                    == Some(first.as_str())
+            })
+            .unwrap();
+        let removed = g.entries.get_mut(&cid).unwrap().remove(at);
+        (at, removed, g.acked_watermarks.clone())
+    };
+    let error = bob.sync().expect_err("a dropped tail row is a seq gap");
+    assert!(
+        error
+            .to_string()
+            .contains("non-contiguous conversation sequence"),
+        "{error:?}"
+    );
+    assert_eq!(last_seq(&bob, &cid), baseline);
+    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_before);
+    ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(&cid)
+        .unwrap()
+        .insert(at, removed);
+    bob.sync().expect("the restored contiguous tail applies");
+    assert!(bob
+        .list_messages(&cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|row| row.message_id == first));
+    assert!(bob
+        .list_messages(&cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|row| row.message_id == second));
+
+    let counter_key = chat_wire::send_counter_key(&cid);
+    alice
+        .db()
+        .write_tx(|tx| {
+            tx.put_account_meta(&counter_key, "3", chrono::Utc::now().timestamp_millis())
+        })
+        .unwrap();
+    let order_key = (cid.clone(), ALICE_DID.to_string(), alice_device);
+    let before_counter_jump = last_seq(&bob, &cid);
+    alice
+        .send_message(&cid, &new_id(), "counter four")
+        .expect("the mock DS sequences a skipped counter");
+    // Counters are monotone reservations, not a gap-free delivery sequence.
+    bob.sync().expect("peer sendCounter 2 -> 4 advances");
+    assert_eq!(last_seq(&bob, &cid), before_counter_jump + 1);
+
+    let candidate = new_id();
+    alice
+        .send_message(&cid, &candidate, "counter five")
+        .expect("the next increasing counter is sequenced");
+    let signer = enrolled_signer(&alice);
+    let before_non_increasing = last_seq(&bob, &cid);
+    let ack_before = ds.inner.lock().unwrap().acked_watermarks.clone();
+    rebind_application_send_counter(&ds, &cid, &candidate, &signer, ALICE_DID, &order_key.2, 4);
+    let error = bob
+        .sync()
+        .expect_err("a distinct duplicate counter is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("non-increasing peer sendCounter"),
+        "{error:?}"
+    );
+    assert_eq!(last_seq(&bob, &cid), before_non_increasing);
+    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_before);
+
+    rebind_application_send_counter(&ds, &cid, &candidate, &signer, ALICE_DID, &order_key.2, 3);
+    let error = bob.sync().expect_err("a peer counter rewind is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("non-increasing peer sendCounter"),
+        "{error:?}"
+    );
+    assert_eq!(last_seq(&bob, &cid), before_non_increasing);
+    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_before);
+
+    rebind_application_send_counter(&ds, &cid, &candidate, &signer, ALICE_DID, &order_key.2, 5);
+    bob.sync().expect("the restored increasing counter applies");
+    assert!(bob
+        .list_messages(&cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|row| row.message_id == candidate));
+}
+
+struct NseReceiptFixture {
+    _tmp: tempfile::TempDir,
+    root: std::path::PathBuf,
+    ds: Arc<SharedMockDs>,
+    alice: Arc<CatbirdMlsClient>,
+    bob: Arc<CatbirdMlsClient>,
+    bob_keys: Arc<MemKeyStore>,
+    cid: String,
+    alice_device: String,
+    bob_device: String,
+}
+
+impl NseReceiptFixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("NSE receipt tempdir");
+        let root = tmp.path().to_path_buf();
+        let ds = SharedMockDs::new();
+        let alice_device = new_id();
+        let bob_device = new_id();
+        let alice_keys = Arc::new(MemKeyStore::new());
+        let bob_keys = Arc::new(MemKeyStore::new());
+        let alice = live_client(
+            &root,
+            &ds,
+            "nse-receipt-alice",
+            ALICE_DID,
+            &alice_device,
+            &alice_keys,
+        );
+        let bob = live_client(
+            &root,
+            &ds,
+            "nse-receipt-bob",
+            BOB_DID,
+            &bob_device,
+            &bob_keys,
+        );
+        alice
+            .enroll_device(&oauth_scopes())
+            .expect("enroll NSE receipt Alice");
+        bob.enroll_device(&oauth_scopes())
+            .expect("enroll NSE receipt Bob");
+        let cid = new_id();
+        alice
+            .create_group(
+                &cid,
+                DS_DID,
+                vec![BOB_DID.to_string()],
+                Some("NSE receipts".into()),
+                Some("group".into()),
+            )
+            .expect("create NSE receipt group");
+        bob.sync().expect("Bob imports NSE receipt group");
+        alice.sync().expect("Alice reaches NSE receipt head");
+        bob.sync().expect("Bob reaches NSE receipt head");
+        assert!(bob
+            .db()
+            .read_tx(|tx| tx.get_account_meta(&format!("did_doc:{DS_DID}")))
+            .unwrap()
+            .is_some());
+        Self {
+            _tmp: tmp,
+            root,
+            ds,
+            alice,
+            bob,
+            bob_keys,
+            cid,
+            alice_device,
+            bob_device,
+        }
+    }
+
+    fn bundle_after_bob_cursor(&self) -> PushFetchBundle {
+        let after_seq = last_seq(&self.bob, &self.cid);
+        let entries = self.ds.inner.lock().unwrap().entries[&self.cid]
+            .iter()
+            .filter(|entry| entry["seq"].as_i64().is_some_and(|seq| seq > after_seq))
+            .map(fetched_nse_entry)
+            .collect();
+        PushFetchBundle {
+            entries,
+            metadata_snapshot: None,
+            authorized_device_keys: vec![
+                AuthorizedPeerDeviceKey {
+                    did: ALICE_DID.into(),
+                    device_id: self.alice_device.clone(),
+                    signature_public_key: enrolled_signer(&self.alice).public().to_vec(),
+                },
+                AuthorizedPeerDeviceKey {
+                    did: BOB_DID.into(),
+                    device_id: self.bob_device.clone(),
+                    signature_public_key: enrolled_signer(&self.bob).public().to_vec(),
+                },
+            ],
+        }
+    }
+
+    fn process(
+        &self,
+        bundle: PushFetchBundle,
+    ) -> (
+        catbird_mls::push::NotificationPreview,
+        Arc<NseReceiptTransport>,
+    ) {
+        let target = bundle
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.entry_kind.ends_with("#applicationEntry") || entry.entry_kind == "application"
+            })
+            .expect("push target application");
+        let signed: Value =
+            serde_json::from_slice(target.signed_request.as_deref().unwrap()).unwrap();
+        let wake = PushWakePayload {
+            kind: "application_message".into(),
+            conversation_id: self.cid.clone(),
+            generation: 0,
+            entry_seq: target.seq,
+            message_id: signed["body"]["messageId"]
+                .as_str()
+                .expect("target message ID")
+                .to_owned(),
+            recipient_account_hash: account_did_hash_hex(BOB_DID).unwrap(),
+            fetch_required: true,
+            sender_did: Some(
+                signed["body"]["actorDid"]
+                    .as_str()
+                    .expect("target sender")
+                    .to_owned(),
+            ),
+            inline_ciphertext: None,
+        };
+        let transport = Arc::new(NseReceiptTransport {
+            bundle,
+            fetch_calls: AtomicUsize::new(0),
+            device_key_calls: AtomicUsize::new(0),
+        });
+        let preview = process_push_notification(
+            &self.root.join("nse-receipt-bob"),
+            &account_did_hash_hex(BOB_DID).unwrap(),
+            Arc::new(NsePushKeystore(self.bob_keys.clone())),
+            Some(transport.clone()),
+            &wake,
+        )
+        .expect("NSE receipt processing returns a preview");
+        (preview, transport)
+    }
+
+    fn state(&self) -> (i64, i64, usize) {
+        let row = self
+            .bob
+            .db()
+            .read_tx(|tx| tx.get_conversation(&self.cid))
+            .unwrap()
+            .unwrap();
+        (
+            row.epoch,
+            row.last_seq,
+            self.bob.list_messages(&self.cid, None, 100).unwrap().len(),
+        )
+    }
+}
+
+struct NseReceiptTransport {
+    bundle: PushFetchBundle,
+    fetch_calls: AtomicUsize,
+    device_key_calls: AtomicUsize,
+}
+
+impl PushFetchTransport for NseReceiptTransport {
+    fn fetch_missing_entries(
+        &self,
+        _conversation_id: String,
+        _after_seq: i64,
+        _chat_dpop_token: String,
+    ) -> Result<PushFetchBundle, MLSError> {
+        self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.bundle.clone())
+    }
+
+    fn get_authorized_device_keys(
+        &self,
+        did: String,
+        _chat_dpop_token: Option<String>,
+    ) -> Result<Vec<AuthorizedPeerDeviceKey>, MLSError> {
+        self.device_key_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .bundle
+            .authorized_device_keys
+            .iter()
+            .filter(|key| key.did == did)
+            .cloned()
+            .collect())
+    }
+}
+
+fn fetched_nse_entry(entry: &Value) -> FetchedPushEntry {
+    let signed_request = &entry["signedRequest"];
+    let body = &signed_request["body"];
+    let mls_bytes = body
+        .pointer("/applicationMessage/bytes")
+        .or_else(|| body.pointer("/commit/bytes"))
+        .map(chat_wire::json_bytes)
+        .transpose()
+        .unwrap()
+        .unwrap_or_default();
+    FetchedPushEntry {
+        entry_id: entry["entryId"].as_str().unwrap().to_owned(),
+        seq: entry["seq"].as_i64().unwrap(),
+        epoch: body["prior"]["epoch"].as_i64().unwrap_or_default(),
+        entry_kind: entry["$type"].as_str().unwrap().to_owned(),
+        sender_did: body["actorDid"].as_str().unwrap().to_owned(),
+        mls_bytes,
+        signed_request: Some(serde_json::to_vec(signed_request).unwrap()),
+        sequencer_receipt: entry
+            .get("sequencerReceipt")
+            .filter(|receipt| receipt.is_object())
+            .map(|receipt| serde_json::to_vec(receipt).unwrap()),
+    }
+}
+
+#[test]
+fn nse_applies_receipted_peer_commit_and_foreground_does_not_apply_it_twice() {
+    let fixture = NseReceiptFixture::new();
+    let before = fixture.state();
+    fixture
+        .alice
+        .self_update(&fixture.cid)
+        .expect("sequence peer Commit");
+    let message_id = new_id();
+    fixture
+        .alice
+        .send_message(&fixture.cid, &message_id, "receipt-verified NSE preview")
+        .expect("sequence post-Commit application");
+    let bundle = fixture.bundle_after_bob_cursor();
+    let target_seq = bundle.entries.last().unwrap().seq;
+    let commit_seq = bundle
+        .entries
+        .iter()
+        .find(|entry| entry.entry_kind.ends_with("#commitEntry"))
+        .unwrap()
+        .seq;
+    fixture
+        .bob
+        .db()
+        .write_tx(|tx| {
+            tx.put_pending_op(
+                "nse_deferred_control",
+                &fixture.cid,
+                &commit_seq.to_string(),
+                1,
+            )
+        })
+        .unwrap();
+    let ack_before = fixture.ds.inner.lock().unwrap().acked_watermarks.clone();
+
+    let (preview, transport) = fixture.process(bundle);
+    assert_eq!(preview.body, "receipt-verified NSE preview");
+    assert!(!preview.fallback_generic);
+    assert_eq!(fixture.state(), (before.0 + 1, target_seq, before.2 + 1));
+    assert_eq!(
+        fixture.ds.inner.lock().unwrap().acked_watermarks,
+        ack_before,
+        "the NSE never acknowledges entries"
+    );
+    assert_eq!(transport.fetch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.device_key_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .bob
+            .db()
+            .read_tx(|tx| tx.get_pending_op("nse_deferred_control", &fixture.cid))
+            .unwrap(),
+        None,
+        "a verified-and-applied Commit clears its deferral marker"
+    );
+
+    let after_nse = fixture.state();
+    fixture
+        .bob
+        .sync()
+        .expect("foreground completes the retained application receipt");
+    assert_eq!(fixture.state(), after_nse);
+    assert_eq!(
+        fixture
+            .bob
+            .list_messages(&fixture.cid, None, 100)
+            .unwrap()
+            .iter()
+            .filter(|message| message.message_id == message_id)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn nse_defers_missing_forged_and_misbound_commit_receipts_for_foreground() {
+    for fault in ["missing", "forged", "wrong-seq", "wrong-entry"] {
+        let fixture = NseReceiptFixture::new();
+        fixture
+            .alice
+            .self_update(&fixture.cid)
+            .expect("sequence peer Commit");
+        let message_id = new_id();
+        fixture
+            .alice
+            .send_message(&fixture.cid, &message_id, fault)
+            .expect("sequence post-Commit application");
+        let mut bundle = fixture.bundle_after_bob_cursor();
+        let commit = bundle
+            .entries
+            .iter_mut()
+            .find(|entry| entry.entry_kind.ends_with("#commitEntry"))
+            .expect("fetched Commit");
+        match fault {
+            "missing" => commit.sequencer_receipt = None,
+            "forged" => {
+                let mut receipt: Value =
+                    serde_json::from_slice(commit.sequencer_receipt.as_deref().unwrap()).unwrap();
+                let mut signature = chat_wire::json_bytes(&receipt["signature"]).unwrap();
+                signature[0] ^= 1;
+                receipt["signature"] = json!({ "$bytes": STANDARD.encode(signature) });
+                commit.sequencer_receipt = Some(serde_json::to_vec(&receipt).unwrap());
+            }
+            "wrong-seq" => {
+                let mut receipt: Value =
+                    serde_json::from_slice(commit.sequencer_receipt.as_deref().unwrap()).unwrap();
+                receipt["seq"] = json!(receipt["seq"].as_i64().unwrap() + 1);
+                commit.sequencer_receipt = Some(serde_json::to_vec(&receipt).unwrap());
+            }
+            "wrong-entry" => {
+                let mut receipt: Value =
+                    serde_json::from_slice(commit.sequencer_receipt.as_deref().unwrap()).unwrap();
+                receipt["entryId"] = json!(new_id());
+                commit.sequencer_receipt = Some(serde_json::to_vec(&receipt).unwrap());
+            }
+            _ => unreachable!(),
+        }
+        let before = fixture.state();
+        let ack_before = fixture.ds.inner.lock().unwrap().acked_watermarks.clone();
+
+        let (preview, _) = fixture.process(bundle);
+        assert!(preview.fallback_generic, "{fault}");
+        assert_eq!(fixture.state(), before, "{fault}");
+        assert_eq!(
+            fixture.ds.inner.lock().unwrap().acked_watermarks,
+            ack_before,
+            "{fault}"
+        );
+        assert!(fixture
+            .bob
+            .db()
+            .read_tx(|tx| tx.get_pending_op("nse_deferred_control", &fixture.cid))
+            .unwrap()
+            .is_some());
+
+        assert!(
+            fixture
+                .bob
+                .sync()
+                .expect("foreground applies genuine entries")
+                > 0
+        );
+        assert_eq!(fixture.state().0, before.0 + 1, "{fault}");
+        assert!(fixture
+            .bob
+            .list_messages(&fixture.cid, None, 100)
+            .unwrap()
+            .iter()
+            .any(|message| message.message_id == message_id));
+    }
+}
+
+#[test]
+fn nse_missing_local_sequencer_key_defers_without_extra_network_request() {
+    let fixture = NseReceiptFixture::new();
+    fixture
+        .alice
+        .self_update(&fixture.cid)
+        .expect("sequence peer Commit");
+    fixture
+        .alice
+        .send_message(
+            &fixture.cid,
+            &new_id(),
+            "not decryptable without receipt key",
+        )
+        .expect("sequence post-Commit application");
+    let bundle = fixture.bundle_after_bob_cursor();
+    fixture
+        .bob
+        .db()
+        .write_tx(|tx| tx.delete_account_meta(&format!("did_doc:{DS_DID}")))
+        .unwrap();
+    let before = fixture.state();
+    let ack_before = fixture.ds.inner.lock().unwrap().acked_watermarks.clone();
+
+    let (preview, transport) = fixture.process(bundle);
+    assert!(preview.fallback_generic);
+    assert_eq!(fixture.state(), before);
+    assert_eq!(
+        fixture.ds.inner.lock().unwrap().acked_watermarks,
+        ack_before,
+        "the NSE never acknowledges entries"
+    );
+    assert_eq!(transport.fetch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        transport.device_key_calls.load(Ordering::SeqCst),
+        0,
+        "a missing receipt key must not trigger any resolver/device network call"
+    );
+}
+
+#[test]
+fn nse_applies_receipted_own_pending_commit_before_preview() {
+    let fixture = NseReceiptFixture::new();
+    let before = fixture.state();
+    fixture.ds.inner.lock().unwrap().lose_next_commit_response = true;
+    fixture
+        .bob
+        .self_update(&fixture.cid)
+        .expect_err("own Commit response is lost after sequencing");
+    fixture
+        .alice
+        .sync()
+        .expect("peer applies the sequenced own-pending Commit");
+    let message_id = new_id();
+    fixture
+        .alice
+        .send_message(&fixture.cid, &message_id, "after own pending Commit")
+        .expect("peer sends after own pending Commit");
+    let bundle = fixture.bundle_after_bob_cursor();
+    let target_seq = bundle.entries.last().unwrap().seq;
+    let ack_before = fixture.ds.inner.lock().unwrap().acked_watermarks.clone();
+
+    let (preview, _) = fixture.process(bundle);
+    assert_eq!(
+        preview.body,
+        "after own pending Commit",
+        "state={:?}, deferred={:?}",
+        fixture.state(),
+        fixture
+            .bob
+            .db()
+            .read_tx(|tx| tx.get_pending_op("nse_deferred_control", &fixture.cid))
+            .unwrap()
+    );
+    assert!(!preview.fallback_generic);
+    assert_eq!(fixture.state(), (before.0 + 1, target_seq, before.2 + 1));
+    assert_eq!(
+        fixture.ds.inner.lock().unwrap().acked_watermarks,
+        ack_before,
+        "the NSE never acknowledges entries"
+    );
+    fixture
+        .bob
+        .db()
+        .read_tx(|tx| {
+            let pending: i64 = tx
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_ops WHERE op_kind = 'commit_transition'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| MLSError::Internal(error.to_string()))?;
+            assert_eq!(pending, 0);
+            Ok(())
+        })
+        .unwrap();
+    let after_nse = fixture.state();
+    fixture
+        .bob
+        .sync()
+        .expect("foreground completes the retained application receipt");
+    assert_eq!(fixture.state(), after_nse);
+    assert_eq!(
+        fixture
+            .bob
+            .list_messages(&fixture.cid, None, 100)
+            .unwrap()
+            .iter()
+            .filter(|message| message.message_id == message_id)
+            .count(),
+        1
+    );
+}
+
+/// D3 leaves a receipt-less push Commit untouched for foreground sync. A native send must apply
+/// the deferred Commit only after its I13 receipt verifies, and must not publish from stale state
+/// when that receipt is absent.
+#[test]
+fn native_send_catches_up_an_nse_deferred_commit_after_receipt_verification() {
+    let (_tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let before_epoch = bob
+        .db()
+        .read_tx(|tx| tx.get_conversation(&cid))
+        .unwrap()
+        .unwrap()
+        .epoch;
+    alice.self_update(&cid).expect("peer Commit is sequenced");
+    let deferred_seq = {
+        let state = ds.inner.lock().unwrap();
+        state.entries[&cid]
+            .iter()
+            .rev()
+            .find(|entry| entry["$type"] == "blue.catbird.chat.defs#commitEntry")
+            .and_then(|entry| entry["seq"].as_i64())
+            .expect("deferred Commit seq")
+    };
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_pending_op(
+                "nse_deferred_control",
+                &cid,
+                &deferred_seq.to_string(),
+                1_762_000_000_000,
+            )
+        })
+        .expect("persist NSE deferred-control marker");
+    assert_eq!(
+        bob.db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+            .epoch,
+        before_epoch,
+        "the NSE-deferred Commit has not changed foreground state"
+    );
+
+    let message_id = new_id();
+    let sent = bob
+        .send_message(&cid, &message_id, "send after deferred Commit")
+        .expect("send foreground-syncs the verified Commit");
+    assert_eq!(sent.epoch, before_epoch + 1);
+    assert_eq!(
+        bob.db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+            .epoch,
+        before_epoch + 1
+    );
+    assert_eq!(ds.send_attempts(&message_id).len(), 1);
+    assert!(bob
+        .db()
+        .read_tx(|tx| tx.get_pending_op("nse_deferred_control", &cid))
+        .unwrap()
+        .is_none());
+
+    let (_tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let before_seq = last_seq(&bob, &cid);
+    let before_epoch = bob
+        .db()
+        .read_tx(|tx| tx.get_conversation(&cid))
+        .unwrap()
+        .unwrap()
+        .epoch;
+    alice.self_update(&cid).expect("peer Commit is sequenced");
+    let (at, deferred_seq) = {
+        let state = ds.inner.lock().unwrap();
+        state.entries[&cid]
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry["$type"] == "blue.catbird.chat.defs#commitEntry")
+            .map(|(at, entry)| (at, entry["seq"].as_i64().expect("deferred Commit seq")))
+            .expect("deferred Commit entry")
+    };
+    ds.inner.lock().unwrap().entries.get_mut(&cid).unwrap()[at]["sequencerReceipt"] = Value::Null;
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_pending_op(
+                "nse_deferred_control",
+                &cid,
+                &deferred_seq.to_string(),
+                1_762_000_000_000,
+            )
+        })
+        .expect("persist NSE deferred-control marker");
+
+    let message_id = new_id();
+    let error = bob
+        .send_message(&cid, &message_id, "must not send past unverified Commit")
+        .expect_err("receipt-less deferred Commit blocks send");
+    assert!(
+        error.to_string().contains("sequencerReceipt") || error.to_string().contains("I13"),
+        "{error:?}"
+    );
+    assert_eq!(
+        (
+            last_seq(&bob, &cid),
+            bob.db()
+                .read_tx(|tx| tx.get_conversation(&cid))
+                .unwrap()
+                .unwrap()
+                .epoch,
+            ds.send_attempts(&message_id).len(),
+        ),
+        (before_seq, before_epoch, 0)
+    );
+    assert!(bob
+        .db()
+        .read_tx(|tx| tx.get_pending_op("nse_deferred_control", &cid))
+        .unwrap()
+        .is_some());
+}
+
+/// With no NSE-deferred control, send starts at `sendMessage`: it performs no network preflight.
+#[test]
+fn native_send_without_deferred_control_makes_no_preflight_request() {
+    let (_tmp, ds, _alice, bob, cid, _, _) = synced_group_pair();
+    let before = ds.inner.lock().unwrap().http_log.len();
+    let message_id = new_id();
+
+    bob.send_message(&cid, &message_id, "ordinary send")
+        .expect("ordinary send succeeds");
+
+    let state = ds.inner.lock().unwrap();
+    let requests = &state.http_log[before..];
+    assert!(
+        requests
+            .first()
+            .is_some_and(|(_, url, _)| url.contains("/xrpc/blue.catbird.chat.sendMessage")),
+        "the first ordinary-send request must be sendMessage: {requests:?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(_, url, _)| url.contains("/xrpc/blue.catbird.chat.getConversationState"))
+            .count(),
+        0,
+        "ordinary send must not preflight getConversationState"
+    );
+}
+
+/// Gap 2 regression. Every Commit/control row must carry the sequencer's I13 receipt, bound to the
+/// same entry ID and `seq`. Missing, forged and re-numbered receipts all fail before MLS state,
+/// cursor, or ACK changes; the untouched row then applies.
+///
+/// Fail-before: commit rows were authenticated only by their actor signature, allowing a mirror
+/// to invent or reorder a valid actor-authored transition.
+#[test]
+fn commit_entry_requires_a_valid_seq_bound_sequencer_receipt() {
+    let (_tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let before_seq = last_seq(&bob, &cid);
+    let before_epoch = bob
+        .db()
+        .read_tx(|tx| tx.get_conversation(&cid))
+        .unwrap()
+        .unwrap()
+        .epoch;
+    alice
+        .self_update(&cid)
+        .expect("production CatbirdMlsClient::self_update is available");
+    let (at, genuine) = {
+        let g = ds.inner.lock().unwrap();
+        g.entries[&cid]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| entry["$type"] == "blue.catbird.chat.defs#commitEntry")
+            .map(|(at, entry)| (at, entry.clone()))
+            .expect("self-update commit entry")
+    };
+    for (name, mut entry) in [
+        ("missing", genuine.clone()),
+        ("forged", genuine.clone()),
+        ("mismatched seq", genuine.clone()),
+    ] {
+        match name {
+            "missing" => {
+                entry["sequencerReceipt"] = Value::Null;
+            }
+            "forged" => {
+                entry["sequencerReceipt"]["signature"] =
+                    json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+            }
+            _ => {
+                entry["sequencerReceipt"]["seq"] = json!(entry["seq"].as_u64().unwrap() + 1);
+            }
+        }
+        ds.inner.lock().unwrap().entries.get_mut(&cid).unwrap()[at] = entry;
+        let ack_before = ds.inner.lock().unwrap().acked_watermarks.clone();
+        let error = bob.sync().expect_err(name);
+        assert!(
+            error.to_string().contains("sequencerReceipt") || error.to_string().contains("I13"),
+            "{name}: {error:?}"
+        );
+        assert_eq!(last_seq(&bob, &cid), before_seq, "{name}");
+        assert_eq!(
+            ds.inner.lock().unwrap().acked_watermarks,
+            ack_before,
+            "{name}"
+        );
+        assert_eq!(
+            bob.db()
+                .read_tx(|tx| tx.get_conversation(&cid))
+                .unwrap()
+                .unwrap()
+                .epoch,
+            before_epoch,
+            "{name}"
+        );
+    }
+    ds.inner.lock().unwrap().entries.get_mut(&cid).unwrap()[at] = genuine;
+    bob.sync()
+        .expect("the genuine signed control receipt applies");
+    assert_eq!(
+        bob.db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+            .epoch,
+        before_epoch + 1
+    );
+    let applied_seq = last_seq(&bob, &cid);
+    let ack_after_apply = ds.inner.lock().unwrap().acked_watermarks.clone();
+    assert_eq!(
+        bob.sync().expect("an applied Commit is not applied again"),
+        0
+    );
+    assert_eq!(last_seq(&bob, &cid), applied_seq);
+    assert_eq!(
+        bob.db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+            .epoch,
+        before_epoch + 1
+    );
+    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_after_apply);
+}
+
+/// Gap 3 regression. If an application row claims the local epoch but its `prior` hash or
+/// confirmation tag differs, sync reports `ForkDetected` before attempting AEAD decryption. It
+/// writes neither an undecryptable-gap row nor an ACK; restoring the local coordinate applies it.
+///
+/// Fail-before: the row fell through to decryption and was persisted as an `AeadFailure` gap,
+/// permanently advancing the cursor over evidence of an equivocated group state.
+#[test]
+fn same_epoch_coordinate_mismatch_is_a_fork_not_an_aead_gap() {
+    let (_tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let message_id = new_id();
+    alice.send_message(&cid, &message_id, "fork probe").unwrap();
+    let before_seq = last_seq(&bob, &cid);
+    let before_messages = bob.list_messages(&cid, None, 100).unwrap().len();
+    let coordinate_key = format!("conversation_coords:{cid}");
+    let original = bob
+        .db()
+        .read_tx(|tx| tx.get_account_meta(&coordinate_key))
+        .unwrap()
+        .expect("local coordinate");
+    let original_json: Value = serde_json::from_str(&original).unwrap();
+    for (field, fill) in [("groupContextHash", 0x51_u8), ("confirmationTag", 0x52_u8)] {
+        let mut mismatched = original_json.clone();
+        mismatched[field] = json!({ "$bytes": STANDARD.encode([fill; 32]) });
+        bob.db()
+            .write_tx(|tx| {
+                tx.put_account_meta(
+                    &coordinate_key,
+                    &serde_json::to_string(&mismatched).unwrap(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .unwrap();
+        let ack_before = ds.inner.lock().unwrap().acked_watermarks.clone();
+        let error = bob.sync().expect_err(field);
+        let diagnostic = format!("{error:?}");
+        assert!(diagnostic.contains("ForkDetected"), "{field}: {diagnostic}");
+        assert!(!diagnostic.contains("AeadFailure"), "{field}: {diagnostic}");
+        assert_eq!(last_seq(&bob, &cid), before_seq, "{field}");
+        assert_eq!(
+            bob.list_messages(&cid, None, 100).unwrap().len(),
+            before_messages,
+            "{field}"
+        );
+        assert_eq!(
+            ds.inner.lock().unwrap().acked_watermarks,
+            ack_before,
+            "{field}"
+        );
+    }
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &coordinate_key,
+                &original,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        })
+        .unwrap();
+    bob.sync().expect("the matching coordinate applies");
+    assert!(bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|row| row.message_id == message_id));
+}
+
+/// Durable fork evidence is authenticated before it is written. A PDS-published outsider and a
+/// current leaf with a forged I13 receipt are ordinary invalid entries: no marker, cursor, message
+/// or ACK change. The same conflicting leaf entry with its genuine receipt still records and
+/// reports `ForkDetected`; restoring the local coordinate then applies it.
+///
+/// The application receipt authenticates the conversation, seq, entry ID, sender and archive
+/// commitment. It does not authenticate the signed-request digest or the prior hash/tag.
+///
+/// Fail-before: any PDS-authorized actor signature plus any receipt-shaped object wrote the marker.
+#[test]
+fn fork_marker_requires_a_current_leaf_and_valid_application_receipt() {
+    let (tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let outsider_device = new_id();
+    let outsider = enrolled(&tmp, &ds, "fork-outsider", EVE_DID, &outsider_device);
+    let message_id = new_id();
+    alice
+        .send_message(&cid, &message_id, "authenticated fork")
+        .unwrap();
+    let (at, genuine) = {
+        let g = ds.inner.lock().unwrap();
+        g.entries[&cid]
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| {
+                entry
+                    .pointer("/signedRequest/body/messageId")
+                    .and_then(Value::as_str)
+                    == Some(message_id.as_str())
+            })
+            .map(|(at, entry)| (at, entry.clone()))
+            .expect("sequenced application")
+    };
+    let coordinate_key = format!("conversation_coords:{cid}");
+    let fork_key = chat_wire::fork_detected_key(&cid);
+    let original = bob
+        .db()
+        .read_tx(|tx| tx.get_account_meta(&coordinate_key))
+        .unwrap()
+        .expect("local coordinate");
+    let mut mismatched: Value = serde_json::from_str(&original).unwrap();
+    mismatched["groupContextHash"] = json!({ "$bytes": STANDARD.encode([0x51_u8; 32]) });
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &coordinate_key,
+                &serde_json::to_string(&mismatched).unwrap(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+        })
+        .unwrap();
+    let before_seq = last_seq(&bob, &cid);
+    let before_messages = bob.list_messages(&cid, None, 100).unwrap().len();
+    let ack_before = ds.inner.lock().unwrap().acked_watermarks.clone();
+    let serve = |entry: Value| {
+        ds.inner.lock().unwrap().entries.get_mut(&cid).unwrap()[at] = entry;
+    };
+    let marker = || {
+        bob.db()
+            .read_tx(|tx| tx.get_account_meta(&fork_key))
+            .unwrap()
+    };
+
+    let mut outsider_entry = genuine.clone();
+    outsider_entry["signedRequest"] = signed_by(
+        &enrolled_signer(&outsider),
+        EVE_DID,
+        &outsider_device,
+        CanonicalOperation::SendMessage,
+        &genuine["signedRequest"]["body"],
+    );
+    outsider_entry["sequencerReceipt"] = json!({ "arbitrary": true });
+    let mut forged_receipt = genuine.clone();
+    forged_receipt["sequencerReceipt"]["signature"] =
+        json!({ "$bytes": STANDARD.encode([0_u8; 64]) });
+    let mut violations = Vec::new();
+    for (name, entry) in [
+        ("PDS-published outsider", outsider_entry),
+        ("leaf with forged receipt", forged_receipt),
+    ] {
+        serve(entry);
+        let error = bob.sync().expect_err(name);
+        if format!("{error:?}").contains("ForkDetected") {
+            violations.push(format!("{name}: reported ForkDetected"));
+        }
+        if marker().is_some() {
+            violations.push(format!("{name}: wrote a durable marker"));
+        }
+        assert_eq!(last_seq(&bob, &cid), before_seq, "{name}");
+        assert_eq!(
+            bob.list_messages(&cid, None, 100).unwrap().len(),
+            before_messages,
+            "{name}"
+        );
+        assert_eq!(
+            ds.inner.lock().unwrap().acked_watermarks,
+            ack_before,
+            "{name}"
+        );
+        bob.db()
+            .write_tx(|tx| tx.delete_account_meta(&fork_key))
+            .unwrap();
+    }
+
+    serve(genuine);
+    let error = bob
+        .sync()
+        .expect_err("the authenticated conflicting entry is a fork");
+    assert!(format!("{error:?}").contains("ForkDetected"), "{error:?}");
+    assert!(marker().is_some(), "authenticated fork evidence is durable");
+    assert_eq!(last_seq(&bob, &cid), before_seq);
+    assert_eq!(
+        bob.list_messages(&cid, None, 100).unwrap().len(),
+        before_messages
+    );
+    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_before);
+
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &coordinate_key,
+                &original,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        })
+        .unwrap();
+    bob.sync()
+        .expect("the genuine entry applies once coordinates match");
+    assert!(bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|row| row.message_id == message_id));
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// Gap 4 regression. The production sync path initiates a real self-update once the configured
+/// per-epoch durable-message threshold is exceeded, and the resulting Commit carries I13.
+///
+/// Fail-before: `self_update` was compiled only for `sim`, and production sync never advanced PCS.
+#[test]
+fn sync_automatically_self_updates_after_the_pcs_message_threshold() {
+    use catbird_mls::sim_hooks::SimClientHooks;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice_device = new_id();
+    let alice = CatbirdMlsClient::open_with_hooks(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("pcs-alice").to_string_lossy().into_owned(),
+            account_did: ALICE_DID.to_string(),
+            device_id: alice_device.clone(),
+            home_ds_did: DS_DID.to_string(),
+            home_ds_endpoint: DS_URL.to_string(),
+            pds_endpoint: PDS_URL.to_string(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(ALICE_DID),
+        None,
+        SimClientHooks::default().with_pcs_policy(0, 1),
+    )
+    .expect("open PCS client");
+    alice.enroll_device(&oauth_scopes()).unwrap();
+    let bob = enrolled(&tmp, &ds, "pcs-bob", BOB_DID, &new_id());
+    let cid = new_id();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            Some("PCS".into()),
+            Some("group".into()),
+        )
+        .unwrap();
+    bob.sync().unwrap();
+    alice.sync().unwrap();
+    bob.sync().unwrap();
+    let before_epoch = alice
+        .db()
+        .read_tx(|tx| tx.get_conversation(&cid))
+        .unwrap()
+        .unwrap()
+        .epoch;
+    alice.send_message(&cid, &new_id(), "one").unwrap();
+    alice.send_message(&cid, &new_id(), "two").unwrap();
+    alice.sync().expect("sync performs automatic PCS");
+    assert_eq!(
+        alice
+            .db()
+            .read_tx(|tx| tx.get_conversation(&cid))
+            .unwrap()
+            .unwrap()
+            .epoch,
+        before_epoch + 1
+    );
+    let g = ds.inner.lock().unwrap();
+    let commit = g.entries[&cid]
+        .iter()
+        .rev()
+        .find(|entry| entry["$type"] == "blue.catbird.chat.defs#commitEntry")
+        .expect("automatic PCS commit");
+    assert!(commit["sequencerReceipt"].is_object(), "{commit}");
 }
 
 /// Alice's open group `cid` (with Bob), synced to the DS head.
@@ -8228,6 +12889,49 @@ fn lost_close_response_is_completed_by_exact_replay_on_sync() {
     assert_closed_by_exact_replay(&alice, &ds, &cid, &before);
 }
 
+/// An exact close replay still needs its valid I13 receipt. A forged replay answer cannot consume
+/// the journal or close locally; the next genuine replay applies the same terminal transition.
+#[test]
+fn close_replay_answer_requires_its_i13_receipt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let (alice, cid) = open_group_for_close(&tmp, &ds);
+    let before = close_state(&alice, &cid);
+
+    ds.inner.lock().unwrap().lose_next_close_response = true;
+    alice
+        .close_conversation(&cid)
+        .expect_err("the close response is lost");
+    let journaled = close_state(&alice, &cid);
+    assert_eq!(
+        (journaled.0, journaled.1, &journaled.2, journaled.3),
+        (false, before.1, &before.2, 1)
+    );
+
+    ds.inner.lock().unwrap().forge_next_close_replay_receipt = true;
+    let error = alice
+        .sync()
+        .expect_err("a replay answer with a forged receipt is refused");
+    assert!(
+        error.to_string().contains("I13") || error.to_string().contains("receipt"),
+        "{error}"
+    );
+    assert_eq!(
+        close_state(&alice, &cid),
+        journaled,
+        "the unverified answer cannot consume the close journal"
+    );
+
+    alice.sync().expect("the next genuine replay closes");
+    let (closed, seq, coords, journals) = close_state(&alice, &cid);
+    assert!(closed);
+    assert_eq!((seq, journals), (before.1 + 1, 0));
+    assert_eq!(coords["lifecycle"], "superseded");
+    let requests = close_requests(&ds);
+    assert_eq!(requests.len(), 3);
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
 /// mls-ds sequences Alice's close but answers with an entry carrying another signed request.
 /// The answer is refused: nothing is applied and the signed close stays journaled. Her retry
 /// replays exactly those bytes, mls-ds answers its recorded result, and the close applies.
@@ -8260,4 +12964,819 @@ fn forged_close_answer_keeps_the_journal_and_the_replay_closes() {
         .close_conversation(&cid)
         .expect("the retry replays the journaled close");
     assert_closed_by_exact_replay(&alice, &ds, &cid, &before);
+}
+
+/// Remove Bob's existing leaf, then create a real signed/I13-receipted re-invitation while
+/// retaining his pinned conversation row. Only the inventory authority is replaced.
+fn serve_bob_pending_again(f: &SendOrderFixture, inventory_sequencer: &str) {
+    f.alice
+        .remove_group_member(MemberRole::Admin, &f.cid, BOB_DID)
+        .expect("remove Bob before re-inviting him");
+    f.bob.sync().expect("Bob applies his removal");
+    f.alice
+        .add_group_members(&f.cid, vec![BOB_DID.to_string()])
+        .expect("re-invite Bob without his old leaf");
+    let invitation = {
+        let mut g = f.ds.inner.lock().unwrap();
+        let invitation = g.entries[&f.cid].last().unwrap().clone();
+        let provenance = invitation["signedRequest"]["body"]["participantChanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["userDid"] == BOB_DID)
+            .unwrap()["invitationProvenance"]
+            .clone();
+        let state = g.conversations.get_mut(&f.cid).unwrap();
+        state["sequencerDid"] = json!(inventory_sequencer);
+        let participants = state["participants"].as_array_mut().unwrap();
+        if let Some(bob) = participants
+            .iter_mut()
+            .find(|participant| participant["userDid"] == BOB_DID)
+        {
+            bob["status"] = json!("pending");
+            bob["leafCount"] = json!(0);
+            bob["invitationProvenance"] = provenance;
+        } else {
+            participants.push(json!({
+                "userDid": BOB_DID,
+                "role": "member",
+                "status": "pending",
+                "leafCount": 0,
+                "invitationProvenance": provenance,
+            }));
+        }
+        invitation
+    };
+    assert_eq!(
+        chat_wire::signed_entry_kind(&invitation).unwrap(),
+        SignedMutationKind::PolicyTransition
+    );
+    let seq = invitation["seq"].as_i64().unwrap();
+    let body = &invitation["signedRequest"]["body"];
+    let coordinates = chat_wire::canonicalize_wire_coordinate(&body["next"], Some(&f.cid))
+        .unwrap()
+        .to_string();
+    f.bob
+        .db()
+        .write_tx(|tx| {
+            tx.delete_account_meta(&chat_wire::invitation_closed_key(&f.cid, BOB_DID))?;
+            let roster_key = chat_wire::conversation_roster_key(&f.cid);
+            let mut roster: Value = serde_json::from_str(
+                &tx.get_account_meta(&roster_key)?
+                    .ok_or_else(|| MLSError::Internal("fixture roster missing".into()))?,
+            )?;
+            chat_wire::apply_roster_effects(
+                &mut roster,
+                SignedMutationKind::PolicyTransition,
+                body,
+            );
+            let mut row = tx.get_conversation(&f.cid)?.unwrap();
+            row.last_seq = seq;
+            tx.upsert_conversation(&row)?;
+            tx.put_account_meta(&format!("conversation_coords:{}", f.cid), &coordinates, 0)?;
+            tx.put_account_meta(&roster_key, &roster.to_string(), 0)
+        })
+        .unwrap();
+}
+
+fn own_recovery(client: &CatbirdMlsClient, cid: &str) -> Option<String> {
+    client
+        .db()
+        .read_tx(|tx| tx.get_account_meta(&chat_wire::own_leaf_recovery_key(cid)))
+        .unwrap()
+}
+
+fn own_acceptance_state(client: &CatbirdMlsClient, cid: &str) -> (i64, String, Option<String>) {
+    client
+        .db()
+        .read_tx(|tx| {
+            let row = tx.get_conversation(cid)?.unwrap();
+            Ok((
+                row.last_seq,
+                tx.get_account_meta(&format!("conversation_coords:{cid}"))?
+                    .unwrap(),
+                tx.get_account_meta(&chat_wire::own_leaf_recovery_key(cid))?,
+            ))
+        })
+        .unwrap()
+}
+
+/// A pending inventory row cannot replace Bob's retained sequencer pin for the receipt on his
+/// own acceptance. A valid receipt from that unsigned substitute changes no local state; the
+/// same inventory row with the pinned sequencer's receipt succeeds.
+///
+/// Fail-before: `accept_group_invitation` selected the inventory `sequencerDid`, accepted the
+/// substitute receipt and persisted its recovery view.
+#[test]
+fn own_acceptance_prefers_the_existing_sequencer_pin() {
+    let malicious = send_order_fixture(false);
+    serve_bob_pending_again(&malicious, CROSS_HOME_DS_DID);
+    malicious
+        .ds
+        .inner
+        .lock()
+        .unwrap()
+        .next_group_acceptance_receipt_sequencer = Some(CROSS_HOME_DS_DID.to_owned());
+    let before = own_acceptance_state(&malicious.bob, &malicious.cid);
+    malicious
+        .bob
+        .sync()
+        .expect_err("another sequencer's otherwise genuine receipt");
+    assert_eq!(own_acceptance_state(&malicious.bob, &malicious.cid), before);
+    assert_eq!(
+        malicious
+            .bob
+            .db()
+            .read_tx(|tx| Ok(tx.get_conversation(&malicious.cid)?.unwrap().sequencer_did))
+            .unwrap(),
+        DS_DID
+    );
+
+    let genuine = send_order_fixture(false);
+    serve_bob_pending_again(&genuine, CROSS_HOME_DS_DID);
+    genuine
+        .bob
+        .sync()
+        .expect("the pinned sequencer's genuine receipt");
+    assert!(own_recovery(&genuine.bob, &genuine.cid).is_some());
+    assert_eq!(
+        genuine
+            .bob
+            .db()
+            .read_tx(|tx| Ok(tx.get_conversation(&genuine.cid)?.unwrap().sequencer_did))
+            .unwrap(),
+        DS_DID
+    );
+}
+
+/// The receipt and recovery view returned for Bob's own acceptance must describe the request he
+/// just submitted. An older genuinely signed and receipted acceptance beside the fresh recovery
+/// view is refused without replacing the prior recovery metadata; an exact answer still succeeds.
+///
+/// Fail-before: the older entry verified independently and the fresh recovery view was persisted.
+#[test]
+fn own_acceptance_receipt_is_bound_to_the_submitted_request() {
+    let replayed = send_order_fixture(false);
+    serve_bob_pending_again(&replayed, DS_DID);
+    replayed.bob.sync().expect("first exact acceptance");
+    let old_entry = replayed.ds.inner.lock().unwrap().entries[&replayed.cid]
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry["$type"] == "blue.catbird.chat.defs#participantAcceptanceEntry"
+                && entry["signedRequest"]["body"]["actorDid"] == BOB_DID
+        })
+        .unwrap()
+        .clone();
+    serve_bob_pending_again(&replayed, DS_DID);
+    replayed
+        .ds
+        .inner
+        .lock()
+        .unwrap()
+        .next_group_acceptance_answer_entry = Some(old_entry);
+    let before = own_recovery(&replayed.bob, &replayed.cid);
+    let error = replayed
+        .bob
+        .sync()
+        .expect_err("an older acceptance cannot authorize the fresh recovery")
+        .to_string();
+    assert!(error.contains("signed request"), "{error}");
+    assert_eq!(own_recovery(&replayed.bob, &replayed.cid), before);
+
+    let exact = send_order_fixture(false);
+    serve_bob_pending_again(&exact, DS_DID);
+    exact.bob.sync().expect("the exact acceptance answer");
+    assert!(own_recovery(&exact.bob, &exact.cid).is_some());
+}
+
+/// An acceptance cannot make a never-invited account active when the sequencer withholds the
+/// invitation history. Consequently no honest member fulfills that account's leaf request.
+#[test]
+fn withheld_invitation_never_admits_or_adds_the_never_invited_account() {
+    let f = send_order_fixture(true);
+    let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+    f.eve.sync().expect("eve accepts");
+    ds.inner.lock().unwrap().leaf_recoveries.remove(cid);
+    let genuine = ds.inner.lock().unwrap().entries[cid]
+        .last()
+        .unwrap()
+        .clone();
+    let acceptance_seq = genuine["seq"].as_i64().unwrap();
+
+    let carol_device = new_id();
+    let carol = enrolled(&f.tmp, ds, "carol", CAROL_DID, &carol_device);
+    let carol_signer = enrolled_signer(&carol);
+    let mut forged_admission = genuine.clone();
+    forged_admission["signedRequest"] = signed_by(
+        &carol_signer,
+        CAROL_DID,
+        &carol_device,
+        CanonicalOperation::AcceptConversation,
+        &genuine["signedRequest"]["body"],
+    );
+    forged_admission
+        .as_object_mut()
+        .unwrap()
+        .remove("sequencerReceipt");
+    *ds.inner
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(cid)
+        .unwrap()
+        .last_mut()
+        .unwrap() = forged_admission;
+    ds.inner
+        .lock()
+        .unwrap()
+        .readable_from
+        .insert(f.alice_dev.clone(), acceptance_seq);
+
+    let before_cursor = last_seq(alice, cid);
+    let before_members = alice.list_members(cid).unwrap();
+    let error = alice
+        .sync()
+        .expect_err("withheld invitation history leaves the acceptance pending");
+    assert!(matches!(error, MLSError::SyncIncomplete { .. }), "{error}");
+    assert_eq!(last_seq(alice, cid), before_cursor);
+    assert_eq!(alice.list_members(cid).unwrap(), before_members);
+    let roster: Value = serde_json::from_str(
+        &alice
+            .db()
+            .read_tx(|tx| tx.get_account_meta(&chat_wire::conversation_roster_key(cid)))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(roster.get(CAROL_DID).is_none());
+
+    ds.inner.lock().unwrap().conversations.get_mut(cid).unwrap()["participants"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "userDid": CAROL_DID,
+            "status": "active",
+            "role": "member",
+            "leafCount": 0,
+        }));
+    let _ = carol.sync();
+    let error = alice
+        .sync()
+        .expect_err("the never-invited acceptance remains refused");
+    assert!(matches!(error, MLSError::SyncIncomplete { .. }));
+    let _ = carol.sync();
+    assert!(
+        !alice
+            .list_members(cid)
+            .unwrap()
+            .iter()
+            .any(|did| did == CAROL_DID),
+        "Carol never receives an MLS leaf"
+    );
+    {
+        let mut state = ds.inner.lock().unwrap();
+        *state.entries.get_mut(cid).unwrap().last_mut().unwrap() = genuine;
+        state.readable_from.insert(f.alice_dev.clone(), 0);
+        state
+            .leaf_recoveries
+            .get_mut(cid)
+            .unwrap()
+            .retain(|request| request["requesterDid"] != CAROL_DID);
+    }
+    alice
+        .sync()
+        .expect("honest contiguous invitation and acceptance recover");
+
+    let secret_id = new_id();
+    alice
+        .send_message(cid, &secret_id, "invited members only")
+        .expect("Alice sends to the unchanged group");
+    let _ = carol.sync();
+    assert!(
+        !carol
+            .list_messages(cid, None, 50)
+            .map(|messages| messages
+                .iter()
+                .any(|message| message.message_id == secret_id))
+            .unwrap_or(false),
+        "Carol cannot decrypt the message"
+    );
+}
+
+/// Alice invites Bob and Eve in the creation. Bob accepts and joins first; a second Alice
+/// device joins from Alice's member-signed recovery Welcome before Eve accepts. Neither joined
+/// device can read the creation entry, so both must carry Eve's pending admission proof from that
+/// Welcome rather than demand the pre-join prefix.
+#[test]
+fn late_joiners_advance_and_can_fulfill_a_later_invitees_acceptance() {
+    let f = send_order_fixture(true);
+    let (ds, cid) = (&f.ds, f.cid.as_str());
+    let alice_d_device = new_id();
+    let alice_d = enrolled(&f.tmp, ds, "alice-d", ALICE_DID, &alice_d_device);
+    alice_d.sync().expect("Alice D requests recovery");
+    f.alice.sync().expect("Alice admits her later device");
+    alice_d
+        .sync()
+        .expect("Alice D joins from the recovery Welcome");
+
+    let bob_join_seq = last_seq(&f.bob, cid);
+    let alice_d_join_seq = last_seq(&alice_d, cid);
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state.readable_from.insert(f.bob_dev.clone(), bob_join_seq);
+        state
+            .readable_from
+            .insert(alice_d_device.clone(), alice_d_join_seq);
+    }
+
+    f.eve
+        .sync()
+        .expect("Eve accepts after Bob and Alice D joined");
+    let acceptance_seq = ds.entry_count(cid);
+    let acceptance_provenance = {
+        let state = ds.inner.lock().unwrap();
+        state.entries[cid].last().unwrap()["signedRequest"]["body"]["invitationProvenance"].clone()
+    };
+    let baseline = |client: &CatbirdMlsClient| -> Option<Value> {
+        client
+            .db()
+            .read_tx(|tx| tx.get_account_meta(&chat_wire::conversation_roster_key(cid)))
+            .unwrap()
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+    };
+    let bob_baseline = baseline(&f.bob);
+    let alice_d_baseline = baseline(&alice_d);
+    assert!(
+        chat_wire::roster_has_pending_invitation(
+            bob_baseline.as_ref(),
+            EVE_DID,
+            &acceptance_provenance
+        ) && chat_wire::roster_has_pending_invitation(
+            alice_d_baseline.as_ref(),
+            EVE_DID,
+            &acceptance_provenance
+        ),
+        "both member-authenticated baselines carry Eve's immutable pending provenance"
+    );
+    let bob_result = f.bob.sync();
+    let alice_d_result = alice_d.sync();
+    let (bob_cursor, alice_d_cursor, eve_has_leaf, fulfillment_count) = {
+        let state = ds.inner.lock().unwrap();
+        let leaves = state.conversations[cid]["leaves"]
+            .as_array()
+            .expect("server leaves");
+        (
+            last_seq(&f.bob, cid),
+            last_seq(&alice_d, cid),
+            leaves.iter().any(|leaf| leaf["userDid"] == EVE_DID),
+            state.entries[cid]
+                .iter()
+                .filter(|entry| {
+                    entry["$type"] == "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
+                        && entry["signedRequest"]["body"]["manifest"]["leafChanges"]
+                            .as_array()
+                            .is_some_and(|changes| {
+                                changes.iter().any(|change| change["userDid"] == EVE_DID)
+                            })
+                })
+                .count(),
+        )
+    };
+    eprintln!(
+        "late-join admission: bob={bob_result:?} cursor={bob_cursor}/{acceptance_seq}; \
+         alice-d={alice_d_result:?} cursor={alice_d_cursor}/{acceptance_seq}; \
+         eve_has_leaf={eve_has_leaf}; fulfillments={fulfillment_count}"
+    );
+    assert!(
+        bob_result.is_ok()
+            && alice_d_result.is_ok()
+            && bob_cursor >= acceptance_seq
+            && alice_d_cursor >= acceptance_seq
+            && eve_has_leaf
+            && fulfillment_count == 1,
+        "member-attested pending admission must survive the unreadable pre-join prefix"
+    );
+
+    f.eve.sync().expect("Eve joins from Bob's fulfillment");
+    let next_message = new_id();
+    f.bob
+        .send_message(cid, &next_message, "welcome after late acceptance")
+        .expect("Bob sends after admitting Eve");
+    f.eve.sync().expect("Eve reads the next message");
+    assert!(f
+        .eve
+        .list_messages(cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|message| message.message_id == next_message));
+
+    let eve_second_device = new_id();
+    let eve_second = enrolled(&f.tmp, ds, "eve-second", EVE_DID, &eve_second_device);
+    eve_second
+        .sync()
+        .expect("Eve's second device requests recovery");
+    alice_d
+        .sync()
+        .expect("the between-invitation Alice device can fulfill Eve's recovery");
+    eve_second
+        .sync()
+        .expect("Eve's second device joins from Alice D's fulfillment");
+    assert_eq!(
+        ds.inner.lock().unwrap().entries[cid].last().unwrap()["signedRequest"]["body"]
+            ["actorDeviceId"],
+        alice_d_device,
+        "Alice D authored the second honest fulfillment"
+    );
+
+    let alice_post_acceptance_device = new_id();
+    let alice_post_acceptance = enrolled(
+        &f.tmp,
+        ds,
+        "alice-post-acceptance",
+        ALICE_DID,
+        &alice_post_acceptance_device,
+    );
+    alice_post_acceptance
+        .sync()
+        .expect("post-acceptance device requests recovery");
+    f.alice
+        .sync()
+        .expect("Alice admits her post-acceptance device");
+    alice_post_acceptance
+        .sync()
+        .expect("post-acceptance device joins");
+    assert!(
+        alice_post_acceptance
+            .db()
+            .read_tx(|tx| {
+                tx.get_account_meta(&chat_wire::verified_participant_admission_key(cid, EVE_DID))
+            })
+            .unwrap()
+            .is_some(),
+        "an active row in the member-signed Welcome grants admission authority"
+    );
+}
+
+#[test]
+fn nse_gap_defers_without_advancing_and_foreground_recovers_the_omitted_entry() {
+    let fixture = NseReceiptFixture::new();
+    let before = fixture.state();
+    let omitted_id = new_id();
+    fixture
+        .alice
+        .send_message(&fixture.cid, &omitted_id, "omitted from push")
+        .expect("first message");
+    fixture
+        .alice
+        .self_update(&fixture.cid)
+        .expect("intervening commit");
+    let later_id = new_id();
+    fixture
+        .alice
+        .send_message(&fixture.cid, &later_id, "after the gap")
+        .expect("later message");
+    let mut bundle = fixture.bundle_after_bob_cursor();
+    let omitted_seq = bundle.entries.remove(0).seq;
+
+    let (preview, _) = fixture.process(bundle);
+    assert!(preview.fallback_generic, "a gap defers to foreground sync");
+    assert_eq!(
+        fixture.state(),
+        before,
+        "the NSE advances no state across a gap"
+    );
+    fixture
+        .bob
+        .sync()
+        .expect("foreground reads the complete contiguous page");
+    let messages = fixture.bob.list_messages(&fixture.cid, None, 100).unwrap();
+    assert!(messages
+        .iter()
+        .any(|message| message.message_id == omitted_id));
+    assert!(messages
+        .iter()
+        .any(|message| message.message_id == later_id));
+    assert!(fixture.state().1 > omitted_seq);
+}
+
+#[test]
+fn nse_application_seq_must_match_its_receipt_before_any_cursor_advance() {
+    let fixture = NseReceiptFixture::new();
+    let before = fixture.state();
+    let message_id = new_id();
+    fixture
+        .alice
+        .send_message(&fixture.cid, &message_id, "receipt-bound sequence")
+        .expect("message");
+    let entry_seq = fixture.ds.entry_count(&fixture.cid);
+    resign_receipt_seq(
+        &fixture.ds,
+        &fixture.cid,
+        entry_seq,
+        u64::try_from(entry_seq + 1_000).unwrap(),
+    );
+    let bundle = fixture.bundle_after_bob_cursor();
+    resign_receipt_seq(
+        &fixture.ds,
+        &fixture.cid,
+        entry_seq,
+        u64::try_from(entry_seq).unwrap(),
+    );
+    assert_eq!(bundle.entries.len(), 1);
+    assert_eq!(bundle.entries[0].seq, entry_seq);
+
+    let (preview, _) = fixture.process(bundle);
+    assert!(
+        preview.fallback_generic,
+        "an outer sequence mismatch defers to foreground sync"
+    );
+    assert_eq!(
+        fixture.state(),
+        before,
+        "the unauthenticated outer sequence changes nothing"
+    );
+    fixture
+        .bob
+        .sync()
+        .expect("foreground applies the genuine sequenced entry");
+    assert!(fixture
+        .bob
+        .list_messages(&fixture.cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|message| message.message_id == message_id));
+}
+
+#[cfg(feature = "sim")]
+#[test]
+fn group_creation_signed_operation_expired_resigns_without_date_header_and_caps_at_eight_attempts()
+{
+    let (_tmp, ds, clock, alice, bob) = r4fix3_clocked_creation_fixture();
+    let cid = new_id();
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Server-authoritative expiry".into()),
+            None,
+        )
+        .expect_err("initial create unavailable");
+    let initial = staged_creation_fingerprint(&alice, &cid);
+    assert_eq!(initial.attempts.len(), 1);
+
+    // Even when the local clock has only advanced 10 s (far below the 360 s local safety bound),
+    // server-side `400 SignedOperationExpired` proves the unclaimed attempt is past the server's
+    // 300 s window and triggers re-signing over the identical staged genesis without `Date`.
+    r4fix3_advance_server_and_client(&ds, &clock, 10_000);
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.createConversation",
+        400,
+        "SignedOperationExpired",
+        None,
+    ));
+    let resigned_err = alice
+        .sync()
+        .expect_err("SignedOperationExpired appends a fresh signed attempt");
+    assert!(
+        matches!(&resigned_err, MLSError::SyncIncomplete { failures, .. }
+            if matches!(failures.as_slice(), [failure]
+                if failure.conversation_id == cid
+                    && matches!(&*failure.error, MLSError::GroupCreationPending {
+                        last_error_code, ..
+                    } if last_error_code == "GroupCreationResigned"))),
+        "{resigned_err:?}"
+    );
+    let second = staged_creation_fingerprint(&alice, &cid);
+    assert_eq!(second.attempts.len(), 2);
+    assert_eq!(second.attempts[0].0, initial.operation_id);
+
+    // Push past GROUP_CREATION_MAX_ATTEMPTS (8): attempts[0] (the journal_id anchor) must stay
+    // pinned at index 0 while total stored attempts never exceed 8.
+    for _ in 0..9 {
+        let current_len = staged_creation_fingerprint(&alice, &cid).attempts.len();
+        r4fix3_advance_server_and_client(&ds, &clock, 1_000);
+        {
+            let mut state = ds.inner.lock().unwrap();
+            for _ in 0..current_len {
+                state.xrpc_failures.push((
+                    "/blue.catbird.chat.createConversation",
+                    400,
+                    "SignedOperationExpired",
+                    None,
+                ));
+            }
+        }
+        alice
+            .retry_pending_group_creation(&cid)
+            .expect_err("all attempts expired -> appends bounded fresh signature");
+    }
+    let capped = staged_creation_fingerprint(&alice, &cid);
+    assert_eq!(
+        capped.attempts.len(),
+        chat_wire::GROUP_CREATION_MAX_ATTEMPTS
+    );
+    assert_eq!(
+        capped.attempts[0].0, initial.operation_id,
+        "attempts[0] must remain anchored to journal_id across evictions"
+    );
+    assert_eq!(capped.attempts[0].1, initial.request);
+    assert_eq!(capped.group_id, initial.group_id);
+    assert_eq!(capped.epoch_authenticator, initial.epoch_authenticator);
+
+    // Now let the newest attempt succeed after the earlier 7 return SignedOperationExpired.
+    {
+        let mut state = ds.inner.lock().unwrap();
+        for _ in 0..(chat_wire::GROUP_CREATION_MAX_ATTEMPTS - 1) {
+            state.xrpc_failures.push((
+                "/blue.catbird.chat.createConversation",
+                400,
+                "SignedOperationExpired",
+                None,
+            ));
+        }
+    }
+    alice
+        .retry_pending_group_creation(&cid)
+        .expect("latest attempt commits")
+        .expect("adopted conversation");
+    assert_eq!(group_creation_journal_count(&alice), 0);
+    assert_eq!(
+        adopted_epoch_authenticator(&alice, &cid),
+        initial.epoch_authenticator
+    );
+    finish_resumed_group(&alice, &bob, &cid);
+}
+
+#[test]
+fn enroll_device_only_adopts_own_device_on_device_already_exists_refusal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes = oauth_scopes();
+    let alice_dev = new_id();
+    let alice_keys = Arc::new(MemKeyStore::new());
+    let alice = live_client(
+        tmp.path(),
+        &ds,
+        "alice-mut1145",
+        ALICE_DID,
+        &alice_dev,
+        &alice_keys,
+    );
+
+    // First call registers on DS and persists signer, then loses the HTTP response before local
+    // completion or PDS writes.
+    ds.inner.lock().unwrap().lose_next_enroll_response = true;
+    assert!(alice.enroll_device(&scopes).is_err());
+
+    // A subsequent non-`DeviceAlreadyExists` refusal (e.g. `429 RateLimited`) MUST NOT fall into
+    // `own_enrolled_device` adoption even though `getOwnDevices` would succeed!
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.chat.enrollDevice",
+        429,
+        "RateLimited",
+        None,
+    ));
+    let err = alice
+        .enroll_device(&scopes)
+        .expect_err("non-DeviceAlreadyExists error must not adopt DS enrollment");
+    assert!(
+        matches!(&err, MLSError::InvalidState(code) if code == "RateLimited"),
+        "expected RateLimited refusal, got {err:?}"
+    );
+    let pds_writes = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(account, url, _)| {
+            account == ALICE_DID && url.ends_with("/xrpc/com.atproto.repo.putRecord")
+        })
+        .count();
+    assert_eq!(
+        pds_writes, 0,
+        "no PDS write may occur on RateLimited refusal"
+    );
+}
+
+struct ContendedDirectRequestTransport {
+    inner: Arc<dyn PlatformTransport>,
+    client: Mutex<Option<std::sync::Weak<CatbirdMlsClient>>>,
+    peer_did: String,
+    prepare_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl PlatformTransport for ContendedDirectRequestTransport {
+    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+        let response = self.inner.execute_http(request.clone())?;
+        if request
+            .url
+            .ends_with("/xrpc/blue.catbird.chat.prepareDirectRequest")
+        {
+            let call = self.prepare_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(client) = self
+                .client
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                let peer_did = self.peer_did.clone();
+                client
+                    .db()
+                    .write_tx(|tx| {
+                        let raw = tx
+                            .get_pending_op("direct_request_creation", &peer_did)?
+                            .expect("pending direct request journal");
+                        let mut value: Value = serde_json::from_str(&raw).unwrap();
+                        value["intro_text"] = json!(format!("contended-{call}"));
+                        let mutated = serde_json::to_string(&value).unwrap();
+                        assert!(tx.compare_exchange_pending_op(
+                            "direct_request_creation",
+                            &peer_did,
+                            Some(&raw),
+                            &mutated,
+                            call as i64,
+                        )?);
+                        Ok(())
+                    })
+                    .expect("mutate direct_request_creation CAS target");
+            }
+        }
+        Ok(response)
+    }
+
+    fn connect_realtime_stream(&self, _url: String, _cursor: Option<i64>) -> Result<(), MLSError> {
+        Ok(())
+    }
+
+    fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn direct_request_creation_cas_contention_terminates_after_four_attempts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes = oauth_scopes();
+    let transport = Arc::new(ContendedDirectRequestTransport {
+        inner: ds.for_account(ALICE_DID),
+        client: Mutex::new(None),
+        peer_did: BOB_DID.to_string(),
+        prepare_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let alice = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("alice-u01").to_string_lossy().into(),
+            account_did: ALICE_DID.into(),
+            device_id: new_id(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        transport.clone(),
+        None,
+    )
+    .expect("open alice");
+    let bob = enrolled(&tmp, &ds, "bob-u01", BOB_DID, &new_id());
+    alice.enroll_device(&scopes).expect("enroll alice");
+    // Replenish enough Bob DR keys so 4 prepare calls never exhaust the pool before CAS bound triggers.
+    let _ = &bob;
+    {
+        let mut g = ds.inner.lock().unwrap();
+        let sample = g.dr_keys[BOB_DID][0].clone();
+        while g.dr_keys[BOB_DID].len() < 8 {
+            g.dr_keys.get_mut(BOB_DID).unwrap().push(sample.clone());
+        }
+    }
+    *transport.client.lock().unwrap() = Some(Arc::downgrade(&alice));
+
+    let err = alice
+        .create_group(
+            &new_id(),
+            DS_DID,
+            vec![BOB_DID.into()],
+            None,
+            Some("Hello under contention".into()),
+        )
+        .expect_err("persistent CAS contention must terminate cleanly");
+    assert!(
+        matches!(&err, MLSError::InvalidState(code) if code == "DirectRequestJournalContention"),
+        "expected DirectRequestJournalContention, got {err:?}"
+    );
+    assert_eq!(
+        transport.prepare_calls.load(Ordering::SeqCst),
+        4,
+        "CAS loop must execute at most 4 attempts"
+    );
 }

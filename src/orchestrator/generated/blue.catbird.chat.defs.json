@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "e782e46ca8489c881517186fe0bf1a9c35c99634",
-    "sourceSha256": "cf931d0fda7b68082f7f0ac9105dd62122692ee35afbf0ddf7eb2d134340f848",
-    "sourceTree": "d9a3c6cfc19c439435332b7d85c8ff80e5edb3af"
+    "sourceRevision": "5c991ba1410c097c659cc82f3be5247982291ce5",
+    "sourceSha256": "acc18be399f521d3b110ba90f0f57a5bebd5894037b4b34c4f7302550cffb075",
+    "sourceTree": "630782e9c5465ed17f73fd9bb95bf5ca0623822a"
   },
   "defs": {
     "accessEndedEvent": {
@@ -72,6 +72,10 @@
         },
         "sequencerDid": {
           "ref": "#bareDid",
+          "type": "ref"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
           "type": "ref"
         },
         "signature": {
@@ -921,6 +925,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedCommitTransition",
           "type": "ref"
@@ -1108,6 +1116,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedConversationClose",
@@ -1554,6 +1566,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedCreation",
@@ -2082,6 +2098,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedDirectRequestAcceptance",
@@ -4532,6 +4552,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedLeafRecoveryFulfillment",
           "type": "ref"
@@ -4844,6 +4868,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedLeaveCancellation",
           "type": "ref"
@@ -4961,6 +4989,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedLeaveCommitFulfillment",
           "type": "ref"
@@ -5055,6 +5087,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedLeaveRequest",
@@ -5679,6 +5715,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedMetadataTransition",
           "type": "ref"
@@ -6085,6 +6125,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedParticipantAcceptance",
           "type": "ref"
@@ -6171,6 +6215,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedPolicyTransition",
@@ -6944,6 +6992,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedResetActivation",
           "type": "ref"
@@ -7066,6 +7118,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedResetRequest",
@@ -8529,6 +8585,10 @@
           "maximum": 9007199254740991,
           "minimum": 1,
           "type": "integer"
+        },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
         },
         "signedRequest": {
           "ref": "#signedZeroLeafLeave",

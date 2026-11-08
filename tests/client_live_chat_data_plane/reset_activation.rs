@@ -61,6 +61,34 @@ fn requests_from(ds: &SharedMockDs, account: &str) -> usize {
         .count()
 }
 
+fn reset_journal_count(client: &CatbirdMlsClient, cid: &str) -> i64 {
+    client
+        .db()
+        .read_tx(|tx| {
+            tx.conn()
+                .query_row(
+                    "SELECT count(*) FROM pending_ops \
+                     WHERE op_kind = 'reset_activation' \
+                     AND json_extract(payload_json, '$.conversation_id') = ?1",
+                    [cid],
+                    |row| row.get(0),
+                )
+                .map_err(|error| MLSError::Internal(error.to_string()))
+        })
+        .unwrap()
+}
+
+fn activation_requests(ds: &SharedMockDs) -> Vec<Value> {
+    ds.inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| url.contains("/xrpc/blue.catbird.chat.activateReset"))
+        .map(|(_, _, body)| serde_json::from_slice(body).unwrap())
+        .collect()
+}
+
 /// The one conversation `client`'s sync reports failing: `cid`, with its error.
 fn sync_failure(client: &CatbirdMlsClient, cid: &str) -> MLSError {
     match client.sync() {
@@ -302,17 +330,81 @@ fn non_admin_reset_activation_is_refused_before_any_effect() {
     assert_eq!((reset_state(bob, cid), acked(ds, cid, &f.bob_dev)), before);
 }
 
-/// An active admin by its verified roster resets. Alice's `reset_conversation` requests the reset,
-/// journals the staged successor and applies it once mls-ds's answer verifies: a fresh group at
-/// the next generation's epoch 0 with Alice its only member, its coordinate and the manifest's
-/// roster, the journal gone. Her own reset request sits between her cursor and the activation, so
-/// the cursor stays; her next sync reads the request and the activation's echo, which move only
-/// the cursor. An own activation she never journaled is then refused with nothing changed.
+/// A reset request's own answer is not authority until it is the exact submitted request and its
+/// I13 receipt verifies. A dishonest home that removes or forges only that answer's receipt gets
+/// no activation request, journal, cursor, coordinate or MLS-state change.
+///
+/// Fail-before: `reset_conversation` discarded this answer and activated from the later entry scan.
+#[test]
+fn reset_request_answer_requires_its_exact_i13_receipt() {
+    let mut violations = Vec::new();
+    for fault in ["missingReceipt", "forgedReceipt"] {
+        let f = send_order_fixture(false);
+        let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+        alice.sync().expect("alice is caught up");
+        let before = reset_state(alice, cid);
+        ds.inner.lock().unwrap().next_reset_request_fault = Some(fault);
+
+        let result = alice.reset_conversation(cid);
+        if !matches!(&result, Err(MLSError::Cryptography(_))) {
+            violations.push(format!("{fault}: answer was not refused: {result:?}"));
+        }
+        if reset_state(alice, cid) != before {
+            violations.push(format!("{fault}: reset state changed"));
+        }
+        if !activation_requests(ds).is_empty() {
+            violations.push(format!("{fault}: activation was submitted"));
+        }
+        if reset_journal_count(alice, cid) != 0 {
+            violations.push(format!("{fault}: activation was journaled"));
+        }
+    }
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// A state view and `getEntries` page that invent this device's pending reset at a higher seq are
+/// not an activation origin. No activation is signed at that fake tail and nothing is journaled.
+///
+/// Fail-before: the unverified state view selected the request ID and the unverified entry scan
+/// selected `fake_seq + 1` as the metadata author proof's origin.
+#[test]
+fn fake_pending_reset_tail_never_becomes_an_activation_origin() {
+    let f = send_order_fixture(false);
+    let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+    alice.sync().expect("alice is caught up");
+    let before = reset_state(alice, cid);
+    let fake_seq = conversation(alice, cid).last_seq + 20;
+    ds.inner.lock().unwrap().fake_pending_reset_seq = Some(fake_seq);
+
+    alice
+        .reset_conversation(cid)
+        .expect_err("the invented non-contiguous tail is refused");
+    assert!(
+        activation_requests(ds)
+            .iter()
+            .all(
+                |request| request["signedRequest"]["body"]["metadataSnapshot"]["authorProof"]
+                    ["originSeq"]
+                    .as_i64()
+                    != Some(fake_seq + 1)
+            ),
+        "the fake tail must never enter a signed activation"
+    );
+    assert_eq!(reset_state(alice, cid), before);
+    assert_eq!(reset_journal_count(alice, cid), 0);
+}
+
+/// An active admin by its verified roster resets. Alice's `reset_conversation` verifies and syncs
+/// her own request through the ordinary contiguous path, then journals the staged successor and
+/// applies it once mls-ds's answer verifies: a fresh group at the next generation's epoch 0 with
+/// Alice its only member, its coordinate and the manifest's roster, the journal gone. The verified
+/// request and activation move the cursor through the activation; its later echo is idempotent.
+/// An own activation she never journaled is then refused with nothing changed.
 ///
 /// Fail-before: there was no `reset_conversation`, and sync refused every activation signed by
 /// this device.
 #[test]
-fn admin_reset_activates_and_its_echo_moves_only_the_cursor() {
+fn admin_reset_activates_and_its_echo_is_idempotent() {
     let f = send_order_fixture(false);
     let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
     alice.sync().expect("alice is caught up");
@@ -336,7 +428,7 @@ fn admin_reset_activates_and_its_echo_moves_only_the_cursor() {
         (
             before.generation + 1,
             0,
-            before.last_seq,
+            reset_seq,
             chat_wire::json_bytes(&successor["groupId"]).unwrap()
         )
     );
@@ -355,6 +447,18 @@ fn admin_reset_activates_and_its_echo_moves_only_the_cursor() {
         vec![ALICE_DID.to_string()]
     );
     assert_eq!(roster(alice, cid), Some(verified_roster.clone()));
+    for did in [ALICE_DID, BOB_DID] {
+        assert!(
+            alice
+                .db()
+                .read_tx(|tx| {
+                    tx.get_account_meta(&chat_wire::verified_participant_admission_key(cid, did))
+                })
+                .unwrap()
+                .is_some(),
+            "the member-signed reset manifest carries {did}'s admission marker"
+        );
+    }
     assert!(!journaled(alice, &transition_id), "the answer consumed it");
 
     alice.sync().expect("the echo verifies");
@@ -362,12 +466,11 @@ fn admin_reset_activates_and_its_echo_moves_only_the_cursor() {
     assert_eq!(echoed.last_seq, reset_seq);
     assert_eq!(
         catbird_mls::storage::ConversationRow {
-            last_seq: reset.last_seq,
             updated_at_ms: reset.updated_at_ms,
             ..echoed
         },
         reset,
-        "the echo moves only the cursor"
+        "the echo is idempotent"
     );
     assert_eq!(stored_coordinates(alice, cid), Some(successor.to_string()));
     assert_eq!(roster(alice, cid), Some(verified_roster));
@@ -388,10 +491,10 @@ fn admin_reset_activates_and_its_echo_moves_only_the_cursor() {
     unserve(ds, cid);
 }
 
-/// mls-ds sequences Alice's activation but its answer is lost: nothing applies and the journal
-/// stays. Her next sync verifies the echo of her own activation and applies exactly the journaled
-/// successor (group, coordinate, roster, cursor); another sync changes nothing, and she sends in
-/// the successor generation.
+/// mls-ds sequences Alice's activation but its answer is lost: only her separately verified reset
+/// request has moved the cursor and the activation journal stays. Her next sync verifies the echo
+/// of her own activation and applies exactly the journaled successor (group, coordinate, roster,
+/// cursor); another sync changes nothing, and she sends in the successor generation.
 ///
 /// Fail-before: sync refused every activation signed by this device, so a lost answer left Alice
 /// on the retired generation for good.
@@ -408,10 +511,12 @@ fn lost_reset_answer_applies_the_journaled_successor_on_its_echo() {
     alice
         .reset_conversation(cid)
         .expect_err("the answer is lost");
+    let mut after_request = before.clone();
+    after_request.3 += 1;
     assert_eq!(
         reset_state(alice, cid),
-        before,
-        "nothing applies unanswered"
+        after_request,
+        "only the verified reset request applies before the activation echo"
     );
     let (reset_seq, transition_id, successor) = last_activation(ds, cid);
     assert!(journaled(alice, &transition_id));
@@ -441,6 +546,49 @@ fn lost_reset_answer_applies_the_journaled_successor_on_its_echo() {
     alice
         .send_message(cid, &new_id(), "successor generation")
         .expect("alice sends in the successor");
+}
+
+/// A reset-activation answer is not authority until its I13 receipt verifies. A forged answer
+/// leaves the staged successor journaled; the genuine sequenced echo applies it.
+#[test]
+fn reset_activation_answer_requires_its_i13_receipt() {
+    let f = send_order_fixture(false);
+    let (ds, cid, alice) = (&f.ds, f.cid.as_str(), &f.alice);
+    alice.sync().expect("alice is caught up");
+    let before = reset_state(alice, cid);
+    let generation = conversation(alice, cid).generation;
+
+    ds.inner.lock().unwrap().forge_next_reset_activation_receipt = true;
+    let error = alice
+        .reset_conversation(cid)
+        .expect_err("an activation answer with a forged receipt is refused");
+    assert!(
+        error.to_string().contains("I13") || error.to_string().contains("receipt"),
+        "{error}"
+    );
+    let mut after_request = before.clone();
+    after_request.3 += 1;
+    assert_eq!(
+        reset_state(alice, cid),
+        after_request,
+        "only the separately verified reset request may apply"
+    );
+    let (reset_seq, transition_id, successor) = last_activation(ds, cid);
+    assert!(journaled(alice, &transition_id));
+
+    alice.sync().expect("the genuine activation echo applies");
+    let row = conversation(alice, cid);
+    assert_eq!(
+        (row.generation, row.epoch, row.last_seq, row.group_id),
+        (
+            generation + 1,
+            0,
+            reset_seq,
+            chat_wire::json_bytes(&successor["groupId"]).unwrap()
+        )
+    );
+    assert_eq!(stored_coordinates(alice, cid), Some(successor.to_string()));
+    assert!(!journaled(alice, &transition_id));
 }
 
 /// A device retired by a reset rejoins through its own signed request and a verified Welcome.

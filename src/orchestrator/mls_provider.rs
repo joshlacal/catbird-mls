@@ -116,10 +116,10 @@ impl OwnEchoProof {
     }
 }
 
-/// The pre-HTTP journal of one orchestrator application send (seed 2323): the exact body to
-/// sign and submit, written in the storage transaction that reserved its `sendCounter` and
-/// advanced the sender ratchet. Only these bytes may ever be resubmitted for `message_id`, and
-/// an own-private echo with exactly this ciphertext is this device's own send.
+/// The pre-HTTP journal of one orchestrator application send (seed 2323): the exact body and
+/// candidate `sendCounter`, written in the storage transaction that advances the sender ratchet.
+/// Only these bytes may ever be resubmitted for `message_id`, and an own-private echo with exactly
+/// this ciphertext is this device's own send.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReservedApplicationSend {
     pub conversation_id: String,
@@ -663,10 +663,11 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     ) -> Result<EncryptResult, MLSError>;
 
     /// Reserve one canonical application send before any HTTP (seed 2323). In a single storage
-    /// transaction: the next `sendCounter` this device signs in `conversation_id`, the
+    /// transaction: the candidate after this device's last confirmed `sendCounter`, the
     /// sender-ratchet advance that encrypts `plaintext` under `aad` at `expected_epoch` (raw MLS
     /// TLS framing), and the journal `complete(send_counter, ciphertext)` builds. A journal
-    /// already reserved for `message_id` is returned unchanged; nothing else is encrypted.
+    /// already reserved for `message_id` is returned unchanged; nothing else is encrypted. The
+    /// accepted-counter watermark is unchanged until a verified response or own echo.
     #[allow(clippy::too_many_arguments)]
     fn reserve_application_send(
         &self,
@@ -683,9 +684,14 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
-    /// Drop the journal of `message_id`: `mls-ds` refused those exact bytes for good
-    /// (`StaleSend`, `StaleCoordinates`) and they must never be resubmitted.
-    fn discard_application_send(&self, _message_id: &str) -> Result<(), MLSError> {
+    /// Drop the journal of `message_id`: the server definitively refused those exact bytes and
+    /// they must never be resubmitted. `stale_send` means the server also proved this counter is
+    /// already at or below its accepted watermark, so advance the local watermark before retry.
+    fn discard_application_send(
+        &self,
+        _message_id: &str,
+        _stale_send: bool,
+    ) -> Result<(), MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "journaled application send reservation is unavailable".into(),
         })

@@ -1193,7 +1193,9 @@ where
         }
         crate::chat_v2::transcript::decode_strict_json(&response.body).map_err(|_| invalid())?;
         let result: Value = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
-        let proof = serde_json::to_vec(&result["acceptanceProof"]).map_err(|_| invalid())?;
+        let proof_value = result["acceptanceProof"].clone();
+        let (legacy_proof, sequencer_receipt) =
+            super::projection::normalize_acceptance_proof_with_i13(proof_value)?;
         let public = self
             .mls_context()
             .identity_public_key(format!("{owner}#{device}").into_bytes())?;
@@ -1202,24 +1204,29 @@ where
                 .map_err(|_| invalid())?;
             val["id"].as_str().ok_or_else(invalid)?.to_string()
         };
-        let proof_value: Value = serde_json::from_slice(&proof).map_err(|_| invalid())?;
-        let method = proof_value["receipt"]["body"]["keyId"]
+        let method = legacy_proof["receipt"]["body"]["keyId"]
             .as_str()
             .ok_or_else(invalid)?;
+        let i13_method =
+            crate::client::chat_wire::sequencer_receipt_kid(&auth_did, &sequencer_receipt)?;
         if transcript::resolve_direct_request_receipt_key_for_authority(
             &auth_did,
             &projection.trusted_authority_document,
             method,
         )
         .is_err()
+            || crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+                &projection.trusted_authority_document,
+                &auth_did,
+                i13_method,
+            )
+            .is_err()
         {
             let doc = self
                 .credentials()
                 .direct_request_receipt_authority_document(&auth_did)
                 .await?
                 .ok_or_else(invalid)?;
-            transcript::resolve_direct_request_receipt_key_for_authority(&auth_did, &doc, method)
-                .map_err(|_| invalid())?;
             projection.trusted_authority_document =
                 intent::merge_trusted_documents_for_expected_authority(
                     &projection.trusted_authority_document,
@@ -1233,15 +1240,33 @@ where
             method,
         )
         .map_err(|_| invalid())?;
-        let canonical_proof =
-            transcript::verify_received_direct_request_acceptance_proof_for_authority(
-                &auth_did,
-                &proof,
-                &authority_key,
-                &public,
+        let i13_key = crate::client::chat_wire::decode_p256_sec1_from_did_doc(
+            &projection.trusted_authority_document,
+            &auth_did,
+            i13_method,
+        )?;
+        let canonical_proof = super::projection::verify_acceptance_proof_with_i13(
+            &auth_did,
+            &legacy_proof,
+            &sequencer_receipt,
+            &authority_key,
+            &i13_key,
+            &public,
+        )?;
+        let accepted_body = &canonical_proof["entry"]["signedRequest"]["body"];
+        let answer_coordinates =
+            crate::orchestrator::canonical_transport::decode_conversation_coordinates(
+                &serde_json::to_vec(&result["coordinates"]).map_err(|_| invalid())?,
             )
             .map_err(|_| invalid())?;
-        let accepted_body = &canonical_proof["entry"]["signedRequest"]["body"];
+        let accepted_coordinates =
+            crate::orchestrator::canonical_transport::decode_conversation_coordinates(
+                &serde_json::to_vec(&accepted_body["next"]).map_err(|_| invalid())?,
+            )
+            .map_err(|_| invalid())?;
+        if answer_coordinates != accepted_coordinates {
+            return Err(invalid());
+        }
         let authorized_key = self
             .request_authorized_device_key(
                 accepted_body["actorDid"].as_str().ok_or_else(invalid)?,
@@ -1254,8 +1279,10 @@ where
         if authorized_key != public {
             return Err(invalid());
         }
+        let mut retained_proof = canonical_proof;
+        retained_proof["entry"]["sequencerReceipt"] = sequencer_receipt;
         projection.acceptance_proof =
-            Some(serde_json::to_vec(&canonical_proof).map_err(|_| invalid())?);
+            Some(serde_json::to_vec(&retained_proof).map_err(|_| invalid())?);
         projection.recipient_public_key = Some(public);
         let accepted = projection.view(&owner, &device)?;
         if accepted.consent != RequestConsent::Accepted {

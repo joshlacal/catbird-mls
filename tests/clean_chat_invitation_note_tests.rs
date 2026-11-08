@@ -9,8 +9,6 @@
 //!   qualification (with real PostgreSQL row locks and fault transport) is in
 //!   `mls-ds/e2e-tests/tests/encrypted_request_c28.rs`.
 #![allow(dead_code)]
-#[path = "fixtures/direct_request_i13.rs"]
-mod direct_request_i13;
 mod e2e_harness;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -26,6 +24,7 @@ use catbird_mls::orchestrator::{
 use catbird_mls::{
     DirectRequestInput, DirectRequestOutcome, RequestConsent, RequestCrypto, RequestPreview,
 };
+use e2e_harness::mock_api_client::direct_request_i13;
 use e2e_harness::TestWorld;
 use p256::ecdsa::signature::Signer;
 use serde_json::{json, Value};
@@ -290,6 +289,7 @@ async fn setup_target_group(
     let mut group_state = prior_state.clone();
     group_state["coordinates"]["stateVersion"] = json!(3);
     group_state["snapshotSeq"] = json!(3);
+    group_state["sequencerDid"] = json!("did:web:chat.catbird.blue");
     let provenance = json!({
         "invitationTransitionId": invitation_id,
         "invitedByDid": alice.did,
@@ -336,16 +336,29 @@ async fn setup_target_group(
         )
         .unwrap();
 
+    let entry_id = uuid::Uuid::new_v4().to_string();
+    let received_at = utc(0);
+    let receipt_key = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
+    let sequencer_receipt = direct_request_i13::control_receipt(
+        &receipt_key,
+        &invitation_body,
+        &entry_id,
+        3,
+        &received_at,
+        *transcript.request_digest(),
+        "did:web:chat.catbird.blue",
+    );
     let invitation_entry = json!({
         "$type": "blue.catbird.chat.defs#policyEntry",
-        "entryId": uuid::Uuid::new_v4().to_string(),
+        "entryId": entry_id,
         "conversationId": cid,
         "seq": 3,
         "signedRequest": {
             "body": invitation_body,
             "signature": STANDARD.encode(signature),
         },
-        "receivedAt": utc(0),
+        "receivedAt": received_at,
+        "sequencerReceipt": sequencer_receipt,
     });
 
     view.canonical_state = Some(
@@ -362,6 +375,112 @@ async fn setup_target_group(
         .set_lifecycle_state_for_test(&cid, group_state.clone());
 
     (cid, group_state, invitation_entry, alice_device)
+}
+
+async fn invitation_receipt_fixture() -> (TestWorld, String, Value, Value) {
+    let mut world = TestWorld::new();
+    for (name, did) in [
+        ("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+        ("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+    ] {
+        world.add_client_with_did(name, did).await;
+        world.register_device(name).await.unwrap();
+    }
+    let (_, document, _) = receipt_authority();
+    for name in ["Alice", "Bob"] {
+        world
+            .client(name)
+            .credentials
+            .set_request_authority_document(document.clone());
+    }
+    let invitation_id = uuid::Uuid::new_v4().to_string();
+    let (cid, state, entry, _) = setup_target_group(&world, &invitation_id).await;
+    (world, cid, state, entry)
+}
+
+fn queue_invitation_lookup(world: &TestWorld, state: &Value, entry: &Value) {
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state": state}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries": [entry], "hasMore": false, "nextAfterSeq": 3}),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invitation_reference_accepts_verified_i13_control_receipt() {
+    let (world, cid, state, entry) = invitation_receipt_fixture().await;
+    queue_invitation_lookup(&world, &state, &entry);
+    assert!(world
+        .client("Alice")
+        .orchestrator
+        .get_group_invitation_reference(&cid, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invitation_reference_rejects_missing_i13_control_receipt() {
+    let (world, cid, state, mut entry) = invitation_receipt_fixture().await;
+    entry.as_object_mut().unwrap().remove("sequencerReceipt");
+    queue_invitation_lookup(&world, &state, &entry);
+    assert!(world
+        .client("Alice")
+        .orchestrator
+        .get_group_invitation_reference(&cid, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invitation_reference_rejects_i13_receipt_for_another_seq_digest_kid_or_sequencer() {
+    let (world, cid, state, entry) = invitation_receipt_fixture().await;
+    let body = &entry["signedRequest"]["body"];
+    let strict = decode_strict_json(&serde_json::to_vec(body).unwrap()).unwrap();
+    let transcript = SigningTranscript::build_for(
+        SignedMutationKind::PolicyTransition,
+        &project_signed_body(SignedMutationKind::PolicyTransition, &strict).unwrap(),
+    )
+    .unwrap();
+    let key = p256::ecdsa::SigningKey::from_slice(&[41; 32]).unwrap();
+    for (seq, digest) in [(4, *transcript.request_digest()), (3, [7; 32])] {
+        let mut wrong = entry.clone();
+        wrong["sequencerReceipt"] = direct_request_i13::control_receipt(
+            &key,
+            body,
+            entry["entryId"].as_str().unwrap(),
+            seq,
+            entry["receivedAt"].as_str().unwrap(),
+            digest,
+            "did:web:chat.catbird.blue",
+        );
+        queue_invitation_lookup(&world, &state, &wrong);
+        assert!(world
+            .client("Alice")
+            .orchestrator
+            .get_group_invitation_reference(&cid, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+            .await
+            .is_err());
+    }
+    let mut wrong_kid = entry.clone();
+    wrong_kid["sequencerReceipt"]["kid"] =
+        json!("did:web:chat.catbird.blue#unpublished-receipt-key");
+    let mut wrong_sequencer = entry.clone();
+    wrong_sequencer["sequencerReceipt"]["sequencerDid"] = json!("did:web:other-chat.example");
+    for wrong in [wrong_kid, wrong_sequencer] {
+        queue_invitation_lookup(&world, &state, &wrong);
+        assert!(world
+            .client("Alice")
+            .orchestrator
+            .get_group_invitation_reference(&cid, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+            .await
+            .is_err());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
