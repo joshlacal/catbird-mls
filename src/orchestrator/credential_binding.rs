@@ -268,6 +268,33 @@ pub(crate) fn validate_fetched_key_package_batch(
     Ok(())
 }
 
+/// KeyPackage request authority for one exact MLS leaf.
+///
+/// A leaf credential is `did#deviceId`, but delivery-service KeyPackage
+/// authority is the bare account DID. The DID half must pass the bare-DID gate
+/// of [`validate_fetched_key_package_batch`] and the device half must be a
+/// canonical device UUID, so a malformed leaf fails closed before any request.
+/// The exact leaf is not dropped: [`MLSOrchestrator::verify_fetched_leaf_key_packages`]
+/// binds each response back to it.
+pub(crate) fn leaf_key_package_request_did(leaf_identity: &[u8]) -> super::error::Result<String> {
+    let malformed = || {
+        super::error::OrchestratorError::InvalidInput(
+            "leaf credential is not an exact `did#deviceId` identity".to_string(),
+        )
+    };
+    let (did, device) = std::str::from_utf8(leaf_identity)
+        .ok()
+        .and_then(|identity| identity.split_once('#'))
+        .ok_or_else(malformed)?;
+    if !did.starts_with("did:")
+        || catbird_atproto::types::string::Did::new(did).is_err()
+        || crate::chat_v2::ids::CanonicalUuid::parse(device).is_err()
+    {
+        return Err(malformed());
+    }
+    Ok(did.to_string())
+}
+
 /// Fail-closed structural gate for outbound Add/Swap key-package batches.
 ///
 /// Unlike [`MLSOrchestrator::verify_fetched_key_packages`], this helper is an
@@ -481,6 +508,61 @@ where
             }
         }
 
+        Ok(())
+    }
+
+    /// [`Self::verify_fetched_key_packages`] for packages requested by the bare
+    /// account DID of each leaf being re-added (see
+    /// [`leaf_key_package_request_did`]).
+    ///
+    /// A bare-DID request cannot name a device, so after the shared fetch
+    /// checks the returned `(credential identity, signature key)` multiset must
+    /// equal `leaves` exactly: neither a same-DID sibling device nor another key
+    /// the DID authorizes may stand in for the device and key being re-added.
+    pub(crate) async fn verify_fetched_leaf_key_packages(
+        &self,
+        leaves: &[(Vec<u8>, Vec<u8>)],
+        requested_dids: &[String],
+        key_packages: &[KeyPackageRef],
+        context: &str,
+        conversation_id: Option<&str>,
+    ) -> super::error::Result<()> {
+        self.verify_fetched_key_packages(requested_dids, key_packages, context, conversation_id)
+            .await?;
+        if key_packages.len() != leaves.len() {
+            return Err(super::error::OrchestratorError::InvalidInput(format!(
+                "{} key packages for {} re-added leaves",
+                key_packages.len(),
+                leaves.len()
+            )));
+        }
+        let mut unmatched = leaves.iter().collect::<Vec<_>>();
+        for kp in key_packages {
+            // Already decoded once by the shared checks above.
+            let binding = extract_key_package_binding(&kp.key_package_data)
+                .map_err(super::error::OrchestratorError::InvalidInput)?;
+            match unmatched.iter().position(|(identity, signature_key)| {
+                identity.as_slice() == binding.identity.as_bytes()
+                    && *signature_key == binding.signature_key
+            }) {
+                Some(index) => {
+                    unmatched.swap_remove(index);
+                }
+                None => {
+                    return Err(self
+                        .emit_credential_binding_rejection(
+                            conversation_id,
+                            "fetch",
+                            context,
+                            &kp.did,
+                            &binding.identity,
+                            &sha256_prefix(&kp.key_package_data),
+                            "credential identity and signature key are not exactly a leaf being re-added",
+                        )
+                        .await)
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1223,6 +1305,31 @@ mod tests {
             .expect_err("aggregate bytes must be bounded before parsing");
         assert!(error.to_string().contains("batch"));
         assert!(error.to_string().contains("exceeding"));
+    }
+
+    #[test]
+    fn leaf_request_did_is_the_bare_did_of_an_exact_leaf_and_refuses_malformed_devices() {
+        let device = "70707070-7070-4070-b070-707070707070";
+        assert_eq!(
+            leaf_key_package_request_did(format!("did:plc:alice#{device}").as_bytes()).unwrap(),
+            "did:plc:alice"
+        );
+        for malformed in [
+            "did:plc:alice".to_string(),
+            "did:plc:alice#".to_string(),
+            "did:plc:alice#device-1".to_string(),
+            format!("did:plc:alice#{}", device.to_uppercase()),
+            format!("did:plc:alice#{device}#{device}"),
+            format!("did:plc:alice#{device}#"),
+            format!("alice#{device}"),
+            format!("did:plc:#{device}"),
+        ] {
+            assert!(
+                leaf_key_package_request_did(malformed.as_bytes()).is_err(),
+                "{malformed} must not become KeyPackage request authority"
+            );
+        }
+        assert!(leaf_key_package_request_did(&[0xFF, b'#']).is_err());
     }
 
     #[test]

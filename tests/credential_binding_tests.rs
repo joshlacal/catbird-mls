@@ -986,6 +986,251 @@ async fn fork_readd_key_package_fetch_warns_on_mismatch() {
 }
 
 // ---------------------------------------------------------------------------
+// (b3) Fork readd: bare account DID requests, exact re-added leaves
+// ---------------------------------------------------------------------------
+
+/// Alice's group with Bob's one device added by `swap_members`, and a
+/// recording observer on Alice.
+async fn fork_readd_world(label: &str) -> (TestWorld, Arc<RecordingObserver>, String, String) {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let observer = Arc::new(RecordingObserver::default());
+    alice
+        .orchestrator
+        .set_event_observer(Some(observer.clone()))
+        .await;
+    let convo = alice
+        .orchestrator
+        .create_group(label, None, None)
+        .await
+        .expect("create group");
+    alice
+        .orchestrator
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
+    (world, observer, convo.conversation_id, convo.group_id)
+}
+
+/// FORK_DETECTION_THRESHOLD undecryptable frames run `attempt_fork_readd`.
+async fn drive_fork_readd(world: &TestWorld, conversation_id: &str, sender_did: &str) {
+    for i in 0..2 {
+        let envelope = IncomingEnvelope {
+            canonical_entry_json: None,
+            conversation_id: conversation_id.to_string(),
+            sender_did: sender_did.to_string(),
+            ciphertext: format!("not-an-mls-message-{i}").into_bytes(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some(format!("fork-readd-exact-leaf-{i}")),
+            server_epoch: None,
+            server_sequence: None,
+        };
+        let result = world
+            .client("Alice")
+            .orchestrator
+            .process_incoming(&envelope)
+            .await;
+        assert!(result.is_err(), "invalid ciphertext drives decrypt failure");
+    }
+}
+
+fn submitted_transitions(world: &TestWorld) -> usize {
+    world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|request| {
+            request.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+        })
+        .count()
+}
+
+async fn assert_fork_readd_refused_before_submit(
+    world: &TestWorld,
+    conversation_id: &str,
+    group_id: &str,
+    epoch_before: u64,
+    submissions_before: usize,
+) {
+    let alice = world.client("Alice");
+    assert_eq!(
+        submitted_transitions(world),
+        submissions_before,
+        "a refused fork readd submits no transition"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(group_id).unwrap())
+            .unwrap(),
+        epoch_before,
+        "a refused fork readd neither stages nor merges a commit"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(conversation_id),
+        Some(&ConversationState::NeedsRejoin)
+    );
+    assert!(alice.storage.has_rejoin_flag(conversation_id));
+}
+
+/// A bare-DID KeyPackage request lets the DS pick the device. Fork readd must
+/// still refuse a package unless it is exactly Bob's re-added leaf, even when
+/// a key that Bob's DID authorizes signed it: a same-DID sibling device, and
+/// Bob's exact `did#deviceId` under another authorized key, both fail closed
+/// before any transition is submitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_readd_refuses_sibling_device_or_other_authorized_key_for_exact_leaf() {
+    for sibling_device in [true, false] {
+        let (mut world, observer, conversation_id, group_id) =
+            fork_readd_world("fork readd exact leaf").await;
+        let bob_did = world.client("Bob").did.clone();
+        let bob_leaf = format!(
+            "{bob_did}#{}",
+            world
+                .client("Bob")
+                .orchestrator
+                .require_actor_device_id()
+                .await
+                .unwrap()
+        );
+        let bob_key = world
+            .client("Bob")
+            .orchestrator
+            .mls_context()
+            .identity_public_key(bob_leaf.clone())
+            .unwrap();
+        let claimed = if sibling_device {
+            format!("{bob_did}#{}", uuid::Uuid::new_v4())
+        } else {
+            bob_leaf
+        };
+        // A fresh context of Bob's account mints the substitute under a new key,
+        // which Bob's DID then authorizes alongside his real device key.
+        world.add_client_with_did("BobOther", &bob_did).await;
+        let substitute = world
+            .client("BobOther")
+            .orchestrator
+            .mls_context()
+            .create_key_package(claimed.clone().into_bytes())
+            .unwrap();
+        let alice = world.client("Alice");
+        alice.credentials.set_authorized_device_keys(
+            &bob_did,
+            vec![bob_key, substitute.signature_public_key.clone()],
+        );
+        let pool = "did:plc:substitutes";
+        world
+            .delivery_service()
+            .clone_as(pool)
+            .publish_key_package(
+                &substitute.key_package_data,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+        world
+            .delivery_service()
+            .redirect_key_packages_for_test(&bob_did, pool);
+        let epoch_before = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&group_id).unwrap())
+            .unwrap();
+        let submissions_before = submitted_transitions(&world);
+
+        drive_fork_readd(&world, &conversation_id, &bob_did).await;
+
+        let warning = observer
+            .credential_warnings()
+            .into_iter()
+            .find(|warning| warning.claimed_identity == claimed)
+            .unwrap_or_else(|| {
+                panic!(
+                    "sibling_device={sibling_device}: the substitute must be refused by the exact-leaf binding, got {:?}",
+                    observer.credential_warnings()
+                )
+            });
+        assert_eq!(warning.operation, "fetch");
+        assert_eq!(
+            warning.expected_did, bob_did,
+            "request authority is the bare DID"
+        );
+        assert!(
+            warning.reason.contains("not exactly a leaf being re-added"),
+            "{}",
+            warning.reason
+        );
+        assert_fork_readd_refused_before_submit(
+            &world,
+            &conversation_id,
+            &group_id,
+            epoch_before,
+            submissions_before,
+        )
+        .await;
+    }
+}
+
+/// A leaf whose device is not a canonical UUID never becomes KeyPackage
+/// request authority: fork readd fails before asking the DS for any package.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_readd_malformed_leaf_device_fails_before_key_package_request() {
+    let (world, observer, conversation_id, group_id) =
+        fork_readd_world("fork readd malformed leaf").await;
+    let bob_did = world.client("Bob").did.clone();
+    let malformed = world
+        .client("Bob")
+        .orchestrator
+        .mls_context()
+        .create_key_package(format!("{bob_did}#device-1").into_bytes())
+        .unwrap();
+    let alice_context = world.client("Alice").orchestrator.mls_context();
+    let group = hex::decode(&group_id).unwrap();
+    MlsCryptoContext::add_members(
+        alice_context.as_ref(),
+        group.clone(),
+        vec![catbird_mls::KeyPackageData {
+            data: malformed.key_package_data,
+        }],
+    )
+    .expect("stage the malformed leaf locally");
+    let epoch_before = MlsCryptoContext::merge_pending_commit(alice_context.as_ref(), group)
+        .expect("merge the malformed leaf locally");
+    let fetches_before = world.delivery_service().get_key_packages_call_count();
+    let submissions_before = submitted_transitions(&world);
+
+    drive_fork_readd(&world, &conversation_id, &bob_did).await;
+
+    assert_eq!(
+        world.delivery_service().get_key_packages_call_count(),
+        fetches_before,
+        "a malformed leaf must not reach the DS as KeyPackage request authority"
+    );
+    assert!(observer.credential_warnings().is_empty());
+    assert_fork_readd_refused_before_submit(
+        &world,
+        &conversation_id,
+        &group_id,
+        epoch_before,
+        submissions_before,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // (c) Equivocating receipts → detection fires, recovery still proceeds
 // ---------------------------------------------------------------------------
 

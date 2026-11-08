@@ -1198,48 +1198,56 @@ where
                 )));
             }
         };
-        let mems = group_state_projection.members.clone();
-        if mems.is_empty() {
-            self.escalate_fork_to_rejoin(convo_id).await;
-            return Err(OrchestratorError::RecoveryFailed("no members".into()));
-        }
-        let actor_device_id = match self.require_actor_device_id().await {
-            Ok(id) => id,
-            Err(e) => {
-                self.escalate_fork_to_rejoin(convo_id).await;
-                return Err(e);
+        // Fork readd re-adds exactly the MLS tree's other leaves (`did#deviceId`
+        // and signature key; the projection may only hold account DIDs). Their
+        // KeyPackage request authority is the bare account DID, so the packages
+        // must come back as exactly those leaves before OpenMLS sees them. This
+        // is an automated Add path a malicious DS can steer clients into via
+        // decrypt failures (ADR-009 D3).
+        let fetched: Result<_> = async {
+            let own_identity = self.require_scoped_identity().await?;
+            let mut leaves = self
+                .mls_context()
+                .group_member_leaf_bindings(gid.clone())?
+                .ok_or_else(|| {
+                    OrchestratorError::RecoveryFailed(
+                        "fork readd needs the group's leaf bindings".into(),
+                    )
+                })?;
+            leaves.retain(|(identity, _)| identity.as_slice() != own_identity.as_bytes());
+            if leaves.is_empty() {
+                return Err(OrchestratorError::RecoveryFailed("no members".into()));
             }
-        };
-        let kp_refs = match self
-            .api_client()
-            .get_key_packages(&actor_device_id, &mems)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                self.escalate_fork_to_rejoin(convo_id).await;
-                return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
-            }
-        };
-
-        // WS-3 stage 1 (ADR-009 D3): warn-and-allow credential binding check
-        // before the fetched packages are consumed by the fork-readd commit
-        // (`recover_fork_by_readding` → `commit_group_change("forkReadd")`).
-        // This is an automated Add path a malicious DS can steer clients into
-        // via decrypt failures, so it must hit the same verify-on-fetch
-        // chokepoint as create_group / add_members / swap_members.
-        if let Err(error) = self
-            .verify_fetched_key_packages(
-                &mems,
+            let request_dids = leaves
+                .iter()
+                .map(|(identity, _)| {
+                    super::credential_binding::leaf_key_package_request_did(identity)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let actor_device_id = self.require_actor_device_id().await?;
+            let kp_refs = self
+                .api_client()
+                .get_key_packages(&actor_device_id, &request_dids)
+                .await
+                .map_err(|e| OrchestratorError::RecoveryFailed(format!("{e}")))?;
+            self.verify_fetched_leaf_key_packages(
+                &leaves,
+                &request_dids,
                 &kp_refs,
                 "fork_readd",
                 Some(&resolved.conversation_id),
             )
-            .await
-        {
-            self.escalate_fork_to_rejoin(convo_id).await;
-            return Err(error);
+            .await?;
+            Ok(kp_refs)
         }
+        .await;
+        let kp_refs = match fetched {
+            Ok(kp_refs) => kp_refs,
+            Err(error) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(error);
+            }
+        };
         let (metadata_plaintext, metadata_version) = match self
             .decrypt_current_metadata_snapshot(&resolved.conversation_id, &gid)
             .await
@@ -6791,6 +6799,9 @@ mod tests {
             .expect("durable group state exists");
         assert_eq!(durable_before.epoch, source_epoch);
         alice.storage.fail_next_set_group_state();
+        let bob_did = world.client("Bob").did.clone();
+        let own_packages_before = world.delivery_service().key_package_count(&alice.did);
+        let bob_packages_before = world.delivery_service().key_package_count(&bob_did);
 
         let result = alice
             .orchestrator
@@ -6805,6 +6816,14 @@ mod tests {
             canonical_transition_submission_count(&world),
             submissions_before + 1,
             "failure injection must occur after canonical server acceptance and local merge"
+        );
+        assert_eq!(
+            (
+                world.delivery_service().key_package_count(&alice.did),
+                world.delivery_service().key_package_count(&bob_did),
+            ),
+            (own_packages_before, bob_packages_before - 1),
+            "fork readd fetches exactly one package, for Bob's one re-added leaf, and none for its own leaf"
         );
         assert_eq!(
             alice
