@@ -38,6 +38,10 @@ mod native_archive_space_auth {
     const MAX_INVENTORY_PAGES: usize = 1_000;
     const MAX_INVENTORY_WRITERS: usize = 100_000;
     const MAX_INVENTORY_BYTES: usize = 64 * 1024 * 1024;
+    /// mls-ds `space_host`: the authority's signed refusal of a credential request.
+    const SPACE_DENIAL_TYP: &str = "catbird-space-denial+jwt";
+    const SPACE_DENIAL_REASON: &str = "notActiveMember";
+    const SPACE_DENIAL_MAX_LIFETIME_SECS: u64 = 60;
 
     struct Credential {
         jwt: Zeroizing<String>,
@@ -179,17 +183,16 @@ mod native_archive_space_auth {
             let authority_kem = authority.atproto_kem_did_key.clone();
             let kem_key = if writer == authority.id { authority_kem.clone() } else { self.space_document(&writer)?.atproto_kem_did_key };
             // Only the Space authority can deny membership: the account PDS for its personal
-            // mailbox, the home DS for a conversation Space it is itself the authority of. A
-            // home DS relaying a foreign authority's refusal, of the credential or of a read
-            // after it was granted, proves no removal.
-            let authority_answers = personal || space.authority == self.config.home_ds_did.trim();
-            let relayed_denial = |status: u16| {
-                format!("{}: relayed HTTP {status}", super::NATIVE_UNAUTHENTICATED_DENIAL)
+            // mailbox, over the account's own session; for a conversation Space, its signed denial
+            // of this credential request (`verify_space_denial`), which a home DS relays byte for
+            // byte whether or not it is that authority. An unsigned refusal, of the credential or
+            // of a read after it was granted, proves no removal.
+            let unsigned_denial = |status: u16| {
+                format!("{}: unsigned HTTP {status}", super::NATIVE_UNAUTHENTICATED_DENIAL)
             };
             let credential = match self.space_credential(&space, personal, authority)? {
                 Ok(credential) => credential,
-                Err(denied) if authority_answers => return Ok(into_response(denied)),
-                Err(denied) => return Err(relayed_denial(denied.status)),
+                Err(denied) => return Ok(into_response(denied)),
             };
             let mut context = ReadContext { space, writer, personal, kem_key, credential };
             if context.space.space_type == "blue.catbird.labyrinth.conversation"
@@ -224,8 +227,8 @@ mod native_archive_space_auth {
             };
             let (mut response, secret) = self.space_read(&context, &request.nsid, &request.path, request.headers, mac_type)?;
             if !(200..300).contains(&response.status) {
-                if !authority_answers && reads_as_space_denial(&response) {
-                    return Err(relayed_denial(response.status));
+                if !personal && reads_as_space_denial(&response) {
+                    return Err(unsigned_denial(response.status));
                 }
                 return Ok(into_response(response));
             }
@@ -331,13 +334,19 @@ mod native_archive_space_auth {
             // No Authorization header here: the existing transport callback supplies
             // PDS OAuth or endpoint-specific home-DS service auth, never a foreign DS.
             let response = bounded(self.execute(base, "POST".into(), format!("/xrpc/{nsid}"), vec![], Some(body))?)?;
-            let denied = response.status == 403
-                && serde_json::from_slice::<Value>(&response.body)
+            if response.status == 403 {
+                if !personal {
+                    self.verify_space_denial(space, &kid, &authority, &response.body)
+                        .map_err(|error| format!("{}: {error}", super::NATIVE_UNAUTHENTICATED_DENIAL))?;
+                    return Ok(Err(response));
+                }
+                let denied = serde_json::from_slice::<Value>(&response.body)
                     .ok()
                     .and_then(|body| body["error"].as_str().map(str::to_owned))
                     .is_some_and(|code| matches!(code.as_str(), "Forbidden" | "NotAuthorized"));
-            if denied {
-                return Ok(Err(response));
+                if denied {
+                    return Ok(Err(response));
+                }
             }
             // A revoked/invalid delegation (401), an undeclared 403, and every other transport or
             // directory failure are authentication failures, never proof of Space removal.
@@ -363,6 +372,75 @@ mod native_archive_space_auth {
                 return Err("native_space_credential_expired".into());
             }
             Ok(())
+        }
+
+        /// The Space authority's signed refusal of this credential request. Its `#atproto` key
+        /// (`kid` names it) signed `catbird-space-denial+jwt` claims for exactly this Space and its
+        /// `{conversationId}-{generation}`, the MLS group pinned for it, this account, the
+        /// non-member reason, and a live window of at most 60 s. `cnf.kid` must be this request's
+        /// fresh PoP key, so no refusal answers any other request.
+        fn verify_space_denial(&self, space: &SpaceUri, kid: &str, authority: &DidDocument, body: &[u8]) -> Result<(), String> {
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            #[derive(Deserialize)]
+            struct Refusal { denial: String }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Header { alg: String, typ: String, kid: String }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Cnf { kid: String }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Claims {
+                iss: String, sub: String, aud: String, iat: u64, exp: u64, jti: String, cnf: Cnf,
+                conversation_id: String, generation: u64, group_id: String, reason: String,
+            }
+            let denial = serde_json::from_slice::<Refusal>(body).map_err(|_| "refusal carries no signed denial")?.denial;
+            if denial.len() > atproto_spaces::tokens::MAX_COMPACT_JWT_BYTES {
+                return Err("oversized denial".into());
+            }
+            let (input, signature) = denial.rsplit_once('.').ok_or("malformed denial")?;
+            let (header, claims) = input.split_once('.').ok_or("malformed denial")?;
+            let part = |part: &str| URL_SAFE_NO_PAD.decode(part).map_err(|_| "malformed denial".to_owned());
+            let header: Header = serde_json::from_slice(&part(header)?).map_err(|_| "malformed denial header")?;
+            let claims: Claims = serde_json::from_slice(&part(claims)?).map_err(|_| "malformed denial claims")?;
+            let signature = part(signature)?;
+            if header.typ != SPACE_DENIAL_TYP || header.kid != atproto_spaces::tokens::ATPROTO_KEY_ID {
+                return Err("not a Space denial".into());
+            }
+            if claims.iss != space.authority || claims.sub != space.raw || claims.aud != self.config.account_did
+                || claims.cnf.kid != kid || claims.reason != SPACE_DENIAL_REASON
+                || format!("{}-{}", claims.conversation_id, claims.generation) != space.rkey
+                || self.pinned_space_group(space)?.as_deref() != Some(claims.group_id.as_str())
+                || claims.jti.is_empty() || claims.jti.len() > atproto_spaces::tokens::MAX_JTI_BYTES
+            {
+                return Err("denial binding mismatch".into());
+            }
+            let now = self.hooks.now_secs();
+            if claims.exp <= now || claims.exp <= claims.iat || claims.exp - claims.iat > SPACE_DENIAL_MAX_LIFETIME_SECS
+                || claims.iat > now + atproto_spaces::tokens::MAX_IAT_LEAD_SECS
+            {
+                return Err("stale denial".into());
+            }
+            // A rotated `#atproto` key: one fresh DID document, as for credentials.
+            let verifies = |document: &DidDocument| document.atproto_key.as_ref()
+                .is_some_and(|key| key.verify_raw(&header.alg, input.as_bytes(), &signature));
+            if verifies(authority) || verifies(&self.space_document(&space.authority)?) {
+                return Ok(());
+            }
+            Err("denial signature".into())
+        }
+
+        /// The MLS group pinned with `space` (`pin_native_conversation*`): from the verified local
+        /// roster or the newest signed owner receipt.
+        fn pinned_space_group(&self, space: &SpaceUri) -> Result<Option<String>, String> {
+            let key = format!("native.placements:{}", crate::labyrinth::space::thread_placement_key(&self.config.account_did));
+            let Some(raw) = self.db.read_tx(|tx| tx.get_labyrinth_state(&key)).map_err(|e| e.to_string())? else {
+                return Ok(None);
+            };
+            let pins: BTreeMap<String, crate::labyrinth::space::ThreadPlacement> =
+                serde_json::from_slice(&raw).map_err(|e| format!("native_space_invalid_pins: {e}"))?;
+            Ok(pins.into_values().find(|pin| pin.space.as_deref() == Some(space.raw.as_str())).and_then(|pin| pin.group_id))
         }
 
         fn space_read(&self, context: &ReadContext, nsid: &str, path: &str, mut headers: Vec<(String, String)>, mac_type: Option<&str>) -> Result<(PlatformHttpResponse, Option<Zeroizing<[u8; 32]>>), String> {
@@ -1204,12 +1282,65 @@ mod native_archive_space_auth {
         const REV: &str = "3jzfcijpj2z2a";
         const NOW: u64 = 1_700_000_000;
         const BLOB: &[u8] = b"sealed attachment ciphertext";
+        /// The MLS group the conversation Space `conversation-0` is pinned with.
+        const GROUP: [u8; 32] = [6; 32];
 
         struct Host {
             signing: P256SecretKey,
             kem: P256SecretKey,
             fault: Mutex<&'static str>,
             requests: Mutex<Vec<PlatformHttpRequest>>,
+        }
+
+        impl Host {
+            /// The authority's refusal of the credential request for `space` under PoP key `kid`,
+            /// as mls-ds signs it, with one `mutation` applied.
+            fn signed_refusal(&self, space: &SpaceUri, kid: &str, mutation: &str) -> Vec<u8> {
+                use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                use p256::ecdsa::signature::Signer as _;
+                if mutation == "unsigned" {
+                    return br#"{"error":"NotAuthorized","message":"not a member"}"#.to_vec();
+                }
+                let (conversation, generation) = space.rkey.rsplit_once('-').unwrap();
+                let mut header = json!({"alg": "ES256", "typ": "catbird-space-denial+jwt", "kid": "#atproto"});
+                let mut claims = json!({
+                    "iss": space.authority, "sub": space.raw, "aud": ACCOUNT, "iat": NOW, "exp": NOW + 60,
+                    "jti": "denial-from-test-host", "cnf": {"kid": kid},
+                    "conversationId": conversation, "generation": generation.parse::<u64>().unwrap(),
+                    "groupId": hex::encode(GROUP), "reason": "notActiveMember",
+                });
+                match mutation {
+                    "valid" | "tampered_signature" | "tampered_claims" | "foreign_key" => {}
+                    // The refusal of an earlier request, under that request's PoP key.
+                    "replayed" => claims["cnf"]["kid"] = encode_p256_did_key(&self.kem.public_key()).into(),
+                    "wrong_authority" => claims["iss"] = "did:web:other-authority.example".into(),
+                    "wrong_requester" => claims["aud"] = WRITER.into(),
+                    "wrong_space" => claims["sub"] = format!("at://{}/space/{}/other-0", space.authority, space.space_type).into(),
+                    "wrong_conversation" => claims["conversationId"] = "other".into(),
+                    "wrong_generation" => claims["generation"] = 1.into(),
+                    "wrong_group" => claims["groupId"] = hex::encode([8; 32]).into(),
+                    "expired" => (claims["iat"], claims["exp"]) = ((NOW - 60).into(), NOW.into()),
+                    "long_lived" => claims["exp"] = (NOW + 61).into(),
+                    "future" => (claims["iat"], claims["exp"]) = ((NOW + 30).into(), (NOW + 90).into()),
+                    "wrong_reason" => claims["reason"] = "spaceDeleted".into(),
+                    "wrong_typ" => header["typ"] = "atproto-space-credential+jwt".into(),
+                    "wrong_kid" => header["kid"] = "#mls-receipt-1".into(),
+                    "extra_claim" => claims["lxm"] = "com.atproto.space.getSpaceCredential".into(),
+                    other => panic!("unknown refusal mutation {other}"),
+                }
+                let encode = |value: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap());
+                let input = format!("{}.{}", encode(&header), encode(&claims));
+                let signing = if mutation == "foreign_key" { P256SecretKey::from_slice(&[9; 32]).unwrap() } else { self.signing.clone() };
+                let signature: p256::ecdsa::Signature = p256::ecdsa::SigningKey::from(&signing).sign(input.as_bytes());
+                let mut signature = signature.to_bytes().to_vec();
+                if mutation == "tampered_signature" { signature[7] ^= 1; }
+                let input = if mutation == "tampered_claims" {
+                    claims["jti"] = "tampered".into();
+                    format!("{}.{}", encode(&header), encode(&claims))
+                } else { input };
+                let denial = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature));
+                serde_json::to_vec(&json!({"error": "NotAuthorized", "message": "not a member", "denial": denial})).unwrap()
+            }
         }
 
         fn response(body: Value) -> PlatformHttpResponse {
@@ -1271,9 +1402,6 @@ mod native_archive_space_auth {
                 }
                 if matches!(nsid, "com.atproto.space.getSpaceCredential" | "blue.catbird.chat.relaySpaceCredential") {
                     assert_eq!(request.method, "POST");
-                    if fault == "credential_denied" {
-                        return Ok(PlatformHttpResponse { status: 403, headers: vec![], body: br#"{"error":"NotAuthorized","message":"not a member"}"#.to_vec() });
-                    }
                     if fault == "credential_auth_failed" {
                         return Ok(PlatformHttpResponse { status: 401, headers: vec![], body: br#"{"error":"InvalidDelegationToken"}"#.to_vec() });
                     }
@@ -1288,6 +1416,12 @@ mod native_archive_space_auth {
                         body["credentialKid"].as_str().unwrap()
                     };
                     assert!(request.headers.iter().all(|h| !h.name.eq_ignore_ascii_case("authorization")));
+                    if fault == "credential_denied" {
+                        return Ok(PlatformHttpResponse { status: 403, headers: vec![], body: self.signed_refusal(&space, kid, "unsigned") });
+                    }
+                    if let Some(mutation) = fault.strip_prefix("denied:") {
+                        return Ok(PlatformHttpResponse { status: 403, headers: vec![], body: self.signed_refusal(&space, kid, mutation) });
+                    }
                     let signing = if fault == "bad_signature" { P256SecretKey::from_slice(&[9; 32]).unwrap() } else { self.signing.clone() };
                     let other_kid = encode_p256_did_key(&self.kem.public_key());
                     let subject = if fault == "wrong_space" {
@@ -1841,51 +1975,93 @@ mod native_archive_space_auth {
             assert!(error.starts_with("native_space_getSpaceCredential: HTTP 401"), "{error}");
         }
 
+        /// Pin the conversation Space with `group`, as `pin_native_conversation*` does.
+        fn pin_group(gateway: &NativeArchiveGateway, group: [u8; 32]) {
+            let pins = json!({"conversation": {"space": space(false).raw, "generation": 0, "groupId": hex::encode(group)}});
+            let key = format!("native.placements:{}", crate::labyrinth::space::thread_placement_key(ACCOUNT));
+            gateway.db.write_tx(|tx| tx.put_labyrinth_state(&key, &serde_json::to_vec(&pins).unwrap(), 0)).unwrap();
+        }
 
-        #[test]
-        fn native_space_auth_accepts_only_the_authoritys_own_refusal_as_space_denial() {
-            for (personal, home_ds_did) in [(true, "did:web:home.example"), (false, AUTHORITY)] {
-                let (_directory, mut gateway, host) = gateway();
-                gateway.config.home_ds_did = home_ds_did.into();
-                *host.fault.lock().unwrap() = "credential_denied";
-                let response = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, personal))).unwrap();
-                assert_eq!(response.status, 403, "personal {personal}");
-                let body: Value = serde_json::from_slice(&response.body).unwrap();
-                let denial = labyrinth::store::space::SpaceError {
-                    status: response.status, error: body["error"].as_str().map(str::to_owned), message: None,
-                };
-                assert_eq!(labyrinth::store::space::map_space_error(denial), labyrinth::Error::Forbidden);
-                assert!(host.requests.lock().unwrap().iter().all(|r| !r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
-                    "no read follows a refused credential");
+        /// What a restore makes of a refusal: Space denial (`Forbidden`) or `ArchiveRestorePending`.
+        fn restore_outcome(gateway: NativeArchiveGateway) -> Result<(), crate::MLSError> {
+            let transport = crate::labyrinth::SpaceXrpcTransport::new(Arc::new(gateway));
+            match block_on_sync(transport.get_record(&space(false).raw, WRITER, COLLECTION, "batch-1")).unwrap_err() {
+                labyrinth::store::space::SpaceError { status: 403, error, .. } => {
+                    let refusal = labyrinth::store::space::SpaceError { status: 403, error, message: None };
+                    assert_eq!(labyrinth::store::space::map_space_error(refusal), labyrinth::Error::Forbidden);
+                    Ok(())
+                }
+                refused => Err(super::super::native_archive_error(crate::labyrinth::map_error(
+                    labyrinth::store::space::map_space_error(refused),
+                ))),
             }
-            // The home DS relaying a foreign authority's refusal is no Space denial.
-            let (_directory, gateway, host) = gateway();
+        }
+
+        /// The personal mailbox's own PDS denies over the account's session. A conversation Space
+        /// refusal is Space denial only as its authority's signed denial of this exact request, the
+        /// same whether the home DS is that authority or relays a foreign one; anything else is a
+        /// pending restore.
+        #[test]
+        fn native_space_auth_accepts_only_the_authoritys_signed_refusal_as_space_denial() {
+            let (_directory, personal, host) = gateway();
             *host.fault.lock().unwrap() = "credential_denied";
-            let error = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false))).unwrap_err();
+            let response = block_on_sync(personal.execute_authenticated_space(request(GET_RECORD, true))).unwrap();
+            assert_eq!(response.status, 403);
+
+            for home_ds_did in ["did:web:home.example", AUTHORITY] {
+                let (_directory, mut accepted, host) = gateway();
+                accepted.config.home_ds_did = home_ds_did.into();
+                pin_group(&accepted, GROUP);
+                *host.fault.lock().unwrap() = "denied:valid";
+                let response = block_on_sync(accepted.execute_authenticated_space(request(GET_RECORD, false))).unwrap();
+                assert_eq!(response.status, 403, "{home_ds_did}");
+                assert!(host.requests.lock().unwrap().iter().all(|r| !r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
+                    "{home_ds_did}: no read follows a refused credential");
+                restore_outcome(accepted).expect("the authority's signed denial is Space denial");
+
+                for fault in [
+                    "credential_denied", "denied:tampered_signature", "denied:tampered_claims",
+                    "denied:foreign_key", "denied:replayed", "denied:wrong_authority", "denied:wrong_requester",
+                    "denied:wrong_space", "denied:wrong_conversation", "denied:wrong_generation",
+                    "denied:wrong_group", "denied:expired", "denied:long_lived", "denied:future",
+                    "denied:wrong_reason", "denied:wrong_typ", "denied:wrong_kid", "denied:extra_claim",
+                ] {
+                    let (_directory, mut refused, host) = gateway();
+                    refused.config.home_ds_did = home_ds_did.into();
+                    pin_group(&refused, GROUP);
+                    *host.fault.lock().unwrap() = fault;
+                    let error = restore_outcome(refused).expect_err(fault);
+                    assert!(matches!(&error, crate::MLSError::InvalidState(code) if code == "ArchiveRestorePending"),
+                        "{home_ds_did} {fault}: {error}");
+                }
+            }
+            // Without the group its restore pinned, no denial binds this device's conversation.
+            let (_directory, unpinned, host) = gateway();
+            *host.fault.lock().unwrap() = "denied:valid";
+            let error = block_on_sync(unpinned.execute_authenticated_space(request(GET_RECORD, false))).unwrap_err();
             assert!(error.starts_with(super::super::NATIVE_UNAUTHENTICATED_DENIAL), "{error}");
         }
 
-        /// A read refused after the credential was granted: the authority's own refusal is Space
-        /// denial; relayed from a foreign authority, the restore stays pending.
+        /// A read refused after the credential was granted carries no signed denial: Space denial
+        /// from the personal mailbox's PDS only; for a conversation Space the restore stays pending,
+        /// through any home.
         #[test]
-        fn native_space_read_refused_after_a_granted_credential_is_denial_only_from_the_authority() {
-            for (personal, home_ds_did) in [(true, "did:web:home.example"), (false, AUTHORITY)] {
-                let (_directory, mut gateway, host) = gateway();
-                gateway.config.home_ds_did = home_ds_did.into();
-                *host.fault.lock().unwrap() = "read_denied";
-                let response = block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, personal))).unwrap();
-                assert_eq!(response.status, 403, "personal {personal}");
-                assert!(host.requests.lock().unwrap().iter().any(|r| r.url.contains("/xrpc/com.atproto.space.getRecord?") || r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
-                    "personal {personal}: the read followed a granted credential");
-            }
-            let (_directory, gateway, host) = gateway();
+        fn native_space_read_refused_after_a_granted_credential_is_never_conversation_denial() {
+            let (_directory, personal, host) = gateway();
             *host.fault.lock().unwrap() = "read_denied";
-            let transport = crate::labyrinth::SpaceXrpcTransport::new(Arc::new(gateway));
-            let refused = block_on_sync(transport.get_record(&space(false).raw, WRITER, COLLECTION, "batch-1")).unwrap_err();
-            assert!(host.requests.lock().unwrap().iter().any(|r| r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
+            let response = block_on_sync(personal.execute_authenticated_space(request(GET_RECORD, true))).unwrap();
+            assert_eq!(response.status, 403);
+            assert!(host.requests.lock().unwrap().iter().any(|r| r.url.contains("/xrpc/com.atproto.space.getRecord?")),
                 "the read followed a granted credential");
-            let error = super::super::native_archive_error(crate::labyrinth::map_error(labyrinth::store::space::map_space_error(refused)));
-            assert!(matches!(&error, crate::MLSError::InvalidState(code) if code == "ArchiveRestorePending"), "{error}");
+            for home_ds_did in ["did:web:home.example", AUTHORITY] {
+                let (_directory, mut refused, host) = gateway();
+                refused.config.home_ds_did = home_ds_did.into();
+                *host.fault.lock().unwrap() = "read_denied";
+                let error = restore_outcome(refused).expect_err(home_ds_did);
+                assert!(host.requests.lock().unwrap().iter().any(|r| r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead")),
+                    "{home_ds_did}: the read followed a granted credential");
+                assert!(matches!(&error, crate::MLSError::InvalidState(code) if code == "ArchiveRestorePending"), "{home_ds_did}: {error}");
+            }
         }
 
         #[test]

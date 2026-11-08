@@ -1098,6 +1098,7 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
                 "at://{foreign_ds}/space/blue.catbird.labyrinth.conversation/{kicked_conv}-0"
             )),
             generation: 0,
+            group_id: None,
         },
     );
     pinned_placements

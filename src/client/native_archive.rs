@@ -335,7 +335,7 @@ impl labyrinth::store::pds::PublicRepoBackend for NativeArchiveGateway {
     }
 }
 
-/// Marks a Space refusal that only the home DS relayed for a foreign Space authority.
+/// Marks a conversation Space refusal that is not the authority's verified signed denial.
 #[cfg(feature = "labyrinth")]
 const NATIVE_UNAUTHENTICATED_DENIAL: &str = "native_space_unauthenticated_denial";
 
@@ -345,7 +345,7 @@ fn native_archive_error(error: crate::orchestrator::error::OrchestratorError) ->
     if message.contains("native_archive_context_closed") {
         return MLSError::ContextClosed;
     }
-    // A relayed refusal proves no removal: the restore waits for the authority itself.
+    // An unproven refusal proves no removal: the restore waits for the authority's signed denial.
     if message.contains(NATIVE_UNAUTHENTICATED_DENIAL) {
         return MLSError::InvalidState("ArchiveRestorePending".into());
     }
@@ -729,6 +729,7 @@ impl CatbirdMlsClient {
         sequencer_did: &str,
         generation: u64,
         explicit_space: Option<&str>,
+        group_id: &[u8],
     ) -> Result<(), MLSError> {
         if !sequencer_did.starts_with("did:") || sequencer_did.contains('#') {
             return Err(MLSError::Cryptography(
@@ -749,6 +750,7 @@ impl CatbirdMlsClient {
             ));
         }
         let space = space_ref.to_string();
+        let group_id = hex::encode(group_id);
         self.db.write_tx(|tx| {
             let key = format!(
                 "native.placements:{}",
@@ -784,13 +786,21 @@ impl CatbirdMlsClient {
                     return Ok(());
                 }
                 if existing.generation == generation {
-                    return if existing_space == space {
-                        Ok(())
-                    } else {
-                        Err(MLSError::Cryptography(
+                    if existing_space != space {
+                        return Err(MLSError::Cryptography(
                             "archive receipt conflicts with the pinned Space".into(),
-                        ))
-                    };
+                        ));
+                    }
+                    // A pin made before groups were pinned gains its group here.
+                    match existing.group_id.as_deref() {
+                        Some(pinned) if pinned == group_id => return Ok(()),
+                        Some(_) => {
+                            return Err(MLSError::Cryptography(
+                                "archive receipt conflicts with the pinned MLS group".into(),
+                            ))
+                        }
+                        None => {}
+                    }
                 }
             }
             placements.insert(
@@ -798,6 +808,7 @@ impl CatbirdMlsClient {
                 crate::labyrinth::space::ThreadPlacement {
                     space: Some(space),
                     generation,
+                    group_id: Some(group_id),
                 },
             );
             tx.put_labyrinth_state(
@@ -823,13 +834,16 @@ impl CatbirdMlsClient {
                 MLSError::Cryptography("archive conversation generation is negative".into())
             })?,
             conversation.space_uri.as_deref(),
+            &conversation.group_id,
         )
     }
 
     /// Owner records are local proof that this account held authenticated conversation material.
     /// Their verified I13 receipts can bootstrap a Space pin but never replace its authority. The
     /// receipt signature covers the sequencer and MLS group, not the generation the Space name
-    /// uses: every owner copy from the newest signed group must name one generation.
+    /// uses: every owner copy from the newest signed group must name one generation, and the pin
+    /// keeps that signed group. The authority signs its group into a denial, so a denial for a
+    /// Space named by a wrong generation never matches the pin.
     fn pin_native_conversation_from_owner_history(
         &self,
         conversation_id: &str,
@@ -876,6 +890,7 @@ impl CatbirdMlsClient {
             &newest.signed.payload.sequencer_did,
             newest.generation,
             None,
+            group_id,
         )
     }
 

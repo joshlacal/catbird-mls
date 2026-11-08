@@ -1460,6 +1460,7 @@ mod tests {
                     labyrinth::store::space::SpaceRef::conversation(AUTHORITY, THREAD).to_string(),
                 ),
                 generation: 1,
+                group_id: None,
             },
         )]))
         .unwrap();

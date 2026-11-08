@@ -48,7 +48,8 @@ struct World {
     inventory_fault: Option<&'static str>,
     directory_outage: bool,
     write_outage: bool,
-    denied_spaces: BTreeSet<(String, String)>,
+    /// `(account, space)` refused, with the MLS group the authority signs into its denial.
+    denied_spaces: BTreeMap<(String, String), Vec<u8>>,
 }
 
 impl World {
@@ -107,15 +108,16 @@ impl NativeArchiveAuthFixture {
     pub fn set_write_outage(&self, outage: bool) {
         self.world.lock().unwrap().write_outage = outage;
     }
+    /// Refuse `account` a credential for `space` with the authority's signed denial binding
+    /// `group` (the Space's MLS group, as mls-ds signs it); `None` admits the account again.
     #[allow(dead_code)]
-    pub fn set_space_denied(&self, account: &str, space: &str, denied: bool) {
+    pub fn set_space_denied(&self, account: &str, space: &str, group: Option<&[u8]>) {
         let key = (account.to_owned(), space.to_owned());
         let mut world = self.world.lock().unwrap();
-        if denied {
-            world.denied_spaces.insert(key);
-        } else {
-            world.denied_spaces.remove(&key);
-        }
+        match group {
+            Some(group) => world.denied_spaces.insert(key, group.to_vec()),
+            None => world.denied_spaces.remove(&key),
+        };
     }
 
     #[allow(dead_code)]
@@ -251,13 +253,14 @@ impl NativeArchiveAuthFixture {
                     return Err(failure("delegation account/Space/expiry mismatch"));
                 }
                 let mut world = self.world.lock().unwrap();
-                if world
+                if let Some(group) = world
                     .denied_spaces
-                    .contains(&(account.to_owned(), space.raw.clone()))
+                    .get(&(account.to_owned(), space.raw.clone()))
                 {
+                    let denial = signed_denial(&space, account, kid, group, now);
                     return Ok(reply(
                         403,
-                        json!({"error": "NotAuthorized", "message": "not a Space member"}),
+                        json!({"error": "NotAuthorized", "message": "not a Space member", "denial": denial}),
                     ));
                 }
                 if !world
@@ -966,6 +969,28 @@ fn key(did: &str, purpose: &[u8]) -> P256SecretKey {
         }
     }
     panic!("fixture key derivation exhausted");
+}
+
+/// The authority's signed refusal of `requester`'s credential request under PoP key `kid`,
+/// exactly as mls-ds `space_host` mints it.
+fn signed_denial(space: &SpaceUri, requester: &str, kid: &str, group: &[u8], now: u64) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::ecdsa::signature::Signer as _;
+    let (conversation, generation) = space.rkey.rsplit_once('-').expect("conversation Space key");
+    let encode = |value: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
+    let input = format!(
+        "{}.{}",
+        encode(json!({"alg": "ES256", "typ": "catbird-space-denial+jwt", "kid": "#atproto"})),
+        encode(json!({
+            "iss": space.authority, "sub": space.raw, "aud": requester, "iat": now, "exp": now + 60,
+            "jti": format!("denial-{now}"), "cnf": {"kid": kid},
+            "conversationId": conversation, "generation": generation.parse::<u64>().unwrap(),
+            "groupId": hex::encode(group), "reason": "notActiveMember",
+        })),
+    );
+    let signature: p256::ecdsa::Signature =
+        p256::ecdsa::SigningKey::from(&key(&space.authority, b"sign")).sign(input.as_bytes());
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
 }
 
 fn tid(sequence: u64) -> String {

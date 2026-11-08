@@ -40,6 +40,8 @@ use labyrinth_protocol::receipt::{sign_sequencer_receipt, SequencerReceiptPayloa
 
 const DS_DID: &str = "did:web:ds.catbird.blue";
 const DS_URL: &str = "https://ds.catbird.blue";
+/// Another home DS: it relays the Space requests of conversations `DS_DID` sequences.
+const CROSS_HOME_DS_DID: &str = "did:web:home-b.catbird.blue";
 const PDS_URL: &str = "https://pds.catbird.blue";
 const ALICE_DID: &str = "did:plc:alicecleanuseraaaaaaaaaa";
 const BOB_DID: &str = "did:plc:bobcleanuserbbbbbbbbbbbb";
@@ -4089,12 +4091,13 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
     assert_eq!(alice.rescue_conversation_on_kick(&cid).unwrap(), 1);
 
     // The DS forgetting the conversation is only a lead: the Space authority itself (here the
-    // home DS) must deny the account before owner records stand in for the conversation.
-    let space = {
+    // home DS) must deny the account, with its signed denial, before owner records stand in for
+    // the conversation.
+    let (space, group) = {
         let mut g = ds.inner.lock().unwrap();
         let conversation = g.conversations.remove(&cid).unwrap();
         g.entries.remove(&cid);
-        conversation["conversationSpace"]
+        let space = conversation["conversationSpace"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| {
@@ -4102,7 +4105,9 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
                     "at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-{}",
                     conversation["coordinates"]["generation"].as_u64().unwrap()
                 )
-            })
+            });
+        let group = chat_wire::json_bytes(&conversation["coordinates"]["groupId"]).unwrap();
+        (space, group)
     };
     alice
         .db()
@@ -4132,7 +4137,8 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
         unproven.to_string().contains("ArchiveRemovalUnverified"),
         "{unproven}"
     );
-    ds.archive_auth.set_space_denied(ALICE_DID, &space, true);
+    ds.archive_auth
+        .set_space_denied(ALICE_DID, &space, Some(&group));
     assert_eq!(
         alice
             .restore_conversation_from_owner_mailbox(&cid)
@@ -4203,10 +4209,10 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         .sync()
         .expect("apply verified removal and seal owner rescue");
 
-    let space = {
+    let (space, group) = {
         let state = ds.inner.lock().unwrap();
         let conversation = &state.conversations[&cid];
-        conversation["conversationSpace"]
+        let space = conversation["conversationSpace"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| {
@@ -4214,13 +4220,44 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
                     "at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-{}",
                     conversation["coordinates"]["generation"].as_u64().unwrap()
                 )
-            })
+            });
+        let group = chat_wire::json_bytes(&conversation["coordinates"]["groupId"]).unwrap();
+        (space, group)
     };
     ds.inner.lock().unwrap().conversation_state_errors.insert(
         (BOB_DID.to_owned(), cid.clone()),
         (400, "NotEntitled".into()),
     );
-    ds.archive_auth.set_space_denied(BOB_DID, &space, true);
+
+    // A signed denial binding another MLS group than the owner receipts pinned (the Space a wrong,
+    // unsigned generation names) proves no removal, through any home.
+    ds.archive_auth
+        .set_space_denied(BOB_DID, &space, Some(&[0x5a; 32]));
+    for (index, home) in [DS_DID, CROSS_HOME_DS_DID].into_iter().enumerate() {
+        let keys = Arc::new(MemKeyStore::new());
+        let client = live_client_homed(
+            tmp.path(),
+            &ds,
+            &format!("misbound-{index}"),
+            BOB_DID,
+            &uuid::Uuid::new_v4().to_string(),
+            &keys,
+            home,
+        );
+        client
+            .restore_with_recovery_code(&code)
+            .expect("recover archive keys");
+        let error = client
+            .restore_conversation_from_owner_mailbox(&cid)
+            .expect_err("a misbound denial proves no removal");
+        assert!(
+            error.to_string().contains("ArchiveRestorePending"),
+            "{home}: {error}"
+        );
+        assert!(client.list_messages(&cid, None, 10).unwrap().is_empty());
+    }
+    ds.archive_auth
+        .set_space_denied(BOB_DID, &space, Some(&group));
 
     let removed_keys = Arc::new(MemKeyStore::new());
     let removed = live_client(
@@ -4254,8 +4291,34 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         message_id
     );
 
+    // Homed on another DS, the removed member gets the same signed denial through its own home's
+    // relay, and the same restore.
+    let cross_keys = Arc::new(MemKeyStore::new());
+    let cross = live_client_homed(
+        tmp.path(),
+        &ds,
+        "removed-cross-home",
+        BOB_DID,
+        &uuid::Uuid::new_v4().to_string(),
+        &cross_keys,
+        CROSS_HOME_DS_DID,
+    );
+    cross
+        .restore_with_recovery_code(&code)
+        .expect("recover removed member archive keys");
+    assert_eq!(
+        cross
+            .restore_conversation_from_owner_mailbox(&cid)
+            .expect("the authority's relayed signed denial permits owner restore"),
+        1
+    );
+    assert_eq!(
+        cross.list_messages(&cid, None, 10).unwrap()[0].message_id,
+        message_id
+    );
+
     // The same DS response is malicious while the Space still admits the account.
-    ds.archive_auth.set_space_denied(BOB_DID, &space, false);
+    ds.archive_auth.set_space_denied(BOB_DID, &space, None);
     let active_keys = Arc::new(MemKeyStore::new());
     let active = live_client(
         tmp.path(),
@@ -4312,12 +4375,26 @@ fn live_client(
     device_id: &str,
     keys: &Arc<MemKeyStore>,
 ) -> Arc<CatbirdMlsClient> {
+    live_client_homed(root, ds, name, did, device_id, keys, DS_DID)
+}
+
+/// A client whose home DS identity is `home_ds_did`; the shared mock still answers at `DS_URL`.
+/// A home other than `DS_DID` relays the Space requests of conversations `DS_DID` sequences.
+fn live_client_homed(
+    root: &std::path::Path,
+    ds: &Arc<SharedMockDs>,
+    name: &str,
+    did: &str,
+    device_id: &str,
+    keys: &Arc<MemKeyStore>,
+    home_ds_did: &str,
+) -> Arc<CatbirdMlsClient> {
     CatbirdMlsClient::open(
         CatbirdMlsClientConfig {
             storage_root: root.join(name).to_string_lossy().into_owned(),
             account_did: did.to_string(),
             device_id: device_id.to_string(),
-            home_ds_did: DS_DID.to_string(),
+            home_ds_did: home_ds_did.to_string(),
             home_ds_endpoint: DS_URL.to_string(),
             pds_endpoint: PDS_URL.to_string(),
         },

@@ -329,6 +329,10 @@ pub struct ThreadPlacement {
     pub space: Option<String>,
     #[serde(default)]
     pub generation: u64,
+    /// Lowercase hex MLS group of `generation`, from the verified local roster or a signed owner
+    /// receipt. A Space denial is removal proof only for this exact group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
 }
 
 impl ThreadPlacement {
@@ -603,6 +607,7 @@ impl ResolvingSpaceThreadStore {
             ThreadPlacement {
                 space: Some(uri),
                 generation,
+                group_id: None,
             },
         );
         if let Ok(encoded) = serde_json::to_vec(&map) {
