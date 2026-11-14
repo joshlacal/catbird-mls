@@ -553,6 +553,7 @@ pub(crate) mod native {
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 use super::{
     api_client::MLSAPIClient,
     credentials::CredentialStore,
@@ -562,6 +563,7 @@ use super::{
     },
     storage::MLSStorageBackend,
 };
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -1046,6 +1048,7 @@ where
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::orchestrator::mls_provider::MlsCryptoContext;
     use crate::{KeychainAccess, MLSError};
     use serde_json::json;
     struct Keys;

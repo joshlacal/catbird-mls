@@ -1439,23 +1439,24 @@ impl LabyrinthSession {
         prf_output: &[u8],
         credential_id: &[u8],
     ) -> Result<()> {
-        let out = match self
-            .lab
-            .create_passkey_recovery(prf_output, credential_id)
-            .await
-        {
-            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
-                if self.try_heal_squat(seq).await {
-                    self.lab
-                        .create_passkey_recovery(prf_output, credential_id)
-                        .await
-                } else {
-                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+        let out = async {
+            self.sync_epochs_healing_squats().await?;
+            match self
+                .lab
+                .create_passkey_recovery(prf_output, credential_id)
+                .await
+            {
+                Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                    if self.try_heal_squat(seq).await {
+                        self.lab.rotate_epoch().await.map(|_| ())
+                    } else {
+                        Err(labyrinth::Error::EpochSquatted { seq, reason })
+                    }
                 }
+                other => other.map(|_| ()),
             }
-            other => other,
         }
-        .map(|_| ());
+        .await;
         self.finish(out)
     }
 

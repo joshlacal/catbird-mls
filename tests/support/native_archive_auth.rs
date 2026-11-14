@@ -63,11 +63,25 @@ impl World {
     }
 }
 
+type BeforeApplyHook = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct SpaceStateSnapshot {
+    records: BTreeMap<RecordKey, Record>,
+    ops: BTreeMap<(String, String), Vec<Value>>,
+    repo_revisions: BTreeMap<(String, String), String>,
+    sequence: u64,
+    committed_space_writes: usize,
+}
+
 #[allow(dead_code)]
 pub struct NativeArchiveAuthFixture {
     account: String,
     now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     world: Mutex<World>,
+    before_apply: Mutex<Option<BeforeApplyHook>>,
+    apply_log: Mutex<Vec<(String, Value)>>,
 }
 
 struct Keys;
@@ -93,7 +107,62 @@ impl NativeArchiveAuthFixture {
             account: account_did.into(),
             now_ms,
             world: Mutex::new(World::default()),
+            before_apply: Mutex::new(None),
+            apply_log: Mutex::new(Vec::new()),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_before_apply_hook(&self, hook: Option<BeforeApplyHook>) {
+        *self.before_apply.lock().unwrap() = hook;
+    }
+
+    #[allow(dead_code)]
+    pub fn snapshot_space_state(&self) -> SpaceStateSnapshot {
+        let world = self.world.lock().unwrap();
+        SpaceStateSnapshot {
+            records: world.records.clone(),
+            ops: world.ops.clone(),
+            repo_revisions: world.repo_revisions.clone(),
+            sequence: world.sequence,
+            committed_space_writes: world.committed_space_writes,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn restore_space_state(&self, snap: SpaceStateSnapshot) {
+        let mut world = self.world.lock().unwrap();
+        world.records = snap.records;
+        world.ops = snap.ops;
+        world.repo_revisions = snap.repo_revisions;
+        world.sequence = world.sequence.max(snap.sequence);
+        world.committed_space_writes = snap.committed_space_writes;
+    }
+
+    #[allow(dead_code)]
+    pub fn drain_apply_calls(&self) -> Vec<(String, Value)> {
+        std::mem::take(&mut *self.apply_log.lock().unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub fn replay_apply(
+        &self,
+        account: &str,
+        body: &Value,
+    ) -> Result<PlatformHttpResponse, MLSError> {
+        self.apply_without_hook(account, body)
+    }
+
+    #[allow(dead_code)]
+    pub fn space_record_rkeys(&self, space: &str, repo: &str, collection: &str) -> Vec<String> {
+        self.world
+            .lock()
+            .unwrap()
+            .records
+            .keys()
+            .filter(|(s, r, c, _)| s == space && r == repo && c == collection)
+            .map(|(_, _, _, k)| k.clone())
+            .collect()
     }
 
     #[allow(dead_code)]
@@ -733,6 +802,22 @@ impl NativeArchiveAuthFixture {
     }
 
     fn apply(&self, account: &str, body: &Value) -> Result<PlatformHttpResponse, MLSError> {
+        let hook = self.before_apply.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(account, body);
+        }
+        self.apply_log
+            .lock()
+            .unwrap()
+            .push((account.to_owned(), body.clone()));
+        self.apply_without_hook(account, body)
+    }
+
+    fn apply_without_hook(
+        &self,
+        account: &str,
+        body: &Value,
+    ) -> Result<PlatformHttpResponse, MLSError> {
         if self.world.lock().unwrap().write_outage {
             return Ok(reply(503, json!({"error": "ServiceUnavailable"})));
         }

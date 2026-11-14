@@ -564,6 +564,7 @@ pub(crate) fn verify_request_publication_entry(
     Ok(hash)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> crate::orchestrator::MLSOrchestrator<S, A, C, M>
 where
     S: crate::orchestrator::MLSStorageBackend + 'static,

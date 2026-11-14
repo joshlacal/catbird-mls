@@ -1,31 +1,44 @@
 //! Async orchestrator hooks for Labyrinth archive status, quarantine retry,
 //! peer re-pinning (`[CB-29]`), pending remote deletion retry, and thread listing.
 
+#[cfg(feature = "legacy-orchestrator")]
 use labyrinth::client::{RepinProposal, ThreadList};
 
+#[cfg(feature = "legacy-orchestrator")]
 use super::hooks::not_enabled;
-use super::queue::{retry_quarantined, ArchiveQueueStore, PendingArchive};
+use super::queue::PendingArchive;
+#[cfg(feature = "legacy-orchestrator")]
+use super::queue::{retry_quarantined, ArchiveQueueStore};
+#[cfg(feature = "legacy-orchestrator")]
 use super::session::SessionDeps;
+#[cfg(feature = "legacy-orchestrator")]
 use super::space::Placement;
 use super::status::ArchiveStatus;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::api_client::MLSAPIClient;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::credentials::CredentialStore;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::error::{OrchestratorError, Result};
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::mls_provider::MlsCryptoContext;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::storage::MLSStorageBackend;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::MLSOrchestrator;
 
-/// [`MLSOrchestrator::labyrinth_archive_status`].
+/// Legacy orchestrator archive status summary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArchiveStatusReport {
     /// Rows waiting to be archived (not quarantined).
     pub pending: usize,
-    /// Rows skipped by flush until [`MLSOrchestrator::labyrinth_retry_quarantined`].
+    /// Rows skipped by flush until quarantine retry.
     pub quarantined: Vec<PendingArchive>,
     /// Excluded members, dropped rows, and any pending remote deletion.
     pub status: ArchiveStatus,
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 pub(super) async fn retry_deletion_async(
     deps: &SessionDeps,
     store: &dyn ArchiveQueueStore,
@@ -75,6 +88,7 @@ pub(super) async fn retry_deletion_async(
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,

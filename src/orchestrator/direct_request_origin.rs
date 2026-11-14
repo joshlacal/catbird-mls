@@ -64,6 +64,7 @@ pub(super) fn legacy_origin(state: &Value, owner: &str, recipient: &str) -> Resu
         json!({"$type":"blue.catbird.chat.defs#legacyPendingDirectOrigin", "exactPrior":signing_prior(&state["coordinates"])?, "originalInvitationProvenance":peer["invitationProvenance"]}),
     ))
 }
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,

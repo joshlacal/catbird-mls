@@ -1,12 +1,15 @@
 //! Exact account-exit intent and accepted proof, independent of MLS Commit journals.
+#[cfg(feature = "legacy-orchestrator")]
 use catbird_atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "legacy-orchestrator")]
 use super::{
     CanonicalOperation, ConversationState, CredentialStore, MLSAPIClient, MLSOrchestrator,
-    MLSStorageBackend, MlsCryptoContext, OrchestratorError, PreparedRequest, Result,
+    MLSStorageBackend, MlsCryptoContext, PreparedRequest,
 };
+use super::{OrchestratorError, Result};
 
 fn invalid(message: &str) -> OrchestratorError {
     OrchestratorError::InvalidInput(format!("Conversation exit: {message}"))
@@ -257,6 +260,7 @@ impl AccountExitRecord {
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,

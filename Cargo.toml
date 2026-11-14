@@ -35,10 +35,234 @@ required-features = ["sim"]
 name = "push_processor_memory_and_gap"
 required-features = ["sim"]
 
+[[test]]
+name = "adversarial_suite77_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "authorized_device_directory_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "c35_offline_journal_hydration"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_account_exit_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_account_removal_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_admission_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_c33_unsupported_federation"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_conversation_projection_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_adoption_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_c09_draft"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_c14_c20"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_c21_c22"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_host_projection"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_lifecycle"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_poison"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_engine_invitation_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_invitation_note_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_leave_fulfillment_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_lifecycle_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_mutation_response_presentation"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_recovery_conflict_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_reset_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_signed_request_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_terminal_close_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_welcome_ack_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_welcome_failure_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_welcome_terminal_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "credential_binding_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "e2e_harness"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "fork_resolution_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "full_rust_engine_lifecycle_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "full_rust_group_lifecycle_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "full_rust_messaging_pipeline_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "full_rust_open_conversation_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "full_rust_recovery_scheduler_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "full_rust_startup_reconcile_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "join_or_rejoin_reset_path_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "key_package_device_scope_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "message_send_actor_fence_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "messaging_security_hardening_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "mock_api_client"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "mock_credentials"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "mock_storage"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "native_decrypt_error_class_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "policy_invite_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "recovery_tracker_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "rejoin_backoff_and_inbox_sharing_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "reset_requested_event_test"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "resolved_conversation_context_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "roster_omission_security_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "sequencer_did_sync_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "staged_commit_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "state_machine_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "welcome_pagination_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "welcome_reissue_responder"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "ws5_recovery_persistence_tests"
+required-features = ["legacy-orchestrator"]
+
 [dependencies]
 catbird-atproto = { path = "../../dec1-w0/wave1-catbird-atproto", version = "0.1.0", features = ["streaming", "namespace-bluecatbird", "namespace-atproto-space"] }
 atproto-spaces = { path = "../../dec1-w0/wave1-catbird-atproto/atproto-spaces", default-features = false }
-labyrinth-protocol = { path = "../labyrinth/labyrinth-protocol" }
+labyrinth-protocol = { path = "../y9b-labyrinth/labyrinth-protocol" }
 # OpenMLS 0.9 release-candidate cutover. The exact revision keeps every
 # OpenMLS crate on one coherent source snapshot.
 openmls = { version = "=0.9.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["js", "extensions-draft", "fork-resolution", "draft-ietf-mls-pq-ciphersuites"] }
@@ -92,7 +316,7 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Labyrinth 1.1 encrypted chat history over ATProto Spaces (on by default per D4).
-labyrinth = { path = "../labyrinth", features = ["space"], optional = true }
+labyrinth = { path = "../y9b-labyrinth", features = ["space"], optional = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
@@ -109,7 +333,9 @@ default = ["labyrinth"]
 android = []
 browser = ["labyrinth"]
 # Echo bot testing binary — adds reqwest + clap + tracing-subscriber
-echo-bot = ["reqwest", "clap", "tracing-subscriber"]
+echo-bot = ["reqwest", "clap", "tracing-subscriber", "legacy-orchestrator"]
+# Legacy MLSOrchestrator / MlsEngine runtime (all production clients use CatbirdMlsClient).
+legacy-orchestrator = []
 # Enables Catbird's fork-recovery orchestration paths.
 fork-resolution = []
 # In-process AAD emitters for cross-repository container tests; never UniFFI-exported.

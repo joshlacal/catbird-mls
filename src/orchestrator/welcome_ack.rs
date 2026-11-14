@@ -1,13 +1,17 @@
 //! Exact Welcome acceptance and durable, entry-less acknowledgement retries.
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(feature = "legacy-orchestrator")]
+use serde_json::json;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "legacy-orchestrator")]
 use super::{
     CanonicalOperation, CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
-    MlsCryptoContext, OrchestratorError, PreparedRequest, Result,
+    MlsCryptoContext, PreparedRequest,
 };
+use super::{OrchestratorError, Result};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native;
@@ -167,6 +171,7 @@ impl WelcomeAcceptance {
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,

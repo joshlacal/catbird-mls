@@ -2,24 +2,31 @@
 //!
 //! A public view is a projection. Only verified signed controls may change
 //! account consent; imports and decryptions change exact-device crypto state.
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "direct_request_commands.rs"]
 mod commands;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "direct_request_controls.rs"]
 mod controls;
 #[path = "direct_request_intent.rs"]
 mod intent;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "group_invitation_reference.rs"]
 mod invitation;
 #[path = "direct_request_origin.rs"]
 mod origin;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "direct_request_peer_keys.rs"]
 mod peer_keys;
 #[path = "direct_request_projection.rs"]
 mod projection;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "direct_request_receive.rs"]
 mod receive;
 pub use intent::DirectRequestIntent;
-pub(crate) use projection::{normalized_close_entry, DirectRequestProjection};
+#[cfg(feature = "legacy-orchestrator")]
+pub(crate) use projection::normalized_close_entry;
+pub(crate) use projection::DirectRequestProjection;
 
 use super::direct_request_types::*;
 use super::{OrchestratorError, Result};
@@ -131,107 +138,113 @@ pub fn reduce_request_preview(
     next
 }
 
-use super::{CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext};
-impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
-where
-    S: MLSStorageBackend + 'static,
-    A: MLSAPIClient + 'static,
-    C: CredentialStore + 'static,
-    M: MlsCryptoContext + 'static,
-{
-    /// Offline startup fence. Network resolution must be scheduled after Ready,
-    /// so an unreachable request cannot stall independent conversations.
-    pub(crate) async fn hydrate_direct_request_ownership(&self, owner: &str) -> Result<()> {
-        if !self.mls_context().supports_direct_request_bootstrap() {
-            return Ok(());
-        }
-        if let Some(device) = self.credentials().get_device_uuid(owner).await? {
-            if let Some(raw) = self
-                .mls_context()
-                .read_direct_request_key_publication(&device)?
-            {
-                super::direct_request_keys::DirectRequestKeyPublication::decode(
-                    &raw, owner, &device,
-                )?;
+#[cfg(feature = "legacy-orchestrator")]
+mod orchestrator_impls {
+    use super::*;
+    use crate::orchestrator::{
+        CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext,
+    };
+    impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
+    where
+        S: MLSStorageBackend + 'static,
+        A: MLSAPIClient + 'static,
+        C: CredentialStore + 'static,
+        M: MlsCryptoContext + 'static,
+    {
+        /// Offline startup fence. Network resolution must be scheduled after Ready,
+        /// so an unreachable request cannot stall independent conversations.
+        pub(crate) async fn hydrate_direct_request_ownership(&self, owner: &str) -> Result<()> {
+            if !self.mls_context().supports_direct_request_bootstrap() {
+                return Ok(());
             }
-        }
-        let intents = self.mls_context().list_direct_request_intents()?;
-        let journals = self.mls_context().list_direct_request_journal()?;
-        if intents.is_empty()
-            && journals.is_empty()
-            && self
-                .mls_context()
-                .list_direct_request_projections()?
-                .is_empty()
-        {
-            return Ok(());
-        }
-        let device = self
-            .credentials()
-            .get_device_uuid(owner)
-            .await?
-            .ok_or_else(|| {
-                OrchestratorError::Credential("Request journal has no device owner".into())
-            })?;
-        let mut attempts = std::collections::HashMap::new();
-        let mut drafts = std::collections::HashSet::new();
-        for raw in intents {
-            let intent = DirectRequestIntent::decode(&raw, owner, &device)?;
-            if !drafts.insert(intent.input.draft_id.clone())
-                || attempts.insert(intent.request_id()?, intent).is_some()
-            {
-                return Err(OrchestratorError::Storage(
-                    "Duplicate direct request ownership".into(),
-                ));
-            }
-        }
-        for raw in self.mls_context().list_direct_request_projections()? {
-            let projection = projection::DirectRequestProjection::decode_for_reauthorization(
-                &raw, owner, &device,
-            )?;
-            if let Some(pending) = &projection.pending_acceptance {
-                let public = self
+            if let Some(device) = self.credentials().get_device_uuid(owner).await? {
+                if let Some(raw) = self
                     .mls_context()
-                    .identity_public_key(format!("{owner}#{device}").into_bytes())?;
-                let accepted = crate::chat_v2::transcript::direct_request::verify_signed_request(
-                    crate::chat_v2::transcript::direct_request::DirectRequestKind::Accept,
-                    pending,
-                    &public,
-                )
-                .map_err(|_| {
-                    OrchestratorError::Storage(
-                        "Invalid pending request acceptance signature".into(),
-                    )
+                    .read_direct_request_key_publication(&device)?
+                {
+                    crate::orchestrator::direct_request_keys::DirectRequestKeyPublication::decode(
+                        &raw, owner, &device,
+                    )?;
+                }
+            }
+            let intents = self.mls_context().list_direct_request_intents()?;
+            let journals = self.mls_context().list_direct_request_journal()?;
+            if intents.is_empty()
+                && journals.is_empty()
+                && self
+                    .mls_context()
+                    .list_direct_request_projections()?
+                    .is_empty()
+            {
+                return Ok(());
+            }
+            let device = self
+                .credentials()
+                .get_device_uuid(owner)
+                .await?
+                .ok_or_else(|| {
+                    OrchestratorError::Credential("Request journal has no device owner".into())
                 })?;
-                let publication =
-                    crate::chat_v2::transcript::direct_request::verify_received_signed_request(
-                        crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
-                        &projection.publication,
-                        &projection.sender_public_key,
-                    )
-                    .map_err(|_| OrchestratorError::Storage("Invalid publication".into()))?;
-                if accepted.actor_did() != Some(owner)
-                    || accepted.actor_device_id() != Some(device.as_str())
-                    || accepted.body()["requestId"] != publication.body()["requestId"]
-                    || accepted.body()["prior"] != publication.body()["next"]
+            let mut attempts = std::collections::HashMap::new();
+            let mut drafts = std::collections::HashSet::new();
+            for raw in intents {
+                let intent = DirectRequestIntent::decode(&raw, owner, &device)?;
+                if !drafts.insert(intent.input.draft_id.clone())
+                    || attempts.insert(intent.request_id()?, intent).is_some()
                 {
                     return Err(OrchestratorError::Storage(
-                        "Invalid pending acceptance binding".into(),
+                        "Duplicate direct request ownership".into(),
                     ));
                 }
             }
-        }
-        for journal in journals {
-            journal.validate()?;
-            if journal.actor_did != owner || journal.actor_device_id != device {
-                return Err(OrchestratorError::Storage(
-                    "Direct request bootstrap owner mismatch".into(),
-                ));
+            for raw in self.mls_context().list_direct_request_projections()? {
+                let projection = projection::DirectRequestProjection::decode_for_reauthorization(
+                    &raw, owner, &device,
+                )?;
+                if let Some(pending) = &projection.pending_acceptance {
+                    let public = self
+                        .mls_context()
+                        .identity_public_key(format!("{owner}#{device}").into_bytes())?;
+                    let accepted =
+                        crate::chat_v2::transcript::direct_request::verify_signed_request(
+                            crate::chat_v2::transcript::direct_request::DirectRequestKind::Accept,
+                            pending,
+                            &public,
+                        )
+                        .map_err(|_| {
+                            OrchestratorError::Storage(
+                                "Invalid pending request acceptance signature".into(),
+                            )
+                        })?;
+                    let publication =
+                        crate::chat_v2::transcript::direct_request::verify_received_signed_request(
+                            crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
+                            &projection.publication,
+                            &projection.sender_public_key,
+                        )
+                        .map_err(|_| OrchestratorError::Storage("Invalid publication".into()))?;
+                    if accepted.actor_did() != Some(owner)
+                        || accepted.actor_device_id() != Some(device.as_str())
+                        || accepted.body()["requestId"] != publication.body()["requestId"]
+                        || accepted.body()["prior"] != publication.body()["next"]
+                    {
+                        return Err(OrchestratorError::Storage(
+                            "Invalid pending acceptance binding".into(),
+                        ));
+                    }
+                }
             }
-            // A terminal bootstrap tombstone can outlive its replaced draft.
-            // Every live candidate must still have its pre-reservation intent.
-            if journal.phase
-                != super::direct_request_journal::DirectRequestJournalPhase::TerminalNotPublished
+            for journal in journals {
+                journal.validate()?;
+                if journal.actor_did != owner || journal.actor_device_id != device {
+                    return Err(OrchestratorError::Storage(
+                        "Direct request bootstrap owner mismatch".into(),
+                    ));
+                }
+                // A terminal bootstrap tombstone can outlive its replaced draft.
+                // Every live candidate must still have its pre-reservation intent.
+                if journal.phase
+                != crate::orchestrator::direct_request_journal::DirectRequestJournalPhase::TerminalNotPublished
             {
                 let intent = attempts.get(&journal.request_id).ok_or_else(|| {
                     OrchestratorError::Storage("Live request bootstrap lacks intent fence".into())
@@ -242,172 +255,176 @@ where
                     ));
                 }
             }
+            }
+            Ok(())
         }
-        Ok(())
     }
-}
 
-impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
-where
-    S: MLSStorageBackend + 'static,
-    A: MLSAPIClient + 'static,
-    C: CredentialStore + 'static,
-    M: MlsCryptoContext + 'static,
-{
-    /// List only account/device-bound protected projections, validating every
-    /// signature and acceptance proof before exposing decrypted previews.
-    pub async fn list_direct_request_views(&self) -> Result<Vec<DirectRequestView>> {
-        self.require_direct_request_support()?;
-        let owner = self.require_user_did().await?;
-        let device = self.require_actor_device_id().await?;
-        let mut views = Vec::new();
-        let mut ids = std::collections::HashSet::new();
-        let retired: std::collections::HashSet<String> = self
-            .mls_context()
-            .list_direct_request_journal()?
-            .into_iter()
-            .filter(|j| {
-                j.phase
-                    == super::direct_request_journal::DirectRequestJournalPhase::RetiredPublished
-            })
-            .map(|j| j.conversation_id)
-            .collect();
-        for mut raw in self.mls_context().list_direct_request_projections()? {
+    impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
+    where
+        S: MLSStorageBackend + 'static,
+        A: MLSAPIClient + 'static,
+        C: CredentialStore + 'static,
+        M: MlsCryptoContext + 'static,
+    {
+        /// List only account/device-bound protected projections, validating every
+        /// signature and acceptance proof before exposing decrypted previews.
+        pub async fn list_direct_request_views(&self) -> Result<Vec<DirectRequestView>> {
+            self.require_direct_request_support()?;
+            let owner = self.require_user_did().await?;
+            let device = self.require_actor_device_id().await?;
+            let mut views = Vec::new();
+            let mut ids = std::collections::HashSet::new();
+            let retired: std::collections::HashSet<String> = self
+                .mls_context()
+                .list_direct_request_journal()?
+                .into_iter()
+                .filter(|j| {
+                    j.phase
+                    == crate::orchestrator::direct_request_journal::DirectRequestJournalPhase::RetiredPublished
+                })
+                .map(|j| j.conversation_id)
+                .collect();
+            for mut raw in self.mls_context().list_direct_request_projections()? {
+                let projection = self
+                    .authorize_direct_request_projection(&mut raw, &owner, &device)
+                    .await?;
+                let view = projection.view(&owner, &device)?;
+                if !ids.insert(view.conversation_id.clone()) {
+                    return Err(OrchestratorError::Storage(
+                        "Duplicate protected request projection".into(),
+                    ));
+                }
+                if view.consent == RequestConsent::Closed
+                    || !retired.contains(&view.conversation_id)
+                {
+                    views.push(view);
+                }
+            }
+            views.sort_by(|a, b| a.conversation_id.cmp(&b.conversation_id));
+            Ok(views)
+        }
+
+        pub(crate) async fn retained_direct_request_view(
+            &self,
+            conversation_id: &str,
+        ) -> Result<Option<DirectRequestView>> {
+            if !self.mls_context().supports_direct_request_bootstrap()
+                || crate::chat_v2::ids::CanonicalUuid::parse(conversation_id).is_err()
+            {
+                return Ok(None);
+            }
+            let owner = self.require_user_did().await?;
+            let device = self.require_actor_device_id().await?;
+            let Some(mut raw) = self
+                .mls_context()
+                .read_direct_request_projection(conversation_id)?
+            else {
+                return Ok(None);
+            };
             let projection = self
                 .authorize_direct_request_projection(&mut raw, &owner, &device)
                 .await?;
             let view = projection.view(&owner, &device)?;
-            if !ids.insert(view.conversation_id.clone()) {
+            if view.conversation_id != conversation_id {
                 return Err(OrchestratorError::Storage(
-                    "Duplicate protected request projection".into(),
+                    "Request projection conversation mismatch".into(),
                 ));
             }
-            if view.consent == RequestConsent::Closed || !retired.contains(&view.conversation_id) {
-                views.push(view);
+            Ok(Some(view))
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
+    where
+        S: MLSStorageBackend + 'static,
+        A: MLSAPIClient + 'static,
+        C: CredentialStore + 'static,
+        M: MlsCryptoContext + 'static,
+    {
+        /// Called after ordinary startup/sync work, never from initialization.
+        /// Each turn has at most two requests and each network future two seconds.
+        /// Timeout drops only the transport future; exact intent bytes stay fenced.
+        pub(crate) async fn reconcile_direct_request_outcomes(&self) {
+            if !self.mls_context().supports_direct_request_bootstrap() {
+                return;
             }
-        }
-        views.sort_by(|a, b| a.conversation_id.cmp(&b.conversation_id));
-        Ok(views)
-    }
-
-    pub(crate) async fn retained_direct_request_view(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Option<DirectRequestView>> {
-        if !self.mls_context().supports_direct_request_bootstrap()
-            || crate::chat_v2::ids::CanonicalUuid::parse(conversation_id).is_err()
-        {
-            return Ok(None);
-        }
-        let owner = self.require_user_did().await?;
-        let device = self.require_actor_device_id().await?;
-        let Some(mut raw) = self
-            .mls_context()
-            .read_direct_request_projection(conversation_id)?
-        else {
-            return Ok(None);
-        };
-        let projection = self
-            .authorize_direct_request_projection(&mut raw, &owner, &device)
-            .await?;
-        let view = projection.view(&owner, &device)?;
-        if view.conversation_id != conversation_id {
-            return Err(OrchestratorError::Storage(
-                "Request projection conversation mismatch".into(),
-            ));
-        }
-        Ok(Some(view))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
-where
-    S: MLSStorageBackend + 'static,
-    A: MLSAPIClient + 'static,
-    C: CredentialStore + 'static,
-    M: MlsCryptoContext + 'static,
-{
-    /// Called after ordinary startup/sync work, never from initialization.
-    /// Each turn has at most two requests and each network future two seconds.
-    /// Timeout drops only the transport future; exact intent bytes stay fenced.
-    pub(crate) async fn reconcile_direct_request_outcomes(&self) {
-        if !self.mls_context().supports_direct_request_bootstrap() {
-            return;
-        }
-        let Ok(records) = self.mls_context().list_direct_request_intents() else {
-            return;
-        };
-        let mut considered = 0;
-        for raw in records {
-            let Ok(intent) = serde_json::from_slice::<DirectRequestIntent>(&raw) else {
-                continue;
+            let Ok(records) = self.mls_context().list_direct_request_intents() else {
+                return;
             };
-            if intent.projection_completed
-                || (intent.terminal_response.is_some()
-                    && intent::DirectRequestTerminalAttempt::from_intent(&intent).is_ok())
-            {
-                continue;
-            }
-            // A persisted `CapacityUnavailable` deferral schedules the draft, across restarts.
-            if intent
-                .retry_not_before_ms
-                .is_some_and(|at| commands::now_ms() < at)
-            {
-                continue;
-            }
-            let id = intent.input.draft_id;
-            let now = web_time::Instant::now();
-            let attempts = {
-                let mut backoff = self.direct_request_reconcile_backoff.lock().await;
-                if backoff
-                    .get(&id)
-                    .is_some_and(|(_, deadline)| *deadline > now)
+            let mut considered = 0;
+            for raw in records {
+                let Ok(intent) = serde_json::from_slice::<DirectRequestIntent>(&raw) else {
+                    continue;
+                };
+                if intent.projection_completed
+                    || (intent.terminal_response.is_some()
+                        && intent::DirectRequestTerminalAttempt::from_intent(&intent).is_ok())
                 {
                     continue;
                 }
-                let attempts = backoff
-                    .get(&id)
-                    .map(|(n, _)| n.saturating_add(1))
-                    .unwrap_or(1);
-                let delay =
-                    std::time::Duration::from_secs(2u64.saturating_pow(attempts.min(6)).min(60));
-                backoff.insert(id.clone(), (attempts, now + delay));
-                attempts
-            };
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                Box::pin(self.resume_direct_request(&id)),
-            )
-            .await
-            {
-                Ok(Ok(
-                    super::DirectRequestOutcome::RequestSent { .. }
-                    | super::DirectRequestOutcome::ExistingDirect { .. },
-                )) => {
-                    self.direct_request_reconcile_backoff
-                        .lock()
-                        .await
-                        .remove(&id);
+                // A persisted `CapacityUnavailable` deferral schedules the draft, across restarts.
+                if intent
+                    .retry_not_before_ms
+                    .is_some_and(|at| commands::now_ms() < at)
+                {
+                    continue;
                 }
-                Ok(Ok(super::DirectRequestOutcome::TerminalNotPublished { .. })) => {
-                    // A semantic refusal leaves the attempt unresolved on disk (no signed
-                    // receipt); resending refused bytes on a timer cannot succeed, so park the
-                    // draft for this process instead of forgetting its backoff.
-                    let parked = now + std::time::Duration::from_secs(24 * 60 * 60);
-                    self.direct_request_reconcile_backoff
-                        .lock()
-                        .await
-                        .insert(id, (attempts, parked));
+                let id = intent.input.draft_id;
+                let now = web_time::Instant::now();
+                let attempts = {
+                    let mut backoff = self.direct_request_reconcile_backoff.lock().await;
+                    if backoff
+                        .get(&id)
+                        .is_some_and(|(_, deadline)| *deadline > now)
+                    {
+                        continue;
+                    }
+                    let attempts = backoff
+                        .get(&id)
+                        .map(|(n, _)| n.saturating_add(1))
+                        .unwrap_or(1);
+                    let delay = std::time::Duration::from_secs(
+                        2u64.saturating_pow(attempts.min(6)).min(60),
+                    );
+                    backoff.insert(id.clone(), (attempts, now + delay));
+                    attempts
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    Box::pin(self.resume_direct_request(&id)),
+                )
+                .await
+                {
+                    Ok(Ok(
+                        super::DirectRequestOutcome::RequestSent { .. }
+                        | super::DirectRequestOutcome::ExistingDirect { .. },
+                    )) => {
+                        self.direct_request_reconcile_backoff
+                            .lock()
+                            .await
+                            .remove(&id);
+                    }
+                    Ok(Ok(super::DirectRequestOutcome::TerminalNotPublished { .. })) => {
+                        // A semantic refusal leaves the attempt unresolved on disk (no signed
+                        // receipt); resending refused bytes on a timer cannot succeed, so park the
+                        // draft for this process instead of forgetting its backoff.
+                        let parked = now + std::time::Duration::from_secs(24 * 60 * 60);
+                        self.direct_request_reconcile_backoff
+                            .lock()
+                            .await
+                            .insert(id, (attempts, parked));
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(draft_id=id,attempts,%error,"Request reconciliation deferred; immutable attempt retained")
+                    }
+                    _ => {}
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(draft_id=id,attempts,%error,"Request reconciliation deferred; immutable attempt retained")
+                considered += 1;
+                if considered >= 2 {
+                    break;
                 }
-                _ => {}
-            }
-            considered += 1;
-            if considered >= 2 {
-                break;
             }
         }
     }

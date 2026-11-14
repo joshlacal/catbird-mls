@@ -143,6 +143,20 @@ impl LiveWorld {
             .get(did)
             .is_some_and(|h| !h.is_empty())
     }
+
+    pub fn ds_head_seqs(&self, did: &str) -> Vec<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .heads
+            .get(did)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|e| e["epochNumber"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Default)]

@@ -5,13 +5,16 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::api_client::MLSAPIClient;
-use super::canonical_transport::{CanonicalOperation, PreparedRequest};
-use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
-use super::mls_provider::MlsCryptoContext;
-use super::orchestrator::MLSOrchestrator;
-use super::storage::MLSStorageBackend;
+#[cfg(feature = "legacy-orchestrator")]
+use super::{
+    api_client::MLSAPIClient,
+    canonical_transport::{CanonicalOperation, PreparedRequest},
+    credentials::CredentialStore,
+    mls_provider::MlsCryptoContext,
+    orchestrator::MLSOrchestrator,
+    storage::MLSStorageBackend,
+};
 
 /// A durable group leave needs another account's current MLS leaf to commit
 /// the removal. Callers must retain local state and show pending until then.
@@ -66,6 +69,7 @@ pub(crate) fn lifecycle_coordinates(value: &Value, conversation_id: &str) -> Res
     Ok(coordinates)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn next_coordinates(prior: &Value, close: bool) -> Result<Value> {
     let version = prior["stateVersion"].as_u64().unwrap();
     if version == 9_007_199_254_740_991 {
@@ -81,6 +85,7 @@ fn next_coordinates(prior: &Value, close: bool) -> Result<Value> {
     Ok(next)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn leave_request_is_live(request: &Value) -> bool {
     let timestamp = |field: &str| {
         request[field]
@@ -98,6 +103,7 @@ fn leave_request_is_live(request: &Value) -> bool {
         && expires - requested <= chrono::Duration::hours(24) + chrono::Duration::seconds(1)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,

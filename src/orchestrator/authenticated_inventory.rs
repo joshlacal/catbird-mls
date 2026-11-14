@@ -7,11 +7,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "legacy-orchestrator")]
 use std::collections::{HashMap, HashSet};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+#[cfg(feature = "legacy-orchestrator")]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,12 +145,15 @@ impl AuthenticatedInventorySnapshot {
         Ok(items)
     }
 }
+#[cfg(feature = "legacy-orchestrator")]
 static NEXT_EXACT_EXECUTION: AtomicU64 = AtomicU64::new(1);
 tokio::task_local! {static EXACT_WELCOME_ITEMS:Arc<Vec<Value>>;}
+#[cfg(feature = "legacy-orchestrator")]
 pub(crate) fn scoped_welcome_items() -> Option<Arc<Vec<Value>>> {
     EXACT_WELCOME_ITEMS.try_with(Clone::clone).ok()
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,

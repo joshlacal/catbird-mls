@@ -47,13 +47,13 @@
 
 use web_time::Instant;
 
-use super::api_client::MLSAPIClient;
-use super::constants;
-use super::credentials::CredentialStore;
-use super::mls_provider::MlsCryptoContext;
-use super::orchestrator::MLSOrchestrator;
-use super::storage::MLSStorageBackend;
-use super::types::{KeyPackageRef, SequencerReceipt};
+use super::types::KeyPackageRef;
+#[cfg(feature = "legacy-orchestrator")]
+use super::{
+    api_client::MLSAPIClient, constants, credentials::CredentialStore,
+    mls_provider::MlsCryptoContext, orchestrator::MLSOrchestrator, storage::MLSStorageBackend,
+    types::SequencerReceipt,
+};
 
 /// Maximum number of KeyPackages accepted from one DS fetch. This matches the
 /// delivery-service batch ceiling and bounds per-item validation work even if
@@ -369,11 +369,13 @@ pub struct DeviceKeyCacheEntry {
 
 /// Short SHA-256 prefix of a byte blob (key package or signature key) for
 /// log correlation (ADR-009 D5 structured-warning field).
+#[cfg(feature = "legacy-orchestrator")]
 fn sha256_prefix(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(data)[..8])
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -1404,302 +1406,306 @@ mod tests {
         );
     }
 
-    fn rogue_group_key_package(identity: &str) -> crate::KeyPackageData {
-        let dir = tempfile::tempdir().expect("rogue tempdir");
-        let ctx = crate::MLSContext::new(
-            dir.path().join("rogue.db").to_string_lossy().into_owned(),
-            "rogue-db-key".to_string(),
-            Box::new(crate::recovery_e2e_harness::InMemoryKeychain::new()),
-        )
-        .expect("rogue MLSContext");
-        let kp = ctx
-            .create_key_package(identity.as_bytes().to_vec())
-            .expect("rogue create_key_package");
-        crate::KeyPackageData {
-            data: kp.key_package_data,
+    #[cfg(feature = "legacy-orchestrator")]
+    mod orchestrator_tests {
+        fn rogue_group_key_package(identity: &str) -> crate::KeyPackageData {
+            let dir = tempfile::tempdir().expect("rogue tempdir");
+            let ctx = crate::MLSContext::new(
+                dir.path().join("rogue.db").to_string_lossy().into_owned(),
+                "rogue-db-key".to_string(),
+                Box::new(crate::recovery_e2e_harness::InMemoryKeychain::new()),
+            )
+            .expect("rogue MLSContext");
+            let kp = ctx
+                .create_key_package(identity.as_bytes().to_vec())
+                .expect("rogue create_key_package");
+            crate::KeyPackageData {
+                data: kp.key_package_data,
+            }
         }
-    }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn f02_inbound_add_commit_with_unauthorized_victim_device_key_is_rejected_and_discarded()
-    {
-        use crate::orchestrator::{
-            IncomingEnvelope, MLSAPIClient, MlsCryptoContext, OrchestratorError,
-        };
-        use crate::recovery_e2e_harness::TestWorld;
+        #[tokio::test(flavor = "multi_thread")]
+        async fn f02_inbound_add_commit_with_unauthorized_victim_device_key_is_rejected_and_discarded(
+        ) {
+            use crate::orchestrator::{
+                IncomingEnvelope, MLSAPIClient, MlsCryptoContext, OrchestratorError,
+            };
+            use crate::recovery_e2e_harness::TestWorld;
 
-        let mut world = TestWorld::new();
-        world
-            .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
-            .await;
-        world
-            .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
-            .await;
-        world
-            .add_client_with_did("Victim", "did:plc:cccccccccccccccccccccccc")
-            .await;
-        let alice_did = world.register_device("Alice").await.unwrap();
-        let bob_did = world.register_device("Bob").await.unwrap();
-        let victim_did = world.register_device("Victim").await.unwrap();
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world
+                .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+                .await;
+            world
+                .add_client_with_did("Victim", "did:plc:cccccccccccccccccccccccc")
+                .await;
+            let alice_did = world.register_device("Alice").await.unwrap();
+            let bob_did = world.register_device("Bob").await.unwrap();
+            let victim_did = world.register_device("Victim").await.unwrap();
 
-        let convo = world
-            .client("Alice")
-            .orchestrator
-            .create_group("f02-commit", None, None)
-            .await
-            .expect("create group");
-        world
-            .client("Alice")
-            .orchestrator
-            .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
-            .await
-            .expect("add Bob");
+            let convo = world
+                .client("Alice")
+                .orchestrator
+                .create_group("f02-commit", None, None)
+                .await
+                .expect("create group");
+            world
+                .client("Alice")
+                .orchestrator
+                .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+                .await
+                .expect("add Bob");
 
-        let welcome = world
-            .client("Bob")
-            .orchestrator
-            .api_client()
-            .get_welcome(&convo.conversation_id)
-            .await
-            .expect("get welcome");
-        world
-            .client("Bob")
-            .orchestrator
-            .join_group(&welcome)
-            .await
-            .expect("Bob join_group");
+            let welcome = world
+                .client("Bob")
+                .orchestrator
+                .api_client()
+                .get_welcome(&convo.conversation_id)
+                .await
+                .expect("get welcome");
+            world
+                .client("Bob")
+                .orchestrator
+                .join_group(&welcome)
+                .await
+                .expect("Bob join_group");
 
-        let group_bytes = hex::decode(&convo.group_id).unwrap();
-        let bob_epoch_before = world
-            .client("Bob")
-            .orchestrator
-            .mls_context()
-            .get_epoch(group_bytes.clone())
-            .unwrap();
-        assert_eq!(bob_epoch_before, 1);
-
-        // Alice (or a compromised member) bypasses outbound checks and builds a valid
-        // MLS Add commit introducing an unauthorized device key for Victim's DID.
-        let rogue_kp = rogue_group_key_package(&format!("{victim_did}#rogue-device"));
-        let add_res = world
-            .client("Alice")
-            .orchestrator
-            .mls_context()
-            .add_members(group_bytes.clone(), vec![rogue_kp])
-            .expect("raw mls add_members");
-
-        let bob = world.client("Bob");
-        let err = bob
-            .orchestrator
-            .process_incoming(&IncomingEnvelope {
-                conversation_id: convo.conversation_id.clone(),
-                sender_did: alice_did,
-                ciphertext: add_res.commit_data,
-                timestamp: chrono::Utc::now(),
-                server_message_id: Some("f02-rogue-add-commit".to_string()),
-                canonical_entry_json: None,
-                server_epoch: None,
-                server_sequence: None,
-            })
-            .await
-            .expect_err("inbound Add commit with unauthorized device key must be rejected");
-        assert!(
-            matches!(err, OrchestratorError::InvalidInput(_))
-                && err.to_string().contains("authorized device key"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(
-            bob.orchestrator
+            let group_bytes = hex::decode(&convo.group_id).unwrap();
+            let bob_epoch_before = world
+                .client("Bob")
+                .orchestrator
                 .mls_context()
                 .get_epoch(group_bytes.clone())
-                .unwrap(),
-            bob_epoch_before,
-            "rejected inbound Add commit must not advance epoch"
-        );
-        assert!(
-            bob.orchestrator
+                .unwrap();
+            assert_eq!(bob_epoch_before, 1);
+
+            // Alice (or a compromised member) bypasses outbound checks and builds a valid
+            // MLS Add commit introducing an unauthorized device key for Victim's DID.
+            let rogue_kp = rogue_group_key_package(&format!("{victim_did}#rogue-device"));
+            let add_res = world
+                .client("Alice")
+                .orchestrator
                 .mls_context()
-                .merge_incoming_commit(group_bytes.clone(), bob_epoch_before + 1)
-                .is_err(),
-            "rejected inbound Add commit must discard staged commit"
-        );
-        let members = bob
-            .orchestrator
-            .mls_context()
-            .group_member_identities(group_bytes)
-            .unwrap();
-        assert!(
-            !members
-                .iter()
-                .any(|m| String::from_utf8_lossy(m).starts_with(&victim_did)),
-            "rogue victim leaf must not be present in Bob's ratchet tree"
-        );
-    }
+                .add_members(group_bytes.clone(), vec![rogue_kp])
+                .expect("raw mls add_members");
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn f02_inbound_welcome_with_unauthorized_peer_device_key_is_rejected_and_rolled_back() {
-        use crate::orchestrator::{MLSAPIClient, MLSStorageBackend, OrchestratorError};
-        use crate::recovery_e2e_harness::TestWorld;
-
-        let mut world = TestWorld::new();
-        world
-            .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
-            .await;
-        world
-            .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
-            .await;
-        world
-            .add_client_with_did("Victim", "did:plc:cccccccccccccccccccccccc")
-            .await;
-        let _alice_did = world.register_device("Alice").await.unwrap();
-        let bob_did = world.register_device("Bob").await.unwrap();
-        let victim_did = world.register_device("Victim").await.unwrap();
-
-        let convo = world
-            .client("Alice")
-            .orchestrator
-            .create_group("f02-welcome", None, None)
-            .await
-            .expect("create group");
-        let group_bytes = hex::decode(&convo.group_id).unwrap();
-
-        // Inject an unauthorized Victim leaf into Alice's local group, then add Bob
-        // so Bob receives a cryptographically valid Welcome containing the rogue leaf.
-        let rogue_kp = rogue_group_key_package(&format!("{victim_did}#rogue-device"));
-        let bob_kps = world
-            .client("Alice")
-            .orchestrator
-            .api_client()
-            .get_key_packages(
-                "00000000-0000-4000-8000-000000000001",
-                std::slice::from_ref(&bob_did),
-            )
-            .await
-            .expect("fetch Bob key package");
-        let bob_kp = crate::KeyPackageData {
-            data: bob_kps[0].key_package_data.clone(),
-        };
-        let add_res = world
-            .client("Alice")
-            .orchestrator
-            .mls_context()
-            .add_members(group_bytes.clone(), vec![rogue_kp, bob_kp])
-            .expect("raw mls add_members");
-        world
-            .client("Alice")
-            .orchestrator
-            .mls_context()
-            .merge_pending_commit(group_bytes.clone())
-            .expect("merge Alice commit");
-
-        let bob = world.client("Bob");
-        let err = bob
-            .orchestrator
-            .join_group(&add_res.welcome_data)
-            .await
-            .expect_err("inbound Welcome with unauthorized peer device key must be rejected");
-        assert!(
-            matches!(err, OrchestratorError::InvalidInput(_))
-                && err.to_string().contains("authorized device key"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !bob.orchestrator.mls_context().group_exists(group_bytes),
-            "rejected Welcome must roll back and delete the OpenMLS group"
-        );
-        assert!(
-            bob.storage
-                .get_group_state(&convo.group_id)
+            let bob = world.client("Bob");
+            let err = bob
+                .orchestrator
+                .process_incoming(&IncomingEnvelope {
+                    conversation_id: convo.conversation_id.clone(),
+                    sender_did: alice_did,
+                    ciphertext: add_res.commit_data,
+                    timestamp: chrono::Utc::now(),
+                    server_message_id: Some("f02-rogue-add-commit".to_string()),
+                    canonical_entry_json: None,
+                    server_epoch: None,
+                    server_sequence: None,
+                })
                 .await
-                .unwrap()
-                .is_none(),
-            "rejected Welcome must not persist GroupState"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn f02_inbound_add_proposal_with_unauthorized_device_key_is_rejected_and_discarded() {
-        use crate::orchestrator::{
-            IncomingEnvelope, MLSAPIClient, MlsCryptoContext, OrchestratorError,
-        };
-        use crate::recovery_e2e_harness::TestWorld;
-
-        let mut world = TestWorld::new();
-        world
-            .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
-            .await;
-        world
-            .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
-            .await;
-        world
-            .add_client_with_did("Victim", "did:plc:cccccccccccccccccccccccc")
-            .await;
-        let alice_did = world.register_device("Alice").await.unwrap();
-        let bob_did = world.register_device("Bob").await.unwrap();
-        let victim_did = world.register_device("Victim").await.unwrap();
-
-        let convo = world
-            .client("Alice")
-            .orchestrator
-            .create_group("f02-proposal", None, None)
-            .await
-            .expect("create group");
-        world
-            .client("Alice")
-            .orchestrator
-            .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
-            .await
-            .expect("add Bob");
-
-        let welcome = world
-            .client("Bob")
-            .orchestrator
-            .api_client()
-            .get_welcome(&convo.conversation_id)
-            .await
-            .expect("get welcome");
-        world
-            .client("Bob")
-            .orchestrator
-            .join_group(&welcome)
-            .await
-            .expect("Bob join_group");
-
-        let group_bytes = hex::decode(&convo.group_id).unwrap();
-        let rogue_kp = rogue_group_key_package(&format!("{victim_did}#rogue-device"));
-        let prop_res = world
-            .client("Alice")
-            .orchestrator
-            .mls_context()
-            .propose_add_member(group_bytes.clone(), rogue_kp.data)
-            .expect("propose_add_member");
-
-        let bob = world.client("Bob");
-        let err = bob
-            .orchestrator
-            .process_incoming(&IncomingEnvelope {
-                conversation_id: convo.conversation_id.clone(),
-                sender_did: alice_did,
-                ciphertext: prop_res.proposal_message,
-                timestamp: chrono::Utc::now(),
-                server_message_id: Some("f02-rogue-add-proposal".to_string()),
-                canonical_entry_json: None,
-                server_epoch: None,
-                server_sequence: None,
-            })
-            .await
-            .expect_err("inbound Add proposal with unauthorized device key must be rejected");
-        assert!(
-            matches!(err, OrchestratorError::InvalidInput(_))
-                && err.to_string().contains("authorized device key"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            bob.orchestrator
+                .expect_err("inbound Add commit with unauthorized device key must be rejected");
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_))
+                    && err.to_string().contains("authorized device key"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                bob.orchestrator
+                    .mls_context()
+                    .get_epoch(group_bytes.clone())
+                    .unwrap(),
+                bob_epoch_before,
+                "rejected inbound Add commit must not advance epoch"
+            );
+            assert!(
+                bob.orchestrator
+                    .mls_context()
+                    .merge_incoming_commit(group_bytes.clone(), bob_epoch_before + 1)
+                    .is_err(),
+                "rejected inbound Add commit must discard staged commit"
+            );
+            let members = bob
+                .orchestrator
                 .mls_context()
-                .accept_incoming_proposal(group_bytes, prop_res.proposal_ref)
-                .is_err(),
-            "rejected inbound Add proposal must be discarded from pending_incoming_proposals"
-        );
+                .group_member_identities(group_bytes)
+                .unwrap();
+            assert!(
+                !members
+                    .iter()
+                    .any(|m| String::from_utf8_lossy(m).starts_with(&victim_did)),
+                "rogue victim leaf must not be present in Bob's ratchet tree"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn f02_inbound_welcome_with_unauthorized_peer_device_key_is_rejected_and_rolled_back()
+        {
+            use crate::orchestrator::{MLSAPIClient, MLSStorageBackend, OrchestratorError};
+            use crate::recovery_e2e_harness::TestWorld;
+
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world
+                .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+                .await;
+            world
+                .add_client_with_did("Victim", "did:plc:cccccccccccccccccccccccc")
+                .await;
+            let _alice_did = world.register_device("Alice").await.unwrap();
+            let bob_did = world.register_device("Bob").await.unwrap();
+            let victim_did = world.register_device("Victim").await.unwrap();
+
+            let convo = world
+                .client("Alice")
+                .orchestrator
+                .create_group("f02-welcome", None, None)
+                .await
+                .expect("create group");
+            let group_bytes = hex::decode(&convo.group_id).unwrap();
+
+            // Inject an unauthorized Victim leaf into Alice's local group, then add Bob
+            // so Bob receives a cryptographically valid Welcome containing the rogue leaf.
+            let rogue_kp = rogue_group_key_package(&format!("{victim_did}#rogue-device"));
+            let bob_kps = world
+                .client("Alice")
+                .orchestrator
+                .api_client()
+                .get_key_packages(
+                    "00000000-0000-4000-8000-000000000001",
+                    std::slice::from_ref(&bob_did),
+                )
+                .await
+                .expect("fetch Bob key package");
+            let bob_kp = crate::KeyPackageData {
+                data: bob_kps[0].key_package_data.clone(),
+            };
+            let add_res = world
+                .client("Alice")
+                .orchestrator
+                .mls_context()
+                .add_members(group_bytes.clone(), vec![rogue_kp, bob_kp])
+                .expect("raw mls add_members");
+            world
+                .client("Alice")
+                .orchestrator
+                .mls_context()
+                .merge_pending_commit(group_bytes.clone())
+                .expect("merge Alice commit");
+
+            let bob = world.client("Bob");
+            let err = bob
+                .orchestrator
+                .join_group(&add_res.welcome_data)
+                .await
+                .expect_err("inbound Welcome with unauthorized peer device key must be rejected");
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_))
+                    && err.to_string().contains("authorized device key"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                !bob.orchestrator.mls_context().group_exists(group_bytes),
+                "rejected Welcome must roll back and delete the OpenMLS group"
+            );
+            assert!(
+                bob.storage
+                    .get_group_state(&convo.group_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "rejected Welcome must not persist GroupState"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn f02_inbound_add_proposal_with_unauthorized_device_key_is_rejected_and_discarded() {
+            use crate::orchestrator::{
+                IncomingEnvelope, MLSAPIClient, MlsCryptoContext, OrchestratorError,
+            };
+            use crate::recovery_e2e_harness::TestWorld;
+
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world
+                .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+                .await;
+            world
+                .add_client_with_did("Victim", "did:plc:cccccccccccccccccccccccc")
+                .await;
+            let alice_did = world.register_device("Alice").await.unwrap();
+            let bob_did = world.register_device("Bob").await.unwrap();
+            let victim_did = world.register_device("Victim").await.unwrap();
+
+            let convo = world
+                .client("Alice")
+                .orchestrator
+                .create_group("f02-proposal", None, None)
+                .await
+                .expect("create group");
+            world
+                .client("Alice")
+                .orchestrator
+                .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+                .await
+                .expect("add Bob");
+
+            let welcome = world
+                .client("Bob")
+                .orchestrator
+                .api_client()
+                .get_welcome(&convo.conversation_id)
+                .await
+                .expect("get welcome");
+            world
+                .client("Bob")
+                .orchestrator
+                .join_group(&welcome)
+                .await
+                .expect("Bob join_group");
+
+            let group_bytes = hex::decode(&convo.group_id).unwrap();
+            let rogue_kp = rogue_group_key_package(&format!("{victim_did}#rogue-device"));
+            let prop_res = world
+                .client("Alice")
+                .orchestrator
+                .mls_context()
+                .propose_add_member(group_bytes.clone(), rogue_kp.data)
+                .expect("propose_add_member");
+
+            let bob = world.client("Bob");
+            let err = bob
+                .orchestrator
+                .process_incoming(&IncomingEnvelope {
+                    conversation_id: convo.conversation_id.clone(),
+                    sender_did: alice_did,
+                    ciphertext: prop_res.proposal_message,
+                    timestamp: chrono::Utc::now(),
+                    server_message_id: Some("f02-rogue-add-proposal".to_string()),
+                    canonical_entry_json: None,
+                    server_epoch: None,
+                    server_sequence: None,
+                })
+                .await
+                .expect_err("inbound Add proposal with unauthorized device key must be rejected");
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_))
+                    && err.to_string().contains("authorized device key"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                bob.orchestrator
+                    .mls_context()
+                    .accept_incoming_proposal(group_bytes, prop_res.proposal_ref)
+                    .is_err(),
+                "rejected inbound Add proposal must be discarded from pending_incoming_proposals"
+            );
+        }
     }
 }

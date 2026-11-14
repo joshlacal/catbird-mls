@@ -318,11 +318,39 @@ fn passkey_prf_registration_and_second_device_restore_roundtrip() {
 
     let cred_id = b"webauthn-cred-wave2-primary".to_vec();
     let prf_secret = vec![0x37_u8; 32];
+    assert_eq!(world.ds_head_seqs(ALICE), vec![0]);
+    assert!(world.mailbox_keys(ALICE, "000000000001").is_none());
+
     let registered = alice_d1
         .register_passkey_prf(cred_id.clone(), prf_secret.clone())
         .expect("register passkey PRF virtual device");
     assert!(registered.backup_enabled);
     assert!(registered.has_passkey_prf);
+    assert_eq!(
+        registered.epoch_seq, 1,
+        "passkey registration must rotate OwnerMailbox epoch 0 -> 1 so members_hash anchors virtualDevice"
+    );
+    assert_eq!(world.ds_head_seqs(ALICE), vec![0, 1]);
+    assert!(
+        world.mailbox_keys(ALICE, "000000000001").is_some(),
+        "rotated epoch 1 mailboxKeys must be published to PDS"
+    );
+    let mailbox_space = format!("at://{ALICE}/space/blue.catbird.labyrinth.mailbox/self");
+    let epoch1_members: Vec<String> = world
+        .archive_auth
+        .space_record_rkeys(
+            &mailbox_space,
+            ALICE,
+            labyrinth::records::nsid::EPOCH_MEMBER,
+        )
+        .into_iter()
+        .filter(|rkey| rkey.starts_with("000000000001-"))
+        .collect();
+    assert_eq!(
+        epoch1_members.len(),
+        2,
+        "epoch 1 must carry both the physical device and passkey virtualDevice: {epoch1_members:?}"
+    );
 
     let d2_dir = tempfile::tempdir().unwrap();
     let alice_d2 = world.client(ALICE, d2_dir.path());
@@ -347,7 +375,7 @@ fn passkey_prf_registration_and_second_device_restore_roundtrip() {
         .expect("restore second device via passkey PRF");
     assert!(restored.backup_enabled);
     assert!(restored.has_passkey_prf);
-    assert!(restored.epoch_seq >= 1);
+    assert_eq!(restored.epoch_seq, 2);
 
     let read_state = alice_d2
         .ffi_get_read_state("conv-passkey".to_owned())
@@ -731,4 +759,429 @@ fn ffi_voice_opus_prepare_and_decode_pcm_roundtrip_and_invalid_rejection() {
         ffi_decode_opus_to_pcm(b"not-a-valid-ogg-opus-stream".to_vec()),
         Err(MLSError::InvalidInput { .. })
     ));
+}
+
+#[test]
+fn concurrent_two_device_circle_owner_state_create_cas_preserves_acl_tombstone_and_read_state_max()
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let world = LiveWorld::default();
+    let d1_dir = tempfile::tempdir().unwrap();
+    let d2_dir = tempfile::tempdir().unwrap();
+    let alice_d1 = world.client(ALICE, d1_dir.path());
+    alice_d1.enroll_device(&all_scopes()).unwrap();
+    let cred_id = b"cred-cas-create-race".to_vec();
+    let prf = vec![0x63_u8; 32];
+    alice_d1
+        .register_passkey_prf(cred_id.clone(), prf.clone())
+        .unwrap();
+    let alice_d2 = world.client(ALICE, d2_dir.path());
+    alice_d2.ffi_restore_with_passkey_prf(cred_id, prf).unwrap();
+
+    // Seed initial version `000000000001` with BOB at key version 1.
+    let initial = CircleOwnerStateDto {
+        circle_id: CIRCLE_ID.to_owned(),
+        space_uri: CIRCLE_SPACE.to_owned(),
+        current_key_version: 1,
+        joined_at_version_json: serde_json::json!({ BOB: 1 }).to_string(),
+        pending_ops_json: "{}".to_owned(),
+        updated_at: String::new(),
+        record_cid: None,
+    };
+    alice_d1.ffi_put_circle_owner_state(initial, None).unwrap();
+
+    // Pre-compute d2's genuine encrypted version-2 `applyWrites` calls, then restore Space
+    // state back to version 1 so d2's writes are replayed mid-flight right as d1 submits
+    // `#create` `<CIRCLE_ID>-000000000002`.
+    let target_v2_rkey = format!("{CIRCLE_ID}-000000000002");
+    let acl_key = format!("__acl__:{BOB}");
+    let v1_snap = world.archive_auth.snapshot_space_state();
+    let _ = world.archive_auth.drain_apply_calls();
+    let d2_evict_bob = CircleOwnerStateDto {
+        circle_id: CIRCLE_ID.to_owned(),
+        space_uri: CIRCLE_SPACE.to_owned(),
+        current_key_version: 2,
+        joined_at_version_json: "{}".to_owned(),
+        pending_ops_json: serde_json::json!({
+            acl_key.clone(): "aclRemovePending:rotated"
+        })
+        .to_string(),
+        updated_at: String::new(),
+        record_cid: None,
+    };
+    alice_d2
+        .ffi_merge_circle_owner_state(d2_evict_bob)
+        .expect("d2 produces encrypted #create version 2 with __acl__ tombstone");
+    let d2_v2_calls = world.archive_auth.drain_apply_calls();
+    assert!(
+        !d2_v2_calls.is_empty(),
+        "d2 must emit applyWrites for version 2"
+    );
+    world.archive_auth.restore_space_state(v1_snap);
+
+    let conflict_injected = Arc::new(AtomicBool::new(false));
+    {
+        let world_for_hook = world.clone();
+        let target_rkey_for_hook = target_v2_rkey.clone();
+        let fired = conflict_injected.clone();
+        world
+            .archive_auth
+            .set_before_apply_hook(Some(Arc::new(move |_account, body| {
+                let is_v2_create = body["writes"].as_array().is_some_and(|writes| {
+                    writes.iter().any(|w| {
+                        w["$type"].as_str() == Some("com.atproto.space.applyWrites#create")
+                            && w["collection"].as_str()
+                                == Some(labyrinth::records::nsid::CIRCLE_OWNER_STATE)
+                            && w["rkey"].as_str() == Some(target_rkey_for_hook.as_str())
+                    })
+                });
+                if is_v2_create && !fired.swap(true, Ordering::SeqCst) {
+                    world_for_hook.archive_auth.set_before_apply_hook(None);
+                    for (acct, call_body) in &d2_v2_calls {
+                        let resp = world_for_hook
+                            .archive_auth
+                            .replay_apply(acct, call_body)
+                            .expect("d2 version 2 replay succeeds");
+                        assert_eq!(resp.status, 200);
+                    }
+                }
+            })));
+    }
+
+    // d1 attempts to merge a stale view `{ BOB: 1, CAROL: 2 }`:
+    // d2 wins `<CIRCLE_ID>-000000000002`, d1 receives `400 RecordAlreadyExists` on `#create`,
+    // re-reads d2's version 2, preserves `__acl__:<BOB>`, keeps BOB evicted, and commits version 3!
+    let d1_add_carol_with_stale_bob = CircleOwnerStateDto {
+        circle_id: CIRCLE_ID.to_owned(),
+        space_uri: CIRCLE_SPACE.to_owned(),
+        current_key_version: 2,
+        joined_at_version_json: serde_json::json!({ BOB: 1, CAROL: 2 }).to_string(),
+        pending_ops_json: serde_json::json!({ BOB: "stalePendingAdd" }).to_string(),
+        updated_at: String::new(),
+        record_cid: None,
+    };
+    let merged = alice_d1
+        .ffi_merge_circle_owner_state(d1_add_carol_with_stale_bob)
+        .expect("d1 retries after #create RecordAlreadyExists and merges cleanly");
+    assert!(
+        conflict_injected.load(Ordering::SeqCst),
+        "interleaved #create conflict hook must fire on version 2"
+    );
+
+    for snapshot in [
+        merged,
+        alice_d2
+            .ffi_get_circle_owner_state(CIRCLE_ID.to_owned())
+            .unwrap()
+            .expect("d2 reads settled version 3"),
+    ] {
+        assert_eq!(snapshot.current_key_version, 2);
+        let joined: serde_json::Value =
+            serde_json::from_str(&snapshot.joined_at_version_json).unwrap();
+        assert!(
+            joined.get(BOB).is_none(),
+            "__acl__ tombstone must keep BOB evicted across #create CAS retry: {joined}"
+        );
+        assert_eq!(joined[CAROL].as_u64(), Some(2));
+        let ops: serde_json::Value = serde_json::from_str(&snapshot.pending_ops_json).unwrap();
+        assert!(ops.get(BOB).is_none(), "stale non-tombstone op suppressed");
+        assert_eq!(ops[&acl_key].as_str(), Some("aclRemovePending:rotated"));
+    }
+
+    let mailbox_space = format!("at://{ALICE}/space/blue.catbird.labyrinth.mailbox/self");
+    let remaining_rkeys = world.archive_auth.space_record_rkeys(
+        &mailbox_space,
+        ALICE,
+        labyrinth::records::nsid::CIRCLE_OWNER_STATE,
+    );
+    assert_eq!(
+        remaining_rkeys,
+        vec![format!("{CIRCLE_ID}-000000000003")],
+        "lazy post-commit cleanup must delete superseded `< version` rows"
+    );
+
+    // Also verify true mid-flight `#create` conflict on `readState` merges monotonic `MAX(readThroughSeq)`.
+    alice_d1
+        .ffi_advance_read_state("conv-race-max".to_owned(), 5)
+        .unwrap();
+    let read_v1_snap = world.archive_auth.snapshot_space_state();
+    let _ = world.archive_auth.drain_apply_calls();
+    alice_d2
+        .ffi_advance_read_state("conv-race-max".to_owned(), 38)
+        .expect("d2 produces encrypted readState version 2 with seq=38");
+    let d2_read_v2_calls = world.archive_auth.drain_apply_calls();
+    assert!(
+        !d2_read_v2_calls.is_empty(),
+        "d2 must emit applyWrites for readState version 2"
+    );
+    world.archive_auth.restore_space_state(read_v1_snap);
+
+    let read_conflict_injected = Arc::new(AtomicBool::new(false));
+    {
+        let world_for_hook = world.clone();
+        let fired = read_conflict_injected.clone();
+        world
+            .archive_auth
+            .set_before_apply_hook(Some(Arc::new(move |_account, body| {
+                let is_read_v2_create = body["writes"].as_array().is_some_and(|writes| {
+                    writes.iter().any(|w| {
+                        w["$type"].as_str() == Some("com.atproto.space.applyWrites#create")
+                            && w["collection"].as_str()
+                                == Some(labyrinth::records::nsid::READ_STATE)
+                            && w["rkey"].as_str() == Some("conv-race-max-000000000002")
+                    })
+                });
+                if is_read_v2_create && !fired.swap(true, Ordering::SeqCst) {
+                    world_for_hook.archive_auth.set_before_apply_hook(None);
+                    for (acct, call_body) in &d2_read_v2_calls {
+                        let resp = world_for_hook
+                            .archive_auth
+                            .replay_apply(acct, call_body)
+                            .expect("d2 readState version 2 replay succeeds");
+                        assert_eq!(resp.status, 200);
+                    }
+                }
+            })));
+    }
+    let settled_read = alice_d1
+        .ffi_advance_read_state("conv-race-max".to_owned(), 12)
+        .expect("d1 retries readState conflict and merges MAX(12, 38)");
+    assert!(read_conflict_injected.load(Ordering::SeqCst));
+    assert_eq!(settled_read.read_through_seq, 38);
+    assert_eq!(
+        alice_d2
+            .ffi_get_read_state("conv-race-max".to_owned())
+            .unwrap()
+            .unwrap()
+            .read_through_seq,
+        38
+    );
+}
+
+#[tokio::test]
+async fn resolving_space_thread_store_find_meks_probes_batch_author_first_o1_with_fallback() {
+    use catbird_mls::labyrinth::space::ResolvingSpaceThreadStore;
+    use catbird_mls::labyrinth::state::StateVault;
+    use labyrinth::records::{Bytes, MekDistribution, MekSenderDef, TransportSenderDef};
+    use labyrinth::store::space::{SpaceError, SpaceRef, SpaceRpc};
+    use labyrinth::store::ThreadStore as _;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemVault(Mutex<BTreeMap<String, Vec<u8>>>);
+    impl StateVault for MemVault {
+        fn load(&self, key: &str) -> Result<Option<Vec<u8>>, MLSError> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        fn delete(&self, key: &str) -> Result<(), MLSError> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+        fn compare_exchange(
+            &self,
+            key: &str,
+            expected: Option<&[u8]>,
+            next: &[u8],
+        ) -> Result<bool, MLSError> {
+            let mut g = self.0.lock().unwrap();
+            if g.get(key).map(Vec::as_slice) != expected {
+                return Ok(false);
+            }
+            g.insert(key.to_owned(), next.to_vec());
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct MockMekSpaceRpc {
+        mek_records: Mutex<BTreeMap<(String, String), serde_json::Value>>,
+        writers: Mutex<Vec<String>>,
+        mek_get_repos: Mutex<Vec<String>>,
+        list_writers_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SpaceRpc for MockMekSpaceRpc {
+        async fn query(
+            &self,
+            nsid: &str,
+            params: &[(&str, String)],
+        ) -> Result<Vec<u8>, SpaceError> {
+            let param = |k: &str| {
+                params
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or_default()
+            };
+            match nsid {
+                "com.atproto.space.getRecord" => {
+                    let repo = param("repo").to_owned();
+                    let collection = param("collection");
+                    let rkey = param("rkey").to_owned();
+                    if collection == labyrinth::records::nsid::MEK {
+                        self.mek_get_repos.lock().unwrap().push(repo.clone());
+                    }
+                    match self
+                        .mek_records
+                        .lock()
+                        .unwrap()
+                        .get(&(repo.clone(), rkey.clone()))
+                    {
+                        Some(val) => Ok(serde_json::to_vec(&serde_json::json!({
+                            "uri": format!("at://{repo}/space/rec/{collection}/{rkey}"),
+                            "cid": "bafyreimek0000000000000000000000000000000000000000000000",
+                            "value": val,
+                        }))
+                        .unwrap()),
+                        None => Err(SpaceError {
+                            status: 404,
+                            error: Some("RecordNotFound".into()),
+                            message: Some("not found".into()),
+                        }),
+                    }
+                }
+                "com.atproto.space.listWriters" => {
+                    self.list_writers_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let repos: Vec<serde_json::Value> = self
+                        .writers
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|did| {
+                            serde_json::json!({
+                                "$type": "com.atproto.space.defs#repoWrite",
+                                "repo": did,
+                                "repoRev": "2222222222222",
+                                "spaceRev": "2222222222222",
+                                "data": { "$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" },
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::to_vec(&serde_json::json!({
+                        "repos": repos,
+                        "complete": true,
+                    }))
+                    .unwrap())
+                }
+                other => Err(SpaceError {
+                    status: 501,
+                    error: Some("Unmocked".into()),
+                    message: Some(other.into()),
+                }),
+            }
+        }
+
+        async fn procedure(&self, nsid: &str, _body: &[u8]) -> Result<Vec<u8>, SpaceError> {
+            Err(SpaceError {
+                status: 501,
+                error: Some("Unmocked".into()),
+                message: Some(nsid.into()),
+            })
+        }
+
+        async fn upload_blob(&self, _: &[u8], _: &str) -> Result<String, SpaceError> {
+            unreachable!()
+        }
+
+        async fn get_blob(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, SpaceError> {
+            unreachable!()
+        }
+    }
+
+    let rpc = Arc::new(MockMekSpaceRpc::default());
+    let mek_id: [u8; 12] = [0x42; 12];
+    let mek_rkey = hex::encode(mek_id);
+    let dist = MekDistribution {
+        type_: labyrinth::records::nsid::MEK.to_owned(),
+        thread_id: "conv-o1".to_owned(),
+        mek_id: Bytes(mek_id.to_vec()),
+        roster_hash: Bytes(vec![0x33; 32]),
+        sender: MekSenderDef::Transport(TransportSenderDef {
+            transport_pubkey: Bytes(vec![0x44; 32]),
+            ephemeral_auth_pubkey: Bytes(vec![0x55; 32]),
+            sig: Bytes(vec![0x66; 64]),
+        }),
+        recipients: Vec::new(),
+        created_at: "2026-11-14T00:00:00.000Z".to_owned(),
+    };
+    let dist_json = serde_json::to_value(&dist).unwrap();
+
+    // Populate 14 writers in `listWriters`, with BOB and CAROL both holding valid MEK distributions.
+    let mut all_writers = vec![ALICE.to_owned(), BOB.to_owned(), CAROL.to_owned()];
+    for idx in 0..11u8 {
+        all_writers.push(format!("did:plc:peerwriter{idx:012}"));
+    }
+    *rpc.writers.lock().unwrap() = all_writers;
+    rpc.mek_records
+        .lock()
+        .unwrap()
+        .insert((BOB.to_owned(), mek_rkey.clone()), dist_json.clone());
+    rpc.mek_records
+        .lock()
+        .unwrap()
+        .insert((CAROL.to_owned(), mek_rkey.clone()), dist_json);
+
+    let store = ResolvingSpaceThreadStore::new(
+        ALICE,
+        rpc.clone(),
+        None,
+        Arc::new(MemVault::default()),
+        Some(circles_live_platform::DS_DID.to_owned()),
+    );
+    store.set_thread_space(
+        "conv-o1",
+        SpaceRef::conversation(circles_live_platform::DS_DID, "conv-o1-0"),
+    );
+    assert!(store.supports_author_mek_fast_path());
+
+    // 1. O(1) author fast path: `find_mek_from_author(BOB)` issues 1 `getRecord` and 0 `listWriters`.
+    let author_hit = store
+        .find_mek_from_author("conv-o1", BOB, &mek_id)
+        .await
+        .expect("author fast path query succeeds")
+        .expect("BOB holds valid MekDistribution");
+    assert_eq!(author_hit.author, BOB);
+    assert_eq!(
+        rpc.list_writers_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "O(1) author fast path must not call listWriters"
+    );
+    assert_eq!(
+        *rpc.mek_get_repos.lock().unwrap(),
+        vec![BOB.to_owned()],
+        "O(1) author fast path must probe only batch author BOB"
+    );
+
+    // 2. When batch author BOB lacks the MEK record, `find_meks_with_hint(..., Some(BOB))` probes BOB first,
+    // then falls back across remaining `listWriters` without re-querying BOB and recovers CAROL's record.
+    rpc.mek_records
+        .lock()
+        .unwrap()
+        .remove(&(BOB.to_owned(), mek_rkey));
+    rpc.mek_get_repos.lock().unwrap().clear();
+
+    let fallback_hits = store
+        .find_meks_with_hint("conv-o1", &mek_id, Some(BOB))
+        .await
+        .expect("bounded fallback across writers succeeds");
+    assert_eq!(fallback_hits.len(), 1);
+    assert_eq!(fallback_hits[0].author, CAROL);
+    assert_eq!(
+        rpc.list_writers_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "fallback queries listWriters once"
+    );
+    let probed = rpc.mek_get_repos.lock().unwrap().clone();
+    assert_eq!(probed.first().map(String::as_str), Some(BOB));
+    assert_eq!(
+        probed.iter().filter(|d| d.as_str() == BOB).count(),
+        1,
+        "BOB must not be re-probed during fallback sweep"
+    );
 }

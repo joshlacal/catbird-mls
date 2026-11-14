@@ -13,17 +13,20 @@
 
 #[path = "epoch_secret_test_support.rs"]
 mod epoch_secret_test_support;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "mock_api_client.rs"]
 mod mock_api_client;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "mock_credentials.rs"]
 mod mock_credentials;
+#[cfg(feature = "legacy-orchestrator")]
 #[path = "mock_storage.rs"]
 mod mock_storage;
 
 use async_trait::async_trait;
-use catbird_mls::orchestrator::{
-    CommitKind, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
-};
+use catbird_mls::orchestrator::CommitKind;
+#[cfg(feature = "legacy-orchestrator")]
+use catbird_mls::orchestrator::{MLSOrchestrator, MLSStorageBackend, OrchestratorConfig};
 use catbird_mls::{GroupConfig, KeychainAccess, MLSContext, MLSError};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -417,6 +420,7 @@ fn direct_group_info_export_failure_clears_untracked_commit_and_allows_retry() {
         .expect("successful retry remains explicitly discardable");
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 #[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_group_info_export_failure_clears_untracked_commit_and_allows_retry() {
     const AUTHENTICATED_DID: &str = "did:plc:authenticated-non-signer";

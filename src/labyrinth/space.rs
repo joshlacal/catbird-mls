@@ -878,6 +878,46 @@ impl labyrinth::store::ThreadStore for ResolvingSpaceThreadStore {
         self.inner.find_meks(thread_id, mek_id).await
     }
 
+    fn supports_author_mek_fast_path(&self) -> bool {
+        self.inner.supports_author_mek_fast_path()
+    }
+
+    async fn find_mek_from_author(
+        &self,
+        thread_id: &str,
+        author_did: &str,
+        mek_id: &[u8; 12],
+    ) -> labyrinth::Result<Option<Stored<labyrinth::records::MekDistribution>>> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .find_mek_from_author(thread_id, author_did, mek_id)
+            .await
+    }
+
+    async fn find_meks_excluding_author(
+        &self,
+        thread_id: &str,
+        excluded_author: &str,
+        mek_id: &[u8; 12],
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::MekDistribution>>> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .find_meks_excluding_author(thread_id, excluded_author, mek_id)
+            .await
+    }
+
+    async fn find_meks_with_hint(
+        &self,
+        thread_id: &str,
+        mek_id: &[u8; 12],
+        preferred_author: Option<&str>,
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::MekDistribution>>> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .find_meks_with_hint(thread_id, mek_id, preferred_author)
+            .await
+    }
+
     async fn append_batch(&self, batch: &labyrinth::records::Batch) -> labyrinth::Result<String> {
         self.ensure_thread_space(&batch.thread_id).await?;
         self.inner.append_batch(batch).await

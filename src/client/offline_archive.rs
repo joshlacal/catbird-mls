@@ -1066,6 +1066,18 @@ impl CatbirdMlsClient {
                     ))
                 },
             )?;
+            if let Some((rotated_seq, rotated_root)) =
+                self.rotate_mailbox_epoch_if_supported(None, now_ms)?
+            {
+                self.db.write_tx(|tx| {
+                    tx.put_labyrinth_state(
+                        &owner_epoch_root_key(rotated_seq),
+                        rotated_root.as_slice(),
+                        now_ms,
+                    )
+                })?;
+                active_seq = rotated_seq;
+            }
         }
 
         let status = self.db.write_tx(|tx| {

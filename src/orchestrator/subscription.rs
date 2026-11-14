@@ -9,17 +9,22 @@ use std::collections::HashSet;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "legacy-orchestrator")]
 use sha2::{Digest, Sha256};
 
+#[cfg(any(feature = "legacy-orchestrator", test))]
+use super::canonical_transport::{CanonicalOperation, PreparedRequest};
+#[cfg(feature = "legacy-orchestrator")]
 use super::{
     api_client::MLSAPIClient,
     authenticated_inventory::{AppliedInventoryFence, AuthenticatedInventorySnapshot},
-    canonical_transport::{CanonicalOperation, PreparedRequest},
     credentials::CredentialStore,
-    error::{OrchestratorError, Result},
     mls_provider::MlsCryptoContext,
     orchestrator::MLSOrchestrator,
     storage::MLSStorageBackend,
+};
+use super::{
+    error::{OrchestratorError, Result},
     types::Message,
 };
 use crate::error::MLSError;
@@ -33,14 +38,17 @@ fn invalid(message: impl std::fmt::Display) -> OrchestratorError {
     OrchestratorError::Api(format!("Subscription: {message}"))
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn invalid_err(e: impl std::fmt::Display) -> OrchestratorError {
     OrchestratorError::Serialization(e.to_string())
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn storage_err(e: MLSError) -> OrchestratorError {
     OrchestratorError::Storage(e.to_string())
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn digest_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -162,6 +170,7 @@ impl Traversal {
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageRef {
@@ -169,6 +178,7 @@ struct PageRef {
     sha256: String,
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
@@ -393,6 +403,7 @@ pub(crate) fn checked_namespace(namespace: &str) -> std::result::Result<(), MLSE
     Ok(())
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn store_pages<M: MlsCryptoContext + ?Sized>(
     ctx: &M,
     namespace: &str,
@@ -436,6 +447,7 @@ fn store_pages<M: MlsCryptoContext + ?Sized>(
         .collect()
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn load_pages<M: MlsCryptoContext + ?Sized>(
     ctx: &M,
     namespace: &str,
@@ -463,6 +475,7 @@ fn load_pages<M: MlsCryptoContext + ?Sized>(
         .collect()
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn restore<M: MlsCryptoContext + ?Sized>(
     ctx: &M,
     namespace: &str,
@@ -487,10 +500,12 @@ fn restore<M: MlsCryptoContext + ?Sized>(
     Ok(snapshot)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 fn snapshot_hash(snapshot: &AuthenticatedInventorySnapshot) -> Result<String> {
     Ok(hex::encode(snapshot.digest()?))
 }
 
+#[cfg(any(feature = "legacy-orchestrator", test))]
 fn query(
     operation: CanonicalOperation,
     actor: &str,
@@ -522,6 +537,7 @@ fn query(
 }
 
 /// Percent-encode everything outside the RFC 3986 unreserved set.
+#[cfg(any(feature = "legacy-orchestrator", test))]
 fn push_query_value(out: &mut String, value: &str) {
     use std::fmt::Write as _;
     for byte in value.bytes() {
@@ -535,6 +551,7 @@ fn push_query_value(out: &mut String, value: &str) {
 
 /// The only admitted subscription endpoint: the production service on its
 /// default port, with no userinfo, query, or fragment.
+#[cfg(any(feature = "legacy-orchestrator", test))]
 fn validate_endpoint(endpoint: &str) -> Result<()> {
     const PATH: &str = "/xrpc/blue.catbird.chat.subscribeEvents";
     let authority = endpoint
@@ -562,6 +579,7 @@ pub fn decode_subscription_frame(raw: &str) -> Result<serde_json::Value> {
         .map_err(invalid)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -1176,9 +1194,8 @@ where
 mod tests {
     use super::*;
     use crate::orchestrator::mls_provider::MlsCryptoContext;
-    use std::sync::Arc;
 
-    struct NoopKeychain;
+    pub(super) struct NoopKeychain;
     #[async_trait::async_trait]
     impl crate::KeychainAccess for NoopKeychain {
         async fn read(&self, _key: String) -> std::result::Result<Option<Vec<u8>>, MLSError> {
@@ -1452,773 +1469,805 @@ mod tests {
         .to_string()
     }
 
-    struct MockStorage;
-    #[async_trait::async_trait]
-    impl MLSStorageBackend for MockStorage {
-        async fn ensure_conversation_exists(&self, _: &str, _: &str, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn update_join_info(
-            &self,
-            _: &str,
-            _: &str,
-            _: super::super::types::JoinMethod,
-            _: u64,
-        ) -> Result<()> {
-            Ok(())
-        }
-        async fn get_conversation(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Option<super::super::types::ConversationView>> {
-            Ok(None)
-        }
-        async fn list_conversations(
-            &self,
-            _: &str,
-        ) -> Result<Vec<super::super::types::ConversationView>> {
-            Ok(vec![])
-        }
-        async fn delete_conversations(&self, _: &str, _: &[&str]) -> Result<()> {
-            Ok(())
-        }
-        async fn set_conversation_state(
-            &self,
-            _: &str,
-            _: super::super::types::ConversationState,
-        ) -> Result<()> {
-            Ok(())
-        }
-        async fn mark_needs_rejoin(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn needs_rejoin(&self, _: &str) -> Result<bool> {
-            Ok(false)
-        }
-        async fn clear_rejoin_flag(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn store_message(&self, _: &Message) -> Result<()> {
-            Ok(())
-        }
-        async fn get_messages(&self, _: &str, _: u32, _: Option<u64>) -> Result<Vec<Message>> {
-            Ok(vec![])
-        }
-        async fn message_exists(&self, _: &str) -> Result<bool> {
-            Ok(false)
-        }
-        async fn get_sync_cursor(&self, _: &str) -> Result<super::super::types::SyncCursor> {
-            Ok(super::super::types::SyncCursor {
-                conversations_cursor: None,
-                messages_cursor: None,
-            })
-        }
-        async fn set_sync_cursor(
-            &self,
-            _: &str,
-            _: &super::super::types::SyncCursor,
-        ) -> Result<()> {
-            Ok(())
-        }
-        async fn set_group_state(&self, _: &super::super::types::GroupState) -> Result<()> {
-            Ok(())
-        }
-        async fn get_group_state(
-            &self,
-            _: &str,
-        ) -> Result<Option<super::super::types::GroupState>> {
-            Ok(None)
-        }
-        async fn delete_group_state(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn get_recovery_state(&self) -> Result<super::super::types::PersistedRecoveryState> {
-            Ok(super::super::types::PersistedRecoveryState::default())
-        }
-        async fn set_recovery_backoff(
-            &self,
-            _: &super::super::types::PersistedRecoveryBackoff,
-        ) -> Result<()> {
-            Ok(())
-        }
-        async fn clear_recovery_backoff(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn set_last_global_rejoin_attempt_at(&self, _: i64) -> Result<()> {
-            Ok(())
-        }
-        async fn get_conversation_state(
-            &self,
-            _: &str,
-        ) -> Result<Option<super::super::types::ConversationState>> {
-            Ok(None)
-        }
-        fn implemented_optional_methods(&self) -> &'static [&'static str] {
-            &[
-                "get_recovery_state",
-                "set_recovery_backoff",
-                "clear_recovery_backoff",
-                "set_last_global_rejoin_attempt_at",
-                "get_conversation_state",
-            ]
-        }
-    }
+    #[cfg(all(feature = "legacy-orchestrator", not(target_arch = "wasm32")))]
+    mod orchestrator_tests {
+        use super::*;
+        use std::sync::Arc;
 
-    struct MockCreds {
-        owner: String,
-        actor: String,
-        gen: i64,
-    }
-    #[async_trait::async_trait]
-    impl CredentialStore for MockCreds {
-        async fn store_signing_key(&self, _: &str, _: &[u8]) -> Result<()> {
-            Ok(())
+        struct MockStorage;
+        #[async_trait::async_trait]
+        impl MLSStorageBackend for MockStorage {
+            async fn ensure_conversation_exists(&self, _: &str, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn update_join_info(
+                &self,
+                _: &str,
+                _: &str,
+                _: crate::orchestrator::types::JoinMethod,
+                _: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn get_conversation(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<crate::orchestrator::types::ConversationView>> {
+                Ok(None)
+            }
+            async fn list_conversations(
+                &self,
+                _: &str,
+            ) -> Result<Vec<crate::orchestrator::types::ConversationView>> {
+                Ok(vec![])
+            }
+            async fn delete_conversations(&self, _: &str, _: &[&str]) -> Result<()> {
+                Ok(())
+            }
+            async fn set_conversation_state(
+                &self,
+                _: &str,
+                _: crate::orchestrator::types::ConversationState,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn mark_needs_rejoin(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn needs_rejoin(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn clear_rejoin_flag(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn store_message(&self, _: &Message) -> Result<()> {
+                Ok(())
+            }
+            async fn get_messages(&self, _: &str, _: u32, _: Option<u64>) -> Result<Vec<Message>> {
+                Ok(vec![])
+            }
+            async fn message_exists(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn get_sync_cursor(
+                &self,
+                _: &str,
+            ) -> Result<crate::orchestrator::types::SyncCursor> {
+                Ok(crate::orchestrator::types::SyncCursor {
+                    conversations_cursor: None,
+                    messages_cursor: None,
+                })
+            }
+            async fn set_sync_cursor(
+                &self,
+                _: &str,
+                _: &crate::orchestrator::types::SyncCursor,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn set_group_state(
+                &self,
+                _: &crate::orchestrator::types::GroupState,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn get_group_state(
+                &self,
+                _: &str,
+            ) -> Result<Option<crate::orchestrator::types::GroupState>> {
+                Ok(None)
+            }
+            async fn delete_group_state(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn get_recovery_state(
+                &self,
+            ) -> Result<crate::orchestrator::types::PersistedRecoveryState> {
+                Ok(crate::orchestrator::types::PersistedRecoveryState::default())
+            }
+            async fn set_recovery_backoff(
+                &self,
+                _: &crate::orchestrator::types::PersistedRecoveryBackoff,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn clear_recovery_backoff(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn set_last_global_rejoin_attempt_at(&self, _: i64) -> Result<()> {
+                Ok(())
+            }
+            async fn get_conversation_state(
+                &self,
+                _: &str,
+            ) -> Result<Option<crate::orchestrator::types::ConversationState>> {
+                Ok(None)
+            }
+            fn implemented_optional_methods(&self) -> &'static [&'static str] {
+                &[
+                    "get_recovery_state",
+                    "set_recovery_backoff",
+                    "clear_recovery_backoff",
+                    "set_last_global_rejoin_attempt_at",
+                    "get_conversation_state",
+                ]
+            }
         }
-        async fn get_signing_key(&self, _: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        async fn delete_signing_key(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn store_mls_did(&self, _: &str, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn get_mls_did(&self, _: &str) -> Result<Option<String>> {
-            Ok(Some(self.owner.clone()))
-        }
-        async fn store_device_uuid(&self, _: &str, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn get_device_uuid(&self, _: &str) -> Result<Option<String>> {
-            Ok(Some(self.actor.clone()))
-        }
-        async fn get_auth_generation(&self, _: &str) -> Result<Option<i64>> {
-            Ok(Some(self.gen))
-        }
-        async fn has_credentials(&self, _: &str) -> Result<bool> {
-            Ok(true)
-        }
-        async fn clear_all(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn verify_member_credential(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<super::super::credential_binding::CredentialVerification> {
-            Ok(super::super::credential_binding::CredentialVerification::Verified)
-        }
-    }
 
-    struct MockApi {
-        did: String,
-    }
-    #[async_trait::async_trait]
-    impl MLSAPIClient for MockApi {
-        async fn is_authenticated_as(&self, did: &str) -> bool {
-            did == self.did
+        struct MockCreds {
+            owner: String,
+            actor: String,
+            gen: i64,
         }
-        async fn current_did(&self) -> Option<String> {
-            Some(self.did.clone())
+        #[async_trait::async_trait]
+        impl CredentialStore for MockCreds {
+            async fn store_signing_key(&self, _: &str, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            async fn get_signing_key(&self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            async fn delete_signing_key(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn store_mls_did(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn get_mls_did(&self, _: &str) -> Result<Option<String>> {
+                Ok(Some(self.owner.clone()))
+            }
+            async fn store_device_uuid(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn get_device_uuid(&self, _: &str) -> Result<Option<String>> {
+                Ok(Some(self.actor.clone()))
+            }
+            async fn get_auth_generation(&self, _: &str) -> Result<Option<i64>> {
+                Ok(Some(self.gen))
+            }
+            async fn has_credentials(&self, _: &str) -> Result<bool> {
+                Ok(true)
+            }
+            async fn clear_all(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn verify_member_credential(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<crate::orchestrator::credential_binding::CredentialVerification>
+            {
+                Ok(crate::orchestrator::credential_binding::CredentialVerification::Verified)
+            }
         }
-        async fn submit_prepared_request(
-            &self,
-            _: PreparedRequest,
-        ) -> Result<super::super::canonical_transport::GatewayResponse> {
-            Ok(super::super::canonical_transport::GatewayResponse {
-                status: 200,
-                content_type: None,
-                body: vec![],
-            })
-        }
-        async fn get_conversations(
-            &self,
-            _: u32,
-            _: Option<&str>,
-        ) -> Result<super::super::types::ConversationListPage> {
-            Ok(super::super::types::ConversationListPage {
-                conversations: vec![],
-                cursor: None,
-            })
-        }
-        async fn get_messages(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            _: u32,
-            _: Option<&str>,
-            _: Option<u32>,
-            _: Option<u32>,
-        ) -> Result<(Vec<super::super::types::IncomingEnvelope>, Option<String>)> {
-            Ok((vec![], None))
-        }
-        async fn get_key_packages(
-            &self,
-            _: &str,
-            _: &[String],
-        ) -> Result<Vec<super::super::types::KeyPackageRef>> {
-            Ok(vec![])
-        }
-        async fn get_key_package_stats(&self) -> Result<super::super::types::KeyPackageStats> {
-            Ok(super::super::types::KeyPackageStats {
-                available: 10,
-                total: 10,
-            })
-        }
-        async fn sync_key_packages(
-            &self,
-            _: &[String],
-            _: &str,
-        ) -> Result<super::super::types::KeyPackageSyncResult> {
-            Ok(super::super::types::KeyPackageSyncResult {
-                orphaned_count: 0,
-                deleted_count: 0,
-            })
-        }
-        async fn list_devices(&self, _: &str) -> Result<Vec<super::super::types::DeviceInfo>> {
-            Ok(vec![])
-        }
-        async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> {
-            Ok(vec![])
-        }
-    }
 
-    /// Serves one inventory snapshot, numbered `snapshot`. Like the server, which keeps one
-    /// session per device and replaces its capability once newer events exist, the ticket
-    /// endpoint only accepts the current snapshot's session.
-    struct MockInventoryApi {
-        did: String,
-        expires: String,
-        snapshot: u8,
-    }
-    impl MockInventoryApi {
-        fn session(&self) -> String {
-            format!("session-inv-{}234567890123456789012", self.snapshot)
+        struct MockApi {
+            did: String,
         }
-    }
-    #[async_trait::async_trait]
-    impl MLSAPIClient for MockInventoryApi {
-        async fn is_authenticated_as(&self, did: &str) -> bool {
-            did == self.did
+        #[async_trait::async_trait]
+        impl MLSAPIClient for MockApi {
+            async fn is_authenticated_as(&self, did: &str) -> bool {
+                did == self.did
+            }
+            async fn current_did(&self) -> Option<String> {
+                Some(self.did.clone())
+            }
+            async fn submit_prepared_request(
+                &self,
+                _: PreparedRequest,
+            ) -> Result<crate::orchestrator::canonical_transport::GatewayResponse> {
+                Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: None,
+                    body: vec![],
+                })
+            }
+            async fn get_conversations(
+                &self,
+                _: u32,
+                _: Option<&str>,
+            ) -> Result<crate::orchestrator::types::ConversationListPage> {
+                Ok(crate::orchestrator::types::ConversationListPage {
+                    conversations: vec![],
+                    cursor: None,
+                })
+            }
+            async fn get_messages(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: u32,
+                _: Option<&str>,
+                _: Option<u32>,
+                _: Option<u32>,
+            ) -> Result<(
+                Vec<crate::orchestrator::types::IncomingEnvelope>,
+                Option<String>,
+            )> {
+                Ok((vec![], None))
+            }
+            async fn get_key_packages(
+                &self,
+                _: &str,
+                _: &[String],
+            ) -> Result<Vec<crate::orchestrator::types::KeyPackageRef>> {
+                Ok(vec![])
+            }
+            async fn get_key_package_stats(
+                &self,
+            ) -> Result<crate::orchestrator::types::KeyPackageStats> {
+                Ok(crate::orchestrator::types::KeyPackageStats {
+                    available: 10,
+                    total: 10,
+                })
+            }
+            async fn sync_key_packages(
+                &self,
+                _: &[String],
+                _: &str,
+            ) -> Result<crate::orchestrator::types::KeyPackageSyncResult> {
+                Ok(crate::orchestrator::types::KeyPackageSyncResult {
+                    orphaned_count: 0,
+                    deleted_count: 0,
+                })
+            }
+            async fn list_devices(
+                &self,
+                _: &str,
+            ) -> Result<Vec<crate::orchestrator::types::DeviceInfo>> {
+                Ok(vec![])
+            }
+            async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
         }
-        async fn current_did(&self) -> Option<String> {
-            Some(self.did.clone())
+
+        /// Serves one inventory snapshot, numbered `snapshot`. Like the server, which keeps one
+        /// session per device and replaces its capability once newer events exist, the ticket
+        /// endpoint only accepts the current snapshot's session.
+        struct MockInventoryApi {
+            did: String,
+            expires: String,
+            snapshot: u8,
         }
-        async fn submit_prepared_request(
-            &self,
-            req: PreparedRequest,
-        ) -> Result<super::super::canonical_transport::GatewayResponse> {
-            let expires = self.expires.as_str();
-            let scope_bytes = STANDARD.encode([3u8; 32]);
-            if req.operation == CanonicalOperation::GetSubscriptionTicket {
-                let asked: serde_json::Value =
-                    serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                if asked["inventorySessionId"] != self.session().as_str() {
-                    return Ok(super::super::canonical_transport::GatewayResponse {
+        impl MockInventoryApi {
+            fn session(&self) -> String {
+                format!("session-inv-{}234567890123456789012", self.snapshot)
+            }
+        }
+        #[async_trait::async_trait]
+        impl MLSAPIClient for MockInventoryApi {
+            async fn is_authenticated_as(&self, did: &str) -> bool {
+                did == self.did
+            }
+            async fn current_did(&self) -> Option<String> {
+                Some(self.did.clone())
+            }
+            async fn submit_prepared_request(
+                &self,
+                req: PreparedRequest,
+            ) -> Result<crate::orchestrator::canonical_transport::GatewayResponse> {
+                let expires = self.expires.as_str();
+                let scope_bytes = STANDARD.encode([3u8; 32]);
+                if req.operation == CanonicalOperation::GetSubscriptionTicket {
+                    let asked: serde_json::Value =
+                        serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                    if asked["inventorySessionId"] != self.session().as_str() {
+                        return Ok(crate::orchestrator::canonical_transport::GatewayResponse {
                         status: 400,
                         content_type: Some("application/json".into()),
                         body: br#"{"error":"InventorySessionMismatch","message":"InventorySessionMismatch"}"#.to_vec(),
                     });
+                    }
+                    let body = serde_json::json!({
+                        "ticket": "ticket-12345678901234567890123456789012",
+                        "endpoint": "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
+                        "expiresAt": expires,
+                        "inventoryScope": {
+                            "supportedProtocolVersions": ["1", "2"],
+                            "scopeDigest": scope_bytes,
+                        }
+                    });
+                    return Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&body).unwrap(),
+                    });
                 }
-                let body = serde_json::json!({
-                    "ticket": "ticket-12345678901234567890123456789012",
-                    "endpoint": "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
-                    "expiresAt": expires,
+                let page = serde_json::json!({
+                    "inventorySessionId": self.session(),
+                    "snapshotEventCursor": format!("cursor-inv-{}", self.snapshot),
+                    "snapshotExpiresAt": expires,
+                    "hasMore": false,
+                    "items": [],
                     "inventoryScope": {
                         "supportedProtocolVersions": ["1", "2"],
-                        "scopeDigest": scope_bytes,
+                        "scopeDigest": { "$bytes": scope_bytes },
                     }
                 });
-                return Ok(super::super::canonical_transport::GatewayResponse {
+                Ok(crate::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
-                    body: serde_json::to_vec(&body).unwrap(),
-                });
+                    body: serde_json::to_vec(&page).unwrap(),
+                })
             }
-            let page = serde_json::json!({
-                "inventorySessionId": self.session(),
-                "snapshotEventCursor": format!("cursor-inv-{}", self.snapshot),
-                "snapshotExpiresAt": expires,
-                "hasMore": false,
-                "items": [],
-                "inventoryScope": {
-                    "supportedProtocolVersions": ["1", "2"],
-                    "scopeDigest": { "$bytes": scope_bytes },
-                }
+            async fn get_conversations(
+                &self,
+                _: u32,
+                _: Option<&str>,
+            ) -> Result<crate::orchestrator::types::ConversationListPage> {
+                Ok(crate::orchestrator::types::ConversationListPage {
+                    conversations: vec![],
+                    cursor: None,
+                })
+            }
+            async fn get_messages(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: u32,
+                _: Option<&str>,
+                _: Option<u32>,
+                _: Option<u32>,
+            ) -> Result<(
+                Vec<crate::orchestrator::types::IncomingEnvelope>,
+                Option<String>,
+            )> {
+                Ok((vec![], None))
+            }
+            async fn get_key_packages(
+                &self,
+                _: &str,
+                _: &[String],
+            ) -> Result<Vec<crate::orchestrator::types::KeyPackageRef>> {
+                Ok(vec![])
+            }
+            async fn get_key_package_stats(
+                &self,
+            ) -> Result<crate::orchestrator::types::KeyPackageStats> {
+                Ok(crate::orchestrator::types::KeyPackageStats {
+                    available: 10,
+                    total: 10,
+                })
+            }
+            async fn sync_key_packages(
+                &self,
+                _: &[String],
+                _: &str,
+            ) -> Result<crate::orchestrator::types::KeyPackageSyncResult> {
+                Ok(crate::orchestrator::types::KeyPackageSyncResult {
+                    orphaned_count: 0,
+                    deleted_count: 0,
+                })
+            }
+            async fn list_devices(
+                &self,
+                _: &str,
+            ) -> Result<Vec<crate::orchestrator::types::DeviceInfo>> {
+                Ok(vec![])
+            }
+            async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[tokio::test]
+        async fn subscription_orchestrator_cursor_lifecycle_and_cas() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir
+                .path()
+                .join("sub_orch_test.db")
+                .to_string_lossy()
+                .to_string();
+            let context = crate::MLSContext::new(
+                db_path,
+                "test-key-1234567890123456".to_string(),
+                Box::new(NoopKeychain),
+            )
+            .unwrap();
+
+            let owner = "did:plc:alice";
+            let actor = "00000000-0000-4000-8000-000000000001";
+            let creds = Arc::new(MockCreds {
+                owner: owner.into(),
+                actor: actor.into(),
+                gen: 1,
             });
-            Ok(super::super::canonical_transport::GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&page).unwrap(),
-            })
-        }
-        async fn get_conversations(
-            &self,
-            _: u32,
-            _: Option<&str>,
-        ) -> Result<super::super::types::ConversationListPage> {
-            Ok(super::super::types::ConversationListPage {
-                conversations: vec![],
-                cursor: None,
-            })
-        }
-        async fn get_messages(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            _: u32,
-            _: Option<&str>,
-            _: Option<u32>,
-            _: Option<u32>,
-        ) -> Result<(Vec<super::super::types::IncomingEnvelope>, Option<String>)> {
-            Ok((vec![], None))
-        }
-        async fn get_key_packages(
-            &self,
-            _: &str,
-            _: &[String],
-        ) -> Result<Vec<super::super::types::KeyPackageRef>> {
-            Ok(vec![])
-        }
-        async fn get_key_package_stats(&self) -> Result<super::super::types::KeyPackageStats> {
-            Ok(super::super::types::KeyPackageStats {
-                available: 10,
-                total: 10,
-            })
-        }
-        async fn sync_key_packages(
-            &self,
-            _: &[String],
-            _: &str,
-        ) -> Result<super::super::types::KeyPackageSyncResult> {
-            Ok(super::super::types::KeyPackageSyncResult {
-                orphaned_count: 0,
-                deleted_count: 0,
-            })
-        }
-        async fn list_devices(&self, _: &str) -> Result<Vec<super::super::types::DeviceInfo>> {
-            Ok(vec![])
-        }
-        async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> {
-            Ok(vec![])
-        }
-    }
+            let storage = Arc::new(MockStorage);
+            let api = Arc::new(MockApi { did: owner.into() });
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn subscription_orchestrator_cursor_lifecycle_and_cas() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir
-            .path()
-            .join("sub_orch_test.db")
-            .to_string_lossy()
+            let orchestrator = MLSOrchestrator::new(
+                context.clone(),
+                storage,
+                api,
+                creds,
+                crate::orchestrator::OrchestratorConfig::default(),
+            );
+            orchestrator.initialize(owner).await.unwrap();
+
+            let ticket = SubscriptionTicket {
+                endpoint: "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents".into(),
+                ticket: "ticket-12345678901234567890123456789012".into(),
+                inventory_session_id: "session-1".into(),
+                event_cursor: "cursor-1".into(),
+            };
+
+            // 1. Initialize cursor fence
+            let fence = orchestrator
+                .initialize_subscription_cursor(&ticket)
+                .await
+                .unwrap();
+            assert_eq!(fence.cursor, "cursor-1");
+            assert_eq!(fence.session, "session-1");
+
+            let current = orchestrator
+                .current_subscription_cursor()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.cursor, "cursor-1");
+
+            // 2. Apply watermark event: cursor-1 -> cursor-2
+            let watermark_frame = serde_json::json!({
+                "$type": "blue.catbird.chat.defs#eventEnvelope",
+                "previousCursor": "cursor-1",
+                "cursor": "cursor-2",
+                "createdAt": "2026-09-23T00:00:00.000Z",
+                "payload": {
+                    "$type": "blue.catbird.chat.defs#watermarkEvent",
+                    "issuedAt": "2026-09-23T00:00:00.000Z"
+                }
+            })
             .to_string();
-        let context = crate::MLSContext::new(
-            db_path,
-            "test-key-1234567890123456".to_string(),
-            Box::new(NoopKeychain),
-        )
-        .unwrap();
 
-        let owner = "did:plc:alice";
-        let actor = "00000000-0000-4000-8000-000000000001";
-        let creds = Arc::new(MockCreds {
-            owner: owner.into(),
-            actor: actor.into(),
-            gen: 1,
-        });
-        let storage = Arc::new(MockStorage);
-        let api = Arc::new(MockApi { did: owner.into() });
+            let outcome = orchestrator
+                .apply_subscription_frame(&watermark_frame)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-2")
+            );
 
-        let orchestrator = MLSOrchestrator::new(
-            context.clone(),
-            storage,
-            api,
-            creds,
-            super::super::orchestrator::OrchestratorConfig::default(),
-        );
-        orchestrator.initialize(owner).await.unwrap();
-
-        let ticket = SubscriptionTicket {
-            endpoint: "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents".into(),
-            ticket: "ticket-12345678901234567890123456789012".into(),
-            inventory_session_id: "session-1".into(),
-            event_cursor: "cursor-1".into(),
-        };
-
-        // 1. Initialize cursor fence
-        let fence = orchestrator
-            .initialize_subscription_cursor(&ticket)
-            .await
-            .unwrap();
-        assert_eq!(fence.cursor, "cursor-1");
-        assert_eq!(fence.session, "session-1");
-
-        let current = orchestrator
-            .current_subscription_cursor()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.cursor, "cursor-1");
-
-        // 2. Apply watermark event: cursor-1 -> cursor-2
-        let watermark_frame = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#eventEnvelope",
-            "previousCursor": "cursor-1",
-            "cursor": "cursor-2",
-            "createdAt": "2026-09-23T00:00:00.000Z",
-            "payload": {
-                "$type": "blue.catbird.chat.defs#watermarkEvent",
-                "issuedAt": "2026-09-23T00:00:00.000Z"
-            }
-        })
-        .to_string();
-
-        let outcome = orchestrator
-            .apply_subscription_frame(&watermark_frame)
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-2")
-        );
-
-        let current = orchestrator
-            .current_subscription_cursor()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.cursor, "cursor-2");
-
-        // 3. Gap frame: expected previousCursor cursor-2, but received cursor-1 -> rejected!
-        let gap_frame = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#eventEnvelope",
-            "previousCursor": "cursor-1",
-            "cursor": "cursor-3",
-            "createdAt": "2026-09-23T00:00:00.000Z",
-            "payload": {
-                "$type": "blue.catbird.chat.defs#watermarkEvent",
-                "issuedAt": "2026-09-23T00:00:00.000Z"
-            }
-        })
-        .to_string();
-        let err = orchestrator
-            .apply_subscription_frame(&gap_frame)
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Subscription cursor chain changed"));
-        // Cursor must remain cursor-2
-        assert_eq!(
-            orchestrator
+            let current = orchestrator
                 .current_subscription_cursor()
                 .await
                 .unwrap()
-                .unwrap()
-                .cursor,
-            "cursor-2"
-        );
+                .unwrap();
+            assert_eq!(current.cursor, "cursor-2");
 
-        // 4. Typing event does NOT advance cursor
-        let bob = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
-        let outcome = orchestrator
-            .apply_subscription_frame(&typing_frame(bob))
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome, SubscriptionDispatchOutcome::Typing { ref conversation_id, ref sender_did, is_typing: true } if conversation_id == "00000000-0000-4000-8000-00000000000b" && sender_did == bob)
-        );
-        // Cursor must remain cursor-2
-        assert_eq!(
-            orchestrator
-                .current_subscription_cursor()
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor,
-            "cursor-2"
-        );
-
-        // 5. Valid advance cursor-2 -> cursor-3
-        let advance_frame = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#eventEnvelope",
-            "previousCursor": "cursor-2",
-            "cursor": "cursor-3",
-            "createdAt": "2026-09-23T00:00:00.000Z",
-            "payload": {
-                "$type": "blue.catbird.chat.defs#watermarkEvent",
-                "issuedAt": "2026-09-23T00:00:00.000Z"
-            }
-        })
-        .to_string();
-        let outcome = orchestrator
-            .apply_subscription_frame(&advance_frame)
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-3")
-        );
-        assert_eq!(
-            orchestrator
-                .current_subscription_cursor()
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor,
-            "cursor-3"
-        );
-
-        // 6. Foreign access-ended event is rejected
-        let foreign_access_ended = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#eventEnvelope",
-            "previousCursor": "cursor-3",
-            "cursor": "cursor-4",
-            "createdAt": "2026-09-23T00:00:00.000Z",
-            "payload": {
-                "$type": "blue.catbird.chat.defs#accessEndedEvent",
-                "conversationId": "00000000-0000-4000-8000-00000000000b",
-                "membershipIntervalId": "00000000-0000-4000-8000-00000000000d",
-                "userDid": "did:plc:ffffffffffffffffffffffff",
-                "deviceId": "00000000-0000-4000-8000-000000000999",
-                "terminalSeq": 1
-            }
-        })
-        .to_string();
-        let err = orchestrator
-            .apply_subscription_frame(&foreign_access_ended)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Foreign access-ended audience"));
-        assert_eq!(
-            orchestrator
-                .current_subscription_cursor()
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor,
-            "cursor-3"
-        );
-
-        // 6b. Unknown payload variant is rejected before the cursor moves
-        let unknown_variant = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#eventEnvelope",
-            "previousCursor": "cursor-3",
-            "cursor": "cursor-4",
-            "createdAt": "2026-09-23T00:00:00.000Z",
-            "payload": {
-                "$type": "blue.catbird.chat.defs#unknownEvent",
-                "issuedAt": "2026-09-23T00:00:00.000Z"
-            }
-        })
-        .to_string();
-        assert!(orchestrator
-            .apply_subscription_frame(&unknown_variant)
-            .await
-            .is_err());
-        assert_eq!(
-            orchestrator
-                .current_subscription_cursor()
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor,
-            "cursor-3"
-        );
-
-        // 7. Concurrent CAS modification: another process updates subscriptionCursor
-        let competing_fence = CursorFence {
-            owner: owner.into(),
-            actor: actor.into(),
-            generation: 1,
-            session: "session-competing".into(),
-            connection: "conn-competing".into(),
-            cursor: "cursor-competing".into(),
-        };
-        let raw_current = context
-            .read_request_value("subscriptionCursor", actor)
-            .unwrap()
-            .unwrap();
-        let competing_bytes = serde_json::to_vec(&competing_fence).unwrap();
-        assert!(context
-            .compare_exchange_request_value(
-                "subscriptionCursor",
-                actor,
-                Some(&raw_current),
-                &competing_bytes
-            )
-            .unwrap());
-
-        // Now apply_subscription_frame fails with authority changed or superseded
-        let advance_frame_4 = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#eventEnvelope",
-            "previousCursor": "cursor-3",
-            "cursor": "cursor-4",
-            "createdAt": "2026-09-23T00:00:00.000Z",
-            "payload": {
-                "$type": "blue.catbird.chat.defs#watermarkEvent",
-                "issuedAt": "2026-09-23T00:00:00.000Z"
-            }
-        })
-        .to_string();
-        assert!(orchestrator
-            .apply_subscription_frame(&advance_frame_4)
-            .await
-            .is_err());
-    }
-
-    /// An initialized orchestrator over the mock inventory API serving `snapshot`
-    /// (`session-inv-<snapshot>…`, `cursor-inv-<snapshot>`), ticket `ticket-…`. Reusing `dir`
-    /// is a relaunch on the same storage.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn inventory_orchestrator(
-        dir: &tempfile::TempDir,
-        snapshot: u8,
-    ) -> MLSOrchestrator<MockStorage, MockInventoryApi, MockCreds, crate::MLSContext> {
-        let db_path = dir
-            .path()
-            .join("sub_inv_test.db")
-            .to_string_lossy()
+            // 3. Gap frame: expected previousCursor cursor-2, but received cursor-1 -> rejected!
+            let gap_frame = serde_json::json!({
+                "$type": "blue.catbird.chat.defs#eventEnvelope",
+                "previousCursor": "cursor-1",
+                "cursor": "cursor-3",
+                "createdAt": "2026-09-23T00:00:00.000Z",
+                "payload": {
+                    "$type": "blue.catbird.chat.defs#watermarkEvent",
+                    "issuedAt": "2026-09-23T00:00:00.000Z"
+                }
+            })
             .to_string();
-        let context = crate::MLSContext::new(
-            db_path,
-            "test-key-1234567890123456".to_string(),
-            Box::new(NoopKeychain),
-        )
-        .unwrap();
-        let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-        let actor = "00000000-0000-4000-8000-000000000001";
-        let creds = Arc::new(MockCreds {
-            owner: owner.into(),
-            actor: actor.into(),
-            gen: 1,
-        });
-        let expires = (chrono::Utc::now() + chrono::Duration::minutes(10))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let api = Arc::new(MockInventoryApi {
-            did: owner.into(),
-            expires,
-            snapshot,
-        });
-        let orchestrator = MLSOrchestrator::new(
-            context,
-            Arc::new(MockStorage),
-            api,
-            creds,
-            super::super::orchestrator::OrchestratorConfig::default(),
-        );
-        orchestrator.initialize(owner).await.unwrap();
-        orchestrator
-    }
+            let err = orchestrator
+                .apply_subscription_frame(&gap_frame)
+                .await
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("Subscription cursor chain changed"));
+            // Cursor must remain cursor-2
+            assert_eq!(
+                orchestrator
+                    .current_subscription_cursor()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "cursor-2"
+            );
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn synchronize_inventory_and_prepare_ticket_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let orchestrator = inventory_orchestrator(&dir, 1).await;
-        let actor = "00000000-0000-4000-8000-000000000001";
+            // 4. Typing event does NOT advance cursor
+            let bob = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            let outcome = orchestrator
+                .apply_subscription_frame(&typing_frame(bob))
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, SubscriptionDispatchOutcome::Typing { ref conversation_id, ref sender_did, is_typing: true } if conversation_id == "00000000-0000-4000-8000-00000000000b" && sender_did == bob)
+            );
+            // Cursor must remain cursor-2
+            assert_eq!(
+                orchestrator
+                    .current_subscription_cursor()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "cursor-2"
+            );
 
-        // 1. Synchronize inventory
-        let fence = orchestrator
-            .synchronize_authenticated_inventory(false)
-            .await
-            .unwrap();
-        assert_eq!(
-            fence.inventory_session_id(),
-            "session-inv-1234567890123456789012"
-        );
-        assert_eq!(fence.event_cursor(), "cursor-inv-1");
+            // 5. Valid advance cursor-2 -> cursor-3
+            let advance_frame = serde_json::json!({
+                "$type": "blue.catbird.chat.defs#eventEnvelope",
+                "previousCursor": "cursor-2",
+                "cursor": "cursor-3",
+                "createdAt": "2026-09-23T00:00:00.000Z",
+                "payload": {
+                    "$type": "blue.catbird.chat.defs#watermarkEvent",
+                    "issuedAt": "2026-09-23T00:00:00.000Z"
+                }
+            })
+            .to_string();
+            let outcome = orchestrator
+                .apply_subscription_frame(&advance_frame)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, SubscriptionDispatchOutcome::Watermark { ref cursor, .. } if cursor == "cursor-3")
+            );
+            assert_eq!(
+                orchestrator
+                    .current_subscription_cursor()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "cursor-3"
+            );
 
-        // 2. Prepare subscription ticket
-        let ticket = orchestrator.prepare_subscription().await.unwrap();
-        assert_eq!(
-            ticket.inventory_session_id,
-            "session-inv-1234567890123456789012"
-        );
-        assert_eq!(ticket.event_cursor, "cursor-inv-1");
-        assert_eq!(
-            ticket.endpoint,
-            "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
-        );
-        assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
+            // 6. Foreign access-ended event is rejected
+            let foreign_access_ended = serde_json::json!({
+                "$type": "blue.catbird.chat.defs#eventEnvelope",
+                "previousCursor": "cursor-3",
+                "cursor": "cursor-4",
+                "createdAt": "2026-09-23T00:00:00.000Z",
+                "payload": {
+                    "$type": "blue.catbird.chat.defs#accessEndedEvent",
+                    "conversationId": "00000000-0000-4000-8000-00000000000b",
+                    "membershipIntervalId": "00000000-0000-4000-8000-00000000000d",
+                    "userDid": "did:plc:ffffffffffffffffffffffff",
+                    "deviceId": "00000000-0000-4000-8000-000000000999",
+                    "terminalSeq": 1
+                }
+            })
+            .to_string();
+            let err = orchestrator
+                .apply_subscription_frame(&foreign_access_ended)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Foreign access-ended audience"));
+            assert_eq!(
+                orchestrator
+                    .current_subscription_cursor()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "cursor-3"
+            );
 
-        // 2b. A ticket whose inventory scope differs from the snapshot is refused
-        let foreign_scope = STANDARD.encode([4u8; 32]);
-        let err = orchestrator
-            .prepare_subscription_ticket(
-                actor,
-                &ticket.inventory_session_id,
-                &ticket.event_cursor,
-                &foreign_scope,
+            // 6b. Unknown payload variant is rejected before the cursor moves
+            let unknown_variant = serde_json::json!({
+                "$type": "blue.catbird.chat.defs#eventEnvelope",
+                "previousCursor": "cursor-3",
+                "cursor": "cursor-4",
+                "createdAt": "2026-09-23T00:00:00.000Z",
+                "payload": {
+                    "$type": "blue.catbird.chat.defs#unknownEvent",
+                    "issuedAt": "2026-09-23T00:00:00.000Z"
+                }
+            })
+            .to_string();
+            assert!(orchestrator
+                .apply_subscription_frame(&unknown_variant)
+                .await
+                .is_err());
+            assert_eq!(
+                orchestrator
+                    .current_subscription_cursor()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                "cursor-3"
+            );
+
+            // 7. Concurrent CAS modification: another process updates subscriptionCursor
+            let competing_fence = CursorFence {
+                owner: owner.into(),
+                actor: actor.into(),
+                generation: 1,
+                session: "session-competing".into(),
+                connection: "conn-competing".into(),
+                cursor: "cursor-competing".into(),
+            };
+            let raw_current = context
+                .read_request_value("subscriptionCursor", actor)
+                .unwrap()
+                .unwrap();
+            let competing_bytes = serde_json::to_vec(&competing_fence).unwrap();
+            assert!(context
+                .compare_exchange_request_value(
+                    "subscriptionCursor",
+                    actor,
+                    Some(&raw_current),
+                    &competing_bytes
+                )
+                .unwrap());
+
+            // Now apply_subscription_frame fails with authority changed or superseded
+            let advance_frame_4 = serde_json::json!({
+                "$type": "blue.catbird.chat.defs#eventEnvelope",
+                "previousCursor": "cursor-3",
+                "cursor": "cursor-4",
+                "createdAt": "2026-09-23T00:00:00.000Z",
+                "payload": {
+                    "$type": "blue.catbird.chat.defs#watermarkEvent",
+                    "issuedAt": "2026-09-23T00:00:00.000Z"
+                }
+            })
+            .to_string();
+            assert!(orchestrator
+                .apply_subscription_frame(&advance_frame_4)
+                .await
+                .is_err());
+        }
+
+        /// An initialized orchestrator over the mock inventory API serving `snapshot`
+        /// (`session-inv-<snapshot>…`, `cursor-inv-<snapshot>`), ticket `ticket-…`. Reusing `dir`
+        /// is a relaunch on the same storage.
+        #[cfg(not(target_arch = "wasm32"))]
+        async fn inventory_orchestrator(
+            dir: &tempfile::TempDir,
+            snapshot: u8,
+        ) -> MLSOrchestrator<MockStorage, MockInventoryApi, MockCreds, crate::MLSContext> {
+            let db_path = dir
+                .path()
+                .join("sub_inv_test.db")
+                .to_string_lossy()
+                .to_string();
+            let context = crate::MLSContext::new(
+                db_path,
+                "test-key-1234567890123456".to_string(),
+                Box::new(NoopKeychain),
             )
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("ticket inventory scope does not match snapshot"));
-
-        // 3. Second call with force_fresh=false restores from cached journal
-        let fence2 = orchestrator
-            .synchronize_authenticated_inventory(false)
-            .await
             .unwrap();
-        assert_eq!(
-            fence2.inventory_session_id(),
-            "session-inv-1234567890123456789012"
-        );
-        assert_eq!(fence2.event_cursor(), "cursor-inv-1");
-    }
+            let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let actor = "00000000-0000-4000-8000-000000000001";
+            let creds = Arc::new(MockCreds {
+                owner: owner.into(),
+                actor: actor.into(),
+                gen: 1,
+            });
+            let expires = (chrono::Utc::now() + chrono::Duration::minutes(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let api = Arc::new(MockInventoryApi {
+                did: owner.into(),
+                expires,
+                snapshot,
+            });
+            let orchestrator = MLSOrchestrator::new(
+                context,
+                Arc::new(MockStorage),
+                api,
+                creds,
+                crate::orchestrator::OrchestratorConfig::default(),
+            );
+            orchestrator.initialize(owner).await.unwrap();
+            orchestrator
+        }
 
-    /// F71: a subscription requested while a sync pass is running (the 5 s periodic sync or a
-    /// UI refresh) waits for that pass and then gets its ticket, instead of failing with
-    /// "another sync is in progress" and backing the stream off.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn ticket_requested_during_in_flight_sync_is_prepared_after_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let orchestrator = inventory_orchestrator(&dir, 1).await;
+        #[cfg(not(target_arch = "wasm32"))]
+        #[tokio::test]
+        async fn synchronize_inventory_and_prepare_ticket_lifecycle() {
+            let dir = tempfile::tempdir().unwrap();
+            let orchestrator = inventory_orchestrator(&dir, 1).await;
+            let actor = "00000000-0000-4000-8000-000000000001";
 
-        *orchestrator.sync_in_progress().lock().await = true;
-        let pending = orchestrator.prepare_subscription();
-        tokio::pin!(pending);
-        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending).await;
-        assert!(
-            early.is_err(),
-            "ticket must wait for the in-flight pass, got {early:?}"
-        );
+            // 1. Synchronize inventory
+            let fence = orchestrator
+                .synchronize_authenticated_inventory(false)
+                .await
+                .unwrap();
+            assert_eq!(
+                fence.inventory_session_id(),
+                "session-inv-1234567890123456789012"
+            );
+            assert_eq!(fence.event_cursor(), "cursor-inv-1");
 
-        *orchestrator.sync_in_progress().lock().await = false;
-        orchestrator.sync_finished().notify_waiters();
-        let ticket = pending.await.expect("ticket after the pass finished");
-        assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
-        assert!(
-            !*orchestrator.sync_in_progress().lock().await,
-            "ingest released the sync flag"
-        );
-    }
+            // 2. Prepare subscription ticket
+            let ticket = orchestrator.prepare_subscription().await.unwrap();
+            assert_eq!(
+                ticket.inventory_session_id,
+                "session-inv-1234567890123456789012"
+            );
+            assert_eq!(ticket.event_cursor, "cursor-inv-1");
+            assert_eq!(
+                ticket.endpoint,
+                "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"
+            );
+            assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
 
-    /// F71: after any newer event the server replaces the device's inventory session
-    /// capability (and its tickets). A relaunched client must mint its ticket from a fresh
-    /// applied inventory, not from the session restored out of the previous launch's journal,
-    /// which the server now answers with 400 InventorySessionMismatch.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn relaunch_after_server_event_mints_ticket_from_fresh_inventory() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = inventory_orchestrator(&dir, 1).await;
-        let ticket = first.prepare_subscription().await.unwrap();
-        assert_eq!(ticket.event_cursor, "cursor-inv-1");
-        drop(first);
+            // 2b. A ticket whose inventory scope differs from the snapshot is refused
+            let foreign_scope = STANDARD.encode([4u8; 32]);
+            let err = orchestrator
+                .prepare_subscription_ticket(
+                    actor,
+                    &ticket.inventory_session_id,
+                    &ticket.event_cursor,
+                    &foreign_scope,
+                )
+                .await
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("ticket inventory scope does not match snapshot"));
 
-        let relaunched = inventory_orchestrator(&dir, 2).await;
-        let ticket = relaunched
-            .prepare_subscription()
-            .await
-            .expect("ticket minted from the fresh inventory");
-        assert_eq!(
-            ticket.inventory_session_id,
-            "session-inv-2234567890123456789012"
-        );
-        assert_eq!(ticket.event_cursor, "cursor-inv-2");
+            // 3. Second call with force_fresh=false restores from cached journal
+            let fence2 = orchestrator
+                .synchronize_authenticated_inventory(false)
+                .await
+                .unwrap();
+            assert_eq!(
+                fence2.inventory_session_id(),
+                "session-inv-1234567890123456789012"
+            );
+            assert_eq!(fence2.event_cursor(), "cursor-inv-1");
+        }
+
+        /// F71: a subscription requested while a sync pass is running (the 5 s periodic sync or a
+        /// UI refresh) waits for that pass and then gets its ticket, instead of failing with
+        /// "another sync is in progress" and backing the stream off.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[tokio::test]
+        async fn ticket_requested_during_in_flight_sync_is_prepared_after_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let orchestrator = inventory_orchestrator(&dir, 1).await;
+
+            *orchestrator.sync_in_progress().lock().await = true;
+            let pending = orchestrator.prepare_subscription();
+            tokio::pin!(pending);
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending).await;
+            assert!(
+                early.is_err(),
+                "ticket must wait for the in-flight pass, got {early:?}"
+            );
+
+            *orchestrator.sync_in_progress().lock().await = false;
+            orchestrator.sync_finished().notify_waiters();
+            let ticket = pending.await.expect("ticket after the pass finished");
+            assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
+            assert!(
+                !*orchestrator.sync_in_progress().lock().await,
+                "ingest released the sync flag"
+            );
+        }
+
+        /// F71: after any newer event the server replaces the device's inventory session
+        /// capability (and its tickets). A relaunched client must mint its ticket from a fresh
+        /// applied inventory, not from the session restored out of the previous launch's journal,
+        /// which the server now answers with 400 InventorySessionMismatch.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[tokio::test]
+        async fn relaunch_after_server_event_mints_ticket_from_fresh_inventory() {
+            let dir = tempfile::tempdir().unwrap();
+            let first = inventory_orchestrator(&dir, 1).await;
+            let ticket = first.prepare_subscription().await.unwrap();
+            assert_eq!(ticket.event_cursor, "cursor-inv-1");
+            drop(first);
+
+            let relaunched = inventory_orchestrator(&dir, 2).await;
+            let ticket = relaunched
+                .prepare_subscription()
+                .await
+                .expect("ticket minted from the fresh inventory");
+            assert_eq!(
+                ticket.inventory_session_id,
+                "session-inv-2234567890123456789012"
+            );
+            assert_eq!(ticket.event_cursor, "cursor-inv-2");
+        }
     }
 }

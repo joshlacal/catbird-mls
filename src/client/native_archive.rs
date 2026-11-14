@@ -998,7 +998,31 @@ impl CatbirdMlsClient {
             session
                 .create_passkey_recovery(prf_output, credential_id)
                 .await
-                .map_err(native_archive_error)
+                .map_err(native_archive_error)?;
+            self.db.write_tx(|tx| {
+                let raw = tx
+                    .get_labyrinth_state("status_json")?
+                    .ok_or_else(|| MLSError::InvalidState("archive status missing".into()))?;
+                let mut status: LabyrinthBackupStatus =
+                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                status.epoch_seq = session.latest_epoch();
+                status.pending_directory_epoch = session.pending_directory_epoch();
+                if session.directory_publish_attempted() {
+                    status.directory_publication_retry_count =
+                        status.directory_publication_retry_count.saturating_add(1);
+                }
+                status.directory_publication_error =
+                    session.directory_publish_error().map(str::to_owned);
+                status.directory_publication_stalled = status.pending_directory_epoch.is_some()
+                    && status.directory_publication_error.is_some();
+                tx.put_labyrinth_state(
+                    "status_json",
+                    &serde_json::to_vec(&status)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?,
+                    self.hooks.now_ms(),
+                )?;
+                Ok(())
+            })
         })
     }
 

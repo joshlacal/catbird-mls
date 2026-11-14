@@ -11,7 +11,7 @@ pub mod chat_v2;
 #[cfg(feature = "labyrinth")]
 pub mod circles;
 pub mod client;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "legacy-orchestrator", not(target_arch = "wasm32")))]
 pub mod engine;
 #[cfg(not(target_arch = "wasm32"))]
 mod epoch_storage;
@@ -63,7 +63,7 @@ pub use client::{
     PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest, PlatformHttpResponse,
     PlatformKeyStore, PlatformTransport, RegisteredDeviceInfo, UploadedConversationAttachment,
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "legacy-orchestrator", not(target_arch = "wasm32")))]
 pub use engine::*;
 pub use error::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -81,6 +81,8 @@ pub use orchestrator::direct_request_types::{
     RequestCapabilities, RequestConsent, RequestCrypto, RequestIntroductionMetadata,
     RequestPreview,
 };
+#[cfg(not(all(feature = "legacy-orchestrator", not(target_arch = "wasm32"))))]
+pub use orchestrator::MessageProcessingResult;
 #[cfg(all(feature = "sim", not(target_arch = "wasm32")))]
 pub use planted::SimGroupState;
 pub use planted::{is_planted_bug_active, set_planted_bug, with_planted_bug, PlantedBug};
@@ -178,7 +180,7 @@ uniffi::setup_scaffolding!();
 #[cfg(test)]
 extern crate self as catbird_mls;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-orchestrator"))]
 #[path = "../tests/e2e_harness.rs"]
 mod recovery_e2e_harness;
 

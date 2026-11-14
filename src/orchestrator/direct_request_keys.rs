@@ -3,10 +3,9 @@ use crate::{
     chat_v2::transcript::direct_request::{self as transcript, DirectRequestKind},
     MLSError,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine as _,
-};
+#[cfg(feature = "legacy-orchestrator")]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -280,6 +279,7 @@ pub(crate) mod native {
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> super::MLSOrchestrator<S, A, C, M>
 where
     S: super::MLSStorageBackend + 'static,

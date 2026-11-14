@@ -394,6 +394,7 @@ mod native_archive_space_auth {
                         negotiated
                             .as_ref()
                             .ok_or("native_space_missing_request_secret")?,
+                        None,
                     )?;
                     self.observe_writer_rev(&context.space.raw, &context.writer, &head.rev)?;
                 }
@@ -1299,6 +1300,7 @@ mod native_archive_space_auth {
                 ops_negotiated
                     .as_ref()
                     .ok_or("native_space_missing_request_secret")?,
+                Some(&repo),
             )?;
             if head.rev != row.repo_rev || head.data.as_ref() != expected_data.as_slice() {
                 return Err("native_space_inventory_oplog_head_mismatch".into());
@@ -1635,6 +1637,7 @@ mod native_archive_space_auth {
             context: &ReadContext,
             response: &mut PlatformHttpResponse,
             negotiated: &NegotiatedMacSecret,
+            verified_star_hint: Option<&ParsedStarRepo>,
         ) -> Result<Commit, String> {
             let requested_head: CommitEnvelope =
                 decode(&response.body, "listRepoOps commit envelope")?;
@@ -1662,6 +1665,8 @@ mod native_archive_space_auth {
             }
             let mut found = BTreeSet::new();
             let mut state = WriterSyncState::empty();
+            let mut touched_paths = BTreeSet::new();
+            let mut genesis_replay_complete = true;
             let mut cursor: Option<String> = None;
             let mut cursors = BTreeSet::new();
             let mut total_bytes = 0usize;
@@ -1727,6 +1732,7 @@ mod native_archive_space_auth {
                         }
                     }
                     let path = format!("{}/{}", op.collection, op.rkey);
+                    let seen_in_replay = !touched_paths.insert(path.clone());
                     let old = state.cid_by_path.remove(&path);
                     let prev = op
                         .prev
@@ -1734,13 +1740,19 @@ mod native_archive_space_auth {
                         .map(str::parse)
                         .transpose()
                         .map_err(|_| "native_space_invalid_prev_cid")?;
-                    if old != prev {
-                        return Err("native_space_op_previous_cid_mismatch".into());
-                    }
-                    if let Some(cid) = old {
-                        state
-                            .lt_hash
-                            .remove_record(&op.collection, &op.rkey, &cid);
+                    if seen_in_replay {
+                        if old != prev {
+                            return Err("native_space_op_previous_cid_mismatch".into());
+                        }
+                        if let Some(cid) = old {
+                            state
+                                .lt_hash
+                                .remove_record(&op.collection, &op.rkey, &cid);
+                        }
+                    } else if prev.is_some() {
+                        // Retained oplog starts after genesis (compacted or post-importRepo):
+                        // require verified `getRepo` STAR snapshot commitment reconciliation.
+                        genesis_replay_complete = false;
                     }
                     if let Some(cid) = op.cid {
                         let cid = cid.parse().map_err(|_| "native_space_invalid_op_cid")?;
@@ -1759,11 +1771,10 @@ mod native_archive_space_auth {
                     continue;
                 }
                 let head = envelope.commit.ok_or("native_space_missing_head_commit")?;
-                if state.lt_hash.commitment().as_slice() != head.data.as_ref()
-                    || state
-                        .latest_rev
-                        .as_ref()
-                        .is_some_and(|rev| rev.as_str() > head.rev.as_str())
+                if state
+                    .latest_rev
+                    .as_ref()
+                    .is_some_and(|rev| rev.as_str() > head.rev.as_str())
                 {
                     return Err("native_space_oplog_commitment_mismatch".into());
                 }
@@ -1774,6 +1785,60 @@ mod native_archive_space_auth {
                 }
                 if found.len() != wanted.len() {
                     return Err("native_space_requested_ops_not_found".into());
+                }
+                if !genesis_replay_complete
+                    || state.lt_hash.commitment().as_slice() != head.data.as_ref()
+                {
+                    // Post-`importRepo`/`clearRecords` (`ops: []` + non-empty `LtHash`) or
+                    // retention-compacted `listRepoOps`: fall back to an authenticated `getRepo`
+                    // STAR snapshot bound to the exact same `(rev, data)` head commitment.
+                    let owned_star;
+                    let star_repo = match verified_star_hint {
+                        Some(repo) => repo,
+                        None => {
+                            let star_params = BTreeMap::from([
+                                ("space".into(), context.space.raw.clone()),
+                                ("repo".into(), context.writer.clone()),
+                            ]);
+                            let (star_response, star_negotiated) = self.space_read(
+                                context,
+                                GET_REPO,
+                                &query_path(GET_REPO, &star_params),
+                                vec![],
+                                Some(MacProfile::Commit),
+                            )?;
+                            require_success(&star_response, "listRepoOps star fallback getRepo")?;
+                            owned_star = verify_star(
+                                context,
+                                &star_response,
+                                star_negotiated
+                                    .as_ref()
+                                    .ok_or("native_space_missing_request_secret")?,
+                            )?;
+                            &owned_star
+                        }
+                    };
+                    if star_repo.rev != head.rev || star_repo.data.as_slice() != head.data.as_ref()
+                    {
+                        return Err("native_space_oplog_commitment_mismatch".into());
+                    }
+                    let mut star_cid_by_path = BTreeMap::new();
+                    for record in &star_repo.records {
+                        context
+                            .space
+                            .record_uri(&context.writer, &record.collection, &record.rkey)
+                            .map_err(|e| format!("native_space_star_coordinates: {e}"))?;
+                        let path = format!("{}/{}", record.collection, record.rkey);
+                        if star_cid_by_path.insert(path, record.cid).is_some() {
+                            return Err("native_space_star_duplicate_record".into());
+                        }
+                    }
+                    for path in &touched_paths {
+                        if state.cid_by_path.get(path) != star_cid_by_path.get(path) {
+                            return Err("native_space_oplog_commitment_mismatch".into());
+                        }
+                    }
+                    state.cid_by_path = star_cid_by_path;
                 }
                 // A current-state commitment cannot authenticate superseded values.
                 // The protocol omits those values; refuse a host that includes them.
@@ -2180,6 +2245,7 @@ mod native_archive_space_auth {
             kem: P256SecretKey,
             fault: Mutex<&'static str>,
             requests: Mutex<Vec<PlatformHttpRequest>>,
+            replayed_mac: Mutex<Option<SpaceMacResponseHeaders>>,
         }
 
         impl Host {
@@ -2528,6 +2594,10 @@ mod native_archive_space_auth {
                         body: BLOB.to_vec(),
                     });
                 }
+                let mut batch0_value = serde_json::to_value(served_record()).unwrap();
+                batch0_value["createdAt"] = "2026-11-02T00:00:00.000Z".into();
+                let batch0_bytes = value_bytes(&batch0_value);
+                let batch0_cid = compute_dagcbor_cid(&batch0_bytes);
                 let mut value = serde_json::to_value(served_record()).unwrap();
                 if fault == "record_changed_after_inventory" {
                     value["createdAt"] = "2026-11-04T00:00:00.000Z".into();
@@ -2542,10 +2612,24 @@ mod native_archive_space_auth {
                             body: br#"{"error":"SnapshotChanged"}"#.to_vec(),
                         });
                     }
-                    let (label, share) =
+                    let (label, client_share) =
                         parse_accept_signature(&accept_sig, MacProfile::Commit).unwrap();
-                    let secret = decapsulate_p256(&self.kem, &share).unwrap();
+                    let (share, secret) = if fault == "keyshare_swap_inventory" {
+                        let enc = encapsulate_p256_deterministic(
+                            &encode_p256_did_key(&self.kem.public_key()),
+                            &P256SecretKey::from_slice(&[99; 32]).unwrap(),
+                        )
+                        .unwrap();
+                        assert_ne!(enc.key_share_did_key, client_share);
+                        (enc.key_share_did_key, enc.shared_secret)
+                    } else {
+                        let secret = decapsulate_p256(&self.kem, &client_share).unwrap();
+                        (client_share, secret)
+                    };
                     let mut repo_hash = LtHash::empty();
+                    if fault.starts_with("ops_compacted") {
+                        repo_hash.add_record(COLLECTION, "batch-0", &batch0_cid);
+                    }
                     repo_hash.add_record(COLLECTION, "batch-1", &cid);
                     let repo_data = repo_hash.commitment();
                     let many = matches!(
@@ -2701,26 +2785,56 @@ mod native_archive_space_auth {
                 } else {
                     MacProfile::Commit
                 };
-                let (label, share) = parse_accept_signature(&accept_sig, profile).unwrap();
-                let secret = decapsulate_p256(&self.kem, &share).unwrap();
+                let (label, client_share) = parse_accept_signature(&accept_sig, profile).unwrap();
+                let (share, secret) = if fault == "keyshare_swap" {
+                    let enc = encapsulate_p256_deterministic(
+                        &encode_p256_did_key(&self.kem.public_key()),
+                        &P256SecretKey::from_slice(&[99; 32]).unwrap(),
+                    )
+                    .unwrap();
+                    assert_ne!(enc.key_share_did_key, client_share);
+                    (enc.key_share_did_key, enc.shared_secret)
+                } else {
+                    let secret = decapsulate_p256(&self.kem, &client_share).unwrap();
+                    (client_share, secret)
+                };
                 let mut output = if read_nsid == GET_RECORD {
-                    let uri = space.record_uri(writer, COLLECTION, "batch-1").unwrap();
-                    let cid_str = cid.to_string();
+                    let rkey = params.get("rkey").map(String::as_str).unwrap_or("batch-1");
+                    let (rec_val, rec_cid) = if rkey == "batch-0" {
+                        (batch0_value, batch0_cid)
+                    } else {
+                        (value, cid)
+                    };
+                    let uri = space.record_uri(writer, COLLECTION, rkey).unwrap();
+                    let cid_str = rec_cid.to_string();
                     let (mut mac_headers, _) =
                         sign_record_mac(&secret, &share, &label, &uri, &cid_str).unwrap();
                     if fault == "bad_mac" {
                         mac_headers.signature = format!("{label}=:{}:", STANDARD.encode([0u8; 32]));
+                    } else if fault == "capture_mac" {
+                        *self.replayed_mac.lock().unwrap() = Some(mac_headers.clone());
+                    } else if fault == "replay_mac" {
+                        mac_headers = self.replayed_mac.lock().unwrap().clone().unwrap();
                     }
                     let mut output = response(json!({
                         "uri": if fault == "wrong_uri" { format!("{uri}x") } else { uri },
                         "cid": cid_str,
-                        "value": if fault == "record_value" { json!({"ciphertext": "forged"}) } else { value },
+                        "value": if fault == "record_value" { json!({"ciphertext": "forged"}) } else { rec_val },
                     }));
                     push_mac_headers(&mut output, mac_headers);
                     output
                 } else {
                     let mut hash = LtHash::empty();
-                    hash.add_record(COLLECTION, "batch-1", &cid);
+                    if fault.starts_with("ops_compacted") {
+                        hash.add_record(COLLECTION, "batch-0", &batch0_cid);
+                    }
+                    if !(read_nsid == "com.atproto.space.getRepo"
+                        && fault == "ops_empty_star_head_mismatch")
+                    {
+                        hash.add_record(COLLECTION, "batch-1", &cid);
+                    } else {
+                        hash.add_record(COLLECTION, "batch-0", &batch0_cid);
+                    }
                     let data = hash.commitment();
                     let (mut mac_headers, _) = sign_commit_mac(
                         &secret,
@@ -2734,39 +2848,80 @@ mod native_archive_space_auth {
                     .unwrap();
                     if fault == "bad_mac" {
                         mac_headers.signature = format!("{label}=:{}:", STANDARD.encode([0u8; 32]));
+                    } else if fault == "capture_mac" {
+                        *self.replayed_mac.lock().unwrap() = Some(mac_headers.clone());
+                    } else if fault == "replay_mac" {
+                        mac_headers = self.replayed_mac.lock().unwrap().clone().unwrap();
                     }
                     let commit = json!({"space": space.raw, "repo": writer, "rev": REV, "ver": 1, "data": {"$bytes": STANDARD.encode(data)}});
                     let mut output = if read_nsid == LIST_OPS {
-                        let mut op = json!({"collection": COLLECTION, "rkey": "batch-1", "cid": cid.to_string(), "rev": REV});
-                        if params.get("excludeValues").map(String::as_str) != Some("true") {
-                            op["value"] = if fault == "op_value" {
-                                json!({"ciphertext": "forged"})
+                        let ops = if fault.starts_with("ops_empty") {
+                            json!([])
+                        } else {
+                            let claimed_cid = if fault == "ops_compacted_final_cid_mismatch" {
+                                batch0_cid
                             } else {
-                                value
+                                cid
                             };
-                        }
-                        response(json!({"commit": commit, "ops": [op]}))
+                            let mut op = json!({
+                                "collection": COLLECTION,
+                                "rkey": "batch-1",
+                                "cid": claimed_cid.to_string(),
+                                "rev": REV
+                            });
+                            if fault.starts_with("ops_compacted") {
+                                let prior_cid = compute_dagcbor_cid(&value_bytes(
+                                    &json!({"superseded": true}),
+                                ));
+                                op["prev"] = prior_cid.to_string().into();
+                            }
+                            if params.get("excludeValues").map(String::as_str) != Some("true") {
+                                op["value"] = if fault == "op_value" {
+                                    json!({"ciphertext": "forged"})
+                                } else if fault == "ops_compacted_final_cid_mismatch" {
+                                    batch0_value
+                                } else {
+                                    value
+                                };
+                            }
+                            json!([op])
+                        };
+                        response(json!({"commit": commit, "ops": ops}))
                     } else {
                         assert_eq!(read_nsid, "com.atproto.space.getRepo");
-                        let record = if fault == "star_value" {
-                            value_bytes(&json!({"ciphertext": "forged"}))
+                        let entries = if fault == "ops_empty_star_head_mismatch" {
+                            vec![StarRecordEntry {
+                                path: format!("{COLLECTION}/batch-0"),
+                                record_dagcbor: batch0_bytes,
+                            }]
+                        } else if fault.starts_with("ops_compacted") {
+                            vec![
+                                StarRecordEntry {
+                                    path: format!("{COLLECTION}/batch-0"),
+                                    record_dagcbor: batch0_bytes,
+                                },
+                                StarRecordEntry {
+                                    path: format!("{COLLECTION}/batch-1"),
+                                    record_dagcbor: bytes,
+                                },
+                            ]
                         } else {
-                            bytes
+                            let record =
+                                if matches!(fault, "star_value" | "ops_empty_star_tampered") {
+                                    value_bytes(&json!({"ciphertext": "forged"}))
+                                } else {
+                                    bytes
+                                };
+                            vec![StarRecordEntry {
+                                path: format!("{COLLECTION}/batch-1"),
+                                record_dagcbor: record,
+                            }]
                         };
                         PlatformHttpResponse {
                             status: 200,
                             headers: vec![],
-                            body: write_star_repo(
-                                &space.raw,
-                                writer,
-                                REV,
-                                &data,
-                                &[StarRecordEntry {
-                                    path: format!("{COLLECTION}/batch-1"),
-                                    record_dagcbor: record,
-                                }],
-                            )
-                            .unwrap(),
+                            body: write_star_repo(&space.raw, writer, REV, &data, &entries)
+                                .unwrap(),
                         }
                     };
                     push_mac_headers(&mut output, mac_headers);
@@ -2811,6 +2966,7 @@ mod native_archive_space_auth {
                 kem: P256SecretKey::from_slice(&[2; 32]).unwrap(),
                 fault: Mutex::new(""),
                 requests: Mutex::new(vec![]),
+                replayed_mac: Mutex::new(None),
             });
             let gateway = NativeArchiveGateway {
                 config: CatbirdMlsClientConfig {
@@ -3386,6 +3542,115 @@ mod native_archive_space_auth {
                     served_record(),
                     "{nsid}"
                 );
+            }
+        }
+
+        #[test]
+        fn native_space_auth_rejects_accept_signature_keyshare_swap_and_pop_header_replay() {
+            for (nsid, fault, expected) in [
+                (GET_RECORD, "keyshare_swap", "native_space_record_mac"),
+                (LIST_OPS, "keyshare_swap", "native_space_commit_mac"),
+                (GET_REPO, "keyshare_swap", "native_space_star_mac"),
+                (
+                    LIST_WRITERS,
+                    "keyshare_swap_inventory",
+                    "native_space_commit_mac",
+                ),
+            ] {
+                let (_directory, gateway, host) = gateway();
+                *host.fault.lock().unwrap() = fault;
+                let error =
+                    block_on_sync(gateway.execute_authenticated_space(request(nsid, false)))
+                        .unwrap_err();
+                assert!(error.contains(expected), "{nsid} ({fault}): {error}");
+            }
+
+            for (nsid, expected) in [
+                (GET_RECORD, "native_space_record_mac"),
+                (LIST_OPS, "native_space_commit_mac"),
+                (GET_REPO, "native_space_star_mac"),
+            ] {
+                let (_directory, gateway, host) = gateway();
+                *host.fault.lock().unwrap() = "capture_mac";
+                let ok_resp =
+                    block_on_sync(gateway.execute_authenticated_space(request(nsid, true)))
+                        .unwrap();
+                assert_eq!(ok_resp.status, 200, "{nsid} initial capture");
+                assert!(
+                    host.replayed_mac.lock().unwrap().is_some(),
+                    "{nsid} captured valid PoP MAC headers"
+                );
+
+                *host.fault.lock().unwrap() = "replay_mac";
+                let error = block_on_sync(gateway.execute_authenticated_space(request(nsid, true)))
+                    .unwrap_err();
+                assert!(error.starts_with(expected), "{nsid} replay: {error}");
+            }
+        }
+
+        #[test]
+        fn native_space_auth_verifies_empty_and_compacted_oplogs_via_authenticated_star_fallback() {
+            let served = serde_json::to_value(served_record()).unwrap();
+
+            // Post-`importRepo`/`clearRecords`: `ops: []` + non-empty `LtHash` succeeds via verified STAR.
+            {
+                let (_directory, gateway, host) = gateway();
+                *host.fault.lock().unwrap() = "ops_empty_after_import";
+                let inv_resp =
+                    block_on_sync(gateway.execute_authenticated_space(request(LIST_WRITERS, false)))
+                        .unwrap();
+                assert_eq!(inv_resp.status, 200);
+
+                let ops_resp =
+                    block_on_sync(gateway.execute_authenticated_space(request(LIST_OPS, false)))
+                        .unwrap();
+                assert_eq!(ops_resp.status, 200);
+                let body: Value = serde_json::from_slice(&ops_resp.body).unwrap();
+                assert_eq!(body["ops"], json!([]));
+                assert_eq!(body["commit"]["rev"], REV);
+            }
+
+            // Retention-compacted oplog: retained op has `prev: Some(...)` and untouched pre-window
+            // `batch-0` in `LtHash`; verified STAR reconciles commitment and releases inline value.
+            {
+                let (_directory, gateway, host) = gateway();
+                *host.fault.lock().unwrap() = "ops_compacted";
+                let inv_resp =
+                    block_on_sync(gateway.execute_authenticated_space(request(LIST_WRITERS, false)))
+                        .unwrap();
+                assert_eq!(inv_resp.status, 200);
+
+                let ops_resp =
+                    block_on_sync(gateway.execute_authenticated_space(request(LIST_OPS, false)))
+                        .unwrap();
+                assert_eq!(ops_resp.status, 200);
+                let body: Value = serde_json::from_slice(&ops_resp.body).unwrap();
+                assert_eq!(body["ops"].as_array().unwrap().len(), 1);
+                assert_eq!(body["ops"][0]["value"], served);
+            }
+
+            // Negative controls: tampered STAR CAR, mismatched STAR head commitment, or compacted
+            // final CID disagreeing with STAR must all fail closed.
+            for (fault, expected) in [
+                (
+                    "ops_empty_star_tampered",
+                    "native_space_star_commitment_mismatch",
+                ),
+                (
+                    "ops_empty_star_head_mismatch",
+                    "native_space_oplog_commitment_mismatch",
+                ),
+                (
+                    "ops_compacted_final_cid_mismatch",
+                    "native_space_oplog_commitment_mismatch",
+                ),
+            ] {
+                let (_directory, gateway, host) = gateway();
+                *host.fault.lock().unwrap() = fault;
+                let error =
+                    block_on_sync(gateway.execute_authenticated_space(request(LIST_OPS, false)))
+                        .unwrap_err();
+                assert_eq!(error, expected, "{fault}");
             }
         }
     }

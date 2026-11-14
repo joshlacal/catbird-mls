@@ -3,10 +3,9 @@ use catbird_atproto::blue_catbird::chat::ConversationState as CanonicalState;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
-use super::{
-    ConversationView, CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
-    MlsCryptoContext, OrchestratorError, Result,
-};
+use super::{ConversationView, OrchestratorError, Result};
+#[cfg(feature = "legacy-orchestrator")]
+use super::{CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext};
 
 fn invalid(message: &str) -> OrchestratorError {
     OrchestratorError::InvalidInput(format!("Invalid conversation policy: {message}"))
@@ -368,6 +367,7 @@ pub fn merge_conversation_view(
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -845,6 +845,7 @@ mod tests {
         decode_conversation_state, decode_conversations_inventory, encode_conversation_state,
     };
     use super::*;
+    use crate::orchestrator::mls_provider::MlsCryptoContext;
     const SWIFT: &[u8] =
         include_bytes!("../../tests/fixtures/swift_pending_conversation_state.json");
     struct Keys;

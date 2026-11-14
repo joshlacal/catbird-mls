@@ -1,32 +1,53 @@
 //! Async orchestrator hooks for Spaces-only Labyrinth history backup.
 
-use std::sync::Arc;
-
-use chrono::{TimeZone as _, Utc};
-use labyrinth::client::{MessageSource, PurgeReport, ThreadCursor};
-use labyrinth::store::pds::PublicRepoBackend;
-use labyrinth::store::space::SpaceRpc;
-use labyrinth::store::TimeRange;
 use serde_json::Value;
 
+#[cfg(feature = "legacy-orchestrator")]
+use std::sync::Arc;
+
+#[cfg(feature = "legacy-orchestrator")]
+use chrono::{TimeZone as _, Utc};
+#[cfg(feature = "legacy-orchestrator")]
+use labyrinth::client::{MessageSource, PurgeReport, ThreadCursor};
+#[cfg(feature = "legacy-orchestrator")]
+use labyrinth::store::pds::PublicRepoBackend;
+#[cfg(feature = "legacy-orchestrator")]
+use labyrinth::store::space::SpaceRpc;
+#[cfg(feature = "legacy-orchestrator")]
+use labyrinth::store::TimeRange;
+
+#[cfg(feature = "legacy-orchestrator")]
 use super::queue::{
     enqueue, flush_in_slot, ArchiveQueueStore, MlsArchiveQueue, PendingArchive, QueueConfig,
 };
+#[cfg(feature = "legacy-orchestrator")]
 use super::session::{
     HistoryPage, ImportReport, LabyrinthSession, LocalConversationAuthority, LocalGroupSnapshot,
     SessionDeps, SessionRotationReport,
 };
+#[cfg(feature = "legacy-orchestrator")]
 use super::signer::ChatKeySigner;
+#[cfg(feature = "legacy-orchestrator")]
 use super::space::{thread_placement_key, MlsPlacementVault, Placement, SpaceXrpcTransport};
+#[cfg(feature = "legacy-orchestrator")]
 use super::state::MlsStateVault;
+#[cfg(feature = "legacy-orchestrator")]
 use super::status::{now_ms, PendingDeletion};
+#[cfg(feature = "legacy-orchestrator")]
 use super::transport::{ApiGateway, GatewayXrpcTransport};
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::api_client::MLSAPIClient;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::credentials::CredentialStore;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::error::{OrchestratorError, Result};
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::mls_provider::MlsCryptoContext;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::storage::MLSStorageBackend;
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::types::{MLSMessagePayload, Message};
+#[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::MLSOrchestrator;
 
 /// Active MLS member DIDs from `getConversationState` (`[CB-16]`).
@@ -60,12 +81,14 @@ pub(crate) fn roster_members(conversation_state: &Value) -> labyrinth::Result<Ve
     Ok(active)
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 struct OrchestratorLocalAuthority<S, M> {
     storage: Arc<S>,
     mls_context: Arc<M>,
     user_did: String,
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl<S, M> LocalConversationAuthority for OrchestratorLocalAuthority<S, M>
@@ -148,6 +171,7 @@ where
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -909,6 +933,7 @@ where
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 pub(super) fn not_enabled() -> OrchestratorError {
     OrchestratorError::InvalidInput(
         "labyrinth: history backup is not enabled on this device".into(),
