@@ -5,10 +5,13 @@ use std::sync::Arc;
 
 use crate::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, wipe_pre_cutover_local_artifacts,
-    CatbirdMlsClient, CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus,
-    OtcPairingCompletion, OtcPairingOffer, PendingGroupCreationStatus, PlatformChangeObserver,
-    PlatformKeyStore, PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload,
+    CatbirdMlsClient, CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport,
+    EnrollmentReceipt, LabyrinthBackupStatus, LeaveConversationOutcome, MailboxReadStateRecord,
+    OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer, PeerRepinProposalInfo,
+    PendingGroupCreationStatus, PlatformChangeObserver, PlatformKeyStore, PlatformTransport,
+    PreCutoverWipeReport, QueuedLabyrinthArchivePayload, RegisteredDeviceInfo,
     SignedPushGatewayRegistration, SpacesEligibilityInput, SpacesEligibilityStatus,
+    UploadedConversationAttachment,
 };
 use crate::error::MLSError;
 use crate::groups::lifecycle::MemberRole;
@@ -20,6 +23,7 @@ use crate::push::{
 use crate::storage::{
     BackgroundCheckpointReport, ConversationRow, GroupMetadataRow, MessageRow, RequestRow,
 };
+use crate::voice::VoicePrepareResult;
 
 /// Compute `sha256(normalized_did)` (64 lowercase hex chars) for `<did_hash>.db` and Keychain keys (`I8`).
 #[uniffi::export(name = "account_did_hash_hex")]
@@ -63,6 +67,22 @@ pub fn ffi_process_push_notification(
         transport,
         &wake,
     )
+}
+
+/// Encode a recorded 16-bit LE mono PCM file to Opus-in-OGG, extract a 64-bar waveform, and seal an AES-256-GCM blob (`FC-09`).
+#[uniffi::export]
+pub fn ffi_prepare_voice_message(
+    pcm_path: String,
+    sample_rate: u32,
+) -> Result<VoicePrepareResult, MLSError> {
+    crate::voice::prepare_voice_message(&pcm_path, sample_rate)
+        .map_err(|e| MLSError::invalid_input(e.to_string()))
+}
+
+/// Decode Opus-in-OGG bytes back to 16-bit LE mono PCM at 48 kHz (`FC-09`).
+#[uniffi::export]
+pub fn ffi_decode_opus_to_pcm(opus_data: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+    crate::voice::decode_opus_to_pcm(&opus_data).map_err(|e| MLSError::invalid_input(e.to_string()))
 }
 
 #[uniffi::export]
@@ -394,5 +414,248 @@ impl CatbirdMlsClient {
         conversation_id: String,
     ) -> Result<u32, MLSError> {
         self.restore_conversation_from_owner_mailbox(&conversation_id)
+    }
+
+    #[uniffi::method(name = "process_push_wake")]
+    pub fn ffi_process_push_wake(
+        &self,
+        wake: PushWakePayload,
+    ) -> Result<NotificationPreview, MLSError> {
+        self.process_push_wake(wake)
+    }
+
+    #[uniffi::method(name = "is_device_pending_approval")]
+    pub fn ffi_is_device_pending_approval(&self) -> Result<bool, MLSError> {
+        self.is_device_pending_approval()
+    }
+
+    #[uniffi::method(name = "approve_device")]
+    pub fn ffi_approve_device(&self, target_device_id: String) -> Result<(), MLSError> {
+        self.approve_device(&target_device_id)
+    }
+
+    #[uniffi::method(name = "approve_device_with_key")]
+    pub fn ffi_approve_device_with_key(
+        &self,
+        target_device_id: String,
+        target_signature_public_key: Vec<u8>,
+        target_auth_generation: i64,
+    ) -> Result<(), MLSError> {
+        self.approve_device_with_key(
+            &target_device_id,
+            &target_signature_public_key,
+            target_auth_generation,
+        )
+    }
+
+    #[uniffi::method(name = "list_devices")]
+    pub fn ffi_list_devices(&self) -> Result<Vec<RegisteredDeviceInfo>, MLSError> {
+        self.list_devices()
+    }
+
+    #[uniffi::method(name = "revoke_device")]
+    pub fn ffi_revoke_device(
+        &self,
+        target_device_id: String,
+    ) -> Result<DeviceRevocationReport, MLSError> {
+        self.revoke_device(&target_device_id)
+    }
+
+    #[uniffi::method(name = "retire_current_device")]
+    pub fn ffi_retire_current_device(&self) -> Result<(), MLSError> {
+        self.retire_current_device()
+    }
+
+    #[uniffi::method(name = "delete_account_data")]
+    pub fn ffi_delete_account_data(&self) -> Result<(), MLSError> {
+        self.delete_account_data()
+    }
+
+    #[uniffi::method(name = "start_otc_pairing")]
+    pub fn ffi_start_otc_pairing(
+        &self,
+        six_digit_code: String,
+    ) -> Result<OtcInitiatedSession, MLSError> {
+        self.start_otc_pairing(&six_digit_code)
+    }
+
+    #[uniffi::method(name = "respond_otc_pairing")]
+    pub fn ffi_respond_otc_pairing(
+        &self,
+        session_id_hex: String,
+        six_digit_code: Option<String>,
+    ) -> Result<(), MLSError> {
+        self.respond_otc_pairing(&session_id_hex, six_digit_code.as_deref())
+    }
+
+    #[uniffi::method(name = "restore_with_passkey_prf")]
+    pub fn ffi_restore_with_passkey_prf(
+        &self,
+        credential_id: Vec<u8>,
+        prf_output_32: Vec<u8>,
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.restore_with_passkey_prf(credential_id, prf_output_32)
+    }
+
+    #[uniffi::method(name = "verify_and_reindex_history")]
+    pub fn ffi_verify_and_reindex_history(&self, conversation_id: String) -> Result<u32, MLSError> {
+        self.verify_and_reindex_history(&conversation_id)
+    }
+
+    #[uniffi::method(name = "propose_peer_repin")]
+    pub fn ffi_propose_peer_repin(
+        &self,
+        peer_did: String,
+    ) -> Result<PeerRepinProposalInfo, MLSError> {
+        self.propose_peer_repin(&peer_did)
+    }
+
+    #[uniffi::method(name = "repin_peer")]
+    pub fn ffi_repin_peer(
+        &self,
+        peer_did: String,
+        confirmed_head: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        self.repin_peer(&peer_did, confirmed_head)
+    }
+
+    #[uniffi::method(name = "leave_conversation")]
+    pub fn ffi_leave_conversation(
+        &self,
+        conversation_id: String,
+    ) -> Result<LeaveConversationOutcome, MLSError> {
+        self.leave_conversation(&conversation_id)
+    }
+
+    #[uniffi::method(name = "fulfill_pending_group_leaves")]
+    pub fn ffi_fulfill_pending_group_leaves(&self) -> Result<u32, MLSError> {
+        self.fulfill_pending_group_leaves()
+    }
+
+    #[uniffi::method(name = "upload_conversation_attachment")]
+    pub fn ffi_upload_conversation_attachment(
+        &self,
+        conversation_id: String,
+        plaintext: Vec<u8>,
+        mime_type: String,
+    ) -> Result<UploadedConversationAttachment, MLSError> {
+        self.upload_conversation_attachment(&conversation_id, plaintext, mime_type)
+    }
+
+    #[uniffi::method(name = "get_read_state")]
+    pub fn ffi_get_read_state(
+        &self,
+        conversation_id: String,
+    ) -> Result<Option<MailboxReadStateRecord>, MLSError> {
+        self.get_read_state(&conversation_id)
+    }
+
+    #[uniffi::method(name = "advance_read_state")]
+    pub fn ffi_advance_read_state(
+        &self,
+        conversation_id: String,
+        candidate_seq: u64,
+    ) -> Result<MailboxReadStateRecord, MLSError> {
+        self.advance_read_state(&conversation_id, candidate_seq)
+    }
+
+    #[uniffi::method(name = "list_read_states")]
+    pub fn ffi_list_read_states(&self) -> Result<Vec<MailboxReadStateRecord>, MLSError> {
+        self.list_read_states()
+    }
+
+    #[uniffi::method(name = "get_circle_owner_state")]
+    pub fn ffi_get_circle_owner_state(
+        &self,
+        circle_id: String,
+    ) -> Result<Option<CircleOwnerStateDto>, MLSError> {
+        self.get_circle_owner_state(&circle_id)
+    }
+
+    #[uniffi::method(name = "put_circle_owner_state")]
+    pub fn ffi_put_circle_owner_state(
+        &self,
+        state: CircleOwnerStateDto,
+        swap_record_cid: Option<String>,
+    ) -> Result<String, MLSError> {
+        self.put_circle_owner_state(state, swap_record_cid)
+    }
+
+    #[uniffi::method(name = "merge_circle_owner_state")]
+    pub fn ffi_merge_circle_owner_state(
+        &self,
+        update: CircleOwnerStateDto,
+    ) -> Result<CircleOwnerStateDto, MLSError> {
+        self.merge_circle_owner_state(update)
+    }
+
+    #[uniffi::method(name = "clear_circle_acl_tombstone")]
+    pub fn ffi_clear_circle_acl_tombstone(
+        &self,
+        circle_id: String,
+        member_did: String,
+    ) -> Result<Option<CircleOwnerStateDto>, MLSError> {
+        self.clear_circle_acl_tombstone(&circle_id, &member_did)
+    }
+
+    #[uniffi::method(name = "list_circle_owner_states")]
+    pub fn ffi_list_circle_owner_states(&self) -> Result<Vec<CircleOwnerStateDto>, MLSError> {
+        self.list_circle_owner_states()
+    }
+}
+
+/// E2EE Circles (`crate::ffi::circles_ffi`): thin wrappers; no mailbox key crosses.
+#[cfg(feature = "labyrinth")]
+#[uniffi::export]
+impl CatbirdMlsClient {
+    #[uniffi::method(name = "circle_key_generate")]
+    pub fn ffi_circle_key_generate(&self) -> Vec<u8> {
+        self.circle_key_generate()
+    }
+
+    #[uniffi::method(name = "circle_key_wrap")]
+    pub fn ffi_circle_key_wrap(
+        &self,
+        req: super::circles_ffi::CircleKeyWrapRequest,
+        circle_key: Vec<u8>,
+    ) -> Result<super::circles_ffi::CircleKeyWrapResult, super::circles_ffi::CircleFfiError> {
+        self.circle_key_wrap(req, circle_key)
+    }
+
+    #[uniffi::method(name = "circle_key_open")]
+    pub fn ffi_circle_key_open(
+        &self,
+        record_json: String,
+        space_uri: String,
+        owner_did: String,
+    ) -> Result<Option<super::circles_ffi::CircleKeyOpenResult>, super::circles_ffi::CircleFfiError>
+    {
+        self.circle_key_open(record_json, space_uri, owner_did)
+    }
+
+    #[uniffi::method(name = "circle_post_seal")]
+    pub fn ffi_circle_post_seal(
+        &self,
+        req: super::circles_ffi::CirclePostSealRequest,
+    ) -> Result<String, super::circles_ffi::CircleFfiError> {
+        self.circle_post_seal(req)
+    }
+
+    #[uniffi::method(name = "circle_post_open")]
+    pub fn ffi_circle_post_open(
+        &self,
+        req: super::circles_ffi::CirclePostOpenRequest,
+    ) -> Result<String, super::circles_ffi::CircleFfiError> {
+        self.circle_post_open(req)
+    }
+
+    #[uniffi::method(name = "circle_post_key")]
+    pub fn ffi_circle_post_key(
+        &self,
+        circle_key: Vec<u8>,
+        circle_id: String,
+        post_uri: String,
+    ) -> Result<Vec<u8>, super::circles_ffi::CircleFfiError> {
+        self.circle_post_key(circle_key, circle_id, post_uri)
     }
 }

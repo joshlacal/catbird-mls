@@ -511,6 +511,8 @@ fn signed_wrapper_name(kind: SignedMutationKind) -> Option<&'static str> {
         K::ZeroLeafLeave => "signedZeroLeafLeave",
         K::LeaveCancellation => "signedLeaveCancellation",
         K::LeaveCommitFulfillment => "signedLeaveCommitFulfillment",
+        K::DeviceApproval => "signedDeviceApproval",
+        K::DeviceRevocation => "signedDeviceRevocation",
         _ => return None,
     })
 }
@@ -747,8 +749,9 @@ pub fn leaf_recovery_request_authorization(body: &Value, cid: &str) -> Result<Va
 /// Whether this device (`own_did`, `own_device`) may fulfill the request `authorization` (from
 /// [`leaf_recovery_request_authorization`]) in a group whose current leaves are `leaves`
 /// (`(did, device)`), given its verified `roster` and durable `verified_admission`. Never its own
-/// request. A `replace` re-adds an exact current leaf and is fulfilled only from another DID
-/// (`CHAT_PROTOCOL` §2: a healthy different-DID leaf contains a poisoned one). An `add` adds a
+/// request. A `replace` re-adds an exact current leaf and may be fulfilled by any active group
+/// member other than the requesting device itself (`did != own_did || device != own_device`),
+/// including an online sibling device on the same account. An `add` adds a
 /// device the tree does not hold, for a DID that either holds another current leaf or is active in
 /// the verified roster and whose invitation and acceptance this device verified. Server roster
 /// state alone never entitles a zero-leaf account.
@@ -773,7 +776,7 @@ pub fn recovery_request_entitled(
         .iter()
         .any(|(leaf_did, leaf_device)| leaf_did == did && leaf_device == device);
     match authorization["recoveryKind"].as_str() {
-        Some("replace") => holds_leaf && did != own_did,
+        Some("replace") => holds_leaf && (did != own_did || device != own_device),
         Some("add") => {
             !holds_leaf
                 && (leaves.iter().any(|(leaf_did, _)| leaf_did == did)
@@ -1783,9 +1786,14 @@ pub fn extract_did_doc_from_resolve_response(body_bytes: &[u8]) -> Result<Vec<u8
     ))
 }
 
-/// Extract `#atproto_pds` service endpoint URL from a DID document if present.
-pub fn extract_pds_endpoint_from_did_doc(did_doc_bytes: &[u8]) -> Option<String> {
+/// Extract the `#atproto_pds` service endpoint from `did`'s DID document.
+/// `None` unless the document's `id` is exactly `did` (a resolver must not
+/// answer for another identity) and the endpoint is an `https://` URL.
+pub fn extract_pds_endpoint_from_did_doc(did_doc_bytes: &[u8], did: &str) -> Option<String> {
     let val: Value = serde_json::from_slice(did_doc_bytes).ok()?;
+    if val.get("id").and_then(|v| v.as_str()) != Some(did) {
+        return None;
+    }
     let services = val.get("service")?.as_array()?;
     for svc in services {
         let id = svc.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1793,7 +1801,8 @@ pub fn extract_pds_endpoint_from_did_doc(did_doc_bytes: &[u8]) -> Option<String>
         if id.ends_with("#atproto_pds") || ty == "AtprotoPersonalDataServer" {
             if let Some(ep) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
                 let trimmed = ep.trim_end_matches('/').to_string();
-                if !trimmed.is_empty() {
+                let host = trimmed.strip_prefix("https://").unwrap_or("");
+                if !host.is_empty() && !host.starts_with('/') {
                     return Some(trimmed);
                 }
             }
@@ -3350,7 +3359,31 @@ mod tests {
         );
         assert!(
             !entitled(&auth(alice, "a2", "replace"), None, false),
-            "replace only from another DID"
+            "replace requires holding a leaf"
+        );
+        let mut sibling_leaves = leaves.clone();
+        sibling_leaves.push((alice.to_owned(), "a2".to_owned()));
+        assert!(
+            recovery_request_entitled(
+                &auth(alice, "a2", "replace"),
+                &sibling_leaves,
+                None,
+                false,
+                alice,
+                "a1",
+            ),
+            "sibling device may fulfill a held-leaf replace"
+        );
+        assert!(
+            !recovery_request_entitled(
+                &auth(alice, "a1", "replace"),
+                &sibling_leaves,
+                None,
+                false,
+                alice,
+                "a1",
+            ),
+            "own device never fulfills its own replace"
         );
         assert!(
             !entitled(&auth(alice, "a1", "add"), Some(&roster), true),

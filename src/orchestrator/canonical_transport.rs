@@ -14,6 +14,7 @@ use crate::atproto::blue_catbird::chat::{
     acknowledge_entries::AcknowledgeEntriesRequest,
     acknowledge_welcome::AcknowledgeWelcomeRequest,
     activate_reset::ActivateResetRequest,
+    approve_device::ApproveDeviceRequest,
     cancel_leaf_recovery::CancelLeafRecoveryRequest,
     cancel_leave::CancelLeaveRequest,
     close_conversation::CloseConversationRequest,
@@ -238,6 +239,7 @@ pub enum CleanChatRequest {
     RevokeDevice(RevokeDeviceRequestBody),
     SubmitTransition(SubmitTransitionRequestBody),
     SubscribeEvents(SubscribeEventsRequestBody),
+    ApproveDevice(ApproveDeviceRequestBody),
 }
 
 pub type AcceptConversationRequestBody =
@@ -294,6 +296,8 @@ pub type RequestResetRequestBody =
     crate::atproto::blue_catbird::chat::request_reset::RequestReset<String>;
 pub type RevokeDeviceRequestBody =
     crate::atproto::blue_catbird::chat::revoke_device::RevokeDevice<String>;
+pub type ApproveDeviceRequestBody =
+    crate::atproto::blue_catbird::chat::approve_device::ApproveDevice<String>;
 pub type SubmitTransitionRequestBody =
     crate::atproto::blue_catbird::chat::submit_transition::SubmitTransition<String>;
 pub type SubscribeEventsRequestBody =
@@ -389,6 +393,9 @@ pub enum CleanChatResponse {
     SubscribeEvents(
         crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>,
     ),
+    ApproveDevice(
+        crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceOutput<String>,
+    ),
 }
 
 /// A generated clean-chat error body, selected by the canonical operation.
@@ -460,6 +467,7 @@ pub enum CleanChatError {
     RevokeDevice(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceError),
     SubmitTransition(crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError),
     SubscribeEvents(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsError),
+    ApproveDevice(crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceError),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -501,6 +509,7 @@ pub enum CleanChatOperationFfi {
     RevokeDevice,
     SubmitTransition,
     SubscribeEvents,
+    ApproveDevice,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -545,6 +554,7 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
             CleanChatOperationFfi::RevokeDevice => Self::RevokeDevice,
             CleanChatOperationFfi::SubmitTransition => Self::SubmitTransition,
             CleanChatOperationFfi::SubscribeEvents => Self::SubscribeEvents,
+            CleanChatOperationFfi::ApproveDevice => Self::ApproveDevice,
         }
     }
 }
@@ -591,6 +601,7 @@ impl From<CanonicalOperation> for CleanChatOperationFfi {
             CanonicalOperation::RevokeDevice => Self::RevokeDevice,
             CanonicalOperation::SubmitTransition => Self::SubmitTransition,
             CanonicalOperation::SubscribeEvents => Self::SubscribeEvents,
+            CanonicalOperation::ApproveDevice => Self::ApproveDevice,
         }
     }
 }
@@ -752,6 +763,7 @@ fn parse_ffi_request(
         CanonicalOperation::SubscribeEvents => {
             parse_json_req(body, CleanChatRequest::SubscribeEvents)
         }
+        CanonicalOperation::ApproveDevice => parse_json_req(body, CleanChatRequest::ApproveDevice),
     }
 }
 
@@ -870,6 +882,7 @@ pub fn decode_clean_chat_response(
         CleanChatResponse::RevokeDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::SubscribeEvents(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::ApproveDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
     }
 }
 
@@ -939,6 +952,7 @@ pub fn decode_clean_chat_error(
         CleanChatError::RevokeDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::SubscribeEvents(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::ApproveDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
     }
 }
 
@@ -983,6 +997,7 @@ impl CleanChatRequest {
             Self::RevokeDevice(_) => CanonicalOperation::RevokeDevice,
             Self::SubmitTransition(_) => CanonicalOperation::SubmitTransition,
             Self::SubscribeEvents(_) => CanonicalOperation::SubscribeEvents,
+            Self::ApproveDevice(_) => CanonicalOperation::ApproveDevice,
         }
     }
 
@@ -1038,6 +1053,7 @@ impl CleanChatRequest {
             Self::RequestReset(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::RevokeDevice(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::SubmitTransition(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::ApproveDevice(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
         }
     }
 }
@@ -1125,6 +1141,7 @@ impl CleanChatResponse {
                 SubmitTransition
             ),
             CanonicalOperation::SubscribeEvents => decode!(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>, SubscribeEvents),
+            CanonicalOperation::ApproveDevice => decode!(crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceOutput<String>, ApproveDevice),
         }
     }
 }
@@ -1200,6 +1217,7 @@ impl CleanChatError {
                 SubmitTransition
             ),
             CanonicalOperation::SubscribeEvents => decode!(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsError, SubscribeEvents),
+            CanonicalOperation::ApproveDevice => decode!(crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceError, ApproveDevice),
         }
     }
 }
@@ -1371,6 +1389,7 @@ pub fn derive_key_id(public_key: &[u8]) -> String {
 }
 
 pub const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
+pub const DEVICE_APPROVE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-APPROVE\0";
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
 const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
 const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
@@ -1476,6 +1495,11 @@ fn signed_request_spec(
         CanonicalOperation::RevokeDevice => SignedRequestSpec {
             domain: DEVICE_REVOKE_SIGNATURE_DOMAIN,
             body_type: "blue.catbird.chat.defs#deviceRevocationBody",
+            variant: None,
+        },
+        CanonicalOperation::ApproveDevice => SignedRequestSpec {
+            domain: DEVICE_APPROVE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#deviceApprovalBody",
             variant: None,
         },
         CanonicalOperation::RequestLeave => match variant {
@@ -4074,6 +4098,7 @@ pub enum CanonicalOperation {
     RevokeDevice,
     SubmitTransition,
     SubscribeEvents,
+    ApproveDevice,
 }
 
 impl CanonicalOperation {
@@ -4115,6 +4140,7 @@ impl CanonicalOperation {
         Self::RevokeDevice,
         Self::SubmitTransition,
         Self::SubscribeEvents,
+        Self::ApproveDevice,
     ];
 
     pub fn route(self) -> CanonicalRoute {
@@ -4183,6 +4209,7 @@ pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
         CanonicalOperation::RevokeDevice => route(RevokeDeviceRequest::PATH),
         CanonicalOperation::SubmitTransition => route(SubmitTransitionRequest::PATH),
         CanonicalOperation::SubscribeEvents => route(SubscribeEventsEndpoint::PATH),
+        CanonicalOperation::ApproveDevice => route(ApproveDeviceRequest::PATH),
     }
 }
 

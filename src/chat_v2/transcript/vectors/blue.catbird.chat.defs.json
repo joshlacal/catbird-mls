@@ -88,6 +88,7 @@
       "type": "string",
       "enum": [
         "active",
+        "pending_approval",
         "revoked"
       ]
     },
@@ -658,6 +659,19 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 1000
+        },
+        "deviceName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "lastActiveAt": {
+          "type": "ref",
+          "ref": "#canonicalDatetime"
+        },
+        "dormantAt": {
+          "type": "ref",
+          "ref": "#canonicalDatetime"
         }
       },
       "description": "availablePackageCount plus reservedPackageCount is at most 1000 live nonterminal KeyPackages for this device."
@@ -1749,6 +1763,71 @@
         "targetDeviceId": {
           "type": "ref",
           "ref": "#deviceId"
+        },
+        "targetAuthGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "idempotencyKey": {
+          "type": "ref",
+          "ref": "#operationId"
+        },
+        "signedAt": {
+          "type": "ref",
+          "ref": "#canonicalDatetime"
+        }
+      }
+    },
+    "deviceApprovalBody": {
+      "type": "object",
+      "required": [
+        "signatureDomain",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "targetDeviceId",
+        "targetKeyId",
+        "targetSignaturePublicKey",
+        "targetAuthGeneration",
+        "idempotencyKey",
+        "signedAt"
+      ],
+      "properties": {
+        "signatureDomain": {
+          "type": "string",
+          "const": "CATBIRD-CHAT-DEVICE-APPROVE\u0000"
+        },
+        "actorDid": {
+          "type": "ref",
+          "ref": "#bareDid"
+        },
+        "actorDeviceId": {
+          "type": "ref",
+          "ref": "#deviceId"
+        },
+        "keyId": {
+          "type": "ref",
+          "ref": "#keyId"
+        },
+        "authGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "targetDeviceId": {
+          "type": "ref",
+          "ref": "#deviceId"
+        },
+        "targetKeyId": {
+          "type": "ref",
+          "ref": "#keyId"
+        },
+        "targetSignaturePublicKey": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
         },
         "targetAuthGeneration": {
           "type": "integer",
@@ -4818,6 +4897,27 @@
         }
       }
     },
+    "signedDeviceApproval": {
+      "type": "object",
+      "required": [
+        "body",
+        "signature"
+      ],
+      "properties": {
+        "body": {
+          "type": "union",
+          "refs": [
+            "#deviceApprovalBody"
+          ],
+          "closed": true
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    },
     "signedBlobUploadPreparation": {
       "type": "object",
       "required": [
@@ -6147,10 +6247,6 @@
           "type": "bytes",
           "minLength": 64,
           "maxLength": 64
-        },
-        "sequencerReceipt": {
-          "type": "ref",
-          "ref": "#sequencerReceipt"
         },
         "receivedAt": {
           "type": "ref",

@@ -127,6 +127,7 @@ pub struct NotificationPreview {
     pub fallback_generic: bool,
     pub darwin_notification_name: String,
     pub receipt_verified: bool,
+    pub is_own_sibling_sender: bool,
 }
 
 /// Synchronous keystore interface for NSE / FCM (`sha256(normalized_did)`-keyed, zero OAuth refresh).
@@ -780,6 +781,35 @@ fn post_darwin_nse_commit_notification() {
 #[cfg(not(target_vendor = "apple"))]
 fn post_darwin_nse_commit_notification() {}
 
+fn is_verified_sibling_sender(
+    owner_did: Option<&str>,
+    own_device_id: Option<&str>,
+    account_did_hash: &str,
+    verified_sender_did: &str,
+    verified_device_id: &str,
+) -> bool {
+    if verified_sender_did.trim().is_empty() || verified_device_id.trim().is_empty() {
+        return false;
+    }
+    let Ok(canonical_sender) = crate::client::normalize_account_did(verified_sender_did) else {
+        return false;
+    };
+    let matches_account = if let Some(owner) = owner_did {
+        crate::client::normalize_account_did(owner)
+            .is_ok_and(|canonical_owner| canonical_owner == canonical_sender)
+    } else {
+        crate::client::account_did_hash_hex(&canonical_sender)
+            .is_ok_and(|hash| hash.eq_ignore_ascii_case(account_did_hash))
+    };
+    if !matches_account {
+        return false;
+    }
+    match own_device_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(own_id) => !own_id.eq_ignore_ascii_case(verified_device_id.trim()),
+        None => true,
+    }
+}
+
 fn build_generic_fallback_preview(
     wake: &PushWakePayload,
     group_title: Option<String>,
@@ -797,6 +827,7 @@ fn build_generic_fallback_preview(
         fallback_generic: true,
         receipt_verified: false,
         darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
+        is_own_sibling_sender: false,
     }
 }
 
@@ -882,6 +913,7 @@ pub fn process_push_notification_with_hooks(
         convo: Option<ConversationRow>,
         cached_title: Option<String>,
         owner_did: Option<String>,
+        own_device_id: Option<String>,
         authorized_keys: HashMap<String, Vec<AuthorizedPeerDeviceKey>>,
         authorized_key_versions: HashMap<String, (String, i64)>,
         sender_display_name: Option<String>,
@@ -889,6 +921,7 @@ pub fn process_push_notification_with_hooks(
 
     let preflight = db.read_tx(|tx| {
         let owner_did = tx.get_account_meta("owner_did")?;
+        let own_device_id = tx.get_account_meta("device_id")?;
         let convo = tx.get_conversation(&wake.conversation_id)?;
         let cached_meta = tx.get_group_metadata(&wake.conversation_id)?;
         let cached_title = cached_meta
@@ -896,10 +929,10 @@ pub fn process_push_notification_with_hooks(
             .and_then(|m| m.title.clone())
             .or_else(|| convo.as_ref().and_then(|c| c.title.clone()));
 
-        let existing_msg: Option<(String, String, String, i64, i64)> = tx
+        let existing_msg: Option<(String, String, String, String, i64, i64)> = tx
             .conn()
             .query_row(
-                "SELECT message_id, sender_did, plaintext_json, epoch, seq \
+                "SELECT message_id, sender_did, sender_device_id, plaintext_json, epoch, seq \
                  FROM messages WHERE conversation_id = ?1 AND seq = ?2;",
                 rusqlite::params![wake.conversation_id, wake.entry_seq],
                 |row| {
@@ -909,6 +942,7 @@ pub fn process_push_notification_with_hooks(
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -925,7 +959,9 @@ pub fn process_push_notification_with_hooks(
             }
         }
 
-        if let Some((message_id, sender_did, plaintext_json, epoch, seq)) = existing_msg {
+        if let Some((message_id, sender_did, sender_device_id, plaintext_json, epoch, seq)) =
+            existing_msg
+        {
             let (body, _) = parse_canonical_message_body(plaintext_json.as_bytes())?;
             let display_name: Option<String> = tx
                 .conn()
@@ -937,6 +973,13 @@ pub fn process_push_notification_with_hooks(
                 .optional()
                 .map_err(|e| MLSError::Internal(format!("query sender profile: {e}")))?
                 .flatten();
+            let is_own_sibling_sender = is_verified_sibling_sender(
+                owner_did.as_deref(),
+                own_device_id.as_deref(),
+                account_did_hash,
+                &sender_did,
+                &sender_device_id,
+            );
 
             return Ok(PreflightState {
                 cached_preview: Some(NotificationPreview {
@@ -952,10 +995,12 @@ pub fn process_push_notification_with_hooks(
                     fallback_generic: false,
                     receipt_verified: true,
                     darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
+                    is_own_sibling_sender,
                 }),
                 convo: None,
                 cached_title: None,
                 owner_did,
+                own_device_id,
                 authorized_keys: HashMap::new(),
                 authorized_key_versions: HashMap::new(),
                 sender_display_name: None,
@@ -1011,6 +1056,7 @@ pub fn process_push_notification_with_hooks(
             convo,
             cached_title,
             owner_did,
+            own_device_id,
             authorized_keys,
             authorized_key_versions,
             sender_display_name,
@@ -1123,13 +1169,22 @@ pub fn process_push_notification_with_hooks(
     let preview_res = db.write_tx(|tx| {
         let result = (|| {
         // Re-check inside BEGIN IMMEDIATE in case the foreground app already inserted this message.
-        let concurrent_msg: Option<(String, String, String, i64, i64)> = tx
+        let concurrent_msg: Option<(String, String, String, String, i64, i64)> = tx
             .conn()
             .query_row(
-                "SELECT conversation_id, sender_did, plaintext_json, epoch, seq FROM messages \
+                "SELECT conversation_id, sender_did, sender_device_id, plaintext_json, epoch, seq FROM messages \
                  WHERE message_id = ?1;",
                 [&wake.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| MLSError::Internal(format!("recheck message in write_tx: {e}")))?;
@@ -1145,7 +1200,15 @@ pub fn process_push_notification_with_hooks(
             .and_then(|m| m.title)
             .or_else(|| current_convo.title.clone());
 
-        if let Some((conversation_id, sender_did, plaintext_json, epoch, seq)) = concurrent_msg {
+        if let Some((
+            conversation_id,
+            sender_did,
+            sender_device_id,
+            plaintext_json,
+            epoch,
+            seq,
+        )) = concurrent_msg
+        {
             // The wake's ids are unauthenticated: a cached row answers only the exact entry.
             if conversation_id != wake.conversation_id || seq != wake.entry_seq {
                 return Err(MLSError::Cryptography(
@@ -1153,6 +1216,13 @@ pub fn process_push_notification_with_hooks(
                 ));
             }
             let (body, _) = parse_canonical_message_body(plaintext_json.as_bytes())?;
+            let is_own_sibling_sender = is_verified_sibling_sender(
+                preflight.owner_did.as_deref(),
+                preflight.own_device_id.as_deref(),
+                account_did_hash,
+                &sender_did,
+                &sender_device_id,
+            );
             return Ok(NotificationPreview {
                 message_id: wake.message_id.clone(),
                 conversation_id: wake.conversation_id.clone(),
@@ -1166,6 +1236,7 @@ pub fn process_push_notification_with_hooks(
                 fallback_generic: false,
                 receipt_verified: true,
                 darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
+                is_own_sibling_sender,
             });
         }
 
@@ -1227,7 +1298,7 @@ pub fn process_push_notification_with_hooks(
         entries_to_apply.sort_by_key(|entry| entry.seq);
         let fetched_metadata_snapshot = fetch_bundle.metadata_snapshot;
 
-        let mut target_decrypted: Option<(String, String, String, i64, i64)> = None;
+        let mut target_decrypted: Option<(String, String, String, String, i64, i64)> = None;
 
         for entry in entries_to_apply {
             if entry.seq <= current_convo.last_seq {
@@ -1471,6 +1542,7 @@ pub fn process_push_notification_with_hooks(
                         target_decrypted = Some((
                             message_id,
                             verified_sender_did,
+                            verified_device_id,
                             body,
                             msg_epoch,
                             entry.seq,
@@ -1573,7 +1645,7 @@ pub fn process_push_notification_with_hooks(
                         epoch: msg_epoch,
                         seq: entry.seq,
                         sender_did: verified_sender_did.clone(),
-                        sender_device_id: verified_device_id,
+                        sender_device_id: verified_device_id.clone(),
                         plaintext_json,
                         created_at_ms: now_ms,
                         is_own,
@@ -1600,6 +1672,7 @@ pub fn process_push_notification_with_hooks(
                         target_decrypted = Some((
                             message_id,
                             verified_sender_did,
+                            verified_device_id,
                             body,
                             msg_epoch,
                             entry.seq,
@@ -1696,9 +1769,18 @@ pub fn process_push_notification_with_hooks(
         current_convo.updated_at_ms = now_ms;
         tx.upsert_conversation(&current_convo)?;
 
-        let Some((message_id, sender_did, body, msg_epoch, msg_seq)) = target_decrypted else {
+        let Some((message_id, sender_did, sender_device_id, body, msg_epoch, msg_seq)) =
+            target_decrypted
+        else {
             return Ok(build_generic_fallback_preview(wake, resolved_title));
         };
+        let is_own_sibling_sender = is_verified_sibling_sender(
+            preflight.owner_did.as_deref(),
+            preflight.own_device_id.as_deref(),
+            account_did_hash,
+            &sender_did,
+            &sender_device_id,
+        );
 
         Ok(NotificationPreview {
             message_id,
@@ -1713,6 +1795,7 @@ pub fn process_push_notification_with_hooks(
             fallback_generic: false,
             receipt_verified: !preview_only,
             darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
+            is_own_sibling_sender,
         })
         })();
         match (preview_only, result) {

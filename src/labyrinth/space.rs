@@ -5,11 +5,15 @@ use std::sync::Arc;
 
 use labyrinth::attachment::AttachmentCiphertextMeta;
 use labyrinth::records::{
-    Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
+    CircleOwnerStateRecord, Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch,
+    ReadStateRecord, VirtualDevice,
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::space::{SpaceError, SpaceMailboxStore, SpaceRpc};
-use labyrinth::store::{AtomicEnrollBundle, MailboxStore, MaybeSend, MaybeSync, Stored, TimeRange};
+use labyrinth::store::{
+    AtomicEnrollBundle, AuthorQuarantine, MailboxStore, MaybeSend, MaybeSync, Stored,
+    ThreadListing, TimeRange,
+};
 use serde::{Deserialize, Serialize};
 
 use super::state::StateVault;
@@ -163,7 +167,10 @@ impl SpaceXrpcTransport {
         }
     }
 
-    async fn send_checked(&self, req: LabyrinthSpaceRequest) -> Result<Vec<u8>, SpaceError> {
+    async fn send_checked_with_headers(
+        &self,
+        req: LabyrinthSpaceRequest,
+    ) -> Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
         let resp = self
             .gateway
             .submit_space_with_headers(req.clone())
@@ -184,7 +191,8 @@ impl SpaceXrpcTransport {
                     })?;
             }
         }
-        decode_response_bounded(
+        let headers = resp.headers;
+        let body = decode_response_bounded(
             Ok(GatewayResponse {
                 status: resp.status,
                 content_type: resp.content_type,
@@ -196,7 +204,14 @@ impl SpaceXrpcTransport {
             status: e.status,
             error: e.error,
             message: e.message,
-        })
+        })?;
+        Ok((headers, body))
+    }
+
+    async fn send_checked(&self, req: LabyrinthSpaceRequest) -> Result<Vec<u8>, SpaceError> {
+        self.send_checked_with_headers(req)
+            .await
+            .map(|(_, body)| body)
     }
 }
 
@@ -231,6 +246,17 @@ impl SpaceRpc for SpaceXrpcTransport {
         nsid: &str,
         params: &[(&str, String)],
     ) -> core::result::Result<Vec<u8>, SpaceError> {
+        self.query_with_headers(nsid, params, &[])
+            .await
+            .map(|(_, body)| body)
+    }
+
+    async fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> core::result::Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
         check_space_nsid(nsid)?;
         let query: Vec<String> = params
             .iter()
@@ -241,8 +267,9 @@ impl SpaceRpc for SpaceXrpcTransport {
         } else {
             format!("/xrpc/{nsid}?{}", query.join("&"))
         };
-        self.send_checked(LabyrinthSpaceRequest::get(nsid, path))
-            .await
+        let mut req = LabyrinthSpaceRequest::get(nsid, path);
+        req.headers = headers.to_vec();
+        self.send_checked_with_headers(req).await
     }
 
     async fn procedure(
@@ -402,6 +429,16 @@ impl MailboxStore for SpaceMailbox {
     ) -> labyrinth::Result<()> {
         self.space.set_device_revoked(device_key, revoked_at).await
     }
+    async fn set_device_revocation(
+        &self,
+        device_key: &XVerifyingKey,
+        revoked_at: &str,
+        revocation: &labyrinth::records::DeviceRevocationDef,
+    ) -> labyrinth::Result<()> {
+        self.space
+            .set_device_revocation(device_key, revoked_at, revocation)
+            .await
+    }
     async fn get_device(&self, device_key: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
         self.space.get_device(device_key).await
     }
@@ -449,11 +486,73 @@ impl MailboxStore for SpaceMailbox {
     async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
         self.space.list_virtual_devices().await
     }
+    async fn list_virtual_device_records(
+        &self,
+    ) -> labyrinth::Result<Vec<labyrinth::Result<VirtualDevice>>> {
+        self.space.list_virtual_device_records().await
+    }
     async fn put_otc_session(&self, session: &OtcSession) -> labyrinth::Result<()> {
         self.space.put_otc_session(session).await
     }
     async fn get_otc_session(&self, session_id: &str) -> labyrinth::Result<Option<OtcSession>> {
         self.space.get_otc_session(session_id).await
+    }
+    async fn get_read_state(
+        &self,
+        conversation_id: &str,
+    ) -> labyrinth::Result<Option<(ReadStateRecord, Option<String>)>> {
+        self.space.get_read_state(conversation_id).await
+    }
+    async fn put_read_state(
+        &self,
+        conversation_id: &str,
+        record: &ReadStateRecord,
+        expected_cid: Option<&str>,
+    ) -> labyrinth::Result<String> {
+        self.space
+            .put_read_state(conversation_id, record, expected_cid)
+            .await
+    }
+    async fn list_read_states(
+        &self,
+    ) -> labyrinth::Result<Vec<(String, ReadStateRecord, Option<String>)>> {
+        self.space.list_read_states().await
+    }
+    async fn get_circle_owner_state(
+        &self,
+        circle_id: &str,
+    ) -> labyrinth::Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
+        self.space.get_circle_owner_state(circle_id).await
+    }
+    async fn put_circle_owner_state(
+        &self,
+        circle_id: &str,
+        record: &CircleOwnerStateRecord,
+        expected_cid: Option<&str>,
+    ) -> labyrinth::Result<String> {
+        self.space
+            .put_circle_owner_state(circle_id, record, expected_cid)
+            .await
+    }
+    async fn list_circle_owner_states(
+        &self,
+    ) -> labyrinth::Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
+        self.space.list_circle_owner_states().await
+    }
+    fn seed_writer_rev_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), String>,
+    ) {
+        self.space.seed_writer_rev_floors(floors);
+    }
+    fn replace_writer_rev_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), String>,
+    ) {
+        self.space.replace_writer_rev_floors(floors);
+    }
+    fn export_writer_rev_floors(&self) -> std::collections::BTreeMap<(String, String), String> {
+        self.space.export_writer_rev_floors()
     }
     async fn append_owner_batch(&self, batch: &OwnerBatch) -> labyrinth::Result<String> {
         self.space.append_owner_batch(batch).await
@@ -719,6 +818,43 @@ impl ResolvingSpaceThreadStore {
         store.set_thread_space("__purge__", space_ref);
         store.clear_records("__purge__").await
     }
+
+    /// Resolves and returns the canonical conversation Space URI for `thread_id`.
+    pub async fn resolved_space_uri(&self, thread_id: &str) -> labyrinth::Result<String> {
+        self.ensure_thread_space(thread_id).await?;
+        let pins = self.load_pins()?;
+        if let Some(pin) = pins.get(thread_id) {
+            pin.validate()?;
+            if let Some(ref uri) = pin.space {
+                return Ok(uri.clone());
+            }
+        }
+        Err(labyrinth::Error::NotFound("space"))
+    }
+
+    /// Uploads encrypted attachment ciphertext into the conversation Space and
+    /// commits its `attachmentManifest` record, returning `(space_uri, cid, rkey)`.
+    pub async fn upload_conversation_attachment_blob(
+        &self,
+        thread_id: &str,
+        ciphertext: &[u8],
+        meta: &AttachmentCiphertextMeta,
+        created_at: &str,
+    ) -> labyrinth::Result<(String, String, String)> {
+        use labyrinth::store::ThreadStore as _;
+        let space_uri = self.resolved_space_uri(thread_id).await?;
+        let rkey = self
+            .inner
+            .upload_and_commit_attachment(thread_id, ciphertext, meta, created_at)
+            .await?;
+        let manifest = self
+            .inner
+            .get_attachment_manifest(thread_id, self.inner.author(), &rkey)
+            .await?
+            .ok_or(labyrinth::Error::NotFound("attachmentManifest"))?;
+        let (cid, _) = manifest.to_meta()?;
+        Ok((space_uri, cid, rkey))
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -757,6 +893,71 @@ impl labyrinth::store::ThreadStore for ResolvingSpaceThreadStore {
         self.inner.list_batches(thread_id, sender, range).await
     }
 
+    async fn list_batches_quarantined(
+        &self,
+        thread_id: &str,
+        sender: Option<&str>,
+        range: TimeRange,
+    ) -> labyrinth::Result<(
+        Vec<Stored<labyrinth::records::Batch>>,
+        Vec<AuthorQuarantine>,
+    )> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .list_batches_quarantined(thread_id, sender, range)
+            .await
+    }
+
+    async fn get_messages(
+        &self,
+        thread_id: &str,
+        message_ids: &[&str],
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::Batch>>> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner.get_messages(thread_id, message_ids).await
+    }
+
+    async fn get_messages_quarantined(
+        &self,
+        thread_id: &str,
+        message_ids: &[&str],
+    ) -> labyrinth::Result<(
+        Vec<Stored<labyrinth::records::Batch>>,
+        Vec<AuthorQuarantine>,
+    )> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .get_messages_quarantined(thread_id, message_ids)
+            .await
+    }
+
+    async fn list_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::Batch>>> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .list_batches_before(thread_id, before_ms, limit)
+            .await
+    }
+
+    async fn list_batches_before_quarantined(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> labyrinth::Result<(
+        Vec<Stored<labyrinth::records::Batch>>,
+        Vec<AuthorQuarantine>,
+    )> {
+        self.ensure_thread_space(thread_id).await?;
+        self.inner
+            .list_batches_before_quarantined(thread_id, before_ms, limit)
+            .await
+    }
+
     async fn list_threads(&self) -> labyrinth::Result<Vec<String>> {
         let mut set: std::collections::BTreeSet<String> =
             self.inner.list_threads().await?.into_iter().collect();
@@ -764,6 +965,16 @@ impl labyrinth::store::ThreadStore for ResolvingSpaceThreadStore {
             set.insert(key);
         }
         Ok(set.into_iter().collect())
+    }
+
+    async fn list_threads_report(&self) -> labyrinth::Result<ThreadListing> {
+        let mut report = self.inner.list_threads_report().await?;
+        let mut set: std::collections::BTreeSet<String> = report.threads.into_iter().collect();
+        for key in self.load_pins()?.into_keys() {
+            set.insert(key);
+        }
+        report.threads = set.into_iter().collect();
+        Ok(report)
     }
 
     async fn redact_item(
@@ -826,5 +1037,23 @@ impl labyrinth::store::ThreadStore for ResolvingSpaceThreadStore {
     async fn clear_records(&self, thread_id: &str) -> labyrinth::Result<()> {
         self.ensure_thread_space(thread_id).await?;
         self.inner.clear_records(thread_id).await
+    }
+
+    fn seed_writer_rev_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), String>,
+    ) {
+        self.inner.seed_writer_rev_floors(floors);
+    }
+
+    fn replace_writer_rev_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), String>,
+    ) {
+        self.inner.replace_writer_rev_floors(floors);
+    }
+
+    fn export_writer_rev_floors(&self) -> std::collections::BTreeMap<(String, String), String> {
+        self.inner.export_writer_rev_floors()
     }
 }

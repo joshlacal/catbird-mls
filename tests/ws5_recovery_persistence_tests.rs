@@ -200,13 +200,24 @@ async fn rejoin_backoff_survives_orchestrator_restart() {
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
-    // Drive a real failed rejoin: the mock DS has no published GroupInfo for
-    // forced rejoin after we drop it, so force_rejoin fails and records a
-    // failure. (get_group_info is published by create_group, so inject a
-    // failure for the next call.)
-    world.delivery_service().fail_next_get_group_info();
-    let err = alice.orchestrator.force_rejoin(&convo_id).await;
-    assert!(err.is_err(), "force_rejoin should fail via injected error");
+    // Drive a real failed deferred recovery: delete local group and fail the
+    // Welcome fetch so `consume_deferred_recovery_for_conversation` records a
+    // rejoin failure.
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(hex::decode(&convo.group_id).unwrap())
+        .unwrap();
+    alice.storage.mark_needs_rejoin(&convo_id).await.unwrap();
+    world.delivery_service().fail_next_get_welcome();
+    let err = alice
+        .orchestrator
+        .consume_deferred_recovery_for_conversation(&convo_id, None, None)
+        .await;
+    assert!(
+        err.is_err(),
+        "deferred recovery should fail via injected error"
+    );
 
     // Write-through happened.
     let entry = alice
@@ -271,11 +282,17 @@ async fn partial_global_write_failure_preserves_per_conversation_backoff_on_rest
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(hex::decode(&convo.group_id).unwrap())
+        .unwrap();
+    alice.storage.mark_needs_rejoin(&convo_id).await.unwrap();
     alice.storage.fail_next_set_last_global_rejoin_attempt_at();
-    world.delivery_service().fail_next_get_group_info();
+    world.delivery_service().fail_next_get_welcome();
     let error = alice
         .orchestrator
-        .force_rejoin(&convo_id)
+        .consume_deferred_recovery_for_conversation(&convo_id, None, None)
         .await
         .expect_err("the injected global persistence failure must propagate");
     assert!(error.to_string().contains("global recovery timestamp"));
@@ -321,8 +338,17 @@ async fn server_reset_clears_persisted_backoff_entry() {
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
-    world.delivery_service().fail_next_get_group_info();
-    let _ = alice.orchestrator.force_rejoin(&convo_id).await;
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(hex::decode(&convo.group_id).unwrap())
+        .unwrap();
+    alice.storage.mark_needs_rejoin(&convo_id).await.unwrap();
+    world.delivery_service().fail_next_get_welcome();
+    let _ = alice
+        .orchestrator
+        .consume_deferred_recovery_for_conversation(&convo_id, None, None)
+        .await;
     assert!(alice
         .storage
         .get_persisted_recovery_backoff(&convo_id)
@@ -878,9 +904,23 @@ async fn failing_clear_rejoin_flag_escalates_and_skips_tracker_clear() {
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
-    // Seed real failure-tracking state via an injected failed rejoin.
-    world.delivery_service().fail_next_get_group_info();
-    let _ = alice.orchestrator.force_rejoin(&convo_id).await;
+    // Seed failure-tracking state while keeping the local group intact so the
+    // caught-up stale-housekeeping branch fires during `sync_with_server`.
+    let seeded = PersistedRecoveryBackoff {
+        conversation_id: convo_id.clone(),
+        failed_rejoin_count: 1,
+        last_attempt_at_ms: now_ms(),
+        quarantined_until_ms: None,
+    };
+    alice.storage.seed_recovery_backoff(seeded.clone());
+    {
+        let state = PersistedRecoveryState {
+            entries: vec![seeded],
+            last_global_rejoin_attempt_at_ms: Some(now_ms()),
+        };
+        let mut tracker = alice.orchestrator.recovery_tracker().lock().await;
+        let _ = tracker.hydrate_from_persisted(&state, now_ms());
+    }
     assert_eq!(
         alice
             .orchestrator
@@ -1481,9 +1521,9 @@ async fn runtime_lockout_expiry_reopens_one_attempt() {
 }
 
 /// FIX-9 (orchestrator level): the rejoin gate itself honors runtime expiry —
-/// a force_rejoin during the lockout is suppressed with max-attempts, and the
+/// deferred recovery during the lockout is suppressed (`Skipped`), and the
 /// same call after the lockout lapses proceeds to a real attempt (failing
-/// with the injected server error instead of the gate error).
+/// with the injected server error instead of skipping at the gate).
 #[tokio::test(flavor = "multi_thread")]
 async fn rejoin_gate_reopens_after_runtime_lockout_expiry() {
     let mut world = TestWorld::new();
@@ -1497,6 +1537,12 @@ async fn rejoin_gate_reopens_after_runtime_lockout_expiry() {
         .await
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(hex::decode(&convo.group_id).unwrap())
+        .unwrap();
+    alice.storage.mark_needs_rejoin(&convo_id).await.unwrap();
 
     let max = OrchestratorConfig::default().max_rejoin_attempts;
     alice
@@ -1511,22 +1557,25 @@ async fn rejoin_gate_reopens_after_runtime_lockout_expiry() {
     let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
 
     // Lockout still active: suppressed by the maxed-out gate.
-    let err = restarted
-        .force_rejoin(&convo_id)
+    let outcome = restarted
+        .consume_deferred_recovery_for_conversation(&convo_id, None, None)
         .await
-        .expect_err("rejoin must be suppressed during the lockout");
+        .expect("deferred recovery during lockout returns Skipped");
     assert!(
-        err.to_string().contains("max attempts"),
-        "expected max-attempts suppression, got: {err}"
+        matches!(
+            outcome,
+            catbird_mls::orchestrator::DeferredRecoveryOutcome::Skipped
+        ),
+        "expected Skipped suppression during lockout, got: {outcome:?}"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
 
     // Lockout lapsed: the gate clamps to max-1 and lets one attempt through,
-    // which then fails with the injected server error (not the gate).
-    world.delivery_service().fail_next_get_group_info();
+    // which then fails with the injected server error (not Skipped at the gate).
+    world.delivery_service().fail_next_get_welcome();
     let err = restarted
-        .force_rejoin(&convo_id)
+        .consume_deferred_recovery_for_conversation(&convo_id, None, None)
         .await
         .expect_err("attempt should fail via injected server error");
     assert!(

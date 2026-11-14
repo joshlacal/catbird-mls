@@ -100,7 +100,7 @@ fn every_signing_domain_is_now_pinned_by_a_server_vector() {
     pinned.sort();
     pinned.dedup();
 
-    assert_eq!(pinned.len(), 24, "one vector per kind, none counted twice");
+    assert_eq!(pinned.len(), 25, "one vector per kind, none counted twice");
     let unpinned: Vec<&str> = SignedMutationKind::ALL
         .iter()
         .filter(|kind| {
@@ -134,7 +134,7 @@ fn the_ten_cases_are_exactly_the_kinds_no_other_fixture_covers() {
         .map(|case| case["bodyName"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 10);
+    assert_eq!(actual.len(), 11);
 }
 
 #[test]
@@ -270,6 +270,6 @@ fn the_vendored_signing_domain_vectors_are_actually_loaded() {
     let vectors = vectors();
     assert_eq!(vectors["schemaVersion"], 1);
     assert_eq!(vectors["signatureAlgorithm"], "Ed25519");
-    assert_eq!(cases().len(), 10);
+    assert_eq!(cases().len(), 11);
     assert!(VECTORS.len() > 10_000, "the fixture is not a stub");
 }

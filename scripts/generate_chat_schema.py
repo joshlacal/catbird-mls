@@ -41,21 +41,21 @@ FIXTURE_SOURCES = (
     (
         Path("mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json"),
         Path("src/orchestrator/generated/mls_chat_signing_domain_vectors.json"),
-        10,
-        "471ee7bac032142b79782d434b685900f7755c710b3a9378e3cb3a5a3c4ab1ac",
+        11,
+        "ed6ae218b707ab8199f5104365c0b04e12b7db114313a955cb080ee324a23bdb",
     ),
 )
 ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json")
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
 GENERATOR_VERSION = 9
 PROVENANCE_KEY = "_catbird_mls_provenance"
-CANONICAL_SOURCE_REVISION = "5c991ba1410c097c659cc82f3be5247982291ce5"
-CANONICAL_SOURCE_TREE = "630782e9c5465ed17f73fd9bb95bf5ca0623822a"
-CANONICAL_SOURCE_SHA256 = "acc18be399f521d3b110ba90f0f57a5bebd5894037b4b34c4f7302550cffb075"
-SERVER_SOURCE_REVISION = "ceed1595117ea0945cfd75677decc3d6ba6cb57b"
-SERVER_SOURCE_TREE = "2f07abd0d3306dae9e822ac2cadfcc6681fa007f"
+CANONICAL_SOURCE_REVISION = "26380cefa2e4734925efabb178d83052e10a46c7"
+CANONICAL_SOURCE_TREE = "0f8bcc02c7f70a14de01b7b60a3a5f329bb7143f"
+CANONICAL_SOURCE_SHA256 = "992206c3cfba8db1733c5795d75aacb8352d68d187fe4c793dfc8fe73adfc2a4"
+SERVER_SOURCE_REVISION = "80d575384c2bae3a8a8e12d543f51c1e82ccf5a4"
+SERVER_SOURCE_TREE = "d29722834ec0d6800ef0bc8ba5b877fd54f7a787"
 SERVER_VECTOR_SET = "signed-mutation"
-SERVER_VECTOR_SET_COUNT = 24
+SERVER_VECTOR_SET_COUNT = 25
 
 
 def repository_root() -> Path:
@@ -65,11 +65,25 @@ def repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def petrel_catbird_root() -> Path:
+    root = repository_root()
+    direct = root / "PetrelCatbird"
+    if direct.is_dir():
+        return direct
+    wave1 = root.parent / "dec1-w0" / "wave1-petrel-catbird"
+    if wave1.is_dir():
+        return wave1
+    return direct
+
+
 def source_path(value: str | Path | None) -> Path:
-    return (repository_root() / (value or SOURCE_RELATIVE)).resolve()
+    rel = Path(value or SOURCE_RELATIVE)
+    if rel.parts and rel.parts[0] == "PetrelCatbird":
+        return (petrel_catbird_root() / Path(*rel.parts[1:])).resolve()
+    return (repository_root() / rel).resolve()
 
 
-def artifact_path(value: str | None) -> Path:
+def artifact_path(value: str | Path | None) -> Path:
     return (Path(__file__).resolve().parents[1] / (value or ARTIFACT_RELATIVE)).resolve()
 
 
@@ -92,9 +106,10 @@ def resolve_tree(repository: Path, commit_id: str) -> str:
     )
     if res.returncode == 0 and res.stdout.strip():
         return res.stdout.strip()
+    canonical_name = "PetrelCatbird" if "petrel-catbird" in repository.name.lower() else repository.name
     for canonical_repo in (
-        repository.parents[2] / repository.name,
-        repository.parents[2] / "Catbird+Petrel" / repository.name,
+        repository.parents[2] / canonical_name,
+        repository.parents[2] / "Catbird+Petrel" / canonical_name,
     ):
         if canonical_repo.exists():
             res = subprocess.run(
@@ -117,7 +132,18 @@ def read_vcs_revision(
     if jj_dir.exists():
         try:
             res = subprocess.run(
-                ["jj", "log", "-R", str(repository), "-r", expected_revision, "--no-graph", "-T", "commit_id"],
+                [
+                    "jj",
+                    "--ignore-working-copy",
+                    "log",
+                    "-R",
+                    str(repository),
+                    "-r",
+                    expected_revision,
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -153,7 +179,7 @@ def read_vcs_revision(
 
 def canonical_revision() -> tuple[str, str]:
     return read_vcs_revision(
-        repository_root() / "PetrelCatbird",
+        petrel_catbird_root(),
         "canonical PetrelCatbird",
         CANONICAL_SOURCE_REVISION,
         CANONICAL_SOURCE_TREE,

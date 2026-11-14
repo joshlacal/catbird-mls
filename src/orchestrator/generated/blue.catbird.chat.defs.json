@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "5c991ba1410c097c659cc82f3be5247982291ce5",
-    "sourceSha256": "acc18be399f521d3b110ba90f0f57a5bebd5894037b4b34c4f7302550cffb075",
-    "sourceTree": "630782e9c5465ed17f73fd9bb95bf5ca0623822a"
+    "sourceRevision": "26380cefa2e4734925efabb178d83052e10a46c7",
+    "sourceSha256": "992206c3cfba8db1733c5795d75aacb8352d68d187fe4c793dfc8fe73adfc2a4",
+    "sourceTree": "0f8bcc02c7f70a14de01b7b60a3a5f329bb7143f"
   },
   "defs": {
     "accessEndedEvent": {
@@ -72,10 +72,6 @@
         },
         "sequencerDid": {
           "ref": "#bareDid",
-          "type": "ref"
-        },
-        "sequencerReceipt": {
-          "ref": "#sequencerReceipt",
           "type": "ref"
         },
         "signature": {
@@ -1608,6 +1604,71 @@
       ],
       "type": "object"
     },
+    "deviceApprovalBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-CHAT-DEVICE-APPROVE\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "targetAuthGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "targetDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "targetKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "targetSignaturePublicKey": {
+          "maxLength": 32,
+          "minLength": 32,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "targetDeviceId",
+        "targetKeyId",
+        "targetSignaturePublicKey",
+        "targetAuthGeneration",
+        "idempotencyKey",
+        "signedAt"
+      ],
+      "type": "object"
+    },
     "deviceCapability": {
       "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures.",
       "properties": {
@@ -1889,6 +1950,7 @@
     "deviceStatus": {
       "enum": [
         "active",
+        "pending_approval",
         "revoked"
       ],
       "type": "string"
@@ -1914,8 +1976,21 @@
           "ref": "#deviceId",
           "type": "ref"
         },
+        "deviceName": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "dormantAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
         "keyId": {
           "ref": "#keyId",
+          "type": "ref"
+        },
+        "lastActiveAt": {
+          "ref": "#canonicalDatetime",
           "type": "ref"
         },
         "reservedPackageCount": {
@@ -7401,6 +7476,27 @@
           "closed": true,
           "refs": [
             "#creationBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDeviceApproval": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#deviceApprovalBody"
           ],
           "type": "union"
         },

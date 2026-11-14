@@ -58,6 +58,7 @@ const COMPRESSOR_MAKEUP_GAIN_DB: f32 = 6.0; // Boost after compression
 const TARGET_LUFS: f32 = -16.0; // Loudness target (similar to Discord/podcasts)
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct VoicePrepareResult {
     pub opus_data: Vec<u8>,
     pub encrypted_blob: Vec<u8>,

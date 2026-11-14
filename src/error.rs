@@ -224,6 +224,11 @@ pub enum MLSError {
         "local state format {found} is unsupported; format {required} is required (wipe and re-enrol)"
     )]
     LocalStateFormatUnsupported { found: u32, required: u32 },
+
+    /// This 2nd+ enrolled device is awaiting existing-device approval (`pending_approval`)
+    /// or Labyrinth pairing/recovery unlock before chat mutations or leaf fulfillment proceed.
+    #[error("DevicePendingApproval: {reason}")]
+    PendingDeviceAccess { reason: String },
 }
 
 /// One conversation `sync` could not finish, and why.
@@ -520,6 +525,7 @@ mod decrypt_class_tests {
             fallback_generic: false,
             darwin_notification_name: "darwin".into(),
             receipt_verified: true,
+            is_own_sibling_sender: false,
         };
         let mut expected_preview = Vec::new();
         append_lowered(&mut expected_preview, preview.message_id.clone());
@@ -537,6 +543,7 @@ mod decrypt_class_tests {
             preview.darwin_notification_name.clone(),
         );
         append_lowered(&mut expected_preview, preview.receipt_verified);
+        append_lowered(&mut expected_preview, preview.is_own_sibling_sender);
         assert_eq!(lower_bytes(preview), expected_preview);
 
         let status = PendingGroupCreationStatus {
@@ -671,6 +678,7 @@ mod decrypt_class_tests {
                 found: 0,
                 required: 1,
             },
+            MLSError::PendingDeviceAccess { reason: "x".into() },
         ];
         for (index, error) in errors.into_iter().enumerate() {
             assert_eq!(

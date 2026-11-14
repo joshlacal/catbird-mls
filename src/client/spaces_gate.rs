@@ -17,9 +17,9 @@ pub const REQUIRED_LABYRINTH_OAUTH_SCOPES: &[&str; 6] = &[
     "atproto",
     "blob:*/*",
     "repo:blue.catbird.labyrinth.mailboxKeys",
-    "repo:blue.catbird.chat.device",
-    "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
-    "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
+    "repo:blue.catbird.chat.device?action=create",
+    "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
+    "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
 ];
 
 /// Reason why MLS chat over ATProto Spaces is available or unavailable (`I15`).
@@ -54,7 +54,92 @@ pub struct SpacesEligibilityStatus {
 
 // Static scope coverage is not a credential authorization result. Returned scope
 // strings cannot prove the issuer retained original explicit-action provenance.
+fn repo_scope_granted(granted_scopes: &[String], required: &str) -> bool {
+    let (req_base, req_query) = match required.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (required, None),
+    };
+    let req_nsid = match req_base.strip_prefix("repo:") {
+        Some(nsid) if !nsid.is_empty() => nsid,
+        _ => return false,
+    };
+    let req_actions: Vec<&str> = match req_query {
+        Some(q) => {
+            let mut actions = Vec::new();
+            for pair in q.split('&') {
+                let Some(("action", val)) = pair.split_once('=') else {
+                    return false;
+                };
+                if !matches!(val, "create" | "update" | "delete") {
+                    return false;
+                }
+                actions.push(val);
+            }
+            if actions.is_empty() {
+                return false;
+            }
+            actions
+        }
+        None => vec!["create", "update", "delete"],
+    };
+
+    granted_scopes.iter().any(|grant| {
+        let grant = grant.trim();
+        let (grant_base, grant_query) = match grant.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (grant, None),
+        };
+        let mut granted_collections = Vec::new();
+        match grant_base.strip_prefix("repo:") {
+            Some("") => {}
+            Some(col) => granted_collections.push(col),
+            None => return false,
+        }
+        let mut granted_actions = Vec::new();
+        if let Some(q) = grant_query {
+            for pair in q.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    return false;
+                };
+                if v.is_empty() {
+                    return false;
+                }
+                match k {
+                    "action" if matches!(v, "create" | "update" | "delete") => {
+                        granted_actions.push(v);
+                    }
+                    "collection"
+                        if v == "*"
+                            || v.bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-')) =>
+                    {
+                        granted_collections.push(v);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        if granted_collections.is_empty() {
+            return false;
+        }
+        let collection_matches =
+            granted_collections.contains(&"*") || granted_collections.contains(&req_nsid);
+        if !collection_matches {
+            return false;
+        }
+        if granted_actions.is_empty() {
+            // Unparameterized `repo:<nsid>` or `repo:*` grants create, update, and delete.
+            true
+        } else {
+            req_actions.iter().all(|req| granted_actions.contains(req))
+        }
+    })
+}
+
 fn scope_granted(granted_scopes: &[String], required: &str, account_did: &str) -> bool {
+    if required.starts_with("repo:") {
+        return repo_scope_granted(granted_scopes, required);
+    }
     let Some((family, required_query)) = required
         .split_once('?')
         .filter(|(family, _)| family.starts_with("space:"))
@@ -246,5 +331,38 @@ mod tests {
                 .iter()
                 .any(|required| scope_granted(&[legacy.into()], required, did)));
         }
+
+        // Verify repo scope rules & subsumption (`Y-6` / `D-12`):
+        // `mailboxKeys` requires full CRUD (`putRecord` updates on epoch rotation),
+        // while `chat.device` is create-only (`?action=create`).
+        let mailbox_req = REQUIRED_LABYRINTH_OAUTH_SCOPES[2];
+        assert_eq!(mailbox_req, "repo:blue.catbird.labyrinth.mailboxKeys");
+        assert!(scope_granted(&[mailbox_req.to_string()], mailbox_req, did));
+        assert!(scope_granted(&["repo:*".to_string()], mailbox_req, did));
+        assert!(
+            !scope_granted(
+                &["repo:blue.catbird.labyrinth.mailboxKeys?action=create".to_string()],
+                mailbox_req,
+                did
+            ),
+            "create-only scope must not satisfy full mailboxKeys rotation requirement"
+        );
+
+        let device_req = REQUIRED_LABYRINTH_OAUTH_SCOPES[3];
+        assert_eq!(device_req, "repo:blue.catbird.chat.device?action=create");
+        assert!(scope_granted(&[device_req.to_string()], device_req, did));
+        assert!(scope_granted(
+            &["repo:blue.catbird.chat.device".to_string()],
+            device_req,
+            did
+        ));
+        assert!(
+            !scope_granted(
+                &["repo:blue.catbird.chat.device?action=delete".to_string()],
+                device_req,
+                did
+            ),
+            "delete-only scope must not satisfy create requirement"
+        );
     }
 }

@@ -406,16 +406,13 @@ fn existing_members_new_device_is_added_once_from_its_signed_request() {
     }
 }
 
-/// A `replace` re-adds exactly the requester device's current leaf, and only from another
-/// account. Bob's second device joins (as above); then Bob's first device signs a replace.
-/// Bob's second device, of the requester's own account, leaves it alone. Alice fulfills it with
-/// one Commit that removes exactly Bob's leaf and adds his new KeyPackage (`removeLeaf`, then
-/// `addLeafByRecovery`); Eve, a third member, and Bob's second device process it to Alice's
-/// leaves: every identity stays and, besides the committer's own, only Bob's leaf is new.
-///
-/// Fail-before: cut 9a2708e1 (`fulfill_pending_leaf_recoveries`) fulfilled only `add` requests
-/// and R4SecurityClose's interim (`fulfill_authorized_leaf_recovery`) only acceptance
-/// authorizations, so neither ever replaced the leaf.
+/// A `replace` re-adds exactly the requester device's current leaf, never fulfilled by the
+/// requesting device itself, and fulfillable by either a peer member or an active sibling device
+/// holding a leaf. Bob's second device joins (as above); then Bob's first device signs a replace.
+/// Bob's first device (`device == own_device`) leaves its own replace alone. Alice fulfills it
+/// with one Commit that removes exactly Bob's leaf and adds his new KeyPackage (`removeLeaf`,
+/// then `addLeafByRecovery`); Eve and Bob's second device process it to Alice's leaves. Bob's
+/// second device (`device != own_device`) likewise fulfills a subsequent sibling replace.
 #[test]
 fn signed_replace_removes_and_readds_the_exact_leaf() {
     let f = send_order_fixture(true);
@@ -441,9 +438,10 @@ fn signed_replace_removes_and_readds_the_exact_leaf() {
         .clone();
     assert_eq!(request["recoveryKind"], "replace", "{request}");
     let entries = ds.entry_count(cid);
-    bob2.sync()
-        .expect("a same-account replace is another account's work");
-    assert!(fulfillments(ds, &bob2_dev).is_empty());
+    f.bob
+        .sync()
+        .expect("a device never fulfills its own replace");
+    assert!(fulfillments(ds, &f.bob_dev).is_empty());
     assert_eq!(ds.entry_count(cid), entries);
 
     let before = leaves(alice, cid);
@@ -494,4 +492,29 @@ fn signed_replace_removes_and_readds_the_exact_leaf() {
     bob2.sync()
         .expect("bob's second device processes the replace");
     assert_eq!(leaves(&bob2, cid), after);
+
+    // An active sibling device (`device != own_device`) holding a leaf can also fulfill replace.
+    let sibling_req = request_recovery(
+        ds,
+        &enrolled_signer(&f.bob),
+        BOB_DID,
+        &f.bob_dev,
+        cid,
+        "replace",
+    )["recovery"]
+        .clone();
+    bob2.sync()
+        .expect("sibling device holding a leaf fulfills same-account replace");
+    let sibling_replace = fulfillments(ds, &bob2_dev)
+        .pop()
+        .expect("bob2's sibling fulfillment");
+    assert_eq!(
+        sibling_replace["recoveryRequestId"],
+        sibling_req["recoveryRequestId"]
+    );
+    let after_sibling = leaves(&bob2, cid);
+    alice.sync().expect("alice processes sibling replace");
+    eve.sync().expect("eve processes sibling replace");
+    assert_eq!(leaves(alice, cid), after_sibling);
+    assert_eq!(leaves(eve, cid), after_sibling);
 }

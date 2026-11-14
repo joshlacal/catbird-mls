@@ -316,6 +316,7 @@ fn this_fixture_pins_fourteen_of_the_twenty_four_domains_and_names_the_rest() {
             "deviceEnrollmentBody",
             "keyPackageReplenishmentBody",
             "deviceRevocationBody",
+            "deviceApprovalBody",
             "blobUploadPreparationBody",
             "applicationSendBody",
             "typingBody",
@@ -324,7 +325,7 @@ fn this_fixture_pins_fourteen_of_the_twenty_four_domains_and_names_the_rest() {
             "welcomeAcknowledgementBody",
             "welcomeRejectionBody",
         ],
-        "these ten are pinned by the signing-domain vectors, not this fixture"
+        "these eleven are pinned by the signing-domain vectors or device-approval tests, not this fixture"
     );
     assert_eq!(
         pinned.len() + elsewhere.len(),

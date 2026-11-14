@@ -472,6 +472,8 @@ impl CatbirdMlsClient {
                 encrypted_prev_seq,
                 encrypted_prev_root,
                 opened_by: me_secrets.public().device_key_pub,
+                revocations: Vec::new(),
+                revocations_sig: None,
             };
             let member_rec = labyrinth::epoch::add_device_mac(&cur_secret, me_secrets.public())
                 .map_err(|e| MLSError::Cryptography(format!("add_device_mac({seq}): {e}")))?;
@@ -1105,6 +1107,56 @@ impl CatbirdMlsClient {
             });
         }
         Ok(grouped)
+    }
+
+    pub(super) fn offline_restore_with_passkey_prf(
+        &self,
+        credential_id: &[u8],
+        prf_output: &[u8],
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        if self.is_handle_closed() {
+            return Err(MLSError::ContextClosed);
+        }
+        let st_before: LabyrinthBackupStatus = self.db.read_tx(|tx| {
+            let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                MLSError::InvalidState("Labyrinth status not initialized".to_string())
+            })?;
+            serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))
+        })?;
+        let remote_opt = self.fetch_remote_mailbox_epoch_state(&st_before.mailbox_space_uri)?;
+        let mut candidates: Vec<labyrinth::records::mailbox::PasskeyWrap> = Vec::new();
+        if let Some(ref remote) = remote_opt {
+            for wrap in remote.vdev_passkey_wraps.values().flatten() {
+                if wrap.credential_id == credential_id {
+                    candidates.push(wrap.clone());
+                }
+            }
+        } else if let Some(raw_doc) = self
+            .db
+            .read_tx(|tx| tx.get_labyrinth_state("passkey_vdev_doc_json"))?
+        {
+            if let Ok(vdev_doc) =
+                serde_json::from_slice::<labyrinth::records::VirtualDevice>(&raw_doc)
+            {
+                if let Ok((_, Some(wrap))) = vdev_doc.to_bundle() {
+                    if wrap.credential_id == credential_id {
+                        candidates.push(wrap);
+                    }
+                }
+            }
+        }
+        for wrap in candidates {
+            if let Ok(code) =
+                labyrinth::virtual_device::passkey::unwrap_code(prf_output, &wrap.wrapped_code)
+            {
+                let mut status = self.offline_restore_with_recovery_code(code.as_str())?;
+                status.has_passkey_prf = true;
+                return Ok(status);
+            }
+        }
+        Err(MLSError::insufficient_permissions(
+            "passkey PRF output did not unlock any enrolled virtual device bundle",
+        ))
     }
 
     pub(super) fn offline_restore_with_recovery_code(

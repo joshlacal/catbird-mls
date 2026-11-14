@@ -1238,7 +1238,9 @@ async fn fork_readd_malformed_leaf_device_fails_before_key_package_request() {
 async fn equivocating_receipts_fire_detection_and_recovery_proceeds() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
     world.register_device("Alice").await.unwrap();
+    let bob_mls_did = world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
 
@@ -1255,12 +1257,11 @@ async fn equivocating_receipts_fire_detection_and_recovery_proceeds() {
         .expect("create_group failed");
     let group_id = convo.group_id.clone();
 
-    // Sequencer starts issuing receipts for External Commits.
+    // Sequencer starts issuing receipts on transition commits.
     world
         .delivery_service()
         .issue_external_commit_receipts_for_test(true);
 
-    // The mock assigns epoch = current + 1 to the next External Commit.
     let next_epoch = world
         .delivery_service()
         .conversation_epoch(&group_id)
@@ -1284,13 +1285,13 @@ async fn equivocating_receipts_fire_detection_and_recovery_proceeds() {
         .await
         .expect("pre-store conflicting receipt");
 
-    // Drive the External-Commit recovery path. Stage-1 contract: detection
-    // fires, recovery still succeeds.
+    // Drive an authenticated Commit transition. Stage-1 contract: detection
+    // fires, commit still succeeds.
     alice
         .orchestrator
-        .force_rejoin(&group_id)
+        .swap_members(&convo.conversation_id, &[], &[bob_mls_did])
         .await
-        .expect("stage-1 detection-only: force_rejoin must still succeed");
+        .expect("stage-1 detection-only: swap_members must still succeed");
 
     let events = observer.equivocations();
     assert_eq!(
@@ -1317,7 +1318,9 @@ async fn equivocating_receipts_fire_detection_and_recovery_proceeds() {
 async fn non_equivocating_receipts_are_silent() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
     world.register_device("Alice").await.unwrap();
+    let bob_mls_did = world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
 
@@ -1347,7 +1350,7 @@ async fn non_equivocating_receipts_are_silent() {
     // A prior receipt at a DIFFERENT epoch is not equivocation, even with a
     // different commit hash.
     let unrelated = SequencerReceipt {
-        convo_id: group_id.clone(),
+        convo_id: convo.conversation_id.clone(),
         epoch: next_epoch + 10,
         sequencer_term: 0,
         commit_hash: vec![0xBB; 32],
@@ -1363,9 +1366,9 @@ async fn non_equivocating_receipts_are_silent() {
 
     alice
         .orchestrator
-        .force_rejoin(&group_id)
+        .swap_members(&convo.conversation_id, &[], &[bob_mls_did])
         .await
-        .expect("force_rejoin failed");
+        .expect("swap_members failed");
 
     assert!(
         observer.equivocations().is_empty(),
@@ -1381,7 +1384,7 @@ async fn non_equivocating_receipts_are_silent() {
     // unrelated one.
     let stored = alice
         .storage
-        .get_sequencer_receipts(&group_id, None)
+        .get_sequencer_receipts(&convo.conversation_id, None)
         .await
         .expect("get_sequencer_receipts");
     assert_eq!(stored.len(), 2, "expected pre-stored + new receipt");
@@ -1389,7 +1392,7 @@ async fn non_equivocating_receipts_are_silent() {
         stored
             .iter()
             .any(|r| r.epoch == next_epoch && r.commit_hash != vec![0xBB; 32]),
-        "the sequencer-issued receipt for the External Commit must be stored"
+        "the sequencer-issued receipt for the Commit must be stored"
     );
 }
 
@@ -1405,7 +1408,9 @@ async fn non_equivocating_receipts_are_silent() {
 async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
     world.register_device("Alice").await.unwrap();
+    let bob_mls_did = world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
 
@@ -1425,19 +1430,16 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
     world
         .delivery_service()
         .issue_external_commit_receipts_for_test(true);
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
 
-    // The mock assigns epoch = current + 1 to the next External Commit, and a
-    // client-side reset ingestion does not touch the mock's epoch counter —
-    // so the post-reset receipt below lands at exactly this epoch number.
     let next_epoch = world
         .delivery_service()
         .conversation_epoch(&convo_id)
         .expect("mock should know the conversation epoch") as i32
         + 1;
 
-    // Pre-reset receipt at that same (conversation, epoch) with a DIFFERENT
-    // commit hash. Without the N44a clear, the genuine post-reset receipt
-    // would false-positive the equivocation check against this stale row.
     let pre_reset = SequencerReceipt {
         convo_id: convo_id.clone(),
         epoch: next_epoch,
@@ -1453,23 +1455,10 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
         .await
         .expect("pre-store pre-reset receipt");
 
-    // A server group reset is ingested. The reset-ingestion path
-    // (`persist_reset_pending_state`) must clear the conversation's stored
-    // receipts alongside its other fresh-start mirrors.
-    // This receipt-boundary test deliberately reuses the mock server's only
-    // cryptographically valid GroupInfo. Remove the local instance first so
-    // the same-ID reset is not classified as a live self-echo. Production
-    // resets normally rotate to a new group ID, but the mock cannot mint a
-    // detached authoritative GroupInfo for an arbitrary replacement ID.
-    let new_group_id = hex::decode(&convo.group_id).expect("created group id must be valid hex");
+    let reset_group_id = vec![0x42; 32];
     alice
         .orchestrator
-        .mls_context()
-        .delete_group(new_group_id.clone())
-        .expect("remove local group before isolated reset-boundary fixture");
-    alice
-        .orchestrator
-        .record_group_reset(&convo_id, new_group_id.clone(), 1)
+        .record_group_reset(&convo_id, reset_group_id, 1)
         .await
         .expect("record_group_reset failed");
 
@@ -1485,29 +1474,22 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
          equivocation receipts so an equivocating sequencer cannot erase evidence"
     );
 
-    assert!(alice
-        .storage
-        .complete_reset_pending(&convo_id, 1, &hex::encode(&new_group_id), 0)
-        .await
-        .expect("complete reset boundary for receipt test"));
     alice
         .orchestrator
-        .conversation_states()
-        .lock()
+        .join_or_rejoin(&convo_id)
         .await
-        .insert(convo_id.clone(), ConversationState::Active);
-
+        .expect("post-reset join_or_rejoin failed");
     alice
         .orchestrator
-        .force_rejoin(&convo_id)
+        .swap_members(&convo_id, &[], &[bob_mls_did])
         .await
-        .expect("post-reset force_rejoin failed");
+        .expect("post-reset swap_members failed");
 
     let stored = alice
         .storage
         .get_sequencer_receipts(&convo_id, None)
         .await
-        .expect("get_sequencer_receipts after rejoin");
+        .expect("get_sequencer_receipts after post-reset recovery");
     assert_eq!(
         stored.len(),
         2,

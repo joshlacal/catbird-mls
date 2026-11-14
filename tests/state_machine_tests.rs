@@ -468,78 +468,6 @@ async fn test_add_members_server_rejection_cleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Force rejoin cleans state
-// ---------------------------------------------------------------------------
-
-/// Tests that force_rejoin properly cleans up old MLS state and allows the
-/// client to resume operations in the new epoch.
-///
-/// Note: force_rejoin's delete_group only removes from the in-memory HashMap,
-/// NOT from OpenMLS SQLite storage (state-machine-recovery.md §1.2).
-/// This test verifies the functional flow works even if storage leaks.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_force_rejoin_cleans_state() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-
-    let _a = world.register_device("Alice").await.unwrap();
-
-    let alice = world.client("Alice");
-
-    // Create a group
-    let convo = alice
-        .orchestrator
-        .create_group("Rejoin Test", None, None)
-        .await
-        .expect("create_group failed");
-    let group_id = &convo.group_id;
-
-    let epoch_before = alice
-        .orchestrator
-        .group_states()
-        .lock()
-        .await
-        .get(group_id)
-        .map(|gs| gs.epoch)
-        .unwrap_or(0);
-
-    // Publish group info (needed for force_rejoin's get_group_info)
-    // (create_group already publishes it, so this should be available)
-
-    // Force rejoin
-    let result = alice.orchestrator.force_rejoin(group_id).await;
-    assert!(result.is_ok(), "force_rejoin failed: {:?}", result.err());
-
-    // Verify epoch advanced after rejoin
-    let epoch_after = alice
-        .orchestrator
-        .group_states()
-        .lock()
-        .await
-        .get(group_id)
-        .map(|gs| gs.epoch)
-        .unwrap_or(0);
-
-    assert!(
-        epoch_after > epoch_before,
-        "Epoch should advance after force_rejoin (before={}, after={})",
-        epoch_before,
-        epoch_after
-    );
-
-    // Verify Alice can still send messages in the new epoch
-    let send_result = alice
-        .orchestrator
-        .send_message(group_id, "After rejoin")
-        .await;
-    assert!(
-        send_result.is_ok(),
-        "Should be able to send messages after rejoin: {:?}",
-        send_result.err()
-    );
-}
-
-// ---------------------------------------------------------------------------
 // 7. Message decryption across epoch advance
 // ---------------------------------------------------------------------------
 
@@ -551,8 +479,10 @@ async fn test_force_rejoin_cleans_state() {
 async fn test_message_after_epoch_advance() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
 
     let _a = world.register_device("Alice").await.unwrap();
+    let bob_mls_did = world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
 
@@ -573,12 +503,12 @@ async fn test_message_after_epoch_advance() {
 
     let epoch_before = msg1.epoch;
 
-    // Force rejoin to advance the epoch (simulates an epoch advance)
+    // Advance the epoch via an authenticated member-addition Commit
     alice
         .orchestrator
-        .force_rejoin(group_id)
+        .swap_members(&convo.conversation_id, &[], &[bob_mls_did])
         .await
-        .expect("force_rejoin failed");
+        .expect("swap_members failed");
 
     let epoch_after = alice
         .orchestrator
@@ -591,7 +521,7 @@ async fn test_message_after_epoch_advance() {
 
     assert!(
         epoch_after > epoch_before,
-        "Epoch should have advanced after force_rejoin"
+        "Epoch should have advanced after member commit"
     );
 
     // Verify Alice can still send at the new epoch
@@ -721,39 +651,6 @@ async fn test_skipped_sync_awaits_in_flight_pass() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_concurrent_force_rejoin_deduped() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    let _did = world.register_device("Alice").await.unwrap();
-
-    let alice = world.client("Alice");
-    let convo = alice
-        .orchestrator
-        .create_group("Concurrent Rejoin Test", None, None)
-        .await
-        .expect("create_group failed");
-    let group_id = &convo.group_id;
-
-    world
-        .delivery_service()
-        .set_process_external_commit_delay_ms(100);
-
-    let rejoin1 = alice.orchestrator.force_rejoin(&convo.conversation_id);
-    let rejoin2 = alice.orchestrator.force_rejoin(&convo.conversation_id);
-    let (r1, r2): (OrcResult<()>, OrcResult<()>) = tokio::join!(rejoin1, rejoin2);
-
-    assert!(r1.is_ok(), "First force_rejoin failed: {:?}", r1.err());
-    assert!(r2.is_ok(), "Second force_rejoin failed: {:?}", r2.err());
-    assert_eq!(
-        world
-            .delivery_service()
-            .external_commit_count(&convo.conversation_id),
-        1,
-        "Only one external commit should be sent for concurrent force_rejoin calls"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_join_or_rejoin_deduped() {
     use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
 
@@ -821,73 +718,6 @@ async fn test_concurrent_join_or_rejoin_deduped() {
             CanonicalOperation::RequestReset | CanonicalOperation::ActivateReset
         )),
         "background recovery must never reset the conversation"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sync_rejoin_skips_when_attempt_in_flight() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    let _did = world.register_device("Alice").await.unwrap();
-
-    let alice = world.client("Alice");
-    let convo = alice
-        .orchestrator
-        .create_group("Sync Rejoin InFlight Test", None, None)
-        .await
-        .expect("create_group failed");
-    let group_id = convo.group_id.clone();
-
-    let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
-    alice
-        .orchestrator
-        .mls_context()
-        .delete_group(group_id_bytes)
-        .expect("delete_group failed");
-    alice
-        .orchestrator
-        .group_states()
-        .lock()
-        .await
-        .remove(&group_id);
-
-    world
-        .delivery_service()
-        .set_process_external_commit_delay_ms(350);
-
-    let in_flight_rejoin = alice.orchestrator.force_rejoin(&convo.conversation_id);
-    let sync_while_rejoin_in_flight = async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let started = std::time::Instant::now();
-        let result = alice.orchestrator.sync_with_server(false).await;
-        (result, started.elapsed())
-    };
-
-    let (rejoin_result, (sync_result, sync_elapsed)): (
-        OrcResult<()>,
-        (OrcResult<()>, std::time::Duration),
-    ) = tokio::join!(in_flight_rejoin, sync_while_rejoin_in_flight);
-
-    assert!(
-        rejoin_result.is_ok(),
-        "Force rejoin should succeed: {:?}",
-        rejoin_result.err()
-    );
-    assert!(
-        sync_result.is_ok(),
-        "Sync should complete while rejoin is in-flight: {:?}",
-        sync_result.err()
-    );
-    assert!(
-        sync_elapsed < std::time::Duration::from_millis(250),
-        "Sync should skip in-flight rejoin instead of waiting; elapsed={sync_elapsed:?}"
-    );
-    assert_eq!(
-        world
-            .delivery_service()
-            .external_commit_count(&convo.conversation_id),
-        1,
-        "Sync should not trigger a second external commit while rejoin is in-flight"
     );
 }
 
@@ -1121,58 +951,6 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
             .get_epoch(hex::decode(&group_id).expect("group id hex"))
             .expect("post-confirm crypto epoch"),
         "staged commit confirmation must update the current group-id-keyed cache entry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    let _did = world.register_device("Alice").await.unwrap();
-
-    let alice = world.client("Alice");
-    let convo = alice
-        .orchestrator
-        .create_group("Rejoin Cooldown Test", None, None)
-        .await
-        .expect("create_group failed");
-    let group_id = &convo.group_id;
-    let group_id_bytes = hex::decode(group_id).expect("valid group id");
-
-    world.delivery_service().fail_next_get_group_info();
-
-    let first = alice
-        .orchestrator
-        .force_rejoin(&convo.conversation_id)
-        .await;
-    assert!(
-        alice
-            .orchestrator
-            .mls_context()
-            .group_exists(group_id_bytes),
-        "GroupInfo fetch failure must preserve the existing local group"
-    );
-
-    let second = alice
-        .orchestrator
-        .force_rejoin(&convo.conversation_id)
-        .await;
-    match second {
-        Err(OrchestratorError::RecoveryFailed(msg)) => {
-            assert!(
-                msg.contains("cooldown"),
-                "Expected cooldown suppression, got: {msg}"
-            );
-        }
-        other => panic!("Expected RecoveryFailed cooldown error, got: {other:?}"),
-    }
-
-    assert_eq!(
-        world
-            .delivery_service()
-            .get_group_info_call_count(&convo.conversation_id),
-        1,
-        "Cooldown retry should not call get_group_info again"
     );
 }
 

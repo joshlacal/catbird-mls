@@ -973,53 +973,6 @@ async fn reset_recording_serializes_with_equal_epoch_stale_rejoin_clear() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn direct_force_rejoin_refuses_to_bypass_reset_authority() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register Alice");
-    let alice = world.client("Alice");
-    let conversation = alice
-        .orchestrator
-        .create_group("force rejoin reset precedence", None, None)
-        .await
-        .expect("create conversation");
-    let conversation_id = conversation.conversation_id.clone();
-    let reset_target = vec![0x75; 32];
-
-    alice
-        .orchestrator
-        .record_group_reset(&conversation_id, reset_target, 10)
-        .await
-        .expect("record reset");
-    let error = alice
-        .orchestrator
-        .force_rejoin(&conversation_id)
-        .await
-        .expect_err("direct force_rejoin must defer to reset-aware recovery");
-
-    assert!(error.to_string().contains("ResetPending"));
-    assert_eq!(
-        world
-            .delivery_service()
-            .external_commit_count(&conversation_id),
-        0,
-        "direct force_rejoin must not submit an External Commit under reset authority"
-    );
-    assert_eq!(
-        alice
-            .storage
-            .get_persisted_reset_pending(&conversation_id)
-            .expect("reset authority must remain durable")
-            .reset_generation,
-        10
-    );
-    assert!(alice.storage.has_rejoin_flag(&conversation_id));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn healthy_clear_serializes_with_reset_recording() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
@@ -1094,83 +1047,6 @@ async fn healthy_clear_serializes_with_reset_recording() {
     assert_eq!(pending.reset_generation, 11);
     assert_eq!(pending.new_group_id_hex, hex::encode(reset_target));
     assert!(alice.storage.has_rejoin_flag(&conversation_id));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn contended_force_rejoin_rechecks_reset_authority_after_waiting() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register Alice");
-    let alice = world.client("Alice");
-    let conversation = alice
-        .orchestrator
-        .create_group("contended force reset precedence", None, None)
-        .await
-        .expect("create conversation");
-    let conversation_id = conversation.conversation_id.clone();
-    let reset_target = vec![0x77; 32];
-    let record_barrier = alice.storage.pause_next_reset_record(&conversation_id);
-
-    let record_reset =
-        alice
-            .orchestrator
-            .record_group_reset_with_outcome(&conversation_id, reset_target, 12);
-    let force_rejoin = async {
-        record_barrier.wait_until_entered().await;
-        let force = alice.orchestrator.force_rejoin(&conversation_id);
-        record_barrier.release();
-        force.await
-    };
-    let (reset_result, force_result) = tokio::join!(record_reset, force_rejoin);
-
-    assert_eq!(
-        reset_result.expect("record reset"),
-        ResetRecordOutcome::Recorded
-    );
-    let error = force_result.expect_err("contended force must observe ResetPending after waiting");
-    assert!(error.to_string().contains("ResetPending"));
-    assert_eq!(
-        world
-            .delivery_service()
-            .external_commit_count(&conversation_id),
-        0
-    );
-    assert!(alice.storage.has_rejoin_flag(&conversation_id));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn direct_force_rejoin_fails_closed_when_reset_authority_is_unreadable() {
-    let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register Alice");
-    let alice = world.client("Alice");
-    let conversation = alice
-        .orchestrator
-        .create_group("force unreadable reset authority", None, None)
-        .await
-        .expect("create conversation");
-    let conversation_id = conversation.conversation_id.clone();
-    alice
-        .storage
-        .fail_next_get_conversation_state_for(&conversation_id);
-
-    alice
-        .orchestrator
-        .force_rejoin(&conversation_id)
-        .await
-        .expect_err("unreadable reset authority must fail closed");
-    assert_eq!(
-        world
-            .delivery_service()
-            .external_commit_count(&conversation_id),
-        0
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1334,7 +1210,7 @@ async fn stale_non_reset_read_cannot_downgrade_cached_reset_authority() {
         .storage
         .override_next_conversation_state_read(&conversation_id, Some(ConversationState::Active));
 
-    let _ = alice.orchestrator.force_rejoin(&conversation_id).await;
+    let _ = alice.orchestrator.join_or_rejoin(&conversation_id).await;
 
     assert!(matches!(
         alice

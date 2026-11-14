@@ -27,7 +27,7 @@
 //!   proposals, external commits, private handshakes, PSKs, ReInit,
 //!   GroupContextExtensions, and draft application-data updates are forbidden."
 //!   OpenMLS emits `external_pub` because the format has the field; protocol
-//!   policy forbids using it. v1's `force_rejoin_unlocked` does `delete_group`
+//!   policy forbids using it. v1's external-commit rejoin helper does `delete_group`
 //!   then `create_external_commit`, which is precisely the shape that must never
 //!   reappear here — an external commit inflates the epoch and isolates the
 //!   sender, and observed epochs of 700-800 in v1 are what that looks like in

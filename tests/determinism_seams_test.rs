@@ -502,6 +502,38 @@ impl DeterministicMockTransport {
         }
 
         if url.contains("com.atproto.repo.getRecord") {
+            let mut q = std::collections::BTreeMap::new();
+            if let Some((_, qs)) = url.split_once('?') {
+                for pair in qs.split('&').filter(|s| !s.is_empty()) {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        q.insert(k.to_string(), urlencoding_decode(v));
+                    }
+                }
+            }
+            let repo = q.get("repo").map(String::as_str).unwrap_or("");
+            let collection = q.get("collection").map(String::as_str).unwrap_or("");
+            let rkey = q.get("rkey").map(String::as_str).unwrap_or("");
+            let found = self
+                .pds_records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.repo == repo && r.collection == collection && r.rkey == rkey)
+                .map(|r| {
+                    (
+                        r.repo.clone(),
+                        r.collection.clone(),
+                        r.rkey.clone(),
+                        r.value.clone(),
+                    )
+                });
+            if let Some((repo, collection, rkey, value)) = found {
+                return Ok(json_ok(serde_json::json!({
+                    "uri": format!("at://{repo}/{collection}/{rkey}"),
+                    "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "value": value,
+                })));
+            }
             return Ok(json_resp(
                 404,
                 serde_json::json!({ "error": "RecordNotFound" }),
@@ -527,11 +559,18 @@ impl DeterministicMockTransport {
                     .unwrap_or("did:plc:aliceaaaaaaaaaaaaaaaaaaa")
                     .to_string();
                 let epoch = body_json["epoch"].clone();
+                let epoch_num = |val: &serde_json::Value| {
+                    val.get("epochNumber")
+                        .or_else(|| val.get("seq"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_default()
+                };
+                let target_num = epoch_num(&epoch);
                 let mut epochs = self.labyrinth_epochs.lock().unwrap();
                 let chain = epochs.entry(did).or_default();
-                chain.retain(|known| known["seq"] != epoch["seq"]);
+                chain.retain(|known| epoch_num(known) != target_num);
                 chain.push(epoch);
-                chain.sort_by_key(|known| known["seq"].as_u64().unwrap_or_default());
+                chain.sort_by_key(epoch_num);
                 return Ok(json_ok(serde_json::json!({})));
             }
             if url.contains("/xrpc/blue.catbird.labyrinth.getEpochHead") {
@@ -864,9 +903,14 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // Moved in Task 5: creation now verifies its mandatory I13 control receipt, including the
     // receipt authority lookup, before accepting the sequenced transition.
     // Moved again in Task 5: confirmed sendCounter persistence adds a clock tick before Labyrinth flush.
+    // Moved in Wave 2 (two separate processes agree): pre-flush MLS enrollment + X-Wing ciphertext
+    // digest (`2eede06b61413adc5cc7bda913feb93f2d5313d1c0f101621efca6f87747c99b` above) is
+    // unchanged, while `flush_labyrinth_queue()` now speaks Nov-12 Spaces (`listWriters` +
+    // RFC 9421 `Accept-Signature` in `native_archive_space.rs`) and `EpochPublic` / `mailboxKeys`
+    // carry `membersHash`.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "ab6d8d6471804c0cfa1e33f3b616460cf00fc8fcd3a9955eb504437eba85a235",
+        "8ac31cbd01d61954b48b633c9eff45b3b09484b383636da44443ef10369d0733",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -875,30 +919,45 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
 #[test]
 fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_writes() {
     let run_mailbox_flow = |seed: u64| -> (String, String, Vec<Vec<u8>>) {
-        let dir = tempfile::tempdir().unwrap();
-        let hooks = SimClientHooks::new(
-            Arc::new(FixedStepClock::new(PINNED_START_MS, 10)),
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let shared_clock: Arc<dyn SimClock> = Arc::new(FixedStepClock::new(PINNED_START_MS, 10));
+        let hooks1 = SimClientHooks::new(
+            shared_clock.clone(),
             Arc::new(ChaChaSimEntropy::from_seed(seed, b"labyrinth-mailbox")),
         );
-        let cfg = test_client_config(dir.path().to_string_lossy().into_owned());
-        let keystore = Arc::new(DeterministicKeyStore::new());
-        let transport = Arc::new(DeterministicMockTransport::new(hooks.clock.clone()));
+        let hooks2 = SimClientHooks::new(
+            shared_clock.clone(),
+            Arc::new(ChaChaSimEntropy::from_seed(seed, b"labyrinth-mailbox-dev2")),
+        );
+        let cfg1 = test_client_config(dir1.path().to_string_lossy().into_owned());
+        let mut cfg2 = test_client_config(dir2.path().to_string_lossy().into_owned());
+        cfg2.device_id = "00000000-0000-4000-8000-000000000002".to_string();
+        let keystore1 = Arc::new(DeterministicKeyStore::new());
+        let keystore2 = Arc::new(DeterministicKeyStore::new());
+        let transport = Arc::new(DeterministicMockTransport::new(shared_clock));
         let client =
-            CatbirdMlsClient::open_with_hooks(cfg, keystore, transport.clone(), None, hooks)
+            CatbirdMlsClient::open_with_hooks(cfg1, keystore1, transport.clone(), None, hooks1)
                 .unwrap();
         transport.attach_client(&client);
+        let client2 =
+            CatbirdMlsClient::open_with_hooks(cfg2, keystore2, transport.clone(), None, hooks2)
+                .unwrap();
 
         client.enroll_device(&default_test_scopes()).unwrap();
 
-        // Advance local Labyrinth epoch via hybrid PQ CPace + ML-KEM-768 OTC pairing
-        // so `complete_otc_pairing` + `setup_recovery_code` publish Device, Epoch(0)
-        // (`EpochPublic::sign(0)`), rotated Epoch(1) (`open_next` / `EpochPublic::sign(1)` +
-        // `aead::seal` prev_seq/prev_root), and `VirtualDevice`!
+        // Advance local Labyrinth epoch via live 2-device hybrid PQ CPace + ML-KEM-768 OTC pairing
+        // over `OwnerMailbox` (`otcSession`) so `complete_otc_pairing` + `setup_recovery_code`
+        // publish Device, Epoch(0), rotated Epoch(1), and `VirtualDevice` deterministically.
         let offer = client.initiate_otc_pairing().unwrap();
-        let completion = client.complete_otc_pairing(&offer.six_digit_code).unwrap();
+        let initiated = client2.start_otc_pairing(&offer.six_digit_code).unwrap();
+        client
+            .respond_otc_pairing(&initiated.session_id_hex, Some(&offer.six_digit_code))
+            .unwrap();
+        let completion = client2.complete_otc_pairing(&offer.six_digit_code).unwrap();
         assert!(completion.new_epoch_seq >= 1);
 
-        let recovery_code = client.setup_recovery_code().unwrap();
+        let recovery_code = client2.setup_recovery_code().unwrap();
 
         let apply_writes_bodies: Vec<Vec<u8>> = transport
             .recorded_calls()
@@ -925,17 +984,12 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
         hasher.update(&(body.len() as u64).to_le_bytes());
         hasher.update(body);
     }
-    // Moved in Task 4 R1 (two separate processes agree; seed 8_492_015 gives c9265718…): native
-    // mailbox reads became authenticated (`native_archive_space.rs`: a PoP-bound Space credential
-    // and a Want-MAC KEM share per read, drawn from SimEntropy) against the account-bound
-    // `NativeArchiveAuthFixture`, shifting the seeded draws and clock ticks that precede the
-    // device/epoch/virtualDevice records. Moved again in R4 (three separate processes agree; seed
-    // 8_492_015 gives cd9923e7…): ordinary rotation now lists the mailbox's virtual devices twice
-    // (the report's recovery-method names, CB-39 expiry), two more authenticated reads ahead of
-    // epoch 1 and the recovery code.
+    // Moved in Wave 2 (two separate processes agree): live 2-device CPace+ML-KEM-768 OTC pairing
+    // over `OwnerMailbox` (`otcSession`), Nov-12 Spaces `Accept-Signature` + `listWriters`, and
+    // `EpochPublic` / `mailboxKeys` `membersHash`.
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "65a1a44dbd162bc10bc7e01722f82e2d497696e855a2023d9371114843466efd",
+        "5e0097ef752f0f9c4780e087e7c1794420e4a25adb730de10f4551ac7a48c27e",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }

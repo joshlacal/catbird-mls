@@ -11,9 +11,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use atproto_spaces::kem::{encode_p256_did_key, P256SecretKey};
 use atproto_spaces::mac::{
-    compute_commit_mac, compute_record_mac, format_commit_mac_header, format_record_mac_header,
-    SPACE_MAC_HEADER_NAME,
+    format_accept_signature, sign_commit_mac, sign_record_mac, MacProfile, ACCEPT_SIGNATURE_HEADER,
+    DEFAULT_MAC_LABEL, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER,
 };
 use catbird_mls::labyrinth::journal::{
     recover_pending_labyrinth_rotations, RotationCommitTransport, RotationJournalPayload,
@@ -156,11 +157,18 @@ async fn gate4_crash_mid_rotation_rolls_forward_from_mutation_journal_on_reopen(
     }
 }
 
-struct StaticSecretLookup([u8; 32]);
+struct StaticSecretLookup {
+    secret: [u8; 32],
+    key_share: String,
+}
 
 impl SharedSecretLookup for StaticSecretLookup {
     fn shared_secret_for_space(&self, _space_uri: &str) -> Option<[u8; 32]> {
-        Some(self.0)
+        Some(self.secret)
+    }
+
+    fn key_share_for_space(&self, _space_uri: &str) -> Option<String> {
+        Some(self.key_share.clone())
     }
 }
 
@@ -195,82 +203,126 @@ impl LabyrinthSpaceGateway for MockMacSpaceGateway {
 #[tokio::test]
 async fn gate7_space_mac_verifier_and_mek_conversation_group_binding() {
     let secret = [0x77u8; 32];
+    let key_share = encode_p256_did_key(
+        &P256SecretKey::from_slice(&[0x33u8; 32])
+            .unwrap()
+            .public_key(),
+    );
     let space_uri =
         "at://did:web:ds.catbird.blue/space/blue.catbird.labyrinth.conversation/convo-1-0";
     let repo_did = "did:plc:alice0000000000000000000";
     let collection = "blue.catbird.labyrinth.messageBatch";
     let rkey = "batch-001";
-    let record_uri_with_query =
-        format!("{space_uri}/{repo_did}/{collection}/{rkey}?space={space_uri}");
+    let record_uri = format!("{space_uri}/{repo_did}/{collection}/{rkey}");
 
     // Deterministic valid CIDv1 bytes + multibase string
     let cid_bytes = vec![0x01, 0x71, 0x12, 0x20, 0xAA, 0xBB, 0xCC, 0xDD];
     let cid_str = multibase::encode(multibase::Base::Base32Lower, &cid_bytes);
     let body_json = serde_json::to_vec(&serde_json::json!({
-        "uri": format!("{space_uri}/{repo_did}/{collection}/{rkey}"),
+        "uri": record_uri,
         "cid": cid_str,
         "value": { "ciphertext": "opaque" }
     }))
     .unwrap();
 
-    let valid_record_mac = compute_record_mac(&secret, &record_uri_with_query, &cid_bytes).unwrap();
-    let valid_header = format_record_mac_header(&valid_record_mac);
+    let (valid_record_headers, _) = sign_record_mac(
+        &secret,
+        &key_share,
+        DEFAULT_MAC_LABEL,
+        &record_uri,
+        &cid_str,
+    )
+    .unwrap();
 
     let gateway = Arc::new(MockMacSpaceGateway {
         response: std::sync::Mutex::new(LabyrinthSpaceResponse {
             status: 200,
             content_type: Some("application/json".into()),
-            headers: Vec::new(), // MISSING MAC header!
+            headers: Vec::new(), // MISSING MAC headers!
             body: body_json.clone(),
         }),
     });
 
-    let verifier = Arc::new(AtprotoSpaceMacVerifier::new(Arc::new(StaticSecretLookup(
+    let verifier = Arc::new(AtprotoSpaceMacVerifier::new(Arc::new(StaticSecretLookup {
         secret,
-    ))));
+        key_share: key_share.clone(),
+    })));
     let transport = SpaceXrpcTransport::new(gateway.clone()).with_mac_verifier(verifier);
 
-    // 1. Missing `Atproto-Space-Mac` header MUST be rejected before returning record JSON.
+    // 1. Missing `Atproto-Space-Record` headers MUST be rejected before returning record JSON.
     let err = transport
         .get_record(space_uri, repo_did, collection, rkey)
         .await
-        .expect_err("missing Atproto-Space-Mac must fail Gate 7");
+        .expect_err("missing Atproto-Space-Record must fail Gate 7");
     assert_eq!(err.error.as_deref(), Some("InvalidSpaceMac"));
 
-    // 2. Tampered `Atproto-Space-Mac` header MUST be rejected.
-    let mut bad_mac = valid_record_mac;
-    bad_mac[0] ^= 0xFF;
+    // 2. Tampered `Signature` header MUST be rejected.
     *gateway.response.lock().unwrap() = LabyrinthSpaceResponse {
         status: 200,
         content_type: Some("application/json".into()),
-        headers: vec![(
-            SPACE_MAC_HEADER_NAME.into(),
-            format_record_mac_header(&bad_mac),
-        )],
+        headers: vec![
+            (
+                valid_record_headers.covered_header_name.into(),
+                valid_record_headers.covered_header.clone(),
+            ),
+            (
+                SIGNATURE_INPUT_HEADER.into(),
+                valid_record_headers.signature_input.clone(),
+            ),
+            (
+                SIGNATURE_HEADER.into(),
+                format!(
+                    "{DEFAULT_MAC_LABEL}=:{}:",
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        [0xFFu8; 32]
+                    )
+                ),
+            ),
+        ],
         body: body_json.clone(),
     };
     let err = transport
         .get_record(space_uri, repo_did, collection, rkey)
         .await
-        .expect_err("tampered Atproto-Space-Mac must fail Gate 7");
+        .expect_err("tampered Atproto-Space-Record signature must fail Gate 7");
     assert_eq!(err.error.as_deref(), Some("InvalidSpaceMac"));
 
-    // 3. Valid `Atproto-Space-Mac` header passes cleanly!
+    // 3. Valid `Atproto-Space-Record` + `Signature-Input` + `Signature` passes cleanly!
     *gateway.response.lock().unwrap() = LabyrinthSpaceResponse {
         status: 200,
         content_type: Some("application/json".into()),
-        headers: vec![(SPACE_MAC_HEADER_NAME.into(), valid_header)],
+        headers: vec![
+            (
+                valid_record_headers.covered_header_name.into(),
+                valid_record_headers.covered_header,
+            ),
+            (
+                SIGNATURE_INPUT_HEADER.into(),
+                valid_record_headers.signature_input,
+            ),
+            (SIGNATURE_HEADER.into(), valid_record_headers.signature),
+        ],
         body: body_json,
     };
     let ok_val = transport
         .get_record(space_uri, repo_did, collection, rkey)
         .await
-        .expect("valid Atproto-Space-Mac must succeed");
+        .expect("valid Atproto-Space-Record must succeed");
     assert!(ok_val.is_some());
 
-    // 4. Commit MAC (`listRepoOps` / `atproto-space-repo`) verification:
+    // 4. Commit MAC (`listRepoOps` / `Atproto-Space-Commit` + `Accept-Signature`) verification:
     let data_32 = [0x55u8; 32];
-    let commit_mac = compute_commit_mac(&secret, space_uri, repo_did, "3klmno", &data_32).unwrap();
+    let (commit_headers, _) = sign_commit_mac(
+        &secret,
+        &key_share,
+        DEFAULT_MAC_LABEL,
+        space_uri,
+        repo_did,
+        "3klmno",
+        &data_32,
+    )
+    .unwrap();
     let commit_body = serde_json::to_vec(&serde_json::json!({
         "rev": "3klmno",
         "data": { "$bytes": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data_32) },
@@ -280,20 +332,31 @@ async fn gate7_space_mac_verifier_and_mek_conversation_group_binding() {
     *gateway.response.lock().unwrap() = LabyrinthSpaceResponse {
         status: 200,
         content_type: Some("application/json".into()),
-        headers: vec![(
-            SPACE_MAC_HEADER_NAME.into(),
-            format_commit_mac_header(&commit_mac),
-        )],
+        headers: vec![
+            (
+                commit_headers.covered_header_name.into(),
+                commit_headers.covered_header,
+            ),
+            (
+                SIGNATURE_INPUT_HEADER.into(),
+                commit_headers.signature_input,
+            ),
+            (SIGNATURE_HEADER.into(), commit_headers.signature),
+        ],
         body: commit_body,
     };
-    let ops_req = LabyrinthSpaceRequest::get(
+    let mut ops_req = LabyrinthSpaceRequest::get(
         "com.atproto.space.listRepoOps",
         format!(
             "/xrpc/com.atproto.space.listRepoOps?space={}&repo={}",
             space_uri, repo_did
         ),
     );
-    AtprotoSpaceMacVerifier::new(Arc::new(StaticSecretLookup(secret)))
+    ops_req.headers.push((
+        ACCEPT_SIGNATURE_HEADER.into(),
+        format_accept_signature(MacProfile::Commit, &key_share).unwrap(),
+    ));
+    AtprotoSpaceMacVerifier::new(Arc::new(StaticSecretLookup { secret, key_share }))
         .verify_space_response(&ops_req, &gateway.response.lock().unwrap())
         .expect("valid commit MAC on listRepoOps must succeed");
 

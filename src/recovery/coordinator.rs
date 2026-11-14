@@ -1,4 +1,4 @@
-//! Epoch-divergence recovery ladder (`Spec §5` & `AGENTS.md`: automated paths MUST NEVER use `force_rejoin`).
+//! Epoch-divergence recovery ladder (`Spec §5` & `AGENTS.md`: automated paths MUST NEVER use external-commit rejoin).
 
 use serde::{Deserialize, Serialize};
 
@@ -11,11 +11,11 @@ pub enum RecoveryAction {
     RequestSiblingLeafReadd { account_did: String },
     /// Request a Welcome reissue from an active conversation admin.
     RequestAdminWelcomeReissue { conversation_id: String },
-    /// Surface explicit user-confirmed reset; automated `force_rejoin` external commits are forbidden.
+    /// Surface explicit user-confirmed reset; automated external-commit rejoins are forbidden.
     AwaitExplicitReset { reason: String },
 }
 
-/// Select the next safe recovery step without ever issuing an automated `force_rejoin` external commit.
+/// Select the next safe recovery step without ever issuing an automated external-commit rejoin.
 pub fn select_recovery_action(
     conversation_id: &str,
     account_did: &str,

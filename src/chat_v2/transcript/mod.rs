@@ -132,6 +132,11 @@ signed_mutation_kinds!(
         "CATBIRD-CHAT-DEVICE-REVOKE\0"
     ),
     (
+        DeviceApproval,
+        "deviceApprovalBody",
+        "CATBIRD-CHAT-DEVICE-APPROVE\0"
+    ),
+    (
         BlobUploadPreparation,
         "blobUploadPreparationBody",
         "CATBIRD-CHAT-BLOB-PREPARE\0"

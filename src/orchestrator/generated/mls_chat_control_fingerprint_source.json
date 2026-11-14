@@ -3,12 +3,12 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json",
-    "sourceRevision": "ceed1595117ea0945cfd75677decc3d6ba6cb57b",
+    "sourceRevision": "80d575384c2bae3a8a8e12d543f51c1e82ccf5a4",
     "sourceSha256": "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311",
-    "sourceTree": "2f07abd0d3306dae9e822ac2cadfcc6681fa007f",
+    "sourceTree": "d29722834ec0d6800ef0bc8ba5b877fd54f7a787",
     "vectorCaseCount": 13,
     "vectorSet": "signed-mutation",
-    "vectorSetCount": 24
+    "vectorSetCount": 25
   },
   "authoritativeReferenceBindings": {
     "blue.catbird.chat.defs#leaveCancellationEntry": {

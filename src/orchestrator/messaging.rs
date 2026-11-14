@@ -592,10 +592,10 @@ where
             return Ok(Self::ready_result(projected, local_epoch));
         }
 
-        // P0.1 (epoch-inflation remediation): close the force_rejoin door at the
+        // P0.1 (epoch-inflation remediation): close the external-rejoin door at the
         // authorization layer, not just at startup. A NeedsRejoin projection on a
         // group that is LOCALLY healthy (present, valid epoch, self is a current
-        // member of the ratchet tree) must NOT drive join_or_rejoin -> force_rejoin
+        // member of the ratchet tree) must NOT drive join_or_rejoin -> external-rejoin
         // (delete_group + External Commit), which heals nothing and only inflates
         // the server's cosmetic group_info_epoch counter. Clear the stale flag and
         // short-circuit to Healthy. The self-membership gate inside the helper means

@@ -8,6 +8,8 @@ pub mod blob_crypto;
 /// Clean chat protocol (`blue.catbird.chat.*`). Isolated from `orchestrator`;
 /// the two protocols never interoperate.
 pub mod chat_v2;
+#[cfg(feature = "labyrinth")]
+pub mod circles;
 pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
@@ -56,12 +58,16 @@ pub use catbird_atproto as atproto;
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::CatbirdMlsClient;
 pub use client::{
-    CatbirdMlsClientConfig, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
-    PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+    CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport, LeaveConversationOutcome,
+    MailboxReadStateRecord, OtcInitiatedSession, PeerRepinProposalInfo, PlatformChangeEvent,
+    PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest, PlatformHttpResponse,
+    PlatformKeyStore, PlatformTransport, RegisteredDeviceInfo, UploadedConversationAttachment,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::*;
 pub use error::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ffi::{ffi_decode_opus_to_pcm, ffi_prepare_voice_message};
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -85,6 +91,8 @@ pub use push::{process_push_notification, process_push_notification_with_hooks};
 #[cfg(not(target_arch = "wasm32"))]
 pub use storage::SqlDriver;
 pub use types::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use voice::{decode_opus_to_pcm, prepare_voice_message, VoicePrepareResult};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]

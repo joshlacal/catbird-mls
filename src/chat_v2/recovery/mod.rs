@@ -5,7 +5,7 @@
 //! reappear in this tree.
 //!
 //! A comment saying "no external commits" is worth very little. v1 has the same
-//! prohibition in its documentation and `force_rejoin_unlocked` in its code, and
+//! prohibition in its documentation and an external-commit rejoin helper in its code, and
 //! the result was production epochs in the 700-800 range. So the rule is
 //! checked mechanically here, in the same shape as the v1 isolation gate, with a
 //! positive control proving the matcher can actually fail.

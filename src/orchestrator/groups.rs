@@ -2210,10 +2210,13 @@ mod tests {
         world.add_client_with_did("Alice", ALICE_DID).await;
         let did = world.client("Alice").did.clone();
         world.add_client_with_did("AlicePhone", &did).await;
+        world.add_client_with_did("AliceTablet", &did).await;
         world.register_device("Alice").await.unwrap();
         world.register_device("AlicePhone").await.unwrap();
+        world.register_device("AliceTablet").await.unwrap();
         let alice = world.client("Alice");
         let phone = world.client("AlicePhone");
+        let tablet = world.client("AliceTablet");
         let group = alice
             .orchestrator
             .create_group("device recovery", None, None)
@@ -2276,16 +2279,24 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0]["deviceId"], *target);
 
-        // A replace is contained only by a different DID (CHAT_PROTOCOL §2).
-        seed("replace").await;
+        // Self-replace (actor device attempting to replace its own leaf) is ineligible.
+        let own_package = alice
+            .orchestrator
+            .mls_context()
+            .create_key_package(format!("{did}#{actor}").into_bytes())
+            .unwrap();
+        let self_replace_view = world
+            .signed_leaf_recovery_view("Alice", cid, "replace", &own_package)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(self_replace_view);
         assert!(matches!(
             alice
                 .orchestrator
                 .fulfill_leaf_recovery(&group.conversation_id)
                 .await,
-            Err(OrchestratorError::Mls(
-                MLSError::InsufficientPermissions { .. }
-            ))
+            Err(OrchestratorError::Api(_))
         ));
         assert_eq!(
             alice
@@ -2299,9 +2310,51 @@ mod tests {
             alice
                 .orchestrator
                 .mls_context()
-                .get_epoch(group_id)
+                .get_epoch(group_id.clone())
                 .unwrap(),
             1
+        );
+
+        // A sibling device without a held leaf cannot request "replace" (InsufficientPermissions).
+        let tablet_device = tablet.orchestrator.require_actor_device_id().await.unwrap();
+        let tablet_package = tablet
+            .orchestrator
+            .mls_context()
+            .create_key_package(format!("{did}#{tablet_device}").into_bytes())
+            .unwrap();
+        let unheld_replace_view = world
+            .signed_leaf_recovery_view("AliceTablet", cid, "replace", &tablet_package)
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(unheld_replace_view);
+        assert!(matches!(
+            alice
+                .orchestrator
+                .fulfill_leaf_recovery(&group.conversation_id)
+                .await,
+            Err(OrchestratorError::Mls(
+                MLSError::InsufficientPermissions { .. }
+            ))
+        ));
+
+        // A sibling device (`device != own_device`) holding a leaf may fulfill a replace.
+        seed("replace").await;
+        assert_eq!(
+            alice
+                .orchestrator
+                .fulfill_pending_leaf_recoveries()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_id)
+                .unwrap(),
+            2
         );
     }
 
@@ -2617,6 +2670,45 @@ mod tests {
             .lock()
             .await
             .contains_key(&group.group_id));
+        let actor_device = reopened
+            .orchestrator
+            .require_actor_device_id()
+            .await
+            .unwrap();
+        let self_replacement = reopened
+            .orchestrator
+            .mls_context()
+            .create_key_package(format!("{did}#{actor_device}").into_bytes())
+            .unwrap();
+        let self_view = world
+            .signed_leaf_recovery_view(
+                "Alice",
+                &group.conversation_id,
+                "replace",
+                &self_replacement,
+            )
+            .await;
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(self_view);
+        assert!(
+            matches!(
+                reopened
+                    .orchestrator
+                    .fulfill_leaf_recovery(&group.conversation_id)
+                    .await,
+                Err(OrchestratorError::Api(_))
+            ),
+            "a device never fulfills its own replace"
+        );
+        assert_eq!(
+            reopened
+                .orchestrator
+                .mls_context()
+                .get_epoch(gid.clone())
+                .unwrap(),
+            2
+        );
         let replacement = world
             .client("Phone")
             .orchestrator
@@ -2629,17 +2721,14 @@ mod tests {
         world
             .delivery_service()
             .add_pending_leaf_recovery_request(view);
-        assert!(
-            matches!(
-                reopened
-                    .orchestrator
-                    .fulfill_leaf_recovery(&group.conversation_id)
-                    .await,
-                Err(OrchestratorError::Mls(
-                    MLSError::InsufficientPermissions { .. }
-                ))
-            ),
-            "a same-DID device never fulfills a replace"
+        assert_eq!(
+            reopened
+                .orchestrator
+                .fulfill_pending_leaf_recoveries()
+                .await
+                .unwrap(),
+            1,
+            "a sibling device fulfills a held-leaf replace"
         );
         assert_eq!(
             reopened
@@ -2647,7 +2736,7 @@ mod tests {
                 .mls_context()
                 .get_epoch(gid.clone())
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             reopened

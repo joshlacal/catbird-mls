@@ -11,8 +11,8 @@ use atproto_spaces::{
     kem::{decapsulate_p256, decode_p256_did_key, encode_p256_did_key, P256SecretKey},
     lthash::{compute_dagcbor_cid, LtHash},
     mac::{
-        compute_commit_mac, compute_record_mac, format_commit_mac_header, format_record_mac_header,
-        parse_want_mac_header, COMMIT_MAC_TYPE, RECORD_MAC_TYPE,
+        parse_accept_signature, sign_commit_mac, sign_record_mac, MacProfile,
+        SpaceMacResponseHeaders, ACCEPT_SIGNATURE_HEADER, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER,
     },
     star::{validate_canonical_dagcbor_record, write_star_repo, StarRecordEntry},
     tokens::{
@@ -39,6 +39,7 @@ struct Record {
 struct World {
     records: BTreeMap<RecordKey, Record>,
     mailbox_keys: BTreeMap<(String, String), Record>,
+    chat_devices: BTreeMap<(String, String), Record>,
     ops: BTreeMap<(String, String), Vec<Value>>,
     repo_revisions: BTreeMap<(String, String), String>,
     blobs: BTreeMap<(String, String), Vec<u8>>,
@@ -49,6 +50,8 @@ struct World {
     directory_outage: bool,
     write_outage: bool,
     unsigned_space_not_found: Option<(&'static str, u16)>,
+    /// `(did, collection, fault_kind)` fault injected on `com.atproto.sync.getRecord`.
+    repo_proof_fault: Option<(String, String, &'static str)>,
     /// `(account, space)` refused, with the MLS group the authority signs into its denial.
     denied_spaces: BTreeMap<(String, String), Vec<u8>>,
 }
@@ -60,6 +63,7 @@ impl World {
     }
 }
 
+#[allow(dead_code)]
 pub struct NativeArchiveAuthFixture {
     account: String,
     now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
@@ -92,6 +96,7 @@ impl NativeArchiveAuthFixture {
         }
     }
 
+    #[allow(dead_code)]
     pub fn committed_space_write_count(&self) -> usize {
         self.world.lock().unwrap().committed_space_writes
     }
@@ -128,6 +133,78 @@ impl NativeArchiveAuthFixture {
     }
 
     #[allow(dead_code)]
+    pub fn set_repo_proof_fault(&self, fault: Option<(&str, &str, &'static str)>) {
+        self.world.lock().unwrap().repo_proof_fault =
+            fault.map(|(did, collection, kind)| (did.to_owned(), collection.to_owned(), kind));
+    }
+
+    #[allow(dead_code)]
+    pub fn build_signed_car_response(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+        value: Option<&Value>,
+    ) -> Result<PlatformHttpResponse, MLSError> {
+        let fault = self
+            .world
+            .lock()
+            .unwrap()
+            .repo_proof_fault
+            .as_ref()
+            .filter(|(f_did, f_coll, _)| f_did == did && f_coll == collection)
+            .map(|(_, _, kind)| *kind);
+        if fault == Some("http_404") {
+            return Ok(reply(404, json!({"error": "RecordNotFound"})));
+        }
+        if fault == Some("malformed_car") {
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: vec![PlatformHttpHeader {
+                    name: "content-type".into(),
+                    value: "application/vnd.ipld.car".into(),
+                }],
+                body: vec![0xff; 20],
+            });
+        }
+        let signing_did = if fault == Some("wrong_signer") {
+            "did:plc:wrongsigner0000000000000"
+        } else {
+            did
+        };
+        let signing_key = SpaceSigningKey::from_p256_secret(&key(signing_did, b"sign"), "#atproto");
+        let entries = if fault == Some("exclusion") {
+            Vec::new()
+        } else if let Some(val) = value {
+            let mut effective = val.clone();
+            if fault == Some("tampered_value") {
+                if let Some(obj) = effective.as_object_mut() {
+                    obj.insert("createdAt".into(), json!("1999-01-01T00:00:00.000Z"));
+                }
+            }
+            let rec = record(&effective)?;
+            vec![(format!("{collection}/{rkey}"), rec.dagcbor)]
+        } else {
+            return Ok(reply(404, json!({"error": "RecordNotFound"})));
+        };
+        let (_, car_bytes) = catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1(
+            did,
+            "3lb2zzzzzzzzz",
+            &entries,
+            &signing_key,
+        )
+        .map_err(failure)?;
+        Ok(PlatformHttpResponse {
+            status: 200,
+            headers: vec![PlatformHttpHeader {
+                name: "content-type".into(),
+                value: "application/vnd.ipld.car".into(),
+            }],
+            body: car_bytes,
+        })
+    }
+
+    #[allow(dead_code)]
     pub fn mailbox_keys_record(&self, did: &str, rkey: &str) -> Option<(Value, String)> {
         self.world
             .lock()
@@ -137,6 +214,25 @@ impl NativeArchiveAuthFixture {
             .map(|record| (record.value.clone(), record.cid.clone()))
     }
 
+    #[allow(dead_code)]
+    pub fn did_document(&self, did: &str, pds_endpoint: &str) -> Result<Value, MLSError> {
+        let mut doc = json!({
+            "id": did,
+            "service": [{
+                "id": format!("{did}#atproto_pds"),
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": pds_endpoint,
+            }],
+        });
+        let fake_url = format!(
+            "{}/xrpc/com.atproto.identity.resolveDid",
+            pds_endpoint.trim_end_matches('/')
+        );
+        self.augment_document(did, &mut doc, &fake_url)?;
+        Ok(doc)
+    }
+
+    #[allow(dead_code)]
     pub fn execute(
         &self,
         request: &PlatformHttpRequest,
@@ -159,6 +255,7 @@ impl NativeArchiveAuthFixture {
         // Only the routes this host serves are parsed strictly; pass-through XRPC
         // keeps repeated array keys (`supportedProtocolVersions=1&...=2`).
         let served = nsid == "com.atproto.identity.resolveDid"
+            || nsid == "com.atproto.sync.getRecord"
             || nsid.starts_with("com.atproto.repo.")
             || nsid.starts_with("com.atproto.space.")
             || matches!(
@@ -169,6 +266,28 @@ impl NativeArchiveAuthFixture {
             return raw(request);
         }
         let params = query_params(query)?;
+        if nsid == "com.atproto.sync.getRecord" {
+            let did = required(&params, "did")?;
+            let collection = required(&params, "collection")?;
+            let rkey = required(&params, "rkey")?;
+            let stored = {
+                let world = self.world.lock().unwrap();
+                if collection == labyrinth::records::nsid::MAILBOX_KEYS {
+                    world
+                        .mailbox_keys
+                        .get(&(did.to_owned(), rkey.to_owned()))
+                        .map(|r| r.value.clone())
+                } else if collection == "blue.catbird.chat.device" {
+                    world
+                        .chat_devices
+                        .get(&(did.to_owned(), rkey.to_owned()))
+                        .map(|r| r.value.clone())
+                } else {
+                    None
+                }
+            };
+            return self.build_signed_car_response(did, collection, rkey, stored.as_ref());
+        }
         if nsid == "com.atproto.identity.resolveDid" {
             if self.world.lock().unwrap().directory_outage {
                 return Ok(reply(503, json!({"error": "DirectoryUnavailable"})));
@@ -198,6 +317,71 @@ impl NativeArchiveAuthFixture {
                 .as_ref()
                 .and_then(|v| v["collection"].as_str())
                 .or_else(|| params.get("collection").map(String::as_str));
+            if collection == Some("blue.catbird.chat.device") {
+                let mut resp = raw(request)?;
+                if (200..300).contains(&resp.status) {
+                    match nsid {
+                        "com.atproto.repo.putRecord" => {
+                            if let Some(b) = body.as_ref() {
+                                if let (Some(repo), Some(rkey), Some(val)) =
+                                    (b["repo"].as_str(), b["rkey"].as_str(), b.get("record"))
+                                {
+                                    if let Ok(rec) = record(val) {
+                                        self.world
+                                            .lock()
+                                            .unwrap()
+                                            .chat_devices
+                                            .insert((repo.to_owned(), rkey.to_owned()), rec);
+                                    }
+                                }
+                            }
+                        }
+                        "com.atproto.repo.deleteRecord" => {
+                            if let Some(b) = body.as_ref() {
+                                if let (Some(repo), Some(rkey)) =
+                                    (b["repo"].as_str(), b["rkey"].as_str())
+                                {
+                                    self.world
+                                        .lock()
+                                        .unwrap()
+                                        .chat_devices
+                                        .remove(&(repo.to_owned(), rkey.to_owned()));
+                                }
+                            }
+                        }
+                        "com.atproto.repo.listRecords" => {
+                            if let Ok(mut parsed) = parse(&resp.body) {
+                                let repo = params.get("repo").cloned().unwrap_or_default();
+                                if let Some(arr) =
+                                    parsed.get_mut("records").and_then(Value::as_array_mut)
+                                {
+                                    let mut world = self.world.lock().unwrap();
+                                    world.chat_devices.retain(|(owner, _), _| owner != &repo);
+                                    for entry in arr.iter_mut() {
+                                        let rkey_opt = entry["uri"]
+                                            .as_str()
+                                            .and_then(|u| u.rsplit('/').next())
+                                            .map(str::to_owned);
+                                        if let (Some(rkey), Some(val)) =
+                                            (rkey_opt, entry.get("value").cloned())
+                                        {
+                                            if let Ok(rec) = record(&val) {
+                                                entry["cid"] = json!(rec.cid);
+                                                world
+                                                    .chat_devices
+                                                    .insert((repo.clone(), rkey), rec);
+                                            }
+                                        }
+                                    }
+                                }
+                                resp.body = serde_json::to_vec(&parsed).map_err(failure)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(resp);
+            }
             if collection != Some(mailbox_collection) {
                 return raw(request);
             }
@@ -215,7 +399,7 @@ impl NativeArchiveAuthFixture {
         let now = ((self.now_ms)().max(0) as u64) / 1000;
         match nsid {
             "com.atproto.space.getDelegationToken" => {
-                let space = SpaceUri::parse(required(&params, "space")?).map_err(failure)?;
+                let space = SpaceUri::parse_hedged(required(&params, "space")?).map_err(failure)?;
                 let sequence = self.world.lock().unwrap().next();
                 let claims = SpaceTokenClaims {
                     iss: account.into(),
@@ -234,19 +418,19 @@ impl NativeArchiveAuthFixture {
                 .map_err(failure)?;
                 Ok(reply(200, json!({"token": token})))
             }
-            "com.atproto.space.getSpaceCredential" | "blue.catbird.chat.relaySpaceCredential" => {
+            "com.atproto.space.authorizeSpaceSync" | "blue.catbird.chat.relaySpaceCredential" => {
                 let body = parse(
                     request
                         .body
                         .as_deref()
                         .ok_or_else(|| failure("credential body missing"))?,
                 )?;
-                let space = SpaceUri::parse(text(&body, "space")?).map_err(failure)?;
+                let space = SpaceUri::parse_hedged(text(&body, "space")?).map_err(failure)?;
                 let relayed = nsid.starts_with("blue.");
                 if relayed && text(&body, "authorityDid")? != space.authority {
                     return Err(failure("relay authority mismatch"));
                 }
-                let kid = text(&body, if relayed { "cnfKey" } else { "credentialKid" })?;
+                let kid = text(&body, if relayed { "cnfKey" } else { "credentialKey" })?;
                 decode_p256_did_key(kid).map_err(failure)?;
                 let delegation = complete(verify_space_token(
                     SpaceTokenKind::Delegation,
@@ -255,7 +439,12 @@ impl NativeArchiveAuthFixture {
                     now,
                 ))
                 .map_err(failure)?;
-                if delegation.iss != account || delegation.sub != space.raw || delegation.exp <= now
+                let delegation_space = SpaceUri::parse_hedged(&delegation.sub)
+                    .map_err(failure)?
+                    .raw;
+                if delegation.iss != account
+                    || delegation_space != space.raw
+                    || delegation.exp <= now
                 {
                     return Err(failure("delegation account/Space/expiry mismatch"));
                 }
@@ -326,7 +515,7 @@ impl NativeArchiveAuthFixture {
                     nsid,
                     &params,
                     &headers,
-                    body["wantMac"].as_str(),
+                    body["acceptSignature"].as_str(),
                     now,
                 )
             }
@@ -394,8 +583,8 @@ impl NativeArchiveAuthFixture {
                     signature_input: request_header(request, "signature-input")?.into(),
                     signature: request_header(request, "signature")?.into(),
                 };
-                let want = optional_header(request, "atproto-space-want-mac")?;
-                self.read(account, nsid, &params, &headers, want, now)
+                let accept_sig = optional_header(request, ACCEPT_SIGNATURE_HEADER)?;
+                self.read(account, nsid, &params, &headers, accept_sig, now)
             }
             _ => Err(failure(format!(
                 "unsupported native Space fixture endpoint: {nsid}"
@@ -547,7 +736,7 @@ impl NativeArchiveAuthFixture {
         if self.world.lock().unwrap().write_outage {
             return Ok(reply(503, json!({"error": "ServiceUnavailable"})));
         }
-        let space = SpaceUri::parse(text(body, "space")?).map_err(failure)?;
+        let space = SpaceUri::parse_hedged(text(body, "space")?).map_err(failure)?;
         let unsigned_space_not_found = self.world.lock().unwrap().unsigned_space_not_found;
         if space.space_type == "blue.catbird.labyrinth.conversation" {
             if let Some((_, status)) = unsigned_space_not_found
@@ -641,13 +830,13 @@ impl NativeArchiveAuthFixture {
         nsid: &str,
         params: &BTreeMap<String, String>,
         headers: &SpaceRequestHeaders,
-        want_mac: Option<&str>,
+        accept_signature: Option<&str>,
         now: u64,
     ) -> Result<PlatformHttpResponse, MLSError> {
-        let space = SpaceUri::parse(required(params, "space")?).map_err(failure)?;
+        let space = SpaceUri::parse_hedged(required(params, "space")?).map_err(failure)?;
         let authority_read = matches!(
             nsid,
-            "com.atproto.space.getSpace" | "com.atproto.space.listRepos"
+            "com.atproto.space.getSpace" | "com.atproto.space.listWriters"
         );
         let writer = if authority_read {
             space.authority.as_str()
@@ -668,7 +857,8 @@ impl NativeArchiveAuthFixture {
             now,
         ))
         .map_err(failure)?;
-        if claims.iss != space.authority || claims.sub != space.raw || claims.exp <= now {
+        let claims_space = SpaceUri::parse_hedged(&claims.sub).map_err(failure)?.raw;
+        if claims.iss != space.authority || claims_space != space.raw || claims.exp <= now {
             return Err(failure("Space credential binding mismatch"));
         }
         let proof = verify_credential_request(
@@ -724,15 +914,17 @@ impl NativeArchiveAuthFixture {
                 let uri = space
                     .record_uri(writer, collection, rkey)
                     .map_err(failure)?;
-                let secret = shared_secret(writer, want_mac, RECORD_MAC_TYPE)?;
-                let (_, cid) = multibase::decode(&record.cid).map_err(failure)?;
-                let mac = compute_record_mac(&secret, &uri, &cid).map_err(failure)?;
+                let (label, key_share, secret) =
+                    shared_secret(writer, accept_signature, MacProfile::Record)?;
+                let (mac_headers, _) =
+                    sign_record_mac(&secret, &key_share, &label, &uri, &record.cid)
+                        .map_err(failure)?;
                 Ok(with_mac(
                     reply(
                         200,
                         json!({"uri": uri, "cid": record.cid, "value": record.value}),
                     ),
-                    format_record_mac_header(&mac),
+                    mac_headers,
                 ))
             }
             "com.atproto.space.listRecords" => {
@@ -775,7 +967,7 @@ impl NativeArchiveAuthFixture {
                     .collect();
                 Ok(reply(200, json!({"records": records, "cursor": cursor})))
             }
-            "com.atproto.space.listRepos" => {
+            "com.atproto.space.listWriters" => {
                 let dids: BTreeSet<_> = world
                     .records
                     .keys()
@@ -820,7 +1012,8 @@ impl NativeArchiveAuthFixture {
                     .iter()
                     .map(|(did, repo_rev, data)| {
                         json!({
-                            "did": did,
+                            "$type": "com.atproto.space.defs#repoWrite",
+                            "repo": did,
                             "repoRev": repo_rev,
                             "spaceRev": repo_rev,
                             "data": {"$bytes": STANDARD.encode(data)}
@@ -841,16 +1034,19 @@ impl NativeArchiveAuthFixture {
                 if !complete {
                     body["cursor"] = end.to_string().into();
                 }
-                let secret = shared_secret(&space.authority, want_mac, COMMIT_MAC_TYPE)?;
-                let mac = compute_commit_mac(
+                let (label, key_share, secret) =
+                    shared_secret(&space.authority, accept_signature, MacProfile::Commit)?;
+                let (mac_headers, _) = sign_commit_mac(
                     &secret,
+                    &key_share,
+                    &label,
                     &space.raw,
                     &space.authority,
                     &snapshot_rev,
                     &inventory_data,
                 )
                 .map_err(failure)?;
-                Ok(with_mac(reply(200, body), format_commit_mac_header(&mac)))
+                Ok(with_mac(reply(200, body), mac_headers))
             }
             "com.atproto.space.getSpace" => Ok(reply(
                 200,
@@ -859,34 +1055,39 @@ impl NativeArchiveAuthFixture {
             "com.atproto.space.getLatestCommit"
             | "com.atproto.space.getRepo"
             | "com.atproto.space.listRepoOps" => {
-                let secret = shared_secret(writer, want_mac, COMMIT_MAC_TYPE)?;
-                let mac = format_commit_mac_header(
-                    &compute_commit_mac(&secret, &space.raw, writer, &rev, &commit)
-                        .map_err(failure)?,
-                );
+                let (label, key_share, secret) =
+                    shared_secret(writer, accept_signature, MacProfile::Commit)?;
+                let (mac_headers, _) = sign_commit_mac(
+                    &secret, &key_share, &label, &space.raw, writer, &rev, &commit,
+                )
+                .map_err(failure)?;
                 if nsid == "com.atproto.space.getRepo" {
-                    let records: Vec<_> = entries
+                    let mut records: Vec<_> = entries
                         .into_iter()
                         .map(|((_, _, collection, rkey), record)| StarRecordEntry {
                             path: format!("{collection}/{rkey}"),
                             record_dagcbor: record.dagcbor.clone(),
                         })
                         .collect();
+                    records.sort_by(|a, b| a.path.cmp(&b.path));
                     return Ok(with_mac(
                         PlatformHttpResponse {
                             status: 200,
                             headers: vec![PlatformHttpHeader {
                                 name: "content-type".into(),
-                                value: "application/vnd.atproto.star".into(),
+                                value: "application/vnd.dasl.star".into(),
                             }],
                             body: write_star_repo(&space.raw, writer, &rev, &commit, &records)
                                 .map_err(failure)?,
                         },
-                        mac,
+                        mac_headers,
                     ));
                 }
                 if nsid == "com.atproto.space.getLatestCommit" {
-                    return Ok(with_mac(reply(200, json!({"commit": commit_json})), mac));
+                    return Ok(with_mac(
+                        reply(200, json!({"commit": commit_json})),
+                        mac_headers,
+                    ));
                 }
                 let mut ops = world
                     .ops
@@ -932,7 +1133,7 @@ impl NativeArchiveAuthFixture {
                 } else {
                     Ok(with_mac(
                         reply(200, json!({"ops": selected, "commit": commit_json})),
-                        mac,
+                        mac_headers,
                     ))
                 }
             }
@@ -974,10 +1175,15 @@ fn record(value: &Value) -> Result<Record, MLSError> {
     })
 }
 
-fn shared_secret(writer: &str, want: Option<&str>, kind: &str) -> Result<[u8; 32], MLSError> {
-    let share = parse_want_mac_header(want.ok_or_else(|| failure("Want-Mac missing"))?, kind)
-        .map_err(failure)?;
-    decapsulate_p256(&key(writer, b"kem"), &share).map_err(failure)
+fn shared_secret(
+    writer: &str,
+    accept_signature: Option<&str>,
+    profile: MacProfile,
+) -> Result<(String, String, [u8; 32]), MLSError> {
+    let header = accept_signature.ok_or_else(|| failure("Accept-Signature missing"))?;
+    let (label, share) = parse_accept_signature(header, profile).map_err(failure)?;
+    let secret = decapsulate_p256(&key(writer, b"kem"), &share).map_err(failure)?;
+    Ok((label, share, secret))
 }
 
 fn key(did: &str, purpose: &[u8]) -> P256SecretKey {
@@ -1104,10 +1310,25 @@ fn reply(status: u16, body: Value) -> PlatformHttpResponse {
         body: serde_json::to_vec(&body).unwrap(),
     }
 }
-fn with_mac(mut response: PlatformHttpResponse, value: String) -> PlatformHttpResponse {
+fn with_mac(
+    mut response: PlatformHttpResponse,
+    mac: SpaceMacResponseHeaders,
+) -> PlatformHttpResponse {
     response.headers.push(PlatformHttpHeader {
-        name: "atproto-space-mac".into(),
-        value,
+        name: mac.covered_header_name.into(),
+        value: mac.covered_header,
+    });
+    response.headers.push(PlatformHttpHeader {
+        name: SIGNATURE_INPUT_HEADER.into(),
+        value: mac.signature_input,
+    });
+    response.headers.push(PlatformHttpHeader {
+        name: SIGNATURE_HEADER.into(),
+        value: mac.signature,
+    });
+    response.headers.push(PlatformHttpHeader {
+        name: "vary".into(),
+        value: ACCEPT_SIGNATURE_HEADER.into(),
     });
     response
 }

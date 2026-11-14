@@ -26,6 +26,8 @@ mod native_archive_auth;
 mod reset_activation;
 #[path = "client_live_chat_data_plane/verified_roster.rs"]
 mod verified_roster;
+#[path = "client_live_chat_data_plane/wave2_unified.rs"]
+mod wave2_unified;
 use native_archive_auth::NativeArchiveAuthFixture;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::RngCore;
@@ -264,6 +266,11 @@ struct MockDsState {
     next_reset_request_fault: Option<&'static str>,
     // Advertise an own pending request and matching `getEntries` row that were never sequenced.
     fake_pending_reset_seq: Option<i64>,
+    // Wave 2 opt-in controls: second-device pending_approval, per-device status/revokedAt, and durable leave requests.
+    enroll_second_device_pending: bool,
+    device_statuses: BTreeMap<(String, String), String>,
+    revoked_device_at: BTreeMap<(String, String), String>,
+    leave_requests: BTreeMap<String, Vec<Value>>,
 }
 
 struct SharedMockDs {
@@ -343,6 +350,10 @@ impl SharedMockDs {
                 forge_next_reset_activation_receipt: false,
                 next_reset_request_fault: None,
                 fake_pending_reset_seq: None,
+                enroll_second_device_pending: false,
+                device_statuses: BTreeMap::new(),
+                revoked_device_at: BTreeMap::new(),
+                leave_requests: BTreeMap::new(),
             }),
             archive_auth: NativeArchiveAuthFixture::new(
                 ALICE_DID,
@@ -684,6 +695,17 @@ impl SharedMockDs {
             }));
         }
 
+        if url.contains("/xrpc/com.atproto.repo.deleteRecord") {
+            let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
+            let coll = body_json["collection"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let rkey = body_json["rkey"].as_str().unwrap_or_default().to_string();
+            g.pds_records.remove(&(repo, coll, rkey));
+            return ok_json(json!({}));
+        }
+
         if url.contains("/xrpc/com.atproto.repo.listRecords")
             && g.transport_error_next_pds_directory_for.as_deref()
                 == q.get("repo").map(String::as_str)
@@ -810,12 +832,24 @@ impl SharedMockDs {
             if epoch.attestation.transport_public_key != device_key {
                 return xrpc_error(400, "AttestationNotCaller", "head not attested by caller");
             }
+            let caller_dev = write["actorDeviceId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let chain = g.labyrinth_epochs.entry(account.to_owned()).or_default();
             if let Some(existing) = chain
                 .iter()
                 .find(|e| e["epochNumber"] == epoch_json["epochNumber"])
             {
                 return if *existing == epoch_json {
+                    if g.device_statuses
+                        .get(&(account.to_owned(), caller_dev.clone()))
+                        .map(String::as_str)
+                        == Some("pending_approval")
+                    {
+                        g.device_statuses
+                            .insert((account.to_owned(), caller_dev), "active".into());
+                    }
                     ok_json(json!({}))
                 } else {
                     xrpc_error(409, "EpochHeadConflict", "different head at this epoch")
@@ -831,6 +865,70 @@ impl SharedMockDs {
                 return xrpc_error(400, "InvalidEpochChain", "head does not extend the chain");
             }
             chain.push(epoch_json);
+            if g.device_statuses
+                .get(&(account.to_owned(), caller_dev.clone()))
+                .map(String::as_str)
+                == Some("pending_approval")
+            {
+                g.device_statuses
+                    .insert((account.to_owned(), caller_dev), "active".into());
+            }
+            return ok_json(json!({}));
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.deleteAccountData") {
+            use catbird_mls::labyrinth::write_auth::{WRITE_BODY_HEADER, WRITE_DOMAIN};
+            let nsid = "blue.catbird.labyrinth.deleteAccountData";
+            let (write, _) = match device_signed_claim(
+                &g,
+                account,
+                &req,
+                WRITE_BODY_HEADER,
+                "actorDeviceId",
+                WRITE_DOMAIN,
+            ) {
+                Ok(verified) => verified,
+                Err(message) => return xrpc_error(401, "InvalidSignature", message),
+            };
+            let payload_sha256 =
+                hex::encode(Sha256::digest(req.body.as_deref().unwrap_or_default()));
+            if write["endpointNsid"] != nsid || write["payloadSha256"] != payload_sha256 {
+                return xrpc_error(
+                    400,
+                    "InvalidRequest",
+                    "write body does not bind this payload",
+                );
+            }
+            g.labyrinth_epochs.remove(account);
+            let receipt_key_id = labyrinth_protocol::receipt::expected_receipt_key_id(DS_DID);
+            let affected_cids: Vec<String> = g
+                .conversations
+                .iter()
+                .filter(|(_, st)| {
+                    st["participants"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|p| p["userDid"].as_str() == Some(account))
+                })
+                .map(|(cid, _)| cid.clone())
+                .collect();
+            for cid in affected_cids {
+                let next_seq = g.entries.get(&cid).map_or(0, Vec::len) as i64 + 1;
+                let del_entry = signed_account_deletion(
+                    &g.receipt_sk,
+                    &receipt_key_id,
+                    DS_DID,
+                    &cid,
+                    account,
+                    next_seq,
+                );
+                g.entries
+                    .entry(cid.clone())
+                    .or_default()
+                    .push(del_entry.clone());
+                g.account_deletions.entry(cid).or_default().push(del_entry);
+            }
             return ok_json(json!({}));
         }
 
@@ -876,11 +974,15 @@ impl SharedMockDs {
                 .device_keys
                 .iter()
                 .filter(|((owner, _), _)| *owner == did)
-                .map(|(_, key)| {
-                    json!({
+                .map(|((owner, dev), key)| {
+                    let mut item = json!({
                         "keyId": derive_key_id(key),
                         "signingPublicKey": { "$bytes": STANDARD.encode(key) },
-                    })
+                    });
+                    if let Some(rev_ts) = g.revoked_device_at.get(&(owner.clone(), dev.clone())) {
+                        item["revokedAt"] = json!(rev_ts);
+                    }
+                    item
                 })
                 .collect();
             return ok_json(json!({ "items": items }));
@@ -921,12 +1023,20 @@ impl SharedMockDs {
             if g.device_keys.contains_key(&(did.clone(), dev.clone())) {
                 return xrpc_error(400, "DeviceAlreadyExists", "DeviceAlreadyExists");
             }
+            let already_has_device = g.device_keys.keys().any(|(owner, _)| owner == &did);
+            let enroll_status = if g.enroll_second_device_pending && already_has_device {
+                "pending_approval"
+            } else {
+                "active"
+            };
             let kps = b["keyPackages"].as_array().cloned().unwrap_or_default();
             let key: [u8; 32] = chat_wire::json_bytes(&b["signaturePublicKey"])
                 .unwrap()
                 .try_into()
                 .unwrap();
             g.device_keys.insert((did.clone(), dev.clone()), key);
+            g.device_statuses
+                .insert((did.clone(), dev.clone()), enroll_status.to_string());
             g.convo_kps
                 .entry((did, dev.clone()))
                 .or_default()
@@ -943,12 +1053,110 @@ impl SharedMockDs {
                 "keyId": derive_key_id(&presented),
                 "signaturePublicKey": { "$bytes": STANDARD.encode(presented) },
                 "authGeneration": 1,
-                "status": "active",
+                "status": enroll_status,
                 "createdAt": "2026-11-03T00:00:00.000Z",
                 "updatedAt": "2026-11-03T00:00:00.000Z",
                 "availablePackageCount": 2,
                 "reservedPackageCount": 0,
             }}));
+        }
+
+        if url.contains("/xrpc/blue.catbird.chat.approveDevice") {
+            let sr = &body_json["signedRequest"];
+            let b = &sr["body"];
+            let actor_did = b["actorDid"].as_str().unwrap_or_default().to_string();
+            let actor_dev = b["actorDeviceId"].as_str().unwrap_or_default().to_string();
+            if actor_did != account {
+                return xrpc_error(403, "NotAuthorized", "actorDid is not the session account");
+            }
+            if g.device_statuses
+                .get(&(actor_did.clone(), actor_dev.clone()))
+                .map(String::as_str)
+                .unwrap_or("active")
+                != "active"
+            {
+                return xrpc_error(403, "DeviceNotActive", "approver device must be active");
+            }
+            let Some(actor_key) = g.device_keys.get(&(actor_did.clone(), actor_dev)).copied()
+            else {
+                return xrpc_error(401, "UnknownDevice", "approver device is not enrolled");
+            };
+            if chat_wire::verify_signed_mutation_body_and_digest(
+                sr,
+                SignedMutationKind::DeviceApproval,
+                &actor_key,
+            )
+            .is_err()
+            {
+                return xrpc_error(401, "InvalidSignature", "invalid device approval signature");
+            }
+            let target_dev = b["targetDeviceId"].as_str().unwrap_or_default().to_string();
+            let Some(target_key) = g
+                .device_keys
+                .get(&(actor_did.clone(), target_dev.clone()))
+                .copied()
+            else {
+                return xrpc_error(404, "DeviceNotFound", "target device not enrolled");
+            };
+            let target_pub =
+                chat_wire::json_bytes(&b["targetSignaturePublicKey"]).unwrap_or_default();
+            if target_pub.as_slice() != target_key.as_slice()
+                || b["targetKeyId"].as_str() != Some(derive_key_id(&target_key).as_str())
+            {
+                return xrpc_error(409, "TargetKeyMismatch", "target device key mismatch");
+            }
+            g.device_statuses
+                .insert((actor_did, target_dev), "active".into());
+            return ok_json(json!({ "approved": true }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.chat.revokeDevice") {
+            let sr = &body_json["signedRequest"];
+            let b = &sr["body"];
+            let actor_did = b["actorDid"].as_str().unwrap_or_default().to_string();
+            let actor_dev = b["actorDeviceId"].as_str().unwrap_or_default().to_string();
+            if actor_did != account {
+                return xrpc_error(403, "NotAuthorized", "actorDid is not the session account");
+            }
+            if g.device_statuses
+                .get(&(actor_did.clone(), actor_dev.clone()))
+                .map(String::as_str)
+                .unwrap_or("active")
+                != "active"
+            {
+                return xrpc_error(403, "DeviceNotActive", "revoker device must be active");
+            }
+            let Some(actor_key) = g.device_keys.get(&(actor_did.clone(), actor_dev)).copied()
+            else {
+                return xrpc_error(401, "UnknownDevice", "revoker device is not enrolled");
+            };
+            if chat_wire::verify_signed_mutation_body_and_digest(
+                sr,
+                SignedMutationKind::DeviceRevocation,
+                &actor_key,
+            )
+            .is_err()
+            {
+                return xrpc_error(
+                    401,
+                    "InvalidSignature",
+                    "invalid device revocation signature",
+                );
+            }
+            let target_dev = b["targetDeviceId"].as_str().unwrap_or_default().to_string();
+            let signed_at = b["signedAt"]
+                .as_str()
+                .unwrap_or("2026-11-12T00:00:00.000Z")
+                .to_string();
+            g.device_statuses
+                .insert((actor_did.clone(), target_dev.clone()), "revoked".into());
+            g.revoked_device_at
+                .insert((actor_did.clone(), target_dev.clone()), signed_at);
+            g.convo_kps.remove(&(actor_did.clone(), target_dev.clone()));
+            if let Some(list) = g.dr_keys.get_mut(&actor_did) {
+                list.retain(|(d, _, _)| d != &target_dev);
+            }
+            return ok_json(json!({ "revoked": true }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.getOwnDevices") {
@@ -973,12 +1181,17 @@ impl SharedMockDs {
                 .filter(|((owner, _), _)| owner == account)
                 .map(|((owner, dev), key)| {
                     let key = &g.enroll_answer_key.filter(|_| *dev == device).unwrap_or(*key);
+                    let status = g
+                        .device_statuses
+                        .get(&(owner.clone(), dev.clone()))
+                        .map(String::as_str)
+                        .unwrap_or("active");
                     let mut item = json!({ "device": {
                         "deviceId": dev,
                         "keyId": derive_key_id(key),
                         "signaturePublicKey": { "$bytes": STANDARD.encode(key) },
                         "authGeneration": 1,
-                        "status": "active",
+                        "status": status,
                         "createdAt": "2026-11-03T00:00:00.000Z",
                         "updatedAt": "2026-11-03T00:00:00.000Z",
                         "availablePackageCount": g.convo_kps.get(&(owner.clone(), dev.clone())).map_or(0, Vec::len),
@@ -1011,6 +1224,13 @@ impl SharedMockDs {
             let b = &body_json["signedRequest"]["body"];
             let did = b["actorDid"].as_str().unwrap().to_string();
             let dev = b["actorDeviceId"].as_str().unwrap().to_string();
+            if g.device_statuses
+                .get(&(did.clone(), dev.clone()))
+                .map(String::as_str)
+                == Some("pending_approval")
+            {
+                return xrpc_error(403, "NotAuthorized", "NotAuthorized");
+            }
             let kps = b["keyPackages"].as_array().cloned().unwrap_or_default();
             g.convo_kps.entry((did, dev)).or_default().extend(kps);
             return ok_json(json!({ "acceptedCount": 4 }));
@@ -1021,6 +1241,13 @@ impl SharedMockDs {
             let b = &sr["body"];
             let did = b["actorDid"].as_str().unwrap().to_string();
             let dev = b["actorDeviceId"].as_str().unwrap().to_string();
+            if g.device_statuses
+                .get(&(did.clone(), dev.clone()))
+                .map(String::as_str)
+                == Some("pending_approval")
+            {
+                return xrpc_error(400, "PreparationConflict", "PreparationConflict");
+            }
             // `mls-ds` `publish_request_keys`: each publication advances the revision by one.
             let revision = b["revision"].as_i64().unwrap();
             let prior = g.dr_revisions.get(&(did.clone(), dev.clone())).copied();
@@ -1161,6 +1388,22 @@ impl SharedMockDs {
                 "$type": "blue.catbird.chat.defs#signedDirectRequestReceipt",
                 "body": outcome_body, "signature": STANDARD.encode(signature.to_bytes()),
             });
+            let mut dr_leaves = vec![json!({
+                "userDid": b["actorDid"],
+                "deviceId": b["actorDeviceId"],
+                "leafOrigin": "genesis",
+            })];
+            for del in b["artifacts"]["welcome"]["deliveries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                dr_leaves.push(json!({
+                    "userDid": del["recipientDid"],
+                    "deviceId": del["recipientDeviceId"],
+                    "leafOrigin": "welcome",
+                }));
+            }
             g.conversations.insert(
                 cid.clone(),
                 json!({
@@ -1171,6 +1414,8 @@ impl SharedMockDs {
                         { "userDid": b["actorDid"], "status": "active", "role": "admin", "leafCount": 1 },
                         { "userDid": b["recipientDid"], "status": "pending", "role": "member", "leafCount": 0 }
                     ],
+                    "leaves": dr_leaves,
+                    "metadataSnapshot": b["artifacts"]["metadataSnapshot"],
                     "directRequest": {
                         "requestId": b["requestId"],
                         "firstMessageId": b["firstMessageId"],
@@ -1290,6 +1535,7 @@ impl SharedMockDs {
                 g.entries.entry(cid.clone()).or_default().push(entry);
                 if let Some(st) = g.conversations.get_mut(&cid) {
                     st["coordinates"] = next_coords.clone();
+                    st["directRequest"]["consent"] = json!("accepted");
                     if let Some(parts) = st["participants"].as_array_mut() {
                         for p in parts {
                             p["status"] = json!("active");
@@ -1406,6 +1652,13 @@ impl SharedMockDs {
             let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
             let did = b["actorDid"].as_str().unwrap().to_string();
             let dev = b["actorDeviceId"].as_str().unwrap().to_string();
+            if g.device_statuses
+                .get(&(did.clone(), dev.clone()))
+                .map(String::as_str)
+                == Some("pending_approval")
+            {
+                return xrpc_error(403, "DevicePendingApproval", "device awaits approval");
+            }
             let Some(state) = g.conversations.get(&cid) else {
                 return xrpc_error(400, "ConversationNotFound", "conversation not found");
             };
@@ -1474,6 +1727,78 @@ impl SharedMockDs {
             return ok_json(json!({ "recovery": view }));
         }
 
+        if url.contains("/xrpc/blue.catbird.chat.requestLeave") {
+            let sr = body_json["signedRequest"].clone();
+            let b = &sr["body"];
+            let btype = b["$type"].as_str().unwrap_or("");
+            let cid = b["prior"]["conversationId"].as_str().unwrap().to_string();
+            let Some(state) = g.conversations.get(&cid).cloned() else {
+                return xrpc_error(400, "ConversationNotFound", "conversation not found");
+            };
+            if state["coordinates"] != b["prior"] {
+                return xrpc_error(400, "StaleCoordinates", "StaleCoordinates");
+            }
+            if btype.ends_with("zeroLeafLeaveBody") {
+                let next_coords = b["next"].clone();
+                let next_seq = (g.entries.get(&cid).map(Vec::len).unwrap_or(0) as i64) + 1;
+                let mut entry = json!({
+                    "$type": "blue.catbird.chat.defs#zeroLeafLeaveEntry",
+                    "entryId": b["transitionId"],
+                    "conversationId": cid,
+                    "seq": next_seq,
+                    "signedRequest": sr,
+                    "receivedAt": b["signedAt"],
+                });
+                entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &next_coords);
+                g.entries
+                    .entry(cid.clone())
+                    .or_default()
+                    .push(entry.clone());
+                if let Some(st) = g.conversations.get_mut(&cid) {
+                    st["coordinates"] = next_coords.clone();
+                    st["snapshotSeq"] = json!(next_seq);
+                    if let Some(parts) = st["participants"].as_array_mut() {
+                        parts.retain(|p| p["userDid"] != b["actorDid"]);
+                    }
+                }
+                return ok_json(json!({
+                    "result": {
+                        "$type": "blue.catbird.chat.defs#zeroLeafLeaveResult",
+                        "coordinates": next_coords,
+                        "entry": entry,
+                    }
+                }));
+            }
+            let next_seq = (g.entries.get(&cid).map(Vec::len).unwrap_or(0) as i64) + 1;
+            let mut entry = json!({
+                "$type": "blue.catbird.chat.defs#leaveRequestEntry",
+                "entryId": b["leaveRequestId"],
+                "conversationId": cid,
+                "seq": next_seq,
+                "signedRequest": sr,
+                "receivedAt": b["signedAt"],
+            });
+            entry["sequencerReceipt"] = control_sequencer_receipt(&g, &entry, &b["prior"]);
+            g.entries.entry(cid.clone()).or_default().push(entry);
+            let view = json!({
+                "leaveRequestId": b["leaveRequestId"],
+                "conversationId": cid,
+                "requesterDid": b["actorDid"],
+                "requesterDeviceId": b["actorDeviceId"],
+                "prior": b["prior"],
+                "status": "pending",
+                "requestedAt": b["signedAt"],
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            });
+            g.leave_requests.entry(cid).or_default().push(view.clone());
+            return ok_json(json!({
+                "result": {
+                    "$type": "blue.catbird.chat.defs#durableLeaveRequestResult",
+                    "leaveRequest": view,
+                }
+            }));
+        }
+
         if url.contains("/xrpc/blue.catbird.chat.submitTransition") {
             if g.stale_next_submit_transition {
                 g.stale_next_submit_transition = false;
@@ -1494,7 +1819,8 @@ impl SharedMockDs {
             let b = &sr["body"];
             let btype = b["$type"].as_str().unwrap_or("");
             let is_commit = btype.ends_with("commitTransitionBody")
-                || btype.ends_with("leafRecoveryFulfillmentBody");
+                || btype.ends_with("leafRecoveryFulfillmentBody")
+                || btype.ends_with("leaveCommitFulfillmentBody");
             if is_commit {
                 if let Some(status) = g.fail_next_commit_status.take() {
                     return Ok(PlatformHttpResponse {
@@ -1523,6 +1849,7 @@ impl SharedMockDs {
             let entry_kind = match btype.trim_start_matches("blue.catbird.chat.defs#") {
                 "commitTransitionBody" => "commitEntry",
                 "leafRecoveryFulfillmentBody" => "leafRecoveryFulfillmentEntry",
+                "leaveCommitFulfillmentBody" => "leaveCommitFulfillmentEntry",
                 "policyTransitionBody" => "policyEntry",
                 "metadataTransitionBody" => "metadataEntry",
                 other => panic!("fixture has no entry kind for {other}"),
@@ -1589,7 +1916,17 @@ impl SharedMockDs {
                         }));
                     }
                 }
-                for change in b["participantChanges"].as_array().into_iter().flatten() {
+                for change in b["participantChanges"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(
+                        b["manifest"]["participantChanges"]
+                            .as_array()
+                            .into_iter()
+                            .flatten(),
+                    )
+                {
                     if change["$type"] == "blue.catbird.chat.defs#removeParticipant" {
                         if let Some(parts) = st["participants"].as_array_mut() {
                             parts.retain(|p| p["userDid"] != change["userDid"]);
@@ -1613,6 +1950,13 @@ impl SharedMockDs {
                     request["status"] = json!(if fulfilled { "fulfilled" } else { "superseded" });
                     request["reservation"]["status"] =
                         json!(if fulfilled { "consumed" } else { "released" });
+                }
+            }
+            for leave_req in g.leave_requests.get_mut(&cid).into_iter().flatten() {
+                if leave_req["status"] == "pending" {
+                    let fulfilled = btype.ends_with("leaveCommitFulfillmentBody")
+                        && leave_req["leaveRequestId"] == b["leaveRequestId"];
+                    leave_req["status"] = json!(if fulfilled { "fulfilled" } else { "superseded" });
                 }
             }
             if is_commit && std::mem::take(&mut g.lose_next_commit_response) {
@@ -1801,7 +2145,17 @@ impl SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.chat.getConversations") {
-            let list: Vec<Value> = g.conversations.values().cloned().collect();
+            let list: Vec<Value> = g
+                .conversations
+                .values()
+                .filter(|st| {
+                    st["participants"].as_array().is_none_or(|parts| {
+                        parts.is_empty()
+                            || parts.iter().any(|p| p["userDid"].as_str() == Some(account))
+                    })
+                })
+                .cloned()
+                .collect();
             return ok_json(json!({ "conversations": list }));
         }
 
@@ -1878,11 +2232,19 @@ impl SharedMockDs {
                     "expiresAt": "2099-01-01T00:00:00.000Z",
                 }));
             }
+            let pending_leave_requests = g
+                .leave_requests
+                .get(cid)
+                .into_iter()
+                .flatten()
+                .filter(|request| request["status"] == "pending")
+                .cloned()
+                .collect::<Vec<_>>();
             return ok_json(json!({
                 "state": state,
                 "pendingLeafRecoveryRequests": requests,
                 "pendingResetRequests": pending_reset_requests,
-                "pendingLeaveRequests": [],
+                "pendingLeaveRequests": pending_leave_requests,
                 // Plain `#accountDeletedEntry` refs: the state list carries no `$type`.
                 "accountDeletions": g.account_deletions.get(cid).into_iter().flatten().map(|entry| {
                     let mut entry = entry.clone();
@@ -4849,7 +5211,7 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
         .unwrap()
         .is_empty());
 
-    // Restore consumes every snapshot-bound listRepos page, verifies its
+    // Restore consumes every snapshot-bound listWriters page, verifies its
     // inventory commitment, and reconciles each writer's STAR/oplog head
     // before importing any message.
     bob.db()
@@ -5083,7 +5445,7 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     // member-repository inventory boundary is not an authority denial.
     for status in [400, 404] {
         ds.archive_auth
-            .set_unsigned_space_not_found(Some("com.atproto.space.listRepos"), status);
+            .set_unsigned_space_not_found(Some("com.atproto.space.listWriters"), status);
         let keys = Arc::new(MemKeyStore::new());
         let client = live_client(
             tmp.path(),

@@ -460,7 +460,7 @@ not redundancy — it was verified. Injecting a real
 | Gate | Where | Catches |
 |---|---|---|
 | v1 import isolation | `chat_v2/mod.rs` | `crate::orchestrator` imports |
-| forbidden recovery mechanism | `recovery/mod.rs` | external commits, `force_rejoin` |
+| forbidden recovery mechanism | `recovery/mod.rs` | external commits, external-commit rejoin |
 | no default trait method | `storage/store.rs` | a store method that could silently discard state |
 | physical separation | `storage/mod.rs` | reaching a v1 or OpenMLS store by any path |
 | reference store absent from release | `storage/mod.rs` | `mod memory;` losing its `#[cfg(test)]` |
@@ -785,7 +785,7 @@ The bounded four-rung ladder, refusing skip, descent, and past-top by name;
 **the absence gate**; poisoned-state containment; and the participation gate.
 
 - **The absence gate is the enforcement shape for every "we will never" in this
-  tree.** v1 documents the prohibition *and* ships `force_rejoin_unlocked`, with
+  tree.** v1 documents the prohibition *and* ships an external-commit rejoin helper, with
   700-800 production epochs as the result. The gate walks the tree, has a
   positive control, assembles needles at runtime, and requires every entry to
   carry a reason so a deleter must read why first.

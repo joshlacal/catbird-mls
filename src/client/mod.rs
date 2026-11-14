@@ -123,6 +123,107 @@ pub struct OtcPairingCompletion {
     pub new_epoch_seq: u64,
 }
 
+/// Initiator session handle returned when a new device writes an `otcSession` offer into `OwnerMailbox`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct OtcInitiatedSession {
+    pub session_id_hex: String,
+    pub expires_at_ms: i64,
+    pub initiator_mlkem768_ek_len: u32,
+}
+
+/// Unified account device inventory entry combining `mls-ds` `getOwnDevices` and `OwnerMailbox` device metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct RegisteredDeviceInfo {
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub signature_public_key: Vec<u8>,
+    pub key_id: String,
+    pub auth_generation: i64,
+    pub status: String,
+    pub created_at: String,
+    pub last_active_at: Option<String>,
+    pub dormant_at: Option<String>,
+    pub labyrinth_device_key_hex: Option<String>,
+    pub is_current_device: bool,
+}
+
+/// Per-step result of unified `revoke_device`, including atomic recovery-method rotation outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct DeviceRevocationReport {
+    pub target_device_id: String,
+    pub ds_revoked: bool,
+    pub groups_updated: u32,
+    pub labyrinth_rotated: bool,
+    pub new_epoch_seq: Option<u64>,
+    pub pds_record_deleted: bool,
+    pub rekeyed_recovery_code: Option<String>,
+    pub rekeyed_passkey_ids: Vec<Vec<u8>>,
+}
+
+/// Safety-number & 72-hour hold metadata for a peer mailbox full-chain reset (`repin_peer`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct PeerRepinProposalInfo {
+    pub did: String,
+    pub previous_seq: Option<u64>,
+    pub old_safety_number: Option<String>,
+    pub offered_seq: u64,
+    pub offered_head_hex: String,
+    pub safety_number: String,
+    pub eligible_at_ms: i64,
+    pub hold_remaining_ms: i64,
+}
+
+/// Outcome of `CatbirdMlsClient::leave_conversation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct LeaveConversationOutcome {
+    pub left_immediately: bool,
+    pub leave_request_id: Option<String>,
+    pub rearchived_messages: u32,
+}
+
+/// Encrypted conversation attachment uploaded into the conversation Space (`"{spaceURI}|{repoDID}|{cid}"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct UploadedConversationAttachment {
+    pub locator: String,
+    pub space_uri: String,
+    pub repo_did: String,
+    pub cid: String,
+    pub rkey: String,
+    pub symmetric_key: Vec<u8>,
+    pub iv: Vec<u8>,
+    pub ciphertext_sha256: Vec<u8>,
+    pub ciphertext_size: u64,
+    pub mime_type: String,
+}
+
+/// Decrypted `OwnerMailbox` `readState` record (`MAX` CRDT).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct MailboxReadStateRecord {
+    pub conversation_id: String,
+    pub read_through_seq: u64,
+    pub updated_at: String,
+}
+
+/// Decrypted `OwnerMailbox` `circleOwnerState` record (`swapRecord` CAS).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct CircleOwnerStateDto {
+    pub circle_id: String,
+    pub space_uri: String,
+    pub current_key_version: u64,
+    pub joined_at_version_json: String,
+    pub pending_ops_json: String,
+    pub updated_at: String,
+    pub record_cid: Option<String>,
+}
+
 /// Durable outbox envelope persisted in `labyrinth_queue.payload_bytes` atomically inside
 /// `CatbirdMlsClient::send_message`'s `write_tx` (`Spec §5 I6`, `[CB-30]`, `[CB-22]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,11 +381,13 @@ pub(crate) mod native_client {
     use super::{
         account_db_path, account_did_hash_hex, normalize_account_did, personal_mailbox_space_uri,
         probe_and_check_spaces_eligibility, wipe_pre_cutover_local_artifacts,
-        CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus,
-        LabyrinthRotationExclusion, OtcPairingCompletion, OtcPairingOffer, PlatformChangeEvent,
-        PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest, PlatformHttpResponse,
-        PlatformKeyStore, PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload,
-        SignedPushGatewayRegistration, SpacesEligibilityStatus,
+        CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport, EnrollmentReceipt,
+        LabyrinthBackupStatus, LabyrinthRotationExclusion, MailboxReadStateRecord,
+        OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer, PeerRepinProposalInfo,
+        PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest,
+        PlatformHttpResponse, PlatformKeyStore, PlatformTransport, PreCutoverWipeReport,
+        QueuedLabyrinthArchivePayload, RegisteredDeviceInfo, SignedPushGatewayRegistration,
+        SpacesEligibilityStatus, UploadedConversationAttachment,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
@@ -374,6 +477,9 @@ pub(crate) mod native_client {
         /// Hot sender `MlsGroup` state; own MLS mutations and external `I7` commits evict it.
         cached_groups: Arc<Mutex<std::collections::HashMap<Vec<u8>, MlsGroup>>>,
         outbox_flush_lock: Mutex<()>,
+        pub(super) pending_otc_offer_digits: Mutex<Option<zeroize::Zeroizing<String>>>,
+        #[cfg(feature = "labyrinth")]
+        pending_otc_initiator: Mutex<Option<(String, labyrinth::otc::Initiator, u32, [u8; 32])>>,
         wipe_report: PreCutoverWipeReport,
         #[cfg(any(test, feature = "test-utils", feature = "sim"))]
         offline_archive_for_test: bool,
@@ -543,6 +649,9 @@ pub(crate) mod native_client {
                 cached_group_titles,
                 cached_groups,
                 outbox_flush_lock: Mutex::new(()),
+                pending_otc_offer_digits: Mutex::new(None),
+                #[cfg(feature = "labyrinth")]
+                pending_otc_initiator: Mutex::new(None),
                 wipe_report,
                 #[cfg(any(test, feature = "test-utils", feature = "sim"))]
                 offline_archive_for_test,
@@ -821,9 +930,221 @@ pub(crate) mod native_client {
             if let Ok(mut guard) = self.cached_group_titles.lock() {
                 guard.clear();
             }
+            if let Ok(mut guard) = self.cached_groups.lock() {
+                guard.clear();
+            }
             let _ = self.sync();
             self.notify(PlatformChangeEvent::ConversationsUpdated);
             Ok(())
+        }
+
+        /// Decrypts a push notification wake payload (`OpenMode::PushExtension` semantics)
+        /// and immediately dispatches signed per-leaf `acknowledgeEntries` after local SQLite `COMMIT`.
+        pub fn process_push_wake(
+            &self,
+            wake: crate::push::PushWakePayload,
+        ) -> Result<crate::push::NotificationPreview, MLSError> {
+            struct ClientPushKeystoreAdapter {
+                keystore: Arc<dyn PlatformKeyStore>,
+                has_live_session: bool,
+            }
+            impl crate::push::PushKeystore for ClientPushKeystoreAdapter {
+                fn load_db_key(&self, account_did_hash: String) -> Result<Vec<u8>, MLSError> {
+                    self.keystore.load_or_create_db_key(account_did_hash)
+                }
+                fn load_signature_keypair(
+                    &self,
+                    key_id: String,
+                ) -> Result<Option<Vec<u8>>, MLSError> {
+                    self.keystore.load_signature_keypair(key_id)
+                }
+                fn load_cached_chat_dpop_token(
+                    &self,
+                    account_did_hash: String,
+                ) -> Result<Option<String>, MLSError> {
+                    if let Some(tok) = self
+                        .keystore
+                        .load_cached_chat_dpop_token(account_did_hash)?
+                    {
+                        if !tok.trim().is_empty() {
+                            return Ok(Some(tok));
+                        }
+                    }
+                    if self.has_live_session {
+                        Ok(Some("client-live-signed-session".to_string()))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            }
+
+            struct PrefetchedPushTransport {
+                bundle: crate::push::PushFetchBundle,
+                authorized_by_did:
+                    std::collections::HashMap<String, Vec<crate::push::AuthorizedPeerDeviceKey>>,
+            }
+            impl crate::push::PushFetchTransport for PrefetchedPushTransport {
+                fn fetch_missing_entries(
+                    &self,
+                    _conversation_id: String,
+                    _after_seq: i64,
+                    _chat_dpop_token: String,
+                ) -> Result<crate::push::PushFetchBundle, MLSError> {
+                    Ok(self.bundle.clone())
+                }
+                fn get_authorized_device_keys(
+                    &self,
+                    did: String,
+                    _chat_dpop_token: Option<String>,
+                ) -> Result<Vec<crate::push::AuthorizedPeerDeviceKey>, MLSError> {
+                    Ok(self
+                        .authorized_by_did
+                        .get(&did)
+                        .cloned()
+                        .unwrap_or_default())
+                }
+            }
+
+            let storage_root = PathBuf::from(&self.config.storage_root);
+            let conv_id = wake.conversation_id.clone();
+
+            let mut prefetched_transport: Option<Arc<dyn crate::push::PushFetchTransport>> = None;
+            let hash_matches = wake.recipient_account_hash.is_empty()
+                || wake
+                    .recipient_account_hash
+                    .eq_ignore_ascii_case(&self.account_did_hash);
+            let inline_ok = wake
+                .inline_ciphertext
+                .as_ref()
+                .is_none_or(|ct| crate::push::should_inline_push_ciphertext(ct));
+            if hash_matches && inline_ok {
+                if let (Ok(Some(convo)), Some(canonical_dev_id), Ok((signer, _))) = (
+                    self.db.read_tx(|tx| tx.get_conversation(&conv_id)),
+                    self.canonical_uuid_v4_device_id(),
+                    self.load_enrolled_signer_and_auth_gen(),
+                ) {
+                    if self
+                        .db
+                        .read_tx(|tx| {
+                            tx.get_account_meta(&format!("did_doc:{}", convo.sequencer_did))
+                        })
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        let _ = self.resolve_did_document(&convo.sequencer_did);
+                    }
+                    let after_seq_str = convo.last_seq.to_string();
+                    if let Ok(entries_val) = self.query_signed_chat_ds(
+                        "blue.catbird.chat.getEntries",
+                        &[
+                            ("actorDeviceId", &canonical_dev_id),
+                            ("afterSeq", &after_seq_str),
+                            ("conversationId", &conv_id),
+                            ("limit", "100"),
+                        ],
+                        &canonical_dev_id,
+                        &signer,
+                    ) {
+                        let mut entries = Vec::new();
+                        let mut sender_dids = std::collections::BTreeSet::new();
+                        if let Some(ref s) = wake.sender_did {
+                            if !s.is_empty() {
+                                sender_dids.insert(s.clone());
+                            }
+                        }
+                        if let Some(arr) = entries_val.get("entries").and_then(|v| v.as_array()) {
+                            for entry in arr {
+                                let signed_req = entry.get("signedRequest");
+                                let body =
+                                    signed_req.and_then(|sr| sr.get("body")).unwrap_or(entry);
+                                let mls_bytes = body
+                                    .pointer("/applicationMessage/bytes")
+                                    .or_else(|| body.pointer("/commit/bytes"))
+                                    .and_then(|b| super::chat_wire::json_bytes(b).ok())
+                                    .unwrap_or_default();
+                                let sender_did = body
+                                    .get("actorDid")
+                                    .or_else(|| entry.get("senderDid"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if !sender_did.is_empty() {
+                                    sender_dids.insert(sender_did.clone());
+                                }
+                                entries.push(crate::push::FetchedPushEntry {
+                                    entry_id: entry
+                                        .get("entryId")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    seq: entry
+                                        .get("seq")
+                                        .and_then(|v| v.as_i64())
+                                        .unwrap_or_default(),
+                                    epoch: body
+                                        .pointer("/prior/epoch")
+                                        .or_else(|| entry.get("epoch"))
+                                        .and_then(|v| v.as_i64())
+                                        .unwrap_or(convo.epoch),
+                                    entry_kind: entry
+                                        .get("$type")
+                                        .or_else(|| entry.get("entryKind"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    sender_did,
+                                    mls_bytes,
+                                    signed_request: signed_req
+                                        .and_then(|sr| serde_json::to_vec(sr).ok()),
+                                    sequencer_receipt: entry
+                                        .get("sequencerReceipt")
+                                        .filter(|r| r.is_object())
+                                        .and_then(|r| serde_json::to_vec(r).ok()),
+                                });
+                            }
+                        }
+                        let mut authorized_by_did = std::collections::HashMap::new();
+                        for did in sender_dids {
+                            if let Ok(keys) = self.fetch_and_cache_authorized_pds_device_keys(&did)
+                            {
+                                authorized_by_did.insert(did, keys);
+                            }
+                        }
+                        prefetched_transport = Some(Arc::new(PrefetchedPushTransport {
+                            bundle: crate::push::PushFetchBundle {
+                                entries,
+                                metadata_snapshot: None,
+                                authorized_device_keys: Vec::new(),
+                            },
+                            authorized_by_did,
+                        }));
+                    }
+                }
+            }
+
+            let push_ks: Arc<dyn crate::push::PushKeystore> = Arc::new(ClientPushKeystoreAdapter {
+                keystore: self.keystore.clone(),
+                has_live_session: prefetched_transport.is_some(),
+            });
+            let preview = crate::push::process_push_notification_with_hooks(
+                &storage_root,
+                &self.account_did_hash,
+                push_ks,
+                prefetched_transport,
+                &wake,
+                &self.hooks,
+            )?;
+            if let Ok(mut guard) = self.cached_groups.lock() {
+                guard.clear();
+            }
+            if !preview.fallback_generic && preview.receipt_verified && preview.seq >= 1 {
+                let _ = self.acknowledge_entries_up_to(&conv_id, preview.seq);
+            }
+            self.notify(PlatformChangeEvent::MessagesUpdated {
+                conversation_id: conv_id,
+            });
+            Ok(preview)
         }
 
         /// Close `<did_hash>.db`, remove the account's SQLite files, and purge Keychain items.
@@ -1616,6 +1937,13 @@ pub(crate) mod native_client {
 
         /// Generate a 6-digit One-Time Code (`OTC`) on an enrolled device (`I16` hybrid `CPace + ML-KEM-768`).
         pub fn initiate_otc_pairing(&self) -> Result<OtcPairingOffer, MLSError> {
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
+            #[cfg(feature = "labyrinth")]
+            {
+                self.ensure_native_archive_ready_for_otc_offer()?;
+            }
             let code = self
                 .hooks
                 .with_labyrinth_rng(labyrinth::otc::OneTimeCode::generate)
@@ -1623,17 +1951,90 @@ pub(crate) mod native_client {
             let raw_digits = code.as_str().to_string();
             let formatted_code = code.format_grouped();
             let now_ms = self.hooks.now_ms();
+            let expires_at_ms = now_ms.saturating_add(5 * 60 * 1000);
+            let mut salt = [0u8; 16];
+            self.hooks.fill_bytes(&mut salt);
+            let mut hasher = Sha256::new();
+            hasher.update(b"catbird.otc.offer.v1\0");
+            hasher.update(salt);
+            hasher.update(raw_digits.as_bytes());
+            let code_digest_hex = hex::encode(hasher.finalize());
+            let offer_state = serde_json::json!({
+                "salt_hex": hex::encode(salt),
+                "code_digest_hex": code_digest_hex,
+                "expires_at_ms": expires_at_ms,
+                "attempts": 0_u8,
+            });
             self.db.write_tx(|tx| {
-                tx.put_labyrinth_state("pending_otc_digits", raw_digits.as_bytes(), now_ms)
+                let _ = tx.conn().execute(
+                    "DELETE FROM labyrinth_state WHERE state_key = 'pending_otc_digits'",
+                    [],
+                );
+                tx.put_labyrinth_state(
+                    "pending_otc_offer",
+                    &serde_json::to_vec(&offer_state)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?,
+                    now_ms,
+                )
             })?;
+            *self
+                .pending_otc_offer_digits
+                .lock()
+                .map_err(|_| MLSError::lock_poisoned("pending_otc_offer_digits"))? =
+                Some(zeroize::Zeroizing::new(raw_digits.clone()));
             Ok(OtcPairingOffer {
                 six_digit_code: raw_digits,
                 formatted_code,
             })
         }
 
-        /// Execute the full hybrid PQ `CPace + ephemeral ML-KEM-768` handshake (`I16`) for `six_digit_code`
-        /// and advance epoch `E -> E+1`.
+        /// Start a live 2-device CPace+ML-KEM-768 OTC session as the new device,
+        /// publishing the initiator `otcSession` record into `OwnerMailbox`.
+        pub fn start_otc_pairing(
+            &self,
+            six_digit_code: &str,
+        ) -> Result<OtcInitiatedSession, MLSError> {
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
+            #[cfg(feature = "labyrinth")]
+            {
+                self.start_live_otc_pairing(six_digit_code)
+            }
+            #[cfg(not(feature = "labyrinth"))]
+            {
+                let _ = six_digit_code;
+                Err(MLSError::InvalidState(
+                    "Labyrinth feature is disabled".into(),
+                ))
+            }
+        }
+
+        /// Respond to a live 2-device `otcSession` in `OwnerMailbox` as an enrolled device.
+        /// Enforces the 5-minute TTL and 3-attempt bound on any locally initiated offer.
+        pub fn respond_otc_pairing(
+            &self,
+            session_id_hex: &str,
+            six_digit_code: Option<&str>,
+        ) -> Result<(), MLSError> {
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
+            #[cfg(feature = "labyrinth")]
+            {
+                self.respond_live_otc_pairing(session_id_hex, six_digit_code)
+            }
+            #[cfg(not(feature = "labyrinth"))]
+            {
+                let _ = (session_id_hex, six_digit_code);
+                Err(MLSError::InvalidState(
+                    "Labyrinth feature is disabled".into(),
+                ))
+            }
+        }
+
+        /// Complete a hybrid PQ `CPace + ephemeral ML-KEM-768` OTC handshake (`I16`)
+        /// over `OwnerMailbox` (`otcSession`) and advance epoch `E -> E+1`.
         pub fn complete_otc_pairing(
             &self,
             six_digit_code: &str,
@@ -1644,89 +2045,123 @@ pub(crate) mod native_client {
             let parsed = labyrinth::otc::OneTimeCode::parse(six_digit_code)
                 .map_err(|_| MLSError::invalid_input("invalid 6-digit OTC code"))?;
 
-            let (initiator, init_msg) = self
-                .hooks
-                .with_labyrinth_rng(|| {
-                    labyrinth::otc::Initiator::start(&parsed, &self.normalized_did)
-                })
-                .map_err(|e| MLSError::Cryptography(format!("OTC Initiator::start: {e}")))?;
-            let ek_len = init_msg.ek_otc.len() as u32;
-            let sid = init_msg.sid.to_vec();
+            #[cfg(feature = "labyrinth")]
+            {
+                let has_pending_live = self
+                    .pending_otc_initiator
+                    .lock()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if has_pending_live {
+                    return self.complete_live_otc_pairing(parsed.as_str());
+                }
+                #[cfg(not(any(test, feature = "test-utils", feature = "sim")))]
+                {
+                    Err(MLSError::InvalidState(
+                        "No pending live OTC initiator session; call start_otc_pairing on this device and respond_otc_pairing on an enrolled device first".into(),
+                    ))
+                }
+                #[cfg(any(test, feature = "test-utils", feature = "sim"))]
+                if !self.offline_archive_for_test {
+                    return Err(MLSError::InvalidState(
+                        "No pending live OTC initiator session; call start_otc_pairing on this device and respond_otc_pairing on an enrolled device first".into(),
+                    ));
+                }
+            }
 
-            let expected_code = self.db.read_tx(|tx| {
-                let maybe = tx.get_labyrinth_state("pending_otc_digits")?;
-                Ok(maybe.and_then(|b| String::from_utf8(b).ok()))
-            })?;
-            let responder_code = match expected_code {
-                Some(stored) => labyrinth::otc::OneTimeCode::parse(&stored)
-                    .map_err(|e| MLSError::Internal(format!("stored OTC invalid: {e}")))?,
-                None => parsed.clone(),
-            };
-
-            let mut responder =
-                labyrinth::otc::Responder::new(responder_code, &self.normalized_did);
-            let (resp_msg, resp_key) = self
-                .hooks
-                .with_labyrinth_rng(|| responder.respond(&init_msg))
-                .map_err(|e| MLSError::Cryptography(format!("OTC Responder::respond: {e}")))?;
-            let ct_len = resp_msg.kem_ct.len() as u32;
-            let init_key = initiator
-                .finish(&resp_msg)
-                .map_err(|e| MLSError::Cryptography(format!("OTC Initiator::finish: {e}")))?;
-
-            if init_key.as_bytes() != resp_key.as_bytes() {
-                return Err(MLSError::insufficient_permissions(
-                    "hybrid PQ CPace + ML-KEM-768 OTC code mismatch",
+            #[cfg(not(feature = "labyrinth"))]
+            {
+                let _ = parsed;
+                return Err(MLSError::InvalidState(
+                    "Labyrinth feature is disabled".into(),
                 ));
             }
 
-            let now_ms = self.hooks.now_ms();
-            #[cfg(feature = "labyrinth")]
-            let rotated_remote = self.rotate_native_archive(None)?;
-            let new_epoch_seq = self.db.write_tx(|tx| {
-                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
-                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
-                })?;
-                let mut st: LabyrinthBackupStatus =
-                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+            #[cfg(all(
+                feature = "labyrinth",
+                any(test, feature = "test-utils", feature = "sim")
+            ))]
+            {
+                let stored = self
+                    .pending_otc_offer_digits
+                    .lock()
+                    .map_err(|_| MLSError::lock_poisoned("pending_otc_offer_digits"))?
+                    .take()
+                    .ok_or_else(|| {
+                        MLSError::InvalidState("No active offline test OTC offer".into())
+                    })?;
+                let responder_code = labyrinth::otc::OneTimeCode::parse(stored.as_str())
+                    .map_err(|e| MLSError::Internal(format!("stored OTC invalid: {e}")))?;
+                let (initiator, init_msg) = self
+                    .hooks
+                    .with_labyrinth_rng(|| {
+                        labyrinth::otc::Initiator::start(&parsed, &self.normalized_did)
+                    })
+                    .map_err(|e| MLSError::Cryptography(format!("OTC Initiator::start: {e}")))?;
+                let ek_len = init_msg.ek_otc.len() as u32;
+                let sid = init_msg.sid.to_vec();
+                let mut responder =
+                    labyrinth::otc::Responder::new(responder_code, &self.normalized_did);
+                let (resp_msg, resp_key) = self
+                    .hooks
+                    .with_labyrinth_rng(|| responder.respond(&init_msg))
+                    .map_err(|e| MLSError::Cryptography(format!("OTC Responder::respond: {e}")))?;
+                let ct_len = resp_msg.kem_ct.len() as u32;
+                let init_key = initiator
+                    .finish(&resp_msg)
+                    .map_err(|e| MLSError::Cryptography(format!("OTC Initiator::finish: {e}")))?;
+                if init_key.as_bytes() != resp_key.as_bytes() {
+                    return Err(MLSError::insufficient_permissions(
+                        "hybrid PQ CPace + ML-KEM-768 OTC code mismatch",
+                    ));
+                }
+                let now_ms = self.hooks.now_ms();
                 #[cfg(feature = "labyrinth")]
-                {
-                    st.epoch_seq = rotated_remote.new_epoch;
-                    st.rotation_exclusions = rotated_remote.exclusions.clone();
-                }
-                #[cfg(not(feature = "labyrinth"))]
-                {
-                    st.epoch_seq = st.epoch_seq.saturating_add(1);
-                }
-                if !st.active_device_ids.contains(&self.config.device_id) {
-                    st.active_device_ids.push(self.config.device_id.clone());
-                }
-                tx.upsert_mutation_journal(&MutationJournalRow {
-                    journal_id: format!("otc-epoch-{}", st.epoch_seq),
-                    op_type: "epoch_rotation".to_string(),
-                    epoch_seq: st.epoch_seq,
-                    state_json: serde_json::json!({ "trigger": "otc_pq_pairing" }).to_string(),
-                    status: "completed".to_string(),
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
+                let rotated_remote = self.rotate_native_archive(None)?;
+                let new_epoch_seq = self.db.write_tx(|tx| {
+                    let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                        MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                    })?;
+                    let mut st: LabyrinthBackupStatus = serde_json::from_slice(&raw)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?;
+                    #[cfg(feature = "labyrinth")]
+                    {
+                        st.epoch_seq = rotated_remote.new_epoch;
+                        st.rotation_exclusions = rotated_remote.exclusions.clone();
+                    }
+                    #[cfg(not(feature = "labyrinth"))]
+                    {
+                        st.epoch_seq = st.epoch_seq.saturating_add(1);
+                    }
+                    if !st.active_device_ids.contains(&self.config.device_id) {
+                        st.active_device_ids.push(self.config.device_id.clone());
+                    }
+                    tx.upsert_mutation_journal(&MutationJournalRow {
+                        journal_id: format!("otc-epoch-{}", st.epoch_seq),
+                        op_type: "epoch_rotation".to_string(),
+                        epoch_seq: st.epoch_seq,
+                        state_json: serde_json::json!({ "trigger": "otc_pq_pairing" }).to_string(),
+                        status: "completed".to_string(),
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                    })?;
+                    tx.put_labyrinth_state(
+                        "status_json",
+                        &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
+                        now_ms,
+                    )?;
+                    Ok(st.epoch_seq)
                 })?;
-                tx.put_labyrinth_state(
-                    "status_json",
-                    &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
-                    now_ms,
-                )?;
-                Ok(st.epoch_seq)
-            })?;
-
-            self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
-                epoch_seq: new_epoch_seq,
-            });
-            Ok(OtcPairingCompletion {
-                session_id: sid,
-                initiator_mlkem768_ek_len: ek_len,
-                responder_mlkem768_ct_len: ct_len,
-                new_epoch_seq,
-            })
+                self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
+                    epoch_seq: new_epoch_seq,
+                });
+                Ok(OtcPairingCompletion {
+                    session_id: sid,
+                    initiator_mlkem768_ek_len: ek_len,
+                    responder_mlkem768_ct_len: ct_len,
+                    new_epoch_seq,
+                })
+            }
         }
 
         /// Revoke a peer Labyrinth device and rotate mailbox epoch `E -> E+1`.
@@ -1784,7 +2219,7 @@ pub(crate) mod native_client {
             Ok(status)
         }
 
-        /// Import verified Space history messages into local `<did_hash>.db` (`I13`).
+        /// Import Space history messages into local `<did_hash>.db` (`I13`).
         /// History does not advance the live entry cursor: missing messages and MLS commits
         /// before the imported sequence must still be reconciled by `sync`.
         pub fn import_conversation_history(
@@ -1799,6 +2234,40 @@ pub(crate) mod native_client {
                         return Err(MLSError::invalid_input(
                             "history message conversation_id mismatch",
                         ));
+                    }
+                    if msg.message_id.trim().is_empty() || msg.seq < 0 {
+                        return Err(MLSError::invalid_input(
+                            "history message requires non-empty message_id and non-negative seq",
+                        ));
+                    }
+                    normalize_account_did(&msg.sender_did)?;
+                    if let Some(raw_del) = tx.get_labyrinth_state(
+                        &super::chat_wire::account_deletion_key(conversation_id, &msg.sender_did),
+                    )? {
+                        let deleted_seq = std::str::from_utf8(&raw_del)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(i64::MAX);
+                        if msg.seq <= deleted_seq {
+                            continue;
+                        }
+                    }
+                    if let Some(retained) = tx.get_labyrinth_state(&format!(
+                        "native.message:{conversation_id}:{}",
+                        msg.message_id
+                    ))? {
+                        let ev: serde_json::Value = serde_json::from_slice(&retained)
+                            .map_err(|e| MLSError::Cryptography(format!("retained archive evidence: {e}")))?;
+                        if ev["sender_did"].as_str().is_some_and(|s| s != msg.sender_did.as_str())
+                            || ev["plaintext_json"]
+                                .as_str()
+                                .is_some_and(|p| p != msg.plaintext_json.as_str())
+                        {
+                            return Err(MLSError::Cryptography(
+                                "history message contradicts retained authenticated archive evidence"
+                                    .into(),
+                            ));
+                        }
                     }
                     let gap_key = super::chat_wire::undecryptable_evidence_key(
                         conversation_id,
@@ -1870,6 +2339,17 @@ pub(crate) mod native_client {
         }
 
         #[cfg(not(feature = "labyrinth"))]
+        pub fn restore_with_passkey_prf(
+            &self,
+            _credential_id: Vec<u8>,
+            _prf_output_32: Vec<u8>,
+        ) -> Result<LabyrinthBackupStatus, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
         pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
             Ok(0)
         }
@@ -1886,6 +2366,152 @@ pub(crate) mod native_client {
             &self,
             _conversation_id: &str,
         ) -> Result<u32, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn verify_and_reindex_history(&self, _conversation_id: &str) -> Result<u32, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn propose_peer_repin(
+            &self,
+            _peer_did: &str,
+        ) -> Result<PeerRepinProposalInfo, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn repin_peer(
+            &self,
+            _peer_did: &str,
+            _confirmed_head: Vec<u8>,
+        ) -> Result<(), MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn upload_conversation_attachment(
+            &self,
+            _conversation_id: &str,
+            _plaintext: Vec<u8>,
+            _mime_type: String,
+        ) -> Result<UploadedConversationAttachment, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn get_read_state(
+            &self,
+            _conversation_id: &str,
+        ) -> Result<Option<MailboxReadStateRecord>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn advance_read_state(
+            &self,
+            _conversation_id: &str,
+            _candidate_seq: u64,
+        ) -> Result<MailboxReadStateRecord, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn list_read_states(&self) -> Result<Vec<MailboxReadStateRecord>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn get_circle_owner_state(
+            &self,
+            _circle_id: &str,
+        ) -> Result<Option<CircleOwnerStateDto>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn put_circle_owner_state(
+            &self,
+            _state: CircleOwnerStateDto,
+            _swap_record_cid: Option<String>,
+        ) -> Result<String, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn merge_circle_owner_state(
+            &self,
+            _update: CircleOwnerStateDto,
+        ) -> Result<CircleOwnerStateDto, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn clear_circle_acl_tombstone(
+            &self,
+            _circle_id: &str,
+            _member_did: &str,
+        ) -> Result<Option<CircleOwnerStateDto>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn list_circle_owner_states(&self) -> Result<Vec<CircleOwnerStateDto>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn delete_account_data(&self) -> Result<(), MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn retire_current_device(&self) -> Result<(), MLSError> {
+            self.sign_out_and_wipe()
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn list_devices(&self) -> Result<Vec<RegisteredDeviceInfo>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn revoke_device(
+            &self,
+            _target_device_id: &str,
+        ) -> Result<DeviceRevocationReport, MLSError> {
             Err(MLSError::InvalidState(
                 "Labyrinth feature is disabled".to_string(),
             ))

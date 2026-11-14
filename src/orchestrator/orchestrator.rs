@@ -784,7 +784,7 @@ where
                             );
                             // Layer 3: when rehydrating Quarantined, also mirror
                             // the state into RecoveryTracker so the in-memory
-                            // gates (should_skip / send preflight / force_rejoin
+                            // gates (should_skip / send preflight / external-rejoin
                             // guard) fire after restart. Without this mirror the
                             // gates only consult the tracker map and miss the
                             // persisted state.

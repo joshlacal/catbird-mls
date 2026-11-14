@@ -1072,6 +1072,7 @@ mod tests {
 
     #[cfg(feature = "labyrinth")]
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn gf32_columns_match_recovery_code_generator_and_triple_erasures() {
         use labyrinth::recovery_code::{RecoveryCode, ALPHABET, ENTROPY_LEN};
 

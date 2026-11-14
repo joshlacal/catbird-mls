@@ -216,7 +216,7 @@ where
                 Some(ConversationState::NeedsRejoin) => {
                     drop(transition_guard);
                     // P0.2: do not re-project NeedsRejoin (which drives
-                    // force_rejoin -> External Commit -> epoch inflation) when
+                    // external-rejoin -> External Commit -> epoch inflation) when
                     // the local group is cryptographically healthy. Clear the
                     // stale flag instead.
                     if self.clear_needs_rejoin_if_locally_healthy(&convo_id).await {

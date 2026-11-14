@@ -1,0 +1,35 @@
+{
+  "$type": "blue.catbird.circle.post",
+  "circleId": "3kcircleid22a",
+  "keyVersion": 2,
+  "createdAt": "2026-11-07T12:05:00.000Z",
+  "reply": {
+    "root": {
+      "uri": "at://did:plc:owner0000000000000000/blue.catbird.circle.post/3kroot2222222",
+      "cid": "bafyreib2rxk3rybk3aobmv5cjuql3bqhjcswcmmuq2hecwgwfyvkdwhm3a"
+    },
+    "parent": {
+      "uri": "at://did:plc:author0000000000000000/blue.catbird.circle.post/3kparent22222",
+      "cid": "bafyreigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+    }
+  },
+  "ciphertext": {
+    "$bytes": "AgV1F8Zo9S05TAv9UD8JyVDt5H0p6yKTZQlkenMIPSxvc9CcwNoSrEK2j+7x5ZPppH3Qmd73ZMVDlxDSyF90QplzfV9VBOhdsuMLUku/wlugr71loCw3Cwr9K/zV8WvBetOMp/WEMq7UjrxhrVW8F07Krd4SbMgztS/7VG/aA10ebpxOWZeKOJLatCawDHrMkrniWz1BXmSNtw4ZpFwvSRtxPMBX6BzoO8rNB603JmbL/EnsAJbKLpKBsoHfn8jHkAmw7tQeU33TYFKcbszz/u43G2SiyrFUxdcOGvYAFjObowBhLP45NITWDmFfI5qwZH2xRN4542zj5Nlvz0XT09o5iWV6R3pyLQilb8HmYzg90blOx/s01uolHOdXiIF0FShhsFpZ0RVEdpsNUps9AhvI0lGxJ0eF6sBc9fBiEj5OVAykBGBmIRQs7rJknEjDkWN9JJjPbz70J8MQ1/fd7dCEOHg//sBeotNJquJDXPt6U4ehcJgEOJOj0mSAFTiOg/76RhGQ70DGFJXEbWKB2uvDtHPCZzxuY+PxSGfVAY5+8asDch/XtdjQ5Dx/vyZnknKNjd2iYY9u5sm9FVOwwThTDYZtWWXsXdzzr/KNY763YZWjN9ss27QXmp4nZMlbGvUCums4ush8bMV4LZ3PlooTYeZcVzuy/t89WiTgvlmeNofaEqwNF7+0W7z6y3Pv/gPN2R64rpW0UEvgOSBLQC8O30dUJa5LveWsWNnfkjws3rb1q91EFZ9J5iopWxbXgyVL1rZ7NfRdfiCyMMWq385Qgl3QG7Nh"
+  },
+  "sig": {
+    "$bytes": "izDidPmiAFvqoydTiEPy0+utWbNXOxdDEIpVYAY7JJ9X9WiXJltuS2hcv+AZYyEOLwKncQEzAehL5bBtb0D+Rw"
+  },
+  "authorEpochHead": {
+    "$bytes": "s2/HTG2drL6R+chiLpM6BrfEZ57Ym8EmbPF8kk9TLMs"
+  },
+  "attachments": [
+    {
+      "$type": "blob",
+      "ref": {
+        "$link": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+      },
+      "mimeType": "application/octet-stream",
+      "size": 48211
+    }
+  ]
+}

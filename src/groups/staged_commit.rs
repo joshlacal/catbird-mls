@@ -1,9 +1,9 @@
-//! Staged-commit sequencing guard (`Spec §5 I5`: server acceptance strictly precedes local merge).
+//! Staged-commit sequencing guard (`Spec §5 I3`: server acceptance strictly precedes local merge).
 
 use crate::MLSError;
 
 /// Tracks a locally staged MLS `Commit` awaiting authoritative sequencing acknowledgment
-/// from `mls-ds` (`I5`). Merging locally before `mark_server_accepted` is rejected.
+/// from `mls-ds` (`I3`). Merging locally before `mark_server_accepted` is rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedCommitTicket {
     pub conversation_id: String,
@@ -25,7 +25,7 @@ impl StagedCommitTicket {
     pub fn mark_server_accepted(&mut self, assigned_seq: i64) -> Result<(), MLSError> {
         if assigned_seq <= 0 {
             return Err(MLSError::invalid_input(
-                "I5: server-assigned seq must be strictly positive",
+                "I3: server-assigned seq must be strictly positive",
             ));
         }
         self.server_accepted_seq = Some(assigned_seq);
@@ -35,7 +35,7 @@ impl StagedCommitTicket {
     pub fn ensure_ready_to_merge(&self) -> Result<i64, MLSError> {
         self.server_accepted_seq.ok_or_else(|| {
             MLSError::InvalidState(format!(
-                "I5 violation: attempted to merge staged commit for {} (epoch {}) before server acknowledgment",
+                "I3 violation: attempted to merge staged commit for {} (epoch {}) before server acknowledgment",
                 self.conversation_id, self.target_epoch
             ))
         })

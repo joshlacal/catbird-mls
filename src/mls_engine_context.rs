@@ -5172,7 +5172,7 @@ impl MLSContext {
                 }
             } else if epoch_after <= epoch_before {
                 // BENIGN no-op, not a data-plane bug: this is the own-commit merge
-                // path. After an External Commit (force_rejoin), OpenMLS `finalize()`
+                // path. After an External Commit rejoin, OpenMLS `finalize()`
                 // has already merged the commit, so the follow-up `merge_pending_commit`
                 // lands at the same epoch. Logging this as CRITICAL has repeatedly
                 // misdirected epoch-stall debugging. The authoritative "epoch must

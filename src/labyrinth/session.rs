@@ -4,15 +4,16 @@ use std::sync::Arc;
 
 use labyrinth::client::{
     delete_account_remote, Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport,
-    RecoveryMethod, RedactedMessage, RepinProposal, RosterExclusion, RotationReport, ThreadCursor,
-    ThreadList,
+    RecoveryMethod, RedactedMessage, RepinProposal, ResolvedRoster, RosterExclusion,
+    RotationReport, ThreadCursor, ThreadList,
 };
+use labyrinth::mailbox::{EpochPublic, MailboxKeys};
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PublicRepoBackend};
 use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, SpaceRpc};
 use labyrinth::store::{
-    ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend, MaybeSync,
-    MemberDeviceKey, SequencerReceiptKey, TimeRange,
+    keys_valid_for, ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend,
+    MaybeSync, MemberDeviceKey, SequencerReceiptKey, ThreadStore, TimeRange, VouchAt,
 };
 use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
@@ -33,17 +34,26 @@ pub struct RotationExclusion {
     pub recovery_method: Option<Mechanism>,
 }
 
-/// A rotation result whose exclusions remain visible to native clients.
+/// A rotation result whose exclusions and re-keyed recovery methods remain visible to native clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRotationReport {
     pub new_epoch: u64,
     pub exclusions: Vec<RotationExclusion>,
+    pub rekeyed_recovery_code: Option<String>,
+    pub rekeyed_passkeys: Vec<[u8; 16]>,
 }
 
 fn rotation_report(
     report: RotationReport,
     recovery_methods: &[RecoveryMethod],
 ) -> SessionRotationReport {
+    let rekeyed_recovery_code = report.rekeyed_recovery.map(|setup| setup.code.to_string());
+    let rekeyed_passkeys = report
+        .invalidated_recovery_methods
+        .iter()
+        .filter(|m| m.mechanism == Mechanism::Passkey)
+        .map(|m| m.vdevice_id)
+        .collect();
     let exclusions = report
         .excluded
         .into_iter()
@@ -70,6 +80,13 @@ fn rotation_report(
                         "chat-device-not-current"
                     }
                     labyrinth::client::ExclusionReason::RecoveryExpired => "recovery-expired",
+                    labyrinth::client::ExclusionReason::MissingRecoveryBundle => {
+                        "missing-recovery-bundle"
+                    }
+                    labyrinth::client::ExclusionReason::InvalidRecoveryBundle => {
+                        "invalid-recovery-bundle"
+                    }
+                    labyrinth::client::ExclusionReason::UnsignedRevocation => "unsigned-revocation",
                 }
                 .into(),
                 recovery_method,
@@ -79,6 +96,8 @@ fn rotation_report(
     SessionRotationReport {
         new_epoch: report.new_epoch,
         exclusions,
+        rekeyed_recovery_code,
+        rekeyed_passkeys,
     }
 }
 
@@ -115,6 +134,22 @@ pub trait LocalConversationAuthority: MaybeSend + MaybeSync {
     /// anchored at an applied conversation entry.
     async fn leaf_keys(&self, conversation_id: &str, did: &str) -> Result<Option<LocalLeafKeys>> {
         let _ = (conversation_id, did);
+        Ok(None)
+    }
+
+    /// `did`'s Ed25519 chat device signing keys verified against `did`'s PDS
+    /// `blue.catbird.chat.device` repository records (`#atproto` commit proof).
+    /// `None` when PDS device verification is not configured on this authority.
+    async fn authorized_chat_device_keys(&self, did: &str) -> Result<Option<Vec<[u8; 32]>>> {
+        let _ = did;
+        Ok(None)
+    }
+
+    /// `did`'s live leaf signing keys across active local MLS groups shared with
+    /// this device. Every such leaf must be present and non-revoked in any
+    /// device-key directory response for `did`.
+    async fn shared_group_leaf_keys(&self, did: &str) -> Result<Option<Vec<[u8; 32]>>> {
+        let _ = did;
         Ok(None)
     }
 }
@@ -165,7 +200,39 @@ impl MailboxDirectory for LocallyCheckedDirectory {
     }
 
     async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
-        self.inner.device_transport_keys(did).await
+        let mut reported = self.inner.device_transport_keys(did).await?;
+        if let Some(allowed) = self
+            .authority
+            .authorized_chat_device_keys(did)
+            .await
+            .map_err(|error| {
+                labyrinth::Error::Backend(format!("authorized PDS devices: {error}"))
+            })?
+        {
+            let allowed_set: std::collections::BTreeSet<[u8; 32]> = allowed.into_iter().collect();
+            reported.retain(|entry| allowed_set.contains(&entry.key));
+        }
+        if let Some(shared_leaves) = self
+            .authority
+            .shared_group_leaf_keys(did)
+            .await
+            .map_err(|error| labyrinth::Error::Backend(format!("shared MLS leaves: {error}")))?
+        {
+            let active_reported: std::collections::BTreeSet<[u8; 32]> = reported
+                .iter()
+                .filter(|entry| entry.removed_at.is_none())
+                .map(|entry| entry.key)
+                .collect();
+            for leaf_key in shared_leaves {
+                if !active_reported.contains(&leaf_key) {
+                    return Err(labyrinth::Error::Backend(
+                        "chat device directory omits or revokes a live shared MLS group leaf"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(reported)
     }
 
     async fn member_device_keys(
@@ -327,31 +394,39 @@ impl SessionDeps {
         )
     }
 
-    fn backends(&self, _placement: Placement) -> Result<Backends> {
-        let space_rpc = self.space.clone().ok_or_else(space_unreachable)?;
-        let space_mb = self.space_store().ok_or_else(space_unreachable)?;
-        let ds_arc = Arc::new(self.ds_directory());
-
-        let (directory, publishers): (Box<dyn MailboxDirectory>, Vec<Box<dyn KeyPublisher>>) =
-            match &self.pds {
-                Some(pds) => (
-                    Box::new(CompositeDirectory::new(
-                        Box::new(PdsDirectory::new(pds.clone())),
-                        Box::new(self.ds_directory()),
-                    )),
-                    vec![Box::new(self.ds_directory())],
-                ),
-                None => (Box::new(self.ds_directory()), Vec::new()),
-            };
-        let directory: Box<dyn MailboxDirectory> = match &self.local_authority {
+    /// The epoch directory: `CompositeDirectory` (PDS `mailboxKeys` cross-checked
+    /// against the DS head chain) when a PDS backend is configured, else the DS.
+    fn directory(&self) -> Box<dyn MailboxDirectory> {
+        let directory: Box<dyn MailboxDirectory> = match &self.pds {
+            Some(pds) => Box::new(CompositeDirectory::new(
+                Box::new(PdsDirectory::new(pds.clone())),
+                Box::new(self.ds_directory()),
+            )),
+            None => Box::new(self.ds_directory()),
+        };
+        match &self.local_authority {
             Some(authority) => Box::new(LocallyCheckedDirectory {
                 inner: directory,
                 authority: authority.clone(),
             }),
             None => directory,
+        }
+    }
+
+    fn backends(&self, _placement: Placement) -> Result<Backends> {
+        let space_rpc = self.space.clone().ok_or_else(space_unreachable)?;
+        let space_mb = self.space_store().ok_or_else(space_unreachable)?;
+        let ds_arc = Arc::new(self.ds_directory());
+
+        let directory = self.directory();
+        let publishers: Vec<Box<dyn KeyPublisher>> = match &self.pds {
+            Some(_) => vec![Box::new(self.ds_directory())],
+            None => Vec::new(),
         };
 
+        let persisted_floors = Self::load_writer_rev_floors(&*self.placements, &self.did);
         let mailbox: Box<dyn MailboxStore> = Box::new(SpaceMailbox::new(space_mb, Some(ds_arc)));
+        mailbox.seed_writer_rev_floors(&persisted_floors);
         let threads = Box::new(ResolvingSpaceThreadStore::new(
             &self.did,
             space_rpc,
@@ -359,6 +434,7 @@ impl SessionDeps {
             self.placements.clone(),
             self.default_conversation_authority_did.clone(),
         ));
+        threads.seed_writer_rev_floors(&persisted_floors);
 
         Ok(Backends {
             mailbox,
@@ -367,6 +443,102 @@ impl SessionDeps {
             publishers,
             clock: Box::new(TransportClock(self.transport.clone())),
         })
+    }
+
+    pub(crate) fn writer_rev_floors_key(did: &str) -> String {
+        format!("writer_rev_floors:{did}")
+    }
+
+    pub(crate) fn load_writer_rev_floors(
+        placements: &dyn StateVault,
+        did: &str,
+    ) -> std::collections::BTreeMap<(String, String), String> {
+        let key = Self::writer_rev_floors_key(did);
+        let Ok(Some(raw)) = placements.load(&key) else {
+            return std::collections::BTreeMap::new();
+        };
+        let Ok(entries) = serde_json::from_slice::<Vec<(String, String, String)>>(&raw) else {
+            return std::collections::BTreeMap::new();
+        };
+        entries
+            .into_iter()
+            .map(|(space, writer, rev)| ((space, writer), rev))
+            .collect()
+    }
+
+    pub(crate) fn persist_writer_rev_floors(
+        placements: &dyn StateVault,
+        did: &str,
+        floors: &std::collections::BTreeMap<(String, String), String>,
+    ) {
+        let key = Self::writer_rev_floors_key(did);
+        let mut merged = Self::load_writer_rev_floors(placements, did);
+        let mut changed = false;
+        for ((space, writer), rev) in floors {
+            let entry = merged.entry((space.clone(), writer.clone()));
+            match entry {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(rev.clone());
+                    changed = true;
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if rev.as_str() > o.get().as_str() {
+                        o.insert(rev.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+        let encoded: Vec<(String, String, String)> =
+            merged.into_iter().map(|((s, w), r)| (s, w, r)).collect();
+        if let Ok(bytes) = serde_json::to_vec(&encoded) {
+            let current = placements.load(&key).ok().flatten();
+            let _ = placements.compare_exchange(&key, current.as_deref(), &bytes);
+        }
+    }
+
+    /// Creates a standalone `ResolvingSpaceThreadStore` seeded with persisted `writer_rev_floors`.
+    pub fn resolving_thread_store(&self) -> Result<ResolvingSpaceThreadStore> {
+        let space_rpc = self.space.clone().ok_or_else(space_unreachable)?;
+        let floors = Self::load_writer_rev_floors(&*self.placements, &self.did);
+        let store = ResolvingSpaceThreadStore::new(
+            &self.did,
+            space_rpc,
+            Some(self.transport.clone()),
+            self.placements.clone(),
+            self.default_conversation_authority_did.clone(),
+        );
+        store.seed_writer_rev_floors(&floors);
+        Ok(store)
+    }
+
+    /// Opens a standalone `SpaceMailbox` seeded with persisted `writer_rev_floors`.
+    pub fn open_mailbox_store(&self) -> Result<SpaceMailbox> {
+        let space_mb = self.space_store().ok_or_else(space_unreachable)?;
+        let ds_arc = Arc::new(self.ds_directory());
+        let floors = Self::load_writer_rev_floors(&*self.placements, &self.did);
+        let mailbox = SpaceMailbox::new(space_mb, Some(ds_arc));
+        mailbox.seed_writer_rev_floors(&floors);
+        Ok(mailbox)
+    }
+
+    /// Lists non-virtual device records currently stored in the account's `OwnerMailbox` Space.
+    pub async fn list_mailbox_devices(&self) -> Result<Vec<labyrinth::records::Device>> {
+        let space_mb = self.space_store().ok_or_else(space_unreachable)?;
+        let ds_arc = Arc::new(self.ds_directory());
+        let floors = Self::load_writer_rev_floors(&*self.placements, &self.did);
+        let mailbox = SpaceMailbox::new(space_mb, Some(ds_arc));
+        mailbox.seed_writer_rev_floors(&floors);
+        let devices = mailbox.list_devices().await.map_err(map_error)?;
+        Self::persist_writer_rev_floors(
+            &*self.placements,
+            &self.did,
+            &mailbox.export_writer_rev_floors(),
+        );
+        Ok(devices)
     }
 
     fn saved_placement(&self) -> Result<Placement> {
@@ -574,6 +746,7 @@ impl SessionDeps {
         persisted: Option<Zeroizing<Vec<u8>>>,
     ) -> LabyrinthSession {
         let persisted = Arc::new(std::sync::Mutex::new(persisted));
+        let directory = Arc::from(self.directory());
         lab.set_state_sink(Box::new(VaultStateSink {
             did: self.did.clone(),
             vault: self.vault.clone(),
@@ -583,6 +756,7 @@ impl SessionDeps {
             did: self.did.clone(),
             transport_key: self.signer.public_key(),
             lab,
+            directory,
             fault,
             vault: self.vault,
             placements: self.placements,
@@ -678,6 +852,153 @@ impl SessionDeps {
         s.save()?;
         Ok(s)
     }
+
+    /// Enrolls this device from a WebAuthn Passkey PRF secret (`Gate 3` atomic enrollment).
+    pub async fn restore_with_passkey_prf(
+        self,
+        credential_id: &[u8],
+        prf_output_32: &[u8],
+    ) -> Result<LabyrinthSession> {
+        let placement = self.probe_placement().await?;
+        let fault = SignerFault::default();
+        let restored = Labyrinth::restore_with_passkey(
+            &self.did,
+            prf_output_32,
+            credential_id,
+            self.transport_signer(&fault),
+            self.backends(placement)?,
+        )
+        .await;
+        surface(&fault)?;
+        let (lab, enrollment) = restored.map_err(map_error)?;
+        self.save_placement(placement)?;
+        let existing = self
+            .vault
+            .load_zeroizing(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        let mut s = self.session(lab, fault, existing);
+        s.recovery_method_stale = enrollment.stale_recovery_method;
+        if let Some(error) = enrollment.unfinished {
+            s.note_directory_publication(&Err(error));
+        }
+        s.save()?;
+        Ok(s)
+    }
+
+    /// Starts a live 2-device CPace+ML-KEM-768 OTC session as the new device,
+    /// writing the initiator offer record to the account's `OwnerMailbox` Space.
+    pub async fn start_otc_session(
+        &self,
+        six_digit_code: &str,
+        now_ms: u64,
+    ) -> Result<(labyrinth::otc::Initiator, String, u64, u32)> {
+        let space_mb = self.space_store().ok_or_else(space_unreachable)?;
+        let ds_arc = Arc::new(self.ds_directory());
+        let floors = Self::load_writer_rev_floors(&*self.placements, &self.did);
+        let mailbox = SpaceMailbox::new(space_mb, Some(ds_arc));
+        mailbox.seed_writer_rev_floors(&floors);
+        let (initiator, msg) =
+            Labyrinth::otc_start(&self.did, six_digit_code).map_err(map_error)?;
+        let ek_len = msg.ek_otc.len() as u32;
+        let session_id_hex = hex::encode(msg.sid);
+        let expires_at_ms = now_ms.saturating_add(5 * 60 * 1000);
+        let record = labyrinth::records::OtcSession {
+            type_: labyrinth::records::nsid::OTC_SESSION.into(),
+            session_id: session_id_hex.clone(),
+            initiator_device_key_pubkey: labyrinth::records::Bytes(
+                self.signer.public_key().to_vec(),
+            ),
+            ya: labyrinth::records::Bytes(msg.ya.to_vec()),
+            ek_otc: labyrinth::records::Bytes(msg.ek_otc),
+            yb: None,
+            kem_ct: None,
+            sealed_payload: None,
+            expires_at: labyrinth::records::datetime_from_ms(expires_at_ms),
+            created_at: labyrinth::records::datetime_from_ms(now_ms),
+        };
+        mailbox.put_otc_session(&record).await.map_err(map_error)?;
+        Self::persist_writer_rev_floors(
+            &*self.placements,
+            &self.did,
+            &mailbox.export_writer_rev_floors(),
+        );
+        Ok((initiator, session_id_hex, expires_at_ms, ek_len))
+    }
+
+    /// Completes a live 2-device OTC session on the new device once an already
+    /// enrolled device has written the responder half into `OwnerMailbox`.
+    pub async fn complete_otc_session(
+        self,
+        initiator: labyrinth::otc::Initiator,
+        session_id_hex: &str,
+        now_ms: u64,
+    ) -> Result<(LabyrinthSession, u64, u32)> {
+        use sha2::{Digest, Sha256};
+        let placement = self.probe_placement().await?;
+        let backends = self.backends(placement)?;
+        let record = backends
+            .mailbox
+            .get_otc_session(session_id_hex)
+            .await
+            .map_err(map_error)?
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput("OTC session not found in OwnerMailbox".into())
+            })?;
+        let expires_at_ms = labyrinth::records::ms_from_datetime(&record.expires_at)
+            .map_err(|_| OrchestratorError::InvalidInput("Malformed OTC expiresAt".into()))?;
+        if now_ms >= expires_at_ms {
+            return Err(OrchestratorError::InvalidInput(
+                "OTC session expired".into(),
+            ));
+        }
+        let yb_vec = record
+            .yb
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput(
+                    "OTC session awaiting responder completion from enrolled device".into(),
+                )
+            })?
+            .0;
+        let yb: [u8; 32] = yb_vec
+            .try_into()
+            .map_err(|_| OrchestratorError::InvalidInput("Malformed OTC yb".into()))?;
+        let kem_ct = record
+            .kem_ct
+            .ok_or_else(|| OrchestratorError::InvalidInput("Missing OTC kemCt".into()))?
+            .0;
+        let kem_ct_len = kem_ct.len() as u32;
+        let sealed_payload = record
+            .sealed_payload
+            .ok_or_else(|| OrchestratorError::InvalidInput("Missing OTC sealedPayload".into()))?
+            .0;
+        let ad = Sha256::digest(&kem_ct).to_vec();
+        let responder_msg = labyrinth::otc::ResponderMessage { yb, kem_ct, ad };
+        let fault = SignerFault::default();
+        let enrolled = Labyrinth::enroll_via_otc_session(
+            &self.did,
+            initiator,
+            &responder_msg,
+            &sealed_payload,
+            Some(session_id_hex.to_owned()),
+            self.transport_signer(&fault),
+            backends,
+        )
+        .await;
+        surface(&fault)?;
+        let (lab, enrollment) = enrolled.map_err(map_error)?;
+        self.save_placement(placement)?;
+        let existing = self
+            .vault
+            .load_zeroizing(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        let mut s = self.session(lab, fault, existing);
+        if let Some(error) = enrollment.unfinished {
+            s.note_directory_publication(&Err(error));
+        }
+        let new_epoch = s.latest_epoch();
+        s.save()?;
+        Ok((s, new_epoch, kem_ct_len))
+    }
 }
 
 struct VaultStateSink {
@@ -710,11 +1031,21 @@ impl labyrinth::client::StateSink for VaultStateSink {
 /// `(conversationId, member DIDs, [(messageId, timestampMs, frame)])`.
 pub type ArchiveBatch = (String, Vec<String>, Vec<(String, u64, Vec<u8>)>);
 
+/// Outcome of a peer-epoch trust check ([`LabyrinthSession::verify_peer_epoch_chain`],
+/// [`LabyrinthSession::check_peer_epoch_attested`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerEpochTrust {
+    Verified,
+    /// The epoch must not be trusted; the reason is safe to show.
+    Untrusted(String),
+}
+
 /// An enabled account on this device.
 pub struct LabyrinthSession {
     did: String,
     transport_key: [u8; 32],
     lab: Labyrinth,
+    directory: Arc<dyn MailboxDirectory>,
     fault: SignerFault,
     vault: Arc<dyn StateVault>,
     placements: Arc<dyn StateVault>,
@@ -731,6 +1062,139 @@ impl LabyrinthSession {
 
     pub fn latest_epoch(&self) -> u64 {
         self.lab.latest_epoch()
+    }
+
+    /// The verified public record of this account's newest epoch.
+    pub fn latest_public(&self) -> Result<EpochPublic> {
+        self.lab.latest_public().map_err(map_error)
+    }
+
+    /// `(seq, head, keys)` for up to `max_epochs` most recent OwnerMailbox epochs.
+    ///
+    /// The keys are secret: use them only inside the process, never log,
+    /// serialize, or pass them across an FFI boundary.
+    pub async fn recent_mailbox_keys(
+        &mut self,
+        max_epochs: usize,
+    ) -> Result<Vec<(u64, [u8; 32], MailboxKeys)>> {
+        let out = self.lab.recent_mailbox_keys(max_epochs).await;
+        self.finish(out)
+    }
+
+    /// `(seq, head, keys)` for the latest epoch and the one before it.
+    pub async fn mailbox_keys_current_and_previous(
+        &mut self,
+    ) -> Result<Vec<(u64, [u8; 32], MailboxKeys)>> {
+        self.recent_mailbox_keys(2).await
+    }
+
+    /// Each member's latest epoch, verified, `[CB-18]`-attested and checked
+    /// against its `[CB-29]` pin, plus this account's own latest epoch;
+    /// members that fail a trust check are reported in `excluded`.
+    pub async fn resolve_roster_report(&mut self, dids: &[&str]) -> Result<ResolvedRoster> {
+        let out = self.lab.resolve_roster_report(dids).await;
+        self.finish(out)
+    }
+
+    /// Whether `offered` is a genuine epoch of `did`: it must chain by
+    /// `prev_head`/`prev_sig` links, through epochs fetched from the
+    /// directory, to `did`'s latest epoch as [`resolve_roster_report`](Self::resolve_roster_report)
+    /// verifies it (pins and `[CB-18]` applied; this account's own verified
+    /// latest when `did` is this account).
+    pub async fn verify_peer_epoch_chain(
+        &mut self,
+        did: &str,
+        offered: &EpochPublic,
+    ) -> Result<PeerEpochTrust> {
+        let untrusted = |r: String| Ok(PeerEpochTrust::Untrusted(r));
+        let roster = self.resolve_roster_report(&[did]).await?;
+        if let Some(x) = roster.excluded.iter().find(|x| x.did == did) {
+            if super::is_operational_failure(&x.error) {
+                return Err(map_error(x.error.clone()));
+            }
+            return untrusted(format!("{did} failed directory verification: {}", x.error));
+        }
+        let Some((_, latest)) = roster.roster.into_iter().find(|(d, _)| d == did) else {
+            return untrusted(format!("{did} has no published Labyrinth epoch"));
+        };
+        if let Err(e) = offered.verify(did, None) {
+            return untrusted(format!("epoch failed verification: {e}"));
+        }
+        if offered.seq > latest.seq {
+            return untrusted(format!(
+                "epoch {} is newer than the verified latest epoch {}",
+                offered.seq, latest.seq
+            ));
+        }
+        if offered.seq == latest.seq {
+            return if offered.head == latest.head {
+                Ok(PeerEpochTrust::Verified)
+            } else {
+                untrusted("epoch head differs from the verified latest epoch".into())
+            };
+        }
+        if latest.seq - offered.seq > labyrinth::client::pins::MAX_PIN_ADVANCE {
+            return untrusted("epoch is too far behind the verified latest epoch".into());
+        }
+        let mut prev = labyrinth::client::PeerPin::of(offered);
+        for seq in offered.seq + 1..latest.seq {
+            let fetched = match self.directory.epoch(did, seq).await {
+                Ok(e) => e,
+                Err(err) if super::is_trust_failure(&err) => {
+                    return untrusted(format!("directory epoch {seq} failed verification: {err}"));
+                }
+                Err(err) => return Err(map_error(err)),
+            };
+            let Some(e) = fetched else {
+                return untrusted(format!("directory has no epoch {seq} to link the chain"));
+            };
+            if e.seq != seq {
+                return untrusted("directory epoch under the wrong number".into());
+            }
+            if let Err(err) = e
+                .verify(did, None)
+                .and_then(|()| e.verify_link(prev.seq, &prev.head, &prev.sig_key))
+            {
+                return untrusted(format!("epoch chain broken at {seq}: {err}"));
+            }
+            prev = labyrinth::client::PeerPin::of(&e);
+        }
+        match latest.verify_link(prev.seq, &prev.head, &prev.sig_key) {
+            Ok(()) => Ok(PeerEpochTrust::Verified),
+            Err(err) => untrusted(format!("epoch chain broken at {}: {err}", latest.seq)),
+        }
+    }
+
+    /// `[CB-18]`/`[CB-27]` for a stored record: `epoch` verifies for `did`
+    /// and its attestation key is one of `did`'s chat devices that may vouch
+    /// at `at`.
+    pub async fn check_peer_epoch_attested(
+        &self,
+        did: &str,
+        epoch: &EpochPublic,
+        at: VouchAt,
+    ) -> Result<PeerEpochTrust> {
+        if let Err(e) = epoch.verify(did, None) {
+            return Ok(PeerEpochTrust::Untrusted(format!(
+                "epoch failed verification: {e}"
+            )));
+        }
+        let keys = match self.directory.device_transport_keys(did).await {
+            Ok(keys) => keys,
+            Err(err) if super::is_trust_failure(&err) => {
+                return Ok(PeerEpochTrust::Untrusted(format!(
+                    "chat device keys of {did} failed verification: {err}"
+                )));
+            }
+            Err(err) => return Err(map_error(err)),
+        };
+        if keys_valid_for(&keys, None, at).contains(&epoch.attestation.transport_public_key) {
+            Ok(PeerEpochTrust::Verified)
+        } else {
+            Ok(PeerEpochTrust::Untrusted(format!(
+                "epoch is not attested by a chat device of {did} valid at the record's time"
+            )))
+        }
     }
 
     pub fn recovery_method_stale(&self) -> bool {
@@ -767,6 +1231,9 @@ impl LabyrinthSession {
             .map_err(OrchestratorError::Mls)?;
         self.placements
             .delete(&thread_placement_key(&self.did))
+            .map_err(OrchestratorError::Mls)?;
+        self.placements
+            .delete(&SessionDeps::writer_rev_floors_key(&self.did))
             .map_err(OrchestratorError::Mls)?;
         *self.persisted.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
@@ -929,6 +1396,11 @@ impl LabyrinthSession {
     }
 
     fn save(&mut self) -> Result<()> {
+        SessionDeps::persist_writer_rev_floors(
+            &*self.placements,
+            &self.did,
+            self.lab.writer_rev_floors(),
+        );
         let next = self.lab.export_state().map_err(map_error)?;
         let mut guard = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
         if guard.as_ref().map(|p| p.as_slice()) == Some(next.as_slice()) {
@@ -1407,6 +1879,149 @@ impl LabyrinthSession {
             .map(|r| r.messages_archived);
         self.finish(out)
     }
+
+    /// Responds to a pending 2-device OTC session in `OwnerMailbox` as an
+    /// already enrolled device, sealing the recovery payload under CPace + ML-KEM-768.
+    pub async fn respond_otc_session(
+        &mut self,
+        mailbox: &dyn MailboxStore,
+        session_id_hex: &str,
+        six_digit_code: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let mut record = mailbox
+            .get_otc_session(session_id_hex)
+            .await
+            .map_err(map_error)?
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput("OTC session not found in OwnerMailbox".into())
+            })?;
+        let expires_at_ms = labyrinth::records::ms_from_datetime(&record.expires_at)
+            .map_err(|_| OrchestratorError::InvalidInput("Malformed OTC expiresAt".into()))?;
+        if now_ms >= expires_at_ms {
+            return Err(OrchestratorError::InvalidInput(
+                "OTC session expired".into(),
+            ));
+        }
+        let sid_bytes = hex::decode(session_id_hex)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid OTC sessionId hex".into()))?;
+        let sid: [u8; 16] = sid_bytes.try_into().map_err(|_| {
+            OrchestratorError::InvalidInput("OTC sessionId must be 16 bytes".into())
+        })?;
+        let ya: [u8; 32] = record
+            .ya
+            .0
+            .clone()
+            .try_into()
+            .map_err(|_| OrchestratorError::InvalidInput("Malformed OTC ya".into()))?;
+        let ek_otc = record.ek_otc.0.clone();
+        let ad = Sha256::digest(&ek_otc).to_vec();
+        let init_msg = labyrinth::otc::InitiatorMessage {
+            sid,
+            ya,
+            ek_otc,
+            ad,
+        };
+        let code = labyrinth::otc::OneTimeCode::parse(six_digit_code).map_err(map_error)?;
+        let mut responder = labyrinth::otc::Responder::new(code, &self.did);
+        let out = self.lab.otc_respond(&mut responder, &init_msg).await;
+        let resp = self.finish(out)?;
+        record.yb = Some(labyrinth::records::Bytes(resp.message.yb.to_vec()));
+        record.kem_ct = Some(labyrinth::records::Bytes(resp.message.kem_ct));
+        record.sealed_payload = Some(labyrinth::records::Bytes(resp.sealed_payload));
+        mailbox.put_otc_session(&record).await.map_err(map_error)?;
+        SessionDeps::persist_writer_rev_floors(
+            &*self.placements,
+            &self.did,
+            &mailbox.export_writer_rev_floors(),
+        );
+        Ok(())
+    }
+
+    pub async fn get_read_state(
+        &mut self,
+        conversation_id: &str,
+    ) -> Result<Option<labyrinth::client::ReadState>> {
+        let out = self.lab.get_read_state(conversation_id).await;
+        self.finish(out)
+    }
+
+    pub async fn advance_read_state(
+        &mut self,
+        conversation_id: &str,
+        candidate_seq: u64,
+    ) -> Result<labyrinth::client::ReadState> {
+        let out = match self
+            .lab
+            .advance_read_state(conversation_id, candidate_seq)
+            .await
+        {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab
+                        .advance_read_state(conversation_id, candidate_seq)
+                        .await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        };
+        self.finish(out)
+    }
+
+    pub async fn list_read_states(&mut self) -> Result<Vec<labyrinth::client::ReadState>> {
+        let out = self.lab.list_read_states().await;
+        self.finish(out)
+    }
+
+    pub async fn get_circle_owner_state(
+        &mut self,
+        circle_id: &str,
+    ) -> Result<Option<(labyrinth::client::CircleOwnerState, Option<String>)>> {
+        let out = self.lab.get_circle_owner_state(circle_id).await;
+        self.finish(out)
+    }
+
+    pub async fn put_circle_owner_state(
+        &mut self,
+        state: &labyrinth::client::CircleOwnerState,
+        swap_record_cid: Option<&str>,
+    ) -> Result<String> {
+        let out = self
+            .lab
+            .put_circle_owner_state(state, swap_record_cid)
+            .await;
+        self.finish(out)
+    }
+
+    pub async fn merge_circle_owner_state(
+        &mut self,
+        update: &labyrinth::client::CircleOwnerState,
+    ) -> Result<(labyrinth::client::CircleOwnerState, String)> {
+        let out = self.lab.merge_circle_owner_state(update).await;
+        self.finish(out)
+    }
+
+    pub async fn clear_circle_acl_tombstone(
+        &mut self,
+        circle_id: &str,
+        member_did: &str,
+    ) -> Result<Option<(labyrinth::client::CircleOwnerState, String)>> {
+        let out = self
+            .lab
+            .clear_circle_acl_tombstone(circle_id, member_did)
+            .await;
+        self.finish(out)
+    }
+
+    pub async fn list_circle_owner_states(
+        &mut self,
+    ) -> Result<Vec<labyrinth::client::CircleOwnerState>> {
+        let out = self.lab.list_circle_owner_states().await;
+        self.finish(out)
+    }
 }
 
 #[cfg(test)]
@@ -1438,6 +2053,7 @@ mod history_error_tests {
         let report = labyrinth::client::RotationReport {
             new_epoch: 9,
             revoked: Some(labyrinth::sign::XVerifyingKey([8; 32])),
+            evicted_revoked: Vec::new(),
             excluded: vec![
                 labyrinth::client::ExcludedMember {
                     device_key: Some(key),
@@ -1448,6 +2064,8 @@ mod history_error_tests {
                     reason: labyrinth::client::ExclusionReason::MalformedMember,
                 },
             ],
+            invalidated_recovery_methods: Vec::new(),
+            rekeyed_recovery: None,
         };
         let methods = [labyrinth::client::RecoveryMethod {
             vdevice_id: [4; 16],

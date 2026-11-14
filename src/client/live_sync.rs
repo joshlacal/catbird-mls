@@ -1360,7 +1360,15 @@ impl CatbirdMlsClient {
             }
         }
 
+        let me = state
+            .get("participants")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|p| p["userDid"].as_str() == Some(self.normalized_did.as_str()));
+
         if kind == "direct" && !has_local {
+            let active_in_direct = me.is_some_and(|p| p["status"].as_str() == Some("active"));
             // A pruned opening's terminal state is recorded once; it is never re-fetched.
             let terminal = self.db.read_tx(|tx| {
                 Ok(tx
@@ -1369,22 +1377,36 @@ impl CatbirdMlsClient {
                     .any(|r| r.conversation_id == cid))
             })?;
             if terminal {
+                if active_in_direct {
+                    owed.push((cid.to_owned(), state.clone()));
+                }
                 return Ok(0);
             }
-            return Ok(u32::from(self.import_incoming_c33_direct_request(
-                canonical_dev_id,
-                signer,
-                cid,
-            )?));
+            return match self.import_incoming_c33_direct_request(canonical_dev_id, signer, cid) {
+                Ok(true) => Ok(1),
+                Ok(false) => {
+                    if active_in_direct {
+                        owed.push((cid.to_owned(), state.clone()));
+                    }
+                    Ok(0)
+                }
+                Err(MLSError::InvalidState(code))
+                    if active_in_direct
+                        && matches!(
+                            code.as_str(),
+                            "ConversationNotFound"
+                                | "NotEntitled"
+                                | "AccessOutsideMembershipInterval"
+                        ) =>
+                {
+                    owed.push((cid.to_owned(), state.clone()));
+                    Ok(0)
+                }
+                Err(err) => Err(err),
+            };
         }
 
         if kind == "group" {
-            let me = state
-                .get("participants")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|p| p["userDid"].as_str() == Some(self.normalized_did.as_str()));
             match me.map(|me| (&me["status"], me.get("invitationProvenance"))) {
                 Some((status, Some(prov))) if status == "pending" => {
                     if let Err(e) = self.accept_group_invitation(
@@ -1770,6 +1792,9 @@ impl CatbirdMlsClient {
             }
             refs.push(r);
         }
+        if local_pkg_ref.is_none() {
+            return Ok(false);
+        }
         let import_until = chrono::DateTime::parse_from_rfc3339(
             vp["importUntil"]
                 .as_str()
@@ -1934,7 +1959,7 @@ impl CatbirdMlsClient {
         let coords_str =
             serde_json::to_string(&coords_canon).map_err(|e| MLSError::Internal(e.to_string()))?;
 
-        self.db.write_tx(|tx| {
+        let imported = self.db.write_tx(|tx| {
             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
             let provider = self.hooks.openmls_provider(storage);
             let mls_welcome = MlsMessageIn::tls_deserialize_exact(&bootstrap.welcome)
@@ -1944,14 +1969,17 @@ impl CatbirdMlsClient {
                     "C33 opaqueWelcome is not an MLS Welcome".to_string(),
                 ));
             };
-            let staged = crate::sim_hooks::build_staged_welcome_at(
+            let staged = match crate::sim_hooks::build_staged_welcome_at(
                 &provider,
                 &build_join_config(),
                 welcome,
                 None,
                 (now_ms.max(0) as u64) / 1_000,
-            )
-            .map_err(|e| MLSError::Cryptography(format!("stage C33 Welcome: {e:?}")))?;
+            ) {
+                Ok(staged) => staged,
+                Err(WelcomeError::NoMatchingKeyPackage) => return Ok(false),
+                Err(e) => return Err(MLSError::Cryptography(format!("stage C33 Welcome: {e:?}"))),
+            };
 
             let sender_member = staged.welcome_sender().map_err(|e| {
                 MLSError::Cryptography(format!("C33 welcome_sender lookup failed: {e:?}"))
@@ -2098,8 +2126,11 @@ impl CatbirdMlsClient {
                     now_ms,
                 )?;
             }
-            Ok(())
+            Ok(true)
         })?;
+        if !imported {
+            return Ok(false);
+        }
 
         self.notify_change(PlatformChangeEvent::RequestsUpdated);
         self.notify_change(PlatformChangeEvent::MessagesUpdated {
@@ -2641,6 +2672,15 @@ impl CatbirdMlsClient {
                 signer,
             )?;
         }
+        #[cfg(feature = "labyrinth")]
+        if transition_seq > 1
+            && self
+                .labyrinth_status()
+                .map(|st| st.backup_enabled)
+                .unwrap_or(false)
+        {
+            let _ = self.restore_conversation_from_owner_mailbox(cid);
+        }
         Ok(true)
     }
 
@@ -2763,8 +2803,19 @@ impl CatbirdMlsClient {
             .unwrap_or_default();
         requests.sort_by_key(|request| request["requestedAt"].as_str());
         let mut unentitled = None;
+        let mut cached_own_devices: Option<Option<Value>> = None;
         let found = 'found: {
             for request in requests {
+                if request["requesterDeviceStatus"].as_str() == Some("pending_approval")
+                    || request["deviceStatus"].as_str() == Some("pending_approval")
+                    || request["status"].as_str() == Some("pending_approval")
+                {
+                    tracing::info!(
+                        cid,
+                        "leaf recovery: refusing pending_approval target device"
+                    );
+                    continue;
+                }
                 let accepted = acceptance.as_ref().filter(|authorization| {
                     authorization["recoveryRequestId"] == request["recoveryRequestId"]
                 });
@@ -2781,6 +2832,50 @@ impl CatbirdMlsClient {
                         ) else {
                             return Err(refused("the request names no requester device"));
                         };
+                        if resp["state"]["leaves"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|leaf| {
+                                leaf["userDid"].as_str() == Some(did)
+                                    && leaf["deviceId"].as_str() == Some(device)
+                                    && leaf["status"].as_str() == Some("pending_approval")
+                            })
+                        {
+                            tracing::info!(
+                                cid,
+                                "leaf recovery: refusing pending_approval leaf in state"
+                            );
+                            continue;
+                        }
+                        if did == self.normalized_did {
+                            let own_devs = cached_own_devices.get_or_insert_with(|| {
+                                self.query_signed_chat_ds(
+                                    "blue.catbird.chat.getOwnDevices",
+                                    &[("actorDeviceId", canonical_dev_id), ("limit", "100")],
+                                    canonical_dev_id,
+                                    signer,
+                                )
+                                .ok()
+                            });
+                            if let Some(own_devs_val) = own_devs {
+                                if let Some(items) =
+                                    own_devs_val.get("items").and_then(Value::as_array)
+                                {
+                                    if items.iter().any(|item| {
+                                        let dev = item.get("device").unwrap_or(item);
+                                        dev["deviceId"].as_str() == Some(device)
+                                            && dev["status"].as_str() == Some("pending_approval")
+                                    }) {
+                                        tracing::info!(
+                                            cid,
+                                            "leaf recovery: refusing own sibling device in pending_approval status"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         // `I4` (`ADR-009`): the PDS-authorized key of exactly that device.
                         let key = self.pds_device_key(did, device, &BTreeMap::new())?;
                         let body = verify_signed_mutation_body(
@@ -2842,7 +2937,17 @@ impl CatbirdMlsClient {
                     conversation_id: cid.to_owned(),
                     participant_did,
                 }),
-                None => Ok(0),
+                None => {
+                    let leave_fulfilled = self.fulfill_pending_group_leave_from_state(
+                        cid,
+                        canonical_dev_id,
+                        &convo_uuid,
+                        signer,
+                        auth_generation,
+                        &resp,
+                    )?;
+                    Ok(u32::from(leave_fulfilled))
+                }
             };
         };
         let (Some(recovery_request_id), Some(target_did), Some(target_device_id)) = (
