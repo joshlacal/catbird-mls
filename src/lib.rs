@@ -19,6 +19,9 @@ pub mod ffi;
 pub mod field_encryption;
 pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub mod kani_proofs;
+#[cfg(not(target_arch = "wasm32"))]
 mod keychain;
 #[cfg(feature = "labyrinth")]
 pub mod labyrinth;
