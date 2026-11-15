@@ -30,7 +30,7 @@ mod tests;
 
 use std::sync::Arc;
 
-use crate::orchestrator::error::OrchestratorError;
+pub use crate::orchestrator::error::OrchestratorError;
 
 pub use flush::FlushReport;
 pub use hooks_status::ArchiveStatusReport;

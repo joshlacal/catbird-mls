@@ -25,7 +25,8 @@ use super::space::{
 };
 use super::state::StateVault;
 use super::transport::{DsDirectoryStore, GatewayXrpcTransport};
-use crate::orchestrator::error::{OrchestratorError, Result};
+pub use crate::orchestrator::error::{OrchestratorError, Result as AuthorityResult};
+use AuthorityResult as Result;
 /// One member dropped during a mailbox epoch rotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationExclusion {
