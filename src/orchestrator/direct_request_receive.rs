@@ -1209,3 +1209,24 @@ mod coordinate_tests {
         assert_ne!(canonical_hash, forged_hash);
     }
 }
+
+#[cfg(all(test, feature = "legacy-orchestrator"))]
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
+where
+    S: MLSStorageBackend + 'static,
+    A: MLSAPIClient + 'static,
+    C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
+{
+    pub(crate) async fn refresh_request_acceptance_for_test(
+        &self,
+        cid: &str,
+        owner: &str,
+        device: &str,
+        projection: &mut DirectRequestProjection,
+        raw: &mut Option<Vec<u8>>,
+    ) -> Result<bool> {
+        self.refresh_request_acceptance(cid, owner, device, projection, raw)
+            .await
+    }
+}

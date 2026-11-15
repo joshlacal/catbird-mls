@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust/OpenMLS/Axum/UniFFI/wasm-bindgen, Swift/SwiftUI/GRDB, Kotlin/Compose/Room/Gradle, TypeScript/SvelteKit/Tauri, PostgreSQL, SQLite/SQLCipher, jj.
 
-**Spec:** `/Users/joshlacalamito/Developer/Catbird+Petrel/docs/MLS_CLIENT_PROTOCOL.md`, `/Users/joshlacalamito/Developer/Catbird+Petrel/docs/mls-v2/CHAT_PROTOCOL.md`, `/Users/joshlacalamito/Developer/Catbird+Petrel/docs/SECURITY_MODEL.md`, and the canonical Petrel/PetrelCatbird lexicons.
+**Spec:** `<workspace-root>/docs/MLS_CLIENT_PROTOCOL.md`, `<workspace-root>/docs/mls-v2/CHAT_PROTOCOL.md`, `<workspace-root>/docs/SECURITY_MODEL.md`, and the canonical Petrel/PetrelCatbird lexicons.
 
 ## Global Constraints
 
@@ -473,15 +473,15 @@ Run these commands against the Task 0 snapshots. Capture exit code and full outp
 ### Contract and provenance
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/Petrel
+cd <workspace-root>/Petrel
 swift build
 swift test
 
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/PetrelCatbird
+cd <workspace-root>/PetrelCatbird
 swift build
 swift test
 
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-atproto
+cd <workspace-root>/catbird-atproto
 cargo metadata --locked --format-version 1 --no-deps
 cargo test --locked --no-fail-fast
 ```
@@ -489,10 +489,10 @@ cargo test --locked --no-fail-fast
 If byte-for-byte generation is needed, create isolated `jj` workspaces at the manifest commits and run only there:
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel
+cd <workspace-root>
 ./scripts/regenerate-atproto-types.sh
 
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/Petrel
+cd <workspace-root>/Petrel
 ./Scripts/regenerate-generated.sh
 ```
 
@@ -501,7 +501,7 @@ Expected: the isolated regeneration either produces no semantic/hash drift or re
 ### Shared Rust core
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked --no-fail-fast
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked --no-default-features --no-fail-fast
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked --all-features --no-fail-fast
@@ -517,7 +517,7 @@ Expected: every suite reports a discrete pass/fail/ignore count; feature and WAS
 ### mls-ds server
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/mls-ds/server
+cd <workspace-root>/mls-ds/server
 cargo test --locked --test chat_protocol_route_inventory
 cargo test --locked --test chat_protocol_error
 cargo test --locked --test chat_protocol_production_cfg
@@ -535,7 +535,7 @@ Expected: route and lexicon inventories agree or yield exact missing/extra NSIDs
 ### Nest gateway
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/nest/catbird
+cd <workspace-root>/nest/catbird
 cargo test --locked --test integration_tests test_clean_chat_token_and_dpop_proof_flow
 cargo test --locked --test integration_tests
 cargo test --locked --test oauth_upgrade
@@ -550,7 +550,7 @@ Expected: gateway forwarding, device binding, and method/status behavior fail ex
 ### CatbirdMLSCore
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/CatbirdMLSCore
+cd <workspace-root>/CatbirdMLSCore
 swift build
 swift test --filter MLSOrchestratorStorageAdapterTests
 swift test --filter MLSOrchestratorCredentialAdapterTests
@@ -568,7 +568,7 @@ Expected: focused adapter/default/identity/recovery behavior is visible before t
 ### Catbird app
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/Catbird
+cd <workspace-root>/Catbird
 swiftlint
 xcodebuild -project Catbird.xcodeproj -scheme Catbird -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 xcodebuild test -project Catbird.xcodeproj -scheme Catbird -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -only-testing:CatbirdTests/MLSConversationIdentityBoundaryTests
@@ -585,7 +585,7 @@ Expected: the app compiles against the recorded Core/FFI pin and focused identit
 ### Android
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/android/Catbird
+cd <workspace-root>/android/Catbird
 ./gradlew :app:testDebugUnitTest --tests 'blue.catbird.mls.*' --tests 'blue.catbird.data.local.db.*' --tests 'blue.catbird.workers.MLS*'
 ./gradlew :app:testDebugUnitTest
 ./gradlew :app:lint
@@ -600,7 +600,7 @@ Expected: `MlsffiArtifactCoherenceTest` and `MLSClientCapabilitiesTest` identify
 ### catbird-mls-web
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls-web
+cd <workspace-root>/catbird-mls-web
 ./test-native.sh
 ./test-wasm.sh
 ./test-tooling-config.sh
@@ -615,7 +615,7 @@ Expected: native and WASM results remain distinct; dependency/version drift is j
 ### Catmos
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos
+cd <workspace-root>/catmos
 npm run check
 npm run build
 npm run check:rust
@@ -627,7 +627,7 @@ Expected: Svelte/TypeScript, Tauri Rust, and WASM packaging each report separate
 ### catmos-cli
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos-cli
+cd <workspace-root>/catmos-cli
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo check --locked -p catmos-core
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked -p catmos-core --no-fail-fast
 CMAKE_POLICY_VERSION_MINIMUM=3.5 cargo test --locked --workspace --no-fail-fast
@@ -641,7 +641,7 @@ Expected: command/storage/auth failures remain visible and sibling provenance ei
 ### BIRDaemon
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/BIRDaemon
+cd <workspace-root>/BIRDaemon
 cargo check --locked
 cargo test --locked canonical_runtime_tests --no-fail-fast
 cargo test --locked xrpc_client --no-fail-fast
@@ -662,7 +662,7 @@ Expected: local tests exercise authority/storage/lifecycle without starting the 
 The workspace scripts below are inventoried for skip/failure semantics during Task 9, but are not executed under this plan without separate authorization and an exact test-account scope:
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel
+cd <workspace-root>
 ./scripts/e2e_mls_chat.sh
 ./scripts/e2e_mls_group.sh
 ./scripts/e2e_parallel.sh

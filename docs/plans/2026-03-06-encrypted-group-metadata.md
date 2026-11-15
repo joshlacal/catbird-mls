@@ -122,7 +122,7 @@ pub mod group_metadata;
 
 **Step 3: Run tests to verify compilation**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo build`
+Run: `cd <workspace-root>/catbird-mls && cargo build`
 Expected: Compiles with no errors
 
 **Step 4: Write unit tests**
@@ -176,13 +176,13 @@ mod tests {
 
 **Step 5: Run tests**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo test group_metadata`
+Run: `cd <workspace-root>/catbird-mls && cargo test group_metadata`
 Expected: 4 tests pass
 
 **Step 6: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add src/group_metadata.rs src/lib.rs
 git commit -m "feat: add GroupMetadata type for MLS group context extensions"
 ```
@@ -279,13 +279,13 @@ In `catbird-mls/src/mls_context.rs`, modify the `create_group` method (around li
 
 **Step 3: Build and run existing tests**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo test`
+Run: `cd <workspace-root>/catbird-mls && cargo test`
 Expected: All existing tests still pass. GroupConfig default now has 2 extra None fields.
 
 **Step 4: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add src/mls_context.rs src/types.rs
 git commit -m "feat: embed GroupMetadata in MLS group context on creation"
 ```
@@ -398,7 +398,7 @@ Add to the `impl MLSContext` block in `catbird-mls/src/api.rs`:
 
 **Step 3: Build**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo build`
+Run: `cd <workspace-root>/catbird-mls && cargo build`
 Expected: Compiles. Note: `tls_serialize_detached` requires `use tls_codec::Serialize as TlsSerializeTrait;` — add the import if needed.
 
 **Step 4: Write integration test**
@@ -495,13 +495,13 @@ fn test_update_group_metadata() {
 
 **Step 5: Run integration test**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo test --test group_metadata_test`
+Run: `cd <workspace-root>/catbird-mls && cargo test --test group_metadata_test`
 Expected: 3 tests pass
 
 **Step 6: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add src/mls_context.rs src/api.rs tests/group_metadata_test.rs
 git commit -m "feat: add get/update_group_metadata FFI methods using group context extensions"
 ```
@@ -638,13 +638,13 @@ If the trait method doesn't exist, add to `catbird-mls/src/orchestrator/api_clie
 
 **Step 4: Build**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo build`
+Run: `cd <workspace-root>/catbird-mls && cargo build`
 Expected: Compiles
 
 **Step 5: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add src/orchestrator/groups.rs src/orchestrator/api_client.rs
 git commit -m "feat: orchestrator update_group_metadata with commit_group_change flow"
 ```
@@ -683,13 +683,13 @@ if let Ok(Some(meta)) = self.get_group_metadata(conversation_id) {
 
 **Step 3: Build and test**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo build`
+Run: `cd <workspace-root>/catbird-mls && cargo build`
 Expected: Compiles
 
 **Step 4: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add src/orchestrator/messaging.rs
 git commit -m "feat: refresh cached metadata after processing incoming commits"
 ```
@@ -712,18 +712,18 @@ The current API uses `Vec<u8>` for metadata JSON bytes, which is UniFFI-compatib
 
 **Step 2: Rebuild FFI bindings**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/CatbirdMLSCore && ./Scripts/rebuild-ffi.sh`
+Run: `cd <workspace-root>/CatbirdMLSCore && ./Scripts/rebuild-ffi.sh`
 Expected: Generates updated Swift bindings with `getGroupMetadata()` and `updateGroupMetadata()` methods
 
 **Step 3: Verify the generated Swift methods exist**
 
-Run: `grep -n "getGroupMetadata\|updateGroupMetadata" /Users/joshlacalamito/Developer/Catbird+Petrel/CatbirdMLSCore/Sources/CatbirdMLS/CatbirdMLS.swift`
+Run: `grep -n "getGroupMetadata\|updateGroupMetadata" <workspace-root>/CatbirdMLSCore/Sources/CatbirdMLS/CatbirdMLS.swift`
 Expected: Both methods present in generated bindings
 
 **Step 4: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel
+cd <workspace-root>
 git add CatbirdMLSCore/Sources/CatbirdMLS/
 git commit -m "feat: regenerate UniFFI bindings with group metadata methods"
 ```
@@ -773,13 +773,13 @@ Add to the `impl MLSAPIClient for WasmApiClient` block:
 
 **Step 2: Build WASM**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos/catmos-web && ./build-dev.sh`
+Run: `cd <workspace-root>/catmos/catmos-web && ./build-dev.sh`
 Expected: Compiles
 
 **Step 3: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos
+cd <workspace-root>/catmos
 git add catmos-web/src/api_client.rs
 git commit -m "feat: implement commit_group_change for WasmApiClient"
 ```
@@ -814,13 +814,13 @@ Remove the `metadata` variable construction block entirely (lines 80-92).
 
 **Step 2: Build**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo build`
+Run: `cd <workspace-root>/catbird-mls && cargo build`
 Expected: Compiles
 
 **Step 3: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add src/orchestrator/groups.rs
 git commit -m "feat: stop sending plaintext metadata to server (now encrypted in MLS extensions)"
 ```
@@ -884,13 +884,13 @@ pub async fn wasm_update_group_metadata(
 
 **Step 2: Build WASM**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos/catmos-web && ./build-dev.sh`
+Run: `cd <workspace-root>/catmos/catmos-web && ./build-dev.sh`
 Expected: Compiles
 
 **Step 3: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos
+cd <workspace-root>/catmos
 git add catmos-web/src/lib.rs
 git commit -m "feat: expose group metadata get/update via WASM"
 ```
@@ -981,13 +981,13 @@ fn test_metadata_visible_after_welcome_join() {
 
 **Step 2: Run the E2E test**
 
-Run: `cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo test --test group_metadata_e2e_test`
+Run: `cd <workspace-root>/catbird-mls && cargo test --test group_metadata_e2e_test`
 Expected: Test passes — Bob sees Alice's metadata after joining via Welcome
 
 **Step 3: Commit**
 
 ```bash
-cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls
+cd <workspace-root>/catbird-mls
 git add tests/group_metadata_e2e_test.rs
 git commit -m "test: E2E verify metadata visible to joiner via Welcome"
 ```

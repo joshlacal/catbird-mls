@@ -827,7 +827,9 @@ impl CatbirdMlsClient {
 
     pub(crate) fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError> {
         let bare = did.split('#').next().unwrap_or(did).trim();
-        let mut resolution_error = None;
+        // Every source that does not return a document records why, so an unresolved DID with
+        // nothing cached fails closed instead of reading as "no document".
+        let mut resolution_error: Option<MLSError>;
 
         // `did:plc:*` MUST resolve from the authoritative PLC directory rather than trusting own PDS.
         if bare.starts_with("did:plc:") {
@@ -907,36 +909,50 @@ impl CatbirdMlsClient {
                     Err(error) => resolution_error = Some(error),
                 }
             }
-            Ok(_) => {}
+            Ok(resp) => {
+                resolution_error = Some(MLSError::Internal(format!(
+                    "PDS resolveDid({bare}) failed with HTTP {}",
+                    resp.status
+                )));
+            }
             Err(error) => resolution_error = Some(error),
         }
 
         if let Some(wk_url) = Self::did_web_well_known_url(bare) {
-            if let Ok(resp) = self.transport.execute_http(PlatformHttpRequest {
+            match self.transport.execute_http(PlatformHttpRequest {
                 method: "GET".to_string(),
                 url: wk_url,
                 headers: Vec::new(),
                 body: None,
             }) {
-                if resp.status == 200 {
-                    if let Ok(doc_bytes) = chat_wire::extract_did_doc_from_resolve_response(
-                        &resp.body,
-                    )
-                    .and_then(|doc_bytes| {
-                        Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
-                        Ok(doc_bytes)
-                    }) {
-                        let now_ms = self.hooks.now_ms();
-                        let _ = self.db.write_tx(|tx| {
-                            tx.put_account_meta(
-                                &format!("did_doc:{bare}"),
-                                &String::from_utf8_lossy(&doc_bytes),
-                                now_ms,
-                            )
-                        });
-                        return Ok(Some(doc_bytes));
+                Ok(resp) if resp.status == 200 => {
+                    match chat_wire::extract_did_doc_from_resolve_response(&resp.body).and_then(
+                        |doc_bytes| {
+                            Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
+                            Ok(doc_bytes)
+                        },
+                    ) {
+                        Ok(doc_bytes) => {
+                            let now_ms = self.hooks.now_ms();
+                            let _ = self.db.write_tx(|tx| {
+                                tx.put_account_meta(
+                                    &format!("did_doc:{bare}"),
+                                    &String::from_utf8_lossy(&doc_bytes),
+                                    now_ms,
+                                )
+                            });
+                            return Ok(Some(doc_bytes));
+                        }
+                        Err(error) => resolution_error = Some(error),
                     }
                 }
+                Ok(resp) => {
+                    resolution_error = Some(MLSError::Internal(format!(
+                        "did:web document fetch for {bare} failed with HTTP {}",
+                        resp.status
+                    )));
+                }
+                Err(error) => resolution_error = Some(error),
             }
         }
 
@@ -8187,3 +8203,7 @@ mod verification_boundary_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "live_plane_unit_tests.rs"]
+mod live_plane_unit_tests;

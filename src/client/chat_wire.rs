@@ -4356,3 +4356,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "chat_wire_unit_tests.rs"]
+mod chat_wire_unit_tests;

@@ -5762,3 +5762,7 @@ mod tests {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "live_sync_unit_tests.rs"]
+mod live_sync_unit_tests;

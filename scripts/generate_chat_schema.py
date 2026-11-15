@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -66,14 +67,10 @@ def repository_root() -> Path:
 
 
 def petrel_catbird_root() -> Path:
-    root = repository_root()
-    direct = root / "PetrelCatbird"
-    if direct.is_dir():
-        return direct
-    wave1 = root.parent / "dec1-w0" / "wave1-petrel-catbird"
-    if wave1.is_dir():
-        return wave1
-    return direct
+    override = os.environ.get("PETREL_CATBIRD_ROOT")
+    if override:
+        return Path(override).resolve()
+    return repository_root() / "PetrelCatbird"
 
 
 def source_path(value: str | Path | None) -> Path:

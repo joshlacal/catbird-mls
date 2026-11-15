@@ -499,9 +499,12 @@ fn v09_fixture_dir() -> PathBuf {
     if root_path.is_dir() {
         return root_path;
     }
-    let canonical = PathBuf::from("/Users/joshlacalamito/Developer/Catbird+Petrel/docs/generated-artifacts/mls-chat-v1/crypto-wire-v09");
-    if canonical.is_dir() {
-        return canonical;
+    if let Some(workspace_root) = std::env::var_os("CATBIRD_WORKSPACE_ROOT") {
+        let configured = PathBuf::from(workspace_root)
+            .join("docs/generated-artifacts/mls-chat-v1/crypto-wire-v09");
+        if configured.is_dir() {
+            return configured;
+        }
     }
     root.join("mls-ds/server/tests/fixtures/crypto-wire-v09")
 }

@@ -305,9 +305,9 @@ name = "ws5_recovery_persistence_tests"
 required-features = ["legacy-orchestrator"]
 
 [dependencies]
-catbird-atproto = { path = "../../dec1-w0/wave1-catbird-atproto", version = "0.1.0", features = ["streaming", "namespace-bluecatbird", "namespace-atproto-space"] }
-atproto-spaces = { path = "../../dec1-w0/wave1-catbird-atproto/atproto-spaces", default-features = false }
-labyrinth-protocol = { path = "../y9b-labyrinth/labyrinth-protocol" }
+catbird-atproto = { path = "../catbird-atproto", version = "0.1.0", features = ["streaming", "namespace-bluecatbird", "namespace-atproto-space"] }
+atproto-spaces = { path = "../catbird-atproto/atproto-spaces", default-features = false }
+labyrinth-protocol = { path = "../labyrinth/labyrinth-protocol" }
 # OpenMLS 0.9 release-candidate cutover. The exact revision keeps every
 # OpenMLS crate on one coherent source snapshot.
 openmls = { version = "=0.9.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["js", "extensions-draft", "fork-resolution", "draft-ietf-mls-pq-ciphersuites"] }
@@ -361,7 +361,7 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Labyrinth 1.1 encrypted chat history over ATProto Spaces (on by default per D4).
-labyrinth = { path = "../y9b-labyrinth", features = ["space"], optional = true }
+labyrinth = { path = "../labyrinth", features = ["space"], optional = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

@@ -2492,3 +2492,10 @@ impl CatbirdMlsClient {
         Ok(imported)
     }
 }
+
+#[cfg(test)]
+#[path = "client_tail_unit_tests.rs"]
+mod client_tail_unit_tests;
+#[cfg(all(test, feature = "legacy-orchestrator"))]
+#[path = "orchestrator_tail_unit_tests.rs"]
+mod orchestrator_tail_unit_tests;

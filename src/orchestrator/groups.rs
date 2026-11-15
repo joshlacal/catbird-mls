@@ -8086,3 +8086,32 @@ where
         Ok((coord, mv, next_seq))
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
+where
+    S: MLSStorageBackend + 'static,
+    A: MLSAPIClient + 'static,
+    C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
+{
+    pub(crate) async fn authorized_leaf_recovery_for_test(
+        &self,
+        view: &serde_json::Value,
+        coordinate: &serde_json::Value,
+        conversation_id: &str,
+        leaves: &[(String, String)],
+        own_did: &str,
+        own_device: &str,
+    ) -> Result<(serde_json::Value, Vec<u8>, Vec<u8>)> {
+        self.authorized_leaf_recovery(
+            view,
+            coordinate,
+            conversation_id,
+            leaves,
+            own_did,
+            own_device,
+        )
+        .await
+    }
+}

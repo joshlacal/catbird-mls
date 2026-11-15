@@ -470,3 +470,11 @@ pub fn validate_closed_request_projection(
         )
         .map_err(failed)
 }
+
+#[cfg(all(test, feature = "legacy-orchestrator"))]
+pub(crate) mod test_exports {
+    pub(crate) use super::projection::{
+        normalize_acceptance_proof_with_i13, normalize_control_sequencer_receipt,
+        verify_acceptance_proof_with_i13,
+    };
+}

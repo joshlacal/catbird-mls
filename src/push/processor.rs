@@ -1907,3 +1907,85 @@ fn has_persisted_verified_receipt(
 
     Ok(false)
 }
+
+#[cfg(test)]
+pub(crate) mod test_exports {
+    use super::*;
+
+    pub(crate) fn fetched_entry_kind_matches_for_test(actual: &str, expected: &str) -> bool {
+        super::fetched_entry_kind_matches(actual, expected)
+    }
+
+    pub(crate) fn verify_push_application_receipt_for_test(
+        tx: &SqlTx<'_>,
+        entry: &FetchedPushEntry,
+        conversation: &ConversationRow,
+    ) -> Result<(Value, Vec<u8>, String, String), MLSError> {
+        let verified = super::verify_push_application_receipt(tx, entry, conversation)?;
+        Ok((
+            verified.receipt,
+            verified.key,
+            verified.sender_did,
+            verified.sender_device_id,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_push_commit_control_for_test<P: OpenMlsProvider>(
+        tx: &SqlTx<'_>,
+        entry: &FetchedPushEntry,
+        conversation: &ConversationRow,
+        group: &MlsGroup,
+        provider: &P,
+        owner_did: Option<&str>,
+        authorized_keys: &HashMap<String, Vec<AuthorizedPeerDeviceKey>>,
+    ) -> Result<(SignedMutationKind, Value, Value, bool), MLSError> {
+        let verified = super::verify_push_commit_control(
+            tx,
+            entry,
+            conversation,
+            group,
+            provider,
+            owner_did,
+            authorized_keys,
+        )?;
+        Ok((
+            verified.kind,
+            verified.body,
+            verified.next,
+            verified.actor_is_own,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_verified_push_commit_for_test(
+        tx: &SqlTx<'_>,
+        keychain: Arc<dyn KeychainAccess>,
+        hooks: &crate::sim_hooks::SimClientHooks,
+        conversation: &ConversationRow,
+        entry: &FetchedPushEntry,
+        kind: SignedMutationKind,
+        body: Value,
+        next: Value,
+        actor_is_own: bool,
+        owner_did: Option<&str>,
+        authorized_keys: &HashMap<String, Vec<AuthorizedPeerDeviceKey>>,
+    ) -> Result<(KvWriteBatch, bool, u64), MLSError> {
+        let verified = super::VerifiedPushCommit {
+            kind,
+            body,
+            next,
+            actor_is_own,
+        };
+        super::stage_verified_push_commit(
+            tx,
+            keychain,
+            hooks,
+            conversation,
+            entry,
+            &verified,
+            owner_did,
+            authorized_keys,
+        )
+    }
+}
