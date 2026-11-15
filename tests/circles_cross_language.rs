@@ -279,11 +279,14 @@ fn write_fixture(name: &str, v: &impl serde::Serialize) {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
     let mut s = serde_json::to_string_pretty(v).expect("json");
     s.push('\n');
-    std::fs::write(&path, s).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    if std::env::var_os("CATBIRD_REGEN_FIXTURES").is_some() {
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    } else {
+        assert!(!s.is_empty());
+    }
 }
 
 #[test]
-#[ignore = "regenerates committed fixtures; run deliberately"]
 fn regenerate_cross_language_fixtures() {
     let owner = identity(OWNER);
     let alice = identity(ALICE);

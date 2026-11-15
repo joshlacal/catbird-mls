@@ -176,6 +176,32 @@ fn authority_did_doc(did: &str, mls_key: &P256SigningKey, dr_key: &P256SigningKe
     })
 }
 
+fn plc_atproto_secret(did: &str) -> p256::SecretKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"catbird-plane-mock-atproto:");
+    hasher.update(did.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    p256::SecretKey::from_slice(&digest).unwrap()
+}
+
+fn plc_did_doc(did: &str) -> Value {
+    let sk = P256SigningKey::from(&plc_atproto_secret(did));
+    json!({
+        "id": did,
+        "verificationMethod": [{
+            "id": format!("{did}#atproto"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": p256_multikey(&sk),
+        }],
+        "service": [{
+            "id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": PDS_URL,
+        }]
+    })
+}
+
 impl PlatformTransport for PlaneMockTransport {
     fn execute_http(&self, req: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
         let mut st = self.state.lock().unwrap();
@@ -193,6 +219,10 @@ impl PlatformTransport for PlaneMockTransport {
             if req.url.contains(needle.as_str()) {
                 return handler(&req);
             }
+        }
+
+        if let Some(plc_did) = req.url.strip_prefix("https://plc.directory/") {
+            return http_json(200, &plc_did_doc(plc_did));
         }
 
         if req.url.ends_with("/.well-known/did.json") {
@@ -231,21 +261,17 @@ impl PlatformTransport for PlaneMockTransport {
                 );
             }
             if decoded.starts_with("did:plc:") {
-                return http_json(
-                    200,
-                    &json!({
-                        "didDoc": {
-                            "id": decoded,
-                            "service": [{
-                                "id": "#atproto_pds",
-                                "type": "AtprotoPersonalDataServer",
-                                "serviceEndpoint": PDS_URL,
-                            }]
-                        }
-                    }),
-                );
+                return http_json(200, &json!({ "didDoc": plc_did_doc(&decoded) }));
             }
             return http_json(404, &json!({ "error": "DidNotFound" }));
+        }
+
+        if req.url.contains("/xrpc/com.atproto.repo.listRecords")
+            && req
+                .url
+                .contains("collection=blue.catbird.chat.deviceRevocation")
+        {
+            return http_json(200, &json!({ "records": [] }));
         }
 
         if req.url.contains("/xrpc/com.atproto.repo.listRecords")
@@ -282,17 +308,39 @@ fn clone_pending(p: &chat_wire::PendingGroupCreation) -> chat_wire::PendingGroup
 }
 
 fn register_pds_device(st: &mut PlaneMockState, did: &str, dev_id: &str, pub_key: &[u8]) {
-    let record = json!({
-        "uri": format!("at://{did}/blue.catbird.chat.device/{dev_id}"),
-        "value": {
-            "$type": "blue.catbird.chat.device",
-            "deviceId": dev_id,
-            "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(pub_key) },
-            "algorithm": "Ed25519",
-            "credentialDid": format!("{did}#{dev_id}"),
-            "createdAt": "2026-11-14T00:00:00.000Z",
-        }
+    let value = json!({
+        "$type": "blue.catbird.chat.device",
+        "deviceId": dev_id,
+        "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(pub_key) },
+        "algorithm": "Ed25519",
+        "credentialDid": format!("{did}#{dev_id}"),
+        "createdAt": "2026-11-14T00:00:00.000Z",
     });
+    #[allow(unused_mut)]
+    let mut record = json!({
+        "uri": format!("at://{did}/blue.catbird.chat.device/{dev_id}"),
+        "value": value,
+    });
+    #[cfg(feature = "labyrinth")]
+    {
+        let secret = plc_atproto_secret(did);
+        let signing_key = atproto_spaces::tokens::SpaceSigningKey::from_p256_secret(
+            &secret,
+            format!("{did}#atproto"),
+        );
+        let (record_cid, record_cbor) =
+            crate::labyrinth::repo_proof::encode_atproto_json_record_dagcbor(&record["value"])
+                .unwrap();
+        let (_, car_bytes) = crate::labyrinth::repo_proof::build_repo_proof_car_v1(
+            did,
+            "3lb2zzzzzzzzz",
+            &[(format!("blue.catbird.chat.device/{dev_id}"), record_cbor)],
+            &signing_key,
+        )
+        .unwrap();
+        record["cid"] = json!(record_cid.to_string());
+        record["proof"] = json!(STANDARD.encode(car_bytes));
+    }
     st.pds_raw_records
         .entry(did.to_string())
         .or_default()
@@ -1412,7 +1460,6 @@ fn build_journaled_group_creation(
 }
 
 #[test]
-#[ignore = "fixture predates PLC-directory DID resolution and repository-proof device directories"]
 fn live_plane_group_creation_journal_presence_and_entry_proof_boundaries() {
     let (transport, state) = PlaneMockTransport::new();
     let (dir, client, signer) = new_plane_client(ALICE_DID, DEV_A1, transport.clone());
@@ -1905,7 +1952,6 @@ fn live_plane_group_creation_journal_presence_and_entry_proof_boundaries() {
 }
 
 #[test]
-#[ignore = "fixture predates PLC-directory DID resolution and repository-proof device directories"]
 fn live_plane_resolve_status_retry_and_cancel_group_creation_boundaries() {
     let (transport, state) = PlaneMockTransport::new();
     let (dir, client, signer) = new_plane_client(ALICE_DID, DEV_A1, transport.clone());

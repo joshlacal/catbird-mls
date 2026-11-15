@@ -206,6 +206,21 @@ fn sign_i13_receipt_json(
 
 impl PlatformTransport for TailTransport {
     fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+        if let Some(plc_did) = request.url.strip_prefix("https://plc.directory/") {
+            return Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&json!({
+                    "id": plc_did,
+                    "service": [{
+                        "id": "#atproto_pds",
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": "https://swan.place",
+                    }],
+                }))
+                .unwrap(),
+            });
+        }
         if request.url.ends_with("/.well-known/did.json")
             || request.url.contains("/xrpc/com.atproto.identity.resolveDid")
         {
@@ -228,6 +243,13 @@ impl PlatformTransport for TailTransport {
             .url
             .contains("/xrpc/com.atproto.repo.listRecords")
         {
+            if request.url.contains("collection=blue.catbird.chat.deviceRevocation") {
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&json!({ "records": [] })).unwrap(),
+                });
+            }
             let records = if let Some(pk) = self.enrolled_device_pub.lock().unwrap().clone() {
                 json!([{
                     "uri": "at://did:plc:tailuseraaaaaaaaaaaaaaaa/blue.catbird.chat.device/11111111-1111-4111-8111-111111111111",
@@ -445,7 +467,6 @@ fn import_conversation_history_skips_existing_replaces_gap_and_validates_convers
 }
 
 #[test]
-#[ignore = "fixture predates PLC-directory DID resolution and repository-proof device directories"]
 fn ffi_pending_group_creation_status_retry_and_cancel_wrappers_preserve_outcomes() {
     let tmp = TempDir::new().unwrap();
     let clock = Arc::new(FixedStepClock::new(1_700_000_000_000, 1));

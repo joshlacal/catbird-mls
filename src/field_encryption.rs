@@ -421,26 +421,23 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "vector emitter; run with --include-ignored to print"]
     fn emit_test_vectors() {
         let root = [0x42u8; KEY_LEN];
         let conv = "conv-1";
 
         let ck = derive_content_key(&root, conv).unwrap();
-        println!("content_key = {}", hex::encode(ck));
         let hk = derive_hmac_key(&root, conv).unwrap();
-        println!("hmac_key    = {}", hex::encode(hk));
+        assert_ne!(ck, hk);
 
         let p1 = [0xABu8; 40];
         let h1 = compute_entry_hmac(&root, conv, None, "m1", &p1).unwrap();
-        println!("hmac_m1     = {}", hex::encode(h1));
 
         let p2 = [0xCDu8; 40];
         let h2 = compute_entry_hmac(&root, conv, Some(&h1), "m2", &p2).unwrap();
-        println!("hmac_m2     = {}", hex::encode(h2));
 
         let p3 = [0xEFu8; 40];
         let h3 = compute_entry_hmac(&root, conv, Some(&h2), "m3", &p3).unwrap();
-        println!("hmac_m3     = {}", hex::encode(h3));
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
     }
 }

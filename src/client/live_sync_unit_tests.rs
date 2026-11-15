@@ -179,10 +179,43 @@ fn authority_did_doc(did: &str, sk: &P256SigningKey) -> Value {
     })
 }
 
+fn plc_atproto_secret(did: &str) -> p256::SecretKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"catbird-sync-mock-atproto:");
+    hasher.update(did.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    p256::SecretKey::from_slice(&digest).unwrap()
+}
+
+fn plc_did_doc(did: &str) -> Value {
+    let sk = P256SigningKey::from(&plc_atproto_secret(did));
+    let sec1 = sk.verifying_key().to_encoded_point(true);
+    let mut multikey = vec![0x80, 0x24];
+    multikey.extend_from_slice(sec1.as_bytes());
+    let multibase_str = multibase::encode(multibase::Base::Base58Btc, multikey);
+    json!({
+        "id": did,
+        "verificationMethod": [{
+            "id": format!("{did}#atproto"),
+            "type": "Multikey",
+            "controller": did,
+            "publicKeyMultibase": multibase_str,
+        }],
+        "service": [{
+            "id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": PDS_URL,
+        }],
+    })
+}
+
 impl PlatformTransport for SyncMockTransport {
     fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
         let q = query_params(&request.url);
         let mut st = self.state.lock().unwrap();
+        if let Some(plc_did) = request.url.strip_prefix("https://plc.directory/") {
+            return json_http(200, &plc_did_doc(plc_did));
+        }
         if request.url.ends_with("/.well-known/did.json") {
             let host = request
                 .url
@@ -205,33 +238,55 @@ impl PlatformTransport for SyncMockTransport {
             if let Some(sk) = st.authority_keys.get(&did) {
                 return json_http(200, &json!({ "didDoc": authority_did_doc(&did, sk) }));
             }
-            return json_http(
-                200,
-                &json!({
-                    "didDoc": {
-                        "id": did,
-                        "service": [{
-                            "id": "#atproto_pds",
-                            "type": "AtprotoPersonalDataServer",
-                            "serviceEndpoint": PDS_URL,
-                        }],
-                    }
-                }),
-            );
+            return json_http(200, &json!({ "didDoc": plc_did_doc(&did) }));
         }
         if request.url.contains("/xrpc/com.atproto.repo.listRecords") {
+            if request
+                .url
+                .contains("collection=blue.catbird.chat.deviceRevocation")
+            {
+                return json_http(200, &json!({ "records": [] }));
+            }
             let repo = q.get("repo").cloned().unwrap_or_default();
             let devices = st.pds_devices.get(&repo).cloned().unwrap_or_default();
             let records: Vec<Value> = devices
                 .into_iter()
                 .map(|(dev_id, pk)| {
-                    json!({
+                    let value = json!({
+                        "$type": "blue.catbird.chat.device",
+                        "deviceId": dev_id,
+                        "algorithm": "Ed25519",
+                        "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(pk) },
+                        "createdAt": "2026-11-14T00:00:00.000Z",
+                    });
+                    #[allow(unused_mut)]
+                    let mut entry = json!({
                         "uri": format!("at://{repo}/blue.catbird.chat.device/{dev_id}"),
-                        "value": {
-                            "algorithm": "ed25519",
-                            "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(pk) },
-                        }
-                    })
+                        "value": value,
+                    });
+                    #[cfg(feature = "labyrinth")]
+                    {
+                        let secret = plc_atproto_secret(&repo);
+                        let signing_key = atproto_spaces::tokens::SpaceSigningKey::from_p256_secret(
+                            &secret,
+                            format!("{repo}#atproto"),
+                        );
+                        let (record_cid, record_cbor) =
+                            crate::labyrinth::repo_proof::encode_atproto_json_record_dagcbor(
+                                &entry["value"],
+                            )
+                            .unwrap();
+                        let (_, car_bytes) = crate::labyrinth::repo_proof::build_repo_proof_car_v1(
+                            &repo,
+                            "3lb2zzzzzzzzz",
+                            &[(format!("blue.catbird.chat.device/{dev_id}"), record_cbor)],
+                            &signing_key,
+                        )
+                        .unwrap();
+                        entry["cid"] = json!(record_cid.to_string());
+                        entry["proof"] = json!(STANDARD.encode(car_bytes));
+                    }
+                    entry
                 })
                 .collect();
             return json_http(200, &json!({ "records": records }));
@@ -1306,7 +1361,6 @@ fn record_undecryptable_entry_tracks_sibling_counter_without_touching_own_device
 }
 
 #[test]
-#[ignore = "fixture predates PLC-directory DID resolution and repository-proof device directories"]
 fn fulfill_leaf_recovery_and_join_pending_welcome_boundary_guards() {
     let tmp = tempfile::tempdir().unwrap();
     let (transport, state) = SyncMockTransport::new();
@@ -1830,7 +1884,6 @@ fn verify_application_prior_and_nse_deferred_marker_boundaries() {
 }
 
 #[test]
-#[ignore = "fixture predates PLC-directory DID resolution and repository-proof device directories"]
 fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let (transport, state) = SyncMockTransport::new();
@@ -2291,12 +2344,13 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         "own sibling device must check sendCounter before decrypt: {err_stale_sib}"
     );
 
-    // 5. Re-delivery at `entry_seq == current.last_seq` (`L4790:49`, `>` vs `>=`):
-    // At `entry_seq == current.last_seq == 4`, `peer_counter` must be `None` (NOT re-verifying
-    // `sendCounter == 10` against `last == "10"`!). If `>` is mutated to `>=`, line 4887 fails
-    // BEFORE reaching `deserialize app msg` (`[0u8; 8]`), whereas original reaches `deserialize app msg`!
+    // 5. Re-delivery at `entry_seq == current.last_seq`:
+    // Without a pending archive receipt at `seq == 4`, re-delivery at cursor is skipped (`Ok(())`).
+    // With a pending archive receipt at `seq == 4`, `cursor_seq` rewinds to `3` and `peer_counter`
+    // stays `None` (`entry_seq > current.last_seq` is false), reaching `deserialize app msg`.
+    let redeliver_msg_id = "77777777-7777-4777-8777-777777777778";
     let redelivered_at_cursor = make_signed_app_entry(
-        "77777777-7777-4777-8777-777777777778",
+        redeliver_msg_id,
         4,
         BOB_DID,
         DEV_A1,
@@ -2311,7 +2365,36 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         .lock()
         .unwrap()
         .entries_by_after
-        .insert(4, vec![redelivered_at_cursor]);
+        .insert(4, vec![redelivered_at_cursor.clone()]);
+    let mut pass = EntryPass {
+        max_seq: convo_row.last_seq,
+        ..EntryPass::default()
+    };
+    alice
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .unwrap();
+
+    alice
+        .db
+        .write_tx(|tx| {
+            tx.put_pending_op(
+                NATIVE_ARCHIVE_RECEIPT_OP,
+                redeliver_msg_id,
+                &json!({
+                    "conversation_id": CONVO_ID,
+                    "seq": 4,
+                    "entry_id": redeliver_msg_id,
+                })
+                .to_string(),
+                100,
+            )
+        })
+        .unwrap();
+    {
+        let mut st = state.lock().unwrap();
+        st.entries_by_after.remove(&4);
+        st.entries_by_after.insert(3, vec![redelivered_at_cursor]);
+    }
     let mut pass = EntryPass {
         max_seq: convo_row.last_seq,
         ..EntryPass::default()

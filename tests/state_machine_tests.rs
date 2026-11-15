@@ -3,8 +3,8 @@
 //! These tests exercise the orchestrator's messaging, group lifecycle, sync, and
 //! recovery flows using the E2E test harness (TestWorld + mock backends).
 //!
-//! Tests marked `#[ignore]` reproduce **known bugs** documented in the Phase 0
-//! analysis. Run with `cargo test -- --ignored` to see failures.
+//! Regression tests covering state-machine invariants documented in the Phase 0
+//! analysis across messaging, group lifecycle, and recovery/sync flows.
 //!
 //! Bug references:
 //!   - state-machine-messaging.md  (messaging flow bugs)
