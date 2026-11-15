@@ -65,7 +65,7 @@ pub fn derive_sqlcipher_96hex_key_spec(db_key_32: &[u8; 32]) -> String {
     let mut salt_16 = [0u8; 16];
     hk.expand(SQLCIPHER_SALT_HKDF_INFO, &mut salt_16)
         .expect("16-byte HKDF-SHA256 output is valid");
-    format!("x'{}{}'", hex::encode(db_key_32), hex::encode(salt_16))
+    crate::kani_proofs::format_sqlcipher_96hex_key_spec(db_key_32, &salt_16)
 }
 
 /// Normalize a caller-provided key string into a 32-byte key (`[u8; 32]`):
@@ -233,6 +233,8 @@ fn open_configured_connection(
         open_sqlite_connection(path).map_err(|e| map_rusqlite_err("Connection::open", &e))?;
 
     let key_spec = Zeroizing::new(derive_sqlcipher_96hex_key_spec(db_key_32));
+    let _ = crate::kani_proofs::parse_sqlcipher_96hex_key_spec(key_spec.as_str())
+        .map_err(|e| MLSError::Internal(format!("invalid SQLCipher key spec: {e}")))?;
 
     // Exact pragma order mandated by Spec §6.1 / I8:
     // 1. PRAGMA key = "x'<64-hex><32-hex>'";
