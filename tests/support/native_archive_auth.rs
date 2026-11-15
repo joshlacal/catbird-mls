@@ -40,6 +40,7 @@ struct World {
     records: BTreeMap<RecordKey, Record>,
     mailbox_keys: BTreeMap<(String, String), Record>,
     chat_devices: BTreeMap<(String, String), Record>,
+    chat_device_revocations: BTreeMap<(String, String), Record>,
     ops: BTreeMap<(String, String), Vec<Value>>,
     repo_revisions: BTreeMap<(String, String), String>,
     blobs: BTreeMap<(String, String), Vec<u8>>,
@@ -52,6 +53,7 @@ struct World {
     unsigned_space_not_found: Option<(&'static str, u16)>,
     /// `(did, collection, fault_kind)` fault injected on `com.atproto.sync.getRecord`.
     repo_proof_fault: Option<(String, String, &'static str)>,
+    omit_atproto_key_for: Option<String>,
     /// `(account, space)` refused, with the MLS group the authority signs into its denial.
     denied_spaces: BTreeMap<(String, String), Vec<u8>>,
 }
@@ -208,6 +210,11 @@ impl NativeArchiveAuthFixture {
     }
 
     #[allow(dead_code)]
+    pub fn set_omit_atproto_key_for(&self, did: Option<&str>) {
+        self.world.lock().unwrap().omit_atproto_key_for = did.map(str::to_owned);
+    }
+
+    #[allow(dead_code)]
     pub fn build_signed_car_response(
         &self,
         did: &str,
@@ -256,9 +263,14 @@ impl NativeArchiveAuthFixture {
         } else {
             return Ok(reply(404, json!({"error": "RecordNotFound"})));
         };
+        let commit_rev = if fault == Some("rev_rollback") {
+            "3la2zzzzzzzzz"
+        } else {
+            "3lb2zzzzzzzzz"
+        };
         let (_, car_bytes) = catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1(
             did,
-            "3lb2zzzzzzzzz",
+            commit_rev,
             &entries,
             &signing_key,
         )
@@ -317,6 +329,34 @@ impl NativeArchiveAuthFixture {
         request: &PlatformHttpRequest,
         raw: impl FnOnce(&PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError>,
     ) -> Result<PlatformHttpResponse, MLSError> {
+        if let Some(did) = request.url.strip_prefix("https://plc.directory/") {
+            if self.world.lock().unwrap().directory_outage {
+                return Ok(reply(503, json!({"error": "DirectoryUnavailable"})));
+            }
+            let original = raw(request)?;
+            if original.status == 404 {
+                return Ok(original);
+            }
+            let mut root = if original.status == 200 {
+                parse(&original.body).unwrap_or_else(|_| json!({"id": did}))
+            } else {
+                json!({"id": did})
+            };
+            let document = if root.get("didDoc").is_some() {
+                &mut root["didDoc"]
+            } else {
+                &mut root
+            };
+            if document["id"].as_str() != Some(did) {
+                document["id"] = json!(did);
+            }
+            self.augment_document(
+                did,
+                document,
+                "https://pds.catbird.test/xrpc/com.atproto.identity.resolveDid",
+            )?;
+            return Ok(reply(200, document.clone()));
+        }
         let Some((_, target)) = request.url.split_once("/xrpc/") else {
             return raw(request);
         };
@@ -349,6 +389,11 @@ impl NativeArchiveAuthFixture {
                 } else if collection == "blue.catbird.chat.device" {
                     world
                         .chat_devices
+                        .get(&(did.to_owned(), rkey.to_owned()))
+                        .map(|r| r.value.clone())
+                } else if collection == "blue.catbird.chat.deviceRevocation" {
+                    world
+                        .chat_device_revocations
                         .get(&(did.to_owned(), rkey.to_owned()))
                         .map(|r| r.value.clone())
                 } else {
@@ -386,21 +431,27 @@ impl NativeArchiveAuthFixture {
                 .as_ref()
                 .and_then(|v| v["collection"].as_str())
                 .or_else(|| params.get("collection").map(String::as_str));
-            if collection == Some("blue.catbird.chat.device") {
+            if matches!(
+                collection,
+                Some("blue.catbird.chat.device" | "blue.catbird.chat.deviceRevocation")
+            ) {
+                let is_revocation = collection == Some("blue.catbird.chat.deviceRevocation");
                 let mut resp = raw(request)?;
                 if (200..300).contains(&resp.status) {
                     match nsid {
-                        "com.atproto.repo.putRecord" => {
+                        "com.atproto.repo.createRecord" | "com.atproto.repo.putRecord" => {
                             if let Some(b) = body.as_ref() {
                                 if let (Some(repo), Some(rkey), Some(val)) =
                                     (b["repo"].as_str(), b["rkey"].as_str(), b.get("record"))
                                 {
                                     if let Ok(rec) = record(val) {
-                                        self.world
-                                            .lock()
-                                            .unwrap()
-                                            .chat_devices
-                                            .insert((repo.to_owned(), rkey.to_owned()), rec);
+                                        let mut world = self.world.lock().unwrap();
+                                        let map = if is_revocation {
+                                            &mut world.chat_device_revocations
+                                        } else {
+                                            &mut world.chat_devices
+                                        };
+                                        map.insert((repo.to_owned(), rkey.to_owned()), rec);
                                     }
                                 }
                             }
@@ -410,11 +461,23 @@ impl NativeArchiveAuthFixture {
                                 if let (Some(repo), Some(rkey)) =
                                     (b["repo"].as_str(), b["rkey"].as_str())
                                 {
-                                    self.world
-                                        .lock()
-                                        .unwrap()
-                                        .chat_devices
-                                        .remove(&(repo.to_owned(), rkey.to_owned()));
+                                    let mut world = self.world.lock().unwrap();
+                                    let map = if is_revocation {
+                                        &mut world.chat_device_revocations
+                                    } else {
+                                        &mut world.chat_devices
+                                    };
+                                    map.remove(&(repo.to_owned(), rkey.to_owned()));
+                                }
+                            }
+                        }
+                        "com.atproto.repo.getRecord" => {
+                            if let Ok(mut parsed) = parse(&resp.body) {
+                                if let Some(val) = parsed.get("value").cloned() {
+                                    if let Ok(rec) = record(&val) {
+                                        parsed["cid"] = json!(rec.cid);
+                                        resp.body = serde_json::to_vec(&parsed).map_err(failure)?;
+                                    }
                                 }
                             }
                         }
@@ -425,7 +488,11 @@ impl NativeArchiveAuthFixture {
                                     parsed.get_mut("records").and_then(Value::as_array_mut)
                                 {
                                     let mut world = self.world.lock().unwrap();
-                                    world.chat_devices.retain(|(owner, _), _| owner != &repo);
+                                    let map = if is_revocation {
+                                        &mut world.chat_device_revocations
+                                    } else {
+                                        &mut world.chat_devices
+                                    };
                                     for entry in arr.iter_mut() {
                                         let rkey_opt = entry["uri"]
                                             .as_str()
@@ -436,9 +503,7 @@ impl NativeArchiveAuthFixture {
                                         {
                                             if let Ok(rec) = record(&val) {
                                                 entry["cid"] = json!(rec.cid);
-                                                world
-                                                    .chat_devices
-                                                    .insert((repo.clone(), rkey), rec);
+                                                map.insert((repo.clone(), rkey), rec);
                                             }
                                         }
                                     }
@@ -674,6 +739,7 @@ impl NativeArchiveAuthFixture {
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| failure("DID methods not array"))?;
+        let omit_atproto = self.world.lock().unwrap().omit_atproto_key_for.as_deref() == Some(did);
         for (fragment, purpose) in [
             ("atproto", b"sign".as_slice()),
             ("atproto_kem", b"kem".as_slice()),
@@ -685,7 +751,9 @@ impl NativeArchiveAuthFixture {
                 method["id"].as_str() != Some(&id)
                     && method["id"].as_str() != Some(&format!("#{fragment}"))
             });
-            methods.push(json!({"id": id, "controller": did, "type": "Multikey", "publicKeyMultibase": public.strip_prefix("did:key:").unwrap()}));
+            if !(omit_atproto && fragment == "atproto") {
+                methods.push(json!({"id": id, "controller": did, "type": "Multikey", "publicKeyMultibase": public.strip_prefix("did:key:").unwrap()}));
+            }
         }
         let base = request_url.split_once("/xrpc/").unwrap().0;
         let services = document

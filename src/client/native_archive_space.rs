@@ -521,6 +521,26 @@ mod native_archive_space_auth {
                 .map_err(|e| e.to_string())
         }
 
+        fn check_writer_rev_not_rolled_back(
+            &self,
+            space: &str,
+            writer: &str,
+            rev: &str,
+        ) -> Result<(), String> {
+            labyrinth::store::validate_writer_rev_floor(space, writer, rev)
+                .map_err(|e| format!("native_space_invalid_writer_rev: {e}"))?;
+            let current = self.load_persisted_writer_rev_floors()?;
+            let key = (space.to_owned(), writer.to_owned());
+            if let Some(floor) = current.get(&key) {
+                if rev < floor.as_str() {
+                    return Err(format!(
+                        "WriterRollback: space={space} writer={writer} offered={rev} floor={floor}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+
         fn observe_writer_rev(&self, space: &str, writer: &str, rev: &str) -> Result<(), String> {
             labyrinth::store::validate_writer_rev_floor(space, writer, rev)
                 .map_err(|e| format!("native_space_invalid_writer_rev: {e}"))?;
@@ -547,48 +567,46 @@ mod native_archive_space_auth {
         }
 
         pub(super) fn space_document(&self, did: &str) -> Result<DidDocument, String> {
-            // Resolve through the account PDS. A direct did:web fallback could
-            // connect to the foreign sequencer, leaking Space interest under D1.
-            // Only when the platform transport explicitly refuses `resolveDid`
-            // (`Err(_)`) and `did` is `did:plc:*` may we fall back to plc.directory.
-            let path = format!(
-                "/xrpc/com.atproto.identity.resolveDid?did={}",
-                encode(did)
-            );
-            let response = match self.execute(
-                &self.config.pds_endpoint,
-                "GET".into(),
-                path,
-                vec![],
-                None,
-            ) {
-                Ok(resp) => bounded(resp)?,
-                Err(_) if did.starts_with("did:plc:") => {
-                    let url = crate::labyrinth::transport::did_document_url(did)?;
-                    if !self.db.is_open() {
-                        return Err("native_archive_context_closed".into());
-                    }
-                    let resp = self
-                        .transport
-                        .execute_http(crate::PlatformHttpRequest {
-                            method: "GET".into(),
-                            url,
-                            headers: vec![],
-                            body: None,
-                        })
-                        .map_err(|e| e.to_string())?;
-                    if !self.db.is_open() {
-                        return Err("native_archive_context_closed".into());
-                    }
-                    bounded(resp)?
+            let bare = did.split('#').next().unwrap_or(did).trim();
+            let response = if bare.starts_with("did:plc:") {
+                let url = crate::labyrinth::transport::did_document_url(bare)?;
+                if !self.db.is_open() {
+                    return Err("native_archive_context_closed".into());
                 }
-                Err(err) => return Err(err),
+                let resp = self
+                    .transport
+                    .execute_http(crate::PlatformHttpRequest {
+                        method: "GET".into(),
+                        url,
+                        headers: vec![],
+                        body: None,
+                    })
+                    .map_err(|e| e.to_string())?;
+                if !self.db.is_open() {
+                    return Err("native_archive_context_closed".into());
+                }
+                bounded(resp)?
+            } else {
+                // For `did:web:*`, resolve through the account PDS so a direct `.well-known`
+                // connection never leaks Space interest to a foreign sequencer under D1.
+                let path = format!(
+                    "/xrpc/com.atproto.identity.resolveDid?did={}",
+                    encode(bare)
+                );
+                let resp = self.execute(
+                    &self.config.pds_endpoint,
+                    "GET".into(),
+                    path,
+                    vec![],
+                    None,
+                )?;
+                bounded(resp)?
             };
             require_success(&response, "resolveDid")?;
             let bytes =
                 super::super::chat_wire::extract_did_doc_from_resolve_response(&response.body)
                     .map_err(|e| format!("native_space_did_document: {e}"))?;
-            DidDocument::parse_json(did, &bytes)
+            DidDocument::parse_json(bare, &bytes)
                 .map_err(|e| format!("native_space_did_document: {e}"))
         }
 
@@ -1212,7 +1230,11 @@ mod native_archive_space_auth {
             let mut verified = VerifiedArchiveInventory::default();
             let mut verified_bytes = 0usize;
             for row in &active_repos {
-                self.observe_writer_rev(&context.space.raw, &row.did, &row.repo_rev)?;
+                self.check_writer_rev_not_rolled_back(
+                    &context.space.raw,
+                    &row.did,
+                    &row.repo_rev,
+                )?;
                 context.writer = row.did.clone();
                 context.kem_key = if row.did == authority {
                     authority_kem.clone()
@@ -1220,6 +1242,7 @@ mod native_archive_space_auth {
                     self.space_document(&row.did)?.atproto_kem_did_key
                 };
                 let (records, writer_bytes) = self.verify_inventory_writer(context, row)?;
+                self.observe_writer_rev(&context.space.raw, &row.did, &row.repo_rev)?;
                 verified_bytes = verified_bytes
                     .checked_add(writer_bytes)
                     .ok_or("native_space_inventory_cache_bytes_overflow")?;
@@ -2423,11 +2446,34 @@ mod native_archive_space_auth {
             ) -> Result<PlatformHttpResponse, crate::MLSError> {
                 self.requests.lock().unwrap().push(request.clone());
                 let fault = *self.fault.lock().unwrap();
+                if let Some(did) = request.url.strip_prefix("https://plc.directory/") {
+                    assert!(request
+                        .headers
+                        .iter()
+                        .all(|h| !h.name.eq_ignore_ascii_case("authorization")));
+                    let signing = encode_p256_did_key(&self.signing.public_key());
+                    let kem = encode_p256_did_key(&self.kem.public_key());
+                    return Ok(response(json!({
+                        "id": did,
+                        "verificationMethod": [
+                            {"id": format!("{did}#atproto"), "type": "Multikey", "controller": did,
+                             "publicKeyMultibase": signing.strip_prefix("did:key:").unwrap()},
+                            {"id": format!("{did}#atproto_kem"), "type": "Multikey", "controller": did,
+                             "publicKeyMultibase": kem.strip_prefix("did:key:").unwrap()},
+                        ],
+                        "service": [{"id": format!("{did}#atproto_pds"), "type": "AtprotoPersonalDataServer",
+                                     "serviceEndpoint": "https://writer-pds.example"}],
+                    })));
+                }
                 let target = request.url.split_once("/xrpc/").unwrap().1;
                 let (nsid, query) = target.split_once('?').unwrap_or((target, ""));
                 if nsid == "com.atproto.identity.resolveDid" {
                     assert!(request.url.starts_with("https://account-pds.example/"));
                     let did = decode_component(query.strip_prefix("did=").unwrap()).unwrap();
+                    assert!(
+                        !did.starts_with("did:plc:"),
+                        "did:plc must resolve directly from plc.directory, never via account PDS"
+                    );
                     let signing = encode_p256_did_key(&self.signing.public_key());
                     let kem = encode_p256_did_key(&self.kem.public_key());
                     return Ok(response(json!({
@@ -3113,6 +3159,7 @@ mod native_archive_space_auth {
                 first_requests.iter().all(|r| {
                     r.url.starts_with("https://account-pds.example/")
                         || r.url.starts_with("https://home.example/")
+                        || r.url.starts_with("https://plc.directory/")
                 }),
                 "D1 forbids direct foreign DS requests"
             );

@@ -76,8 +76,13 @@ fn state_view_sequencer_did(state: &Value) -> Option<&str> {
         .filter(|did| did.starts_with("did:") && !did.contains('#'))
 }
 
-fn conversation_space_uri(sequencer_did: &str, cid: &str, generation: i64) -> String {
-    format!("at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{cid}-{generation}")
+pub(crate) fn conversation_space_uri(sequencer_did: &str, cid: &str, generation: i64) -> String {
+    let rkey = format!("{cid}-{generation}");
+    atproto_spaces::SpaceUri::new(sequencer_did, "blue.catbird.labyrinth.conversation", &rkey)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| {
+            format!("at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{rkey}")
+        })
 }
 
 /// What one conversation's entry pass applied before it finished or stopped.
@@ -2020,9 +2025,7 @@ impl CatbirdMlsClient {
                     ),
                 };
 
-            let space_uri = Some(format!(
-                "at://{effective_seq_did}/space/blue.catbird.labyrinth.conversation/{cid}-0"
-            ));
+            let space_uri = Some(conversation_space_uri(&effective_seq_did, cid, 0));
             let convo_row = ConversationRow {
                 conversation_id: cid.to_string(),
                 group_id: group_id.clone(),
@@ -3759,8 +3762,16 @@ impl CatbirdMlsClient {
                 |label| label == crate::chat_v2::wire::APPLICATION_ENTRY_KIND,
             );
             if entry_seq <= convo.last_seq {
-                if !is_application {
-                    // A control already below the durable cursor has already had its effects.
+                #[cfg(feature = "sim")]
+                let sim_replay = self.sim_reopened
+                    && crate::planted::is_planted_bug_active(
+                        crate::planted::PlantedBug::P12SkipMessageIdDedupeAfterCrashRestart,
+                    );
+                #[cfg(not(feature = "sim"))]
+                let sim_replay = false;
+                if !is_application || (!pending_receipts.contains_key(&entry_seq) && !sim_replay) {
+                    // Entries already at or below the durable cursor have already been applied;
+                    // only a pending NSE archive receipt (or sim P12) re-inspects an application entry.
                     continue;
                 }
             } else {
@@ -5088,8 +5099,11 @@ impl CatbirdMlsClient {
                         .map_err(|e| MLSError::Cryptography(format!("app protocol msg: {e:?}")))?;
                     let msg_epoch = proto.epoch().as_u64() as i64;
                     let current_epoch = proto.epoch() == group.epoch();
+                    let eligible_for_gap = current_epoch
+                        && entry_seq > c.last_seq
+                        && tx.get_message(msg_id)?.is_none();
                     let processed = group.process_message(&provider, proto).map_err(|e| {
-                        if current_epoch {
+                        if eligible_for_gap {
                             undecryptable = chat_wire::permanent_decrypt_failure(&e)
                                 .map(|reason| (reason, msg_epoch));
                         }
@@ -5261,6 +5275,11 @@ impl CatbirdMlsClient {
                     tx.put_labyrinth_state(
                         &format!("native.message:{cid}:{msg_id}"),
                         &serde_json::to_vec(&archive)?,
+                        now_ms,
+                    )?;
+                    tx.put_labyrinth_state(
+                        &format!("push.verified_receipt:{cid}:{msg_id}"),
+                        b"1",
                         now_ms,
                     )?;
                     // Witness copy: pre-removal history must not depend on its sender flushing.

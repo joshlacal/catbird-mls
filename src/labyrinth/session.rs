@@ -138,11 +138,19 @@ pub trait LocalConversationAuthority: MaybeSend + MaybeSync {
     }
 
     /// `did`'s Ed25519 chat device signing keys verified against `did`'s PDS
-    /// `blue.catbird.chat.device` repository records (`#atproto` commit proof).
+    /// `blue.catbird.chat.device` repository records (`#atproto` commit proof),
+    /// excluding any device retired by `blue.catbird.chat.deviceRevocation`.
     /// `None` when PDS device verification is not configured on this authority.
     async fn authorized_chat_device_keys(&self, did: &str) -> Result<Option<Vec<[u8; 32]>>> {
         let _ = did;
         Ok(None)
+    }
+
+    /// `did`'s Ed25519 chat device signing keys retired via verified append-only
+    /// `blue.catbird.chat.deviceRevocation` records on `did`'s PDS.
+    async fn revoked_chat_device_keys(&self, did: &str) -> Result<Vec<[u8; 32]>> {
+        let _ = did;
+        Ok(Vec::new())
     }
 
     /// `did`'s live leaf signing keys across active local MLS groups shared with
@@ -201,6 +209,18 @@ impl MailboxDirectory for LocallyCheckedDirectory {
 
     async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         let mut reported = self.inner.device_transport_keys(did).await?;
+        let revoked_set: std::collections::BTreeSet<[u8; 32]> = self
+            .authority
+            .revoked_chat_device_keys(did)
+            .await
+            .map_err(|error| labyrinth::Error::Backend(format!("revoked PDS devices: {error}")))?
+            .into_iter()
+            .collect();
+        for entry in &mut reported {
+            if revoked_set.contains(&entry.key) {
+                entry.removed_at.get_or_insert(1);
+            }
+        }
         if let Some(allowed) = self
             .authority
             .authorized_chat_device_keys(did)
@@ -210,7 +230,14 @@ impl MailboxDirectory for LocallyCheckedDirectory {
             })?
         {
             let allowed_set: std::collections::BTreeSet<[u8; 32]> = allowed.into_iter().collect();
-            reported.retain(|entry| allowed_set.contains(&entry.key));
+            reported.retain(|entry| {
+                allowed_set.contains(&entry.key) || revoked_set.contains(&entry.key)
+            });
+            for entry in &mut reported {
+                if !allowed_set.contains(&entry.key) {
+                    entry.removed_at.get_or_insert(1);
+                }
+            }
         }
         if let Some(shared_leaves) = self
             .authority
@@ -696,7 +723,12 @@ impl SessionDeps {
                 .or_else(|| entry["uri"].as_str())
                 .or_else(|| entry["space"].as_str());
             uri.is_some_and(|u| {
-                u == expected_mailbox || u.contains("/space/blue.catbird.labyrinth.mailbox")
+                u == expected_mailbox
+                    || atproto_spaces::SpaceUri::parse_hedged(u).is_ok_and(|parsed| {
+                        parsed.authority == self.did
+                            && parsed.space_type == "blue.catbird.labyrinth.mailbox"
+                            && parsed.rkey == "self"
+                    })
             })
         });
         if still_present {

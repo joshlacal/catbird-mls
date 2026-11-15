@@ -39,15 +39,15 @@ use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize, VLBytes};
 use uuid::{Uuid, Version};
 
+use catbird_mls::canonical_transport::{
+    canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
+    canonical_commit_aad_bytes, canonical_metadata_exporter_context_bytes,
+};
 use catbird_mls::chat_v2::ids::KeyId;
 use catbird_mls::chat_v2::transcript::{
     project_signed_body, SignedMutationKind, SignedWrapper, VerifiedMutation,
 };
 use catbird_mls::metadata::{GroupMetadataV1, METADATA_REFERENCE_COMPONENT_ID};
-use catbird_mls::orchestrator::canonical_transport::{
-    canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
-    canonical_commit_aad_bytes, canonical_metadata_exporter_context_bytes,
-};
 
 const OPT_IN_ENV: &str = "CATBIRD_REGENERATE_MLS_CHAT_CRYPTO_WIRE";
 const OPT_IN_VALUE: &str = "1";

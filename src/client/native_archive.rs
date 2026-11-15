@@ -127,24 +127,54 @@ impl crate::labyrinth::LabyrinthGateway for NativeArchiveGateway {
         self.execute(&self.config.home_ds_endpoint, request.method, request.path, headers, request.body).map(Self::response)
     }
     async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
-        let path = format!("/xrpc/com.atproto.identity.resolveDid?did={}", super::chat_wire::urlencode_form_component(did));
+        let bare = did.split('#').next().unwrap_or(did).trim();
+        if bare.is_empty() {
+            return Err("empty DID".into());
+        }
+        if bare.starts_with("did:plc:") {
+            let url = crate::labyrinth::transport::did_document_url(bare)?;
+            if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
+            let response = self.transport.execute_http(PlatformHttpRequest { method: "GET".into(), url, headers: vec![], body: None }).map_err(|e| e.to_string())?;
+            if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
+            if response.status == 404 { return Ok(None); }
+            if response.status != 200 { return Err(format!("resolve archive DID returned HTTP {}", response.status)); }
+            let doc = super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map_err(|e| e.to_string())?;
+            let parsed: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| e.to_string())?;
+            if parsed.get("id").and_then(serde_json::Value::as_str) != Some(bare) {
+                return Err(format!("resolved DID document id mismatch for `{bare}`"));
+            }
+            return Ok(Some(doc));
+        }
+        let path = format!("/xrpc/com.atproto.identity.resolveDid?did={}", super::chat_wire::urlencode_form_component(bare));
         match self.execute(&self.config.pds_endpoint, "GET".into(), path, vec![], None) {
             Ok(response) if response.status == 200 => {
                 match super::chat_wire::extract_did_doc_from_resolve_response(&response.body) {
-                    Ok(doc) => return Ok(Some(doc)),
+                    Ok(doc) => {
+                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&doc) {
+                            if parsed.get("id").and_then(serde_json::Value::as_str) == Some(bare) {
+                                return Ok(Some(doc));
+                            }
+                        }
+                        tracing::debug!("own-PDS resolveDid returned mismatched DID document id; falling back");
+                    }
                     Err(e) => tracing::debug!("own-PDS resolveDid returned no DID document ({e}); falling back"),
                 }
             }
             Ok(response) => tracing::debug!("own-PDS resolveDid returned HTTP {}; falling back", response.status),
             Err(e) => tracing::debug!("own-PDS resolveDid failed ({e}); falling back"),
         }
-        let url = crate::labyrinth::transport::did_document_url(did)?;
+        let url = crate::labyrinth::transport::did_document_url(bare)?;
         if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
         let response = self.transport.execute_http(PlatformHttpRequest { method: "GET".into(), url, headers: vec![], body: None }).map_err(|e| e.to_string())?;
         if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
         if response.status == 404 { return Ok(None); }
         if response.status != 200 { return Err(format!("resolve archive DID returned HTTP {}", response.status)); }
-        super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map(Some).map_err(|e| e.to_string())
+        let doc = super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map_err(|e| e.to_string())?;
+        let parsed: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| e.to_string())?;
+        if parsed.get("id").and_then(serde_json::Value::as_str) != Some(bare) {
+            return Err(format!("resolved DID document id mismatch for `{bare}`"));
+        }
+        Ok(Some(doc))
     }
 }
 
@@ -283,7 +313,7 @@ impl NativeArchiveGateway {
         let record_val = response
             .get("value")
             .ok_or(labyrinth::Error::Malformed("getRecord missing value"))?;
-        crate::labyrinth::repo_proof::verify_car_record_json_match(
+        let (_, commit_rev) = crate::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
             &car_bytes,
             did,
             labyrinth::records::nsid::MAILBOX_KEYS,
@@ -292,7 +322,13 @@ impl NativeArchiveGateway {
             record_val,
             atproto_key,
         )
-        .map(|_| ())
+        .map_err(|_| labyrinth::Error::BadSignature)?;
+        crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+            &self.db,
+            did,
+            &commit_rev,
+            self.hooks.now_ms(),
+        )
         .map_err(|_| labyrinth::Error::BadSignature)
     }
 }
@@ -479,6 +515,427 @@ impl NativeLocalAuthority {
         });
         group.map_err(crate::orchestrator::error::OrchestratorError::Mls)
     }
+    fn paginate_pds_collection(
+        &self,
+        pds_endpoint: &str,
+        did: &str,
+        collection: &str,
+        allow_not_found: bool,
+    ) -> crate::orchestrator::error::Result<Option<Vec<serde_json::Value>>> {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let mut all_records = Vec::new();
+        for page_idx in 0..super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+            let mut path = format!(
+                "/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit={}",
+                super::chat_wire::urlencode_form_component(did),
+                super::chat_wire::urlencode_form_component(collection),
+                super::chat_wire::PDS_LIST_RECORDS_PAGE_LIMIT,
+            );
+            if let Some(ref c) = cursor {
+                path.push_str(&format!(
+                    "&cursor={}",
+                    super::chat_wire::urlencode_form_component(c)
+                ));
+            }
+            let resp = self
+                .gateway
+                .execute(pds_endpoint, "GET".into(), path, vec![], None)
+                .map_err(crate::orchestrator::error::OrchestratorError::Credential)?;
+            if page_idx == 0 && allow_not_found && resp.status == 404 {
+                return Ok(None);
+            }
+            if resp.status >= 400 {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!(
+                        "PDS listRecords({did}, {collection}) failed with HTTP {}",
+                        resp.status
+                    ),
+                ));
+            }
+            let (page_records, next_cursor) =
+                super::chat_wire::parse_pds_list_records_page(did, collection, &resp.body)
+                    .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
+            all_records.extend(page_records);
+            if all_records.len() > super::chat_wire::MAX_PDS_LIST_RECORDS_ITEMS {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!(
+                        "PDS listRecords({did}, {collection}) exceeded {} record ceiling",
+                        super::chat_wire::MAX_PDS_LIST_RECORDS_ITEMS
+                    ),
+                ));
+            }
+            match next_cursor {
+                None => return Ok(Some(all_records)),
+                Some(next) => {
+                    if !seen_cursors.insert(next.clone()) {
+                        return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                            format!(
+                                "PDS listRecords({did}, {collection}) repeated pagination cursor"
+                            ),
+                        ));
+                    }
+                    if page_idx + 1 == super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+                        return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                            format!(
+                                "PDS listRecords({did}, {collection}) truncated past {} pages",
+                                super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES
+                            ),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+        Ok(Some(all_records))
+    }
+
+    fn verify_record_car_proof_and_pin_rev(
+        &self,
+        pds_endpoint: &str,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+        record_entry: &serde_json::Value,
+        atproto_key: &atproto_spaces::tokens::SpaceVerifyingKey,
+    ) -> crate::orchestrator::error::Result<()> {
+        let expected_uri = format!("at://{did}/{collection}/{rkey}");
+        let expected_cid = record_entry["cid"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| {
+                crate::orchestrator::error::OrchestratorError::Credential(format!(
+                    "missing CID on `{expected_uri}`"
+                ))
+            })?;
+        let record_val = record_entry.get("value").ok_or_else(|| {
+            crate::orchestrator::error::OrchestratorError::Credential(format!(
+                "missing value on `{expected_uri}`"
+            ))
+        })?;
+        let inline_proof = record_entry.get("proof").and_then(|p| {
+            p.as_str()
+                .or_else(|| p.get("$bytes").and_then(serde_json::Value::as_str))
+        });
+        let car_bytes = if let Some(b64) = inline_proof {
+            BASE64_STANDARD.decode(b64).map_err(|e| {
+                crate::orchestrator::error::OrchestratorError::Credential(format!(
+                    "inline CAR proof decode on `{expected_uri}`: {e}"
+                ))
+            })?
+        } else {
+            let proof_path = format!(
+                "/xrpc/com.atproto.sync.getRecord?did={}&collection={}&rkey={}",
+                super::chat_wire::urlencode_form_component(did),
+                super::chat_wire::urlencode_form_component(collection),
+                super::chat_wire::urlencode_form_component(rkey),
+            );
+            let proof_resp = self
+                .gateway
+                .execute(pds_endpoint, "GET".into(), proof_path, vec![], None)
+                .map_err(crate::orchestrator::error::OrchestratorError::Credential)?;
+            if proof_resp.status >= 400 {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!(
+                        "CARv1 sync.getRecord(`{expected_uri}`) failed with HTTP {}",
+                        proof_resp.status
+                    ),
+                ));
+            }
+            proof_resp.body
+        };
+        let (_, commit_rev) =
+            crate::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+                &car_bytes,
+                did,
+                collection,
+                rkey,
+                Some(expected_cid),
+                record_val,
+                atproto_key,
+            )
+            .map_err(|e| {
+                crate::orchestrator::error::OrchestratorError::Credential(format!(
+                    "CARv1 repo proof failed for `{expected_uri}`: {e}"
+                ))
+            })?;
+        crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+            &self.db,
+            did,
+            &commit_rev,
+            self.hooks.now_ms(),
+        )
+        .map_err(|e| {
+            crate::orchestrator::error::OrchestratorError::Credential(format!(
+                "repository commit rev floor check failed for `{expected_uri}`: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn load_cached_peer_device_keys(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Option<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
+        let cached = self
+            .db
+            .read_tx(|tx| tx.get_account_meta(&format!("authorized_device_keys:{did}")))
+            .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
+        let Some(raw) = cached else {
+            return Ok(None);
+        };
+        let items: Vec<AuthorizedPeerDeviceKey> = serde_json::from_str(&raw).map_err(|e| {
+            crate::orchestrator::error::OrchestratorError::Credential(format!(
+                "decode cached authorized_device_keys: {e}"
+            ))
+        })?;
+        let mut keys = Vec::with_capacity(items.len());
+        for item in items {
+            if let Ok(key) = <[u8; 32]>::try_from(item.signature_public_key.as_slice()) {
+                keys.push(key);
+            }
+        }
+        Ok(Some((keys, Vec::new())))
+    }
+
+    async fn fetch_verified_pds_chat_devices(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Option<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
+        use crate::labyrinth::LabyrinthGateway as _;
+
+        if did == self.account_did {
+            let doc_opt = self.gateway.resolve_did_document(did).await.ok().flatten();
+            let parsed_doc = doc_opt
+                .as_deref()
+                .and_then(|b| atproto_spaces::did_resolver::DidDocument::parse_json(did, b).ok());
+            let atproto_key = parsed_doc.as_ref().and_then(|d| d.atproto_key.clone());
+            let pds_endpoint = doc_opt
+                .as_deref()
+                .and_then(|b| super::chat_wire::extract_pds_endpoint_from_did_doc(b, did))
+                .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
+
+            let raw_devices = match self.paginate_pds_collection(
+                &pds_endpoint,
+                did,
+                "blue.catbird.chat.device",
+                true,
+            ) {
+                Ok(Some(records)) => records,
+                Ok(None) => return Ok(None),
+                Err(_) if atproto_key.is_none() => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let entries = super::chat_wire::parse_pds_device_entries(did, &raw_devices);
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            if let Some(ref atproto_key) = atproto_key {
+                for (device_id, _, record_entry) in &entries {
+                    self.verify_record_car_proof_and_pin_rev(
+                        &pds_endpoint,
+                        did,
+                        "blue.catbird.chat.device",
+                        device_id,
+                        record_entry,
+                        atproto_key,
+                    )?;
+                }
+            }
+            let mut enrolled_map = std::collections::BTreeMap::new();
+            for (device_id, pk, _) in &entries {
+                enrolled_map.insert(device_id.clone(), pk.clone());
+            }
+            let raw_revocations = self
+                .paginate_pds_collection(
+                    &pds_endpoint,
+                    did,
+                    "blue.catbird.chat.deviceRevocation",
+                    true,
+                )?
+                .unwrap_or_default();
+            let rev_prefix = format!("at://{did}/blue.catbird.chat.deviceRevocation/");
+            let mut revoked_ids = std::collections::BTreeSet::new();
+            for rev_entry in &raw_revocations {
+                let Some(uri) = rev_entry.get("uri").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let Some(rkey) = uri
+                    .strip_prefix(&rev_prefix)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.contains('/'))
+                else {
+                    continue;
+                };
+                let Some(record_val) = rev_entry.get("value") else {
+                    return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                        format!("missing value on `{uri}`"),
+                    ));
+                };
+                if let Some(ref atproto_key) = atproto_key {
+                    self.verify_record_car_proof_and_pin_rev(
+                        &pds_endpoint,
+                        did,
+                        "blue.catbird.chat.deviceRevocation",
+                        rkey,
+                        rev_entry,
+                        atproto_key,
+                    )?;
+                }
+                let target_id = super::chat_wire::verify_pds_device_revocation_record(
+                    did,
+                    rkey,
+                    record_val,
+                    &enrolled_map,
+                )
+                .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
+                revoked_ids.insert(target_id);
+            }
+            let mut active = Vec::new();
+            let mut revoked = Vec::new();
+            for (device_id, pk, _) in entries {
+                if let Ok(key) = <[u8; 32]>::try_from(pk.as_slice()) {
+                    if revoked_ids.contains(&device_id) {
+                        revoked.push(key);
+                    } else {
+                        active.push(key);
+                    }
+                }
+            }
+            return Ok(Some((active, revoked)));
+        }
+
+        let doc_opt = self
+            .gateway
+            .resolve_did_document(did)
+            .await
+            .map_err(crate::orchestrator::error::OrchestratorError::Credential)?;
+        let Some(doc_bytes) = doc_opt else {
+            #[cfg(test)]
+            {
+                return self.load_cached_peer_device_keys(did);
+            }
+            #[cfg(not(test))]
+            {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("DID document not found for peer `{did}`"),
+                ));
+            }
+        };
+        let parsed_doc =
+            atproto_spaces::did_resolver::DidDocument::parse_json(did, &doc_bytes).ok();
+        let atproto_key = parsed_doc.as_ref().and_then(|d| d.atproto_key.clone());
+        #[cfg(not(test))]
+        if atproto_key.is_none() {
+            return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                format!("missing #atproto repository signing key in DID document for `{did}`"),
+            ));
+        }
+        let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
+            .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
+
+        let allow_test_fallback = cfg!(test) && atproto_key.is_none();
+        let raw_devices = match self.paginate_pds_collection(
+            &pds_endpoint,
+            did,
+            "blue.catbird.chat.device",
+            allow_test_fallback,
+        )? {
+            Some(records) => records,
+            None => {
+                #[cfg(test)]
+                {
+                    return self.load_cached_peer_device_keys(did);
+                }
+                #[cfg(not(test))]
+                {
+                    return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                        format!("peer PDS chat.device listRecords({did}) returned 404"),
+                    ));
+                }
+            }
+        };
+        let entries = super::chat_wire::parse_pds_device_entries(did, &raw_devices);
+        if entries.is_empty() {
+            return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                format!("peer PDS holds zero valid chat.device records for `{did}`"),
+            ));
+        }
+        if let Some(ref atproto_key) = atproto_key {
+            for (device_id, _, record_entry) in &entries {
+                self.verify_record_car_proof_and_pin_rev(
+                    &pds_endpoint,
+                    did,
+                    "blue.catbird.chat.device",
+                    device_id,
+                    record_entry,
+                    atproto_key,
+                )?;
+            }
+        }
+        let mut enrolled_map = std::collections::BTreeMap::new();
+        for (device_id, pk, _) in &entries {
+            enrolled_map.insert(device_id.clone(), pk.clone());
+        }
+        let raw_revocations = self
+            .paginate_pds_collection(
+                &pds_endpoint,
+                did,
+                "blue.catbird.chat.deviceRevocation",
+                allow_test_fallback,
+            )?
+            .unwrap_or_default();
+        let rev_prefix = format!("at://{did}/blue.catbird.chat.deviceRevocation/");
+        let mut revoked_ids = std::collections::BTreeSet::new();
+        for rev_entry in &raw_revocations {
+            let Some(uri) = rev_entry.get("uri").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(rkey) = uri
+                .strip_prefix(&rev_prefix)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains('/'))
+            else {
+                continue;
+            };
+            let Some(record_val) = rev_entry.get("value") else {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("missing value on `{uri}`"),
+                ));
+            };
+            if let Some(ref atproto_key) = atproto_key {
+                self.verify_record_car_proof_and_pin_rev(
+                    &pds_endpoint,
+                    did,
+                    "blue.catbird.chat.deviceRevocation",
+                    rkey,
+                    rev_entry,
+                    atproto_key,
+                )?;
+            }
+            let target_id = super::chat_wire::verify_pds_device_revocation_record(
+                did,
+                rkey,
+                record_val,
+                &enrolled_map,
+            )
+            .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
+            revoked_ids.insert(target_id);
+        }
+        let mut active = Vec::new();
+        let mut revoked = Vec::new();
+        for (device_id, pk, _) in entries {
+            if let Ok(key) = <[u8; 32]>::try_from(pk.as_slice()) {
+                if revoked_ids.contains(&device_id) {
+                    revoked.push(key);
+                } else {
+                    active.push(key);
+                }
+            }
+        }
+        Ok(Some((active, revoked)))
+    }
 }
 
 #[cfg(feature = "labyrinth")]
@@ -528,156 +985,26 @@ impl crate::labyrinth::session::LocalConversationAuthority for NativeLocalAuthor
         if did == self.account_did {
             return Ok(None);
         }
-        use crate::labyrinth::LabyrinthGateway as _;
-        if let Some(doc_bytes) = self
-            .gateway
-            .resolve_did_document(did)
-            .await
-            .map_err(crate::orchestrator::error::OrchestratorError::Credential)?
-        {
-            let parsed_doc = atproto_spaces::did_resolver::DidDocument::parse_json(did, &doc_bytes)
-                .ok();
-            let atproto_key = parsed_doc.as_ref().and_then(|d| d.atproto_key.clone());
-            let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
-                .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
-            let list_path = format!(
-                "/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.chat.device&limit=100",
-                super::chat_wire::urlencode_form_component(did),
-            );
-            let resp = self
-                .gateway
-                .execute(&pds_endpoint, "GET".into(), list_path, vec![], None)
-                .map_err(crate::orchestrator::error::OrchestratorError::Credential)?;
-            if resp.status == 404 && atproto_key.is_none() {
-                // Synthetic test mock without PDS chat.device list route or #atproto key:
-                // fall back to locally cached authorized_device_keys if present.
-            } else {
-                if resp.status >= 400 {
-                    return Err(crate::orchestrator::error::OrchestratorError::Credential(
-                        format!(
-                            "peer PDS chat.device listRecords({did}) failed with HTTP {}",
-                            resp.status
-                        ),
-                    ));
-                }
-                let pairs = super::chat_wire::parse_pds_device_list_records(did, &resp.body)
-                    .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
-                if pairs.is_empty() {
-                    return Err(crate::orchestrator::error::OrchestratorError::Credential(
-                        format!("peer PDS holds zero valid chat.device records for `{did}`"),
-                    ));
-                }
-                if let Some(ref atproto_key) = atproto_key {
-                    let parsed_list: serde_json::Value = serde_json::from_slice(&resp.body)
-                        .map_err(|e| {
-                            crate::orchestrator::error::OrchestratorError::Credential(format!(
-                                "peer PDS chat.device listRecords JSON: {e}"
-                            ))
-                        })?;
-                    let records = parsed_list
-                        .get("records")
-                        .and_then(serde_json::Value::as_array)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    for (device_id, _) in &pairs {
-                        let expected_uri = format!("at://{did}/blue.catbird.chat.device/{device_id}");
-                        let record_entry = records
-                            .iter()
-                            .find(|entry| entry["uri"].as_str() == Some(expected_uri.as_str()))
-                            .ok_or_else(|| {
-                                crate::orchestrator::error::OrchestratorError::Credential(format!(
-                                    "missing canonical PDS record entry `{expected_uri}`"
-                                ))
-                            })?;
-                        let expected_cid = record_entry["cid"]
-                            .as_str()
-                            .filter(|c| !c.is_empty())
-                            .ok_or_else(|| {
-                                crate::orchestrator::error::OrchestratorError::Credential(format!(
-                                    "missing CID on `{expected_uri}`"
-                                ))
-                            })?;
-                        let record_val = record_entry.get("value").ok_or_else(|| {
-                            crate::orchestrator::error::OrchestratorError::Credential(format!(
-                                "missing value on `{expected_uri}`"
-                            ))
-                        })?;
-                        let inline_proof = record_entry.get("proof").and_then(|p| {
-                            p.as_str()
-                                .or_else(|| p.get("$bytes").and_then(serde_json::Value::as_str))
-                        });
-                        let car_bytes = if let Some(b64) = inline_proof {
-                            BASE64_STANDARD.decode(b64).map_err(|e| {
-                                crate::orchestrator::error::OrchestratorError::Credential(format!(
-                                    "inline CAR proof decode on `{expected_uri}`: {e}"
-                                ))
-                            })?
-                        } else {
-                            let proof_path = format!(
-                                "/xrpc/com.atproto.sync.getRecord?did={}&collection=blue.catbird.chat.device&rkey={}",
-                                super::chat_wire::urlencode_form_component(did),
-                                super::chat_wire::urlencode_form_component(device_id),
-                            );
-                            let proof_resp = self
-                                .gateway
-                                .execute(&pds_endpoint, "GET".into(), proof_path, vec![], None)
-                                .map_err(crate::orchestrator::error::OrchestratorError::Credential)?;
-                            if proof_resp.status >= 400 {
-                                return Err(
-                                    crate::orchestrator::error::OrchestratorError::Credential(
-                                        format!(
-                                            "CARv1 sync.getRecord(`{expected_uri}`) failed with HTTP {}",
-                                            proof_resp.status
-                                        ),
-                                    ),
-                                );
-                            }
-                            proof_resp.body
-                        };
-                        crate::labyrinth::repo_proof::verify_car_record_json_match(
-                            &car_bytes,
-                            did,
-                            "blue.catbird.chat.device",
-                            device_id,
-                            Some(expected_cid),
-                            record_val,
-                            atproto_key,
-                        )
-                        .map_err(|e| {
-                            crate::orchestrator::error::OrchestratorError::Credential(format!(
-                                "CARv1 repo proof failed for `{expected_uri}`: {e}"
-                            ))
-                        })?;
-                    }
-                }
-                let mut verified_keys = Vec::with_capacity(pairs.len());
-                for (_, pk) in pairs {
-                    if let Ok(key) = <[u8; 32]>::try_from(pk.as_slice()) {
-                        verified_keys.push(key);
-                    }
-                }
-                return Ok(Some(verified_keys));
-            }
-        }
-        let cached = self
-            .db
-            .read_tx(|tx| tx.get_account_meta(&format!("authorized_device_keys:{did}")))
-            .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
-        let Some(raw) = cached else {
+        let Some((active, _)) = self.fetch_verified_pds_chat_devices(did).await? else {
             return Ok(None);
         };
-        let items: Vec<AuthorizedPeerDeviceKey> = serde_json::from_str(&raw).map_err(|e| {
-            crate::orchestrator::error::OrchestratorError::Credential(format!(
-                "decode cached authorized_device_keys: {e}"
-            ))
-        })?;
-        let mut keys = Vec::with_capacity(items.len());
-        for item in items {
-            if let Ok(key) = <[u8; 32]>::try_from(item.signature_public_key.as_slice()) {
-                keys.push(key);
-            }
+        if active.is_empty() {
+            return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                format!("peer PDS holds zero unrevoked chat.device records for `{did}`"),
+            ));
         }
-        Ok(Some(keys))
+        Ok(Some(active))
+    }
+
+    async fn revoked_chat_device_keys(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Vec<[u8; 32]>> {
+        Ok(self
+            .fetch_verified_pds_chat_devices(did)
+            .await?
+            .map(|(_, revoked)| revoked)
+            .unwrap_or_default())
     }
 
     async fn shared_group_leaf_keys(
@@ -2853,16 +3180,18 @@ impl CatbirdMlsClient {
         let _ = self.flush_labyrinth_queue();
         if let Some(own_device_id) = self.canonical_uuid_v4_device_id() {
             if let Ok((signer, _)) = self.load_enrolled_signer_and_auth_gen() {
-                let other_active = self
+                let own_devices_opt = self
                     .query_signed_chat_ds(
                         "blue.catbird.chat.getOwnDevices",
                         &[("actorDeviceId", &own_device_id), ("limit", "100")],
                         &own_device_id,
                         &signer,
                     )
-                    .ok()
+                    .ok();
+                let other_active = own_devices_opt
+                    .as_ref()
                     .map(|resp| {
-                        Self::extract_own_device_views(&resp).into_iter().any(|d| {
+                        Self::extract_own_device_views(resp).into_iter().any(|d| {
                             d["deviceId"].as_str() != Some(own_device_id.as_str())
                                 && matches!(d["status"].as_str(), Some("active"))
                         })
@@ -2874,20 +3203,44 @@ impl CatbirdMlsClient {
                             let _ = self.leave_conversation(&conv.conversation_id);
                         }
                     }
-                    if let Ok((_, gateway)) = self.native_archive_deps_with_gateway() {
-                        let body = serde_json::json!({
-                            "repo": self.normalized_did,
-                            "collection": "blue.catbird.chat.device",
-                            "rkey": own_device_id,
-                        });
-                        if let Ok(bytes) = serde_json::to_vec(&body) {
-                            let _ = gateway.pds_json(
-                                &self.config.pds_endpoint,
-                                "POST",
-                                "/xrpc/com.atproto.repo.deleteRecord".into(),
-                                Some(bytes),
-                            );
+                    let mut enrolled_map = std::collections::BTreeMap::new();
+                    enrolled_map.insert(own_device_id.clone(), signer.public().to_vec());
+                    if let Some(ref resp) = own_devices_opt {
+                        for item in Self::extract_own_device_views(resp) {
+                            if let Some(dev_id) = item["deviceId"].as_str() {
+                                let pk =
+                                    Self::decode_device_pubkey_field(&item["signaturePublicKey"]);
+                                if pk.len() == 32 {
+                                    enrolled_map.insert(dev_id.to_owned(), pk);
+                                }
+                            }
                         }
+                    }
+                    let created_at = self.hooks.now_rfc3339_millis();
+                    if let Ok(body) =
+                        super::chat_wire::build_pds_device_revocation_create_record_body_at(
+                            &self.normalized_did,
+                            &own_device_id,
+                            &own_device_id,
+                            &created_at,
+                            &signer,
+                            Some("retired"),
+                        )
+                    {
+                        let _ = self.publish_pds_record_create_only(
+                            "blue.catbird.chat.deviceRevocation",
+                            &own_device_id,
+                            body,
+                            |existing_val| {
+                                super::chat_wire::verify_pds_device_revocation_record(
+                                    &self.normalized_did,
+                                    &own_device_id,
+                                    existing_val,
+                                    &enrolled_map,
+                                )
+                                .is_ok()
+                            },
+                        );
                     }
                 }
             }
@@ -3086,22 +3439,45 @@ impl CatbirdMlsClient {
         }
 
         let mut pds_record_deleted = false;
-        if let Ok((_, gateway)) = self.native_archive_deps_with_gateway() {
-            let body = serde_json::json!({
-                "repo": self.normalized_did,
-                "collection": "blue.catbird.chat.device",
-                "rkey": target_trimmed,
-            });
-            if let Ok(bytes) = serde_json::to_vec(&body) {
-                pds_record_deleted = gateway
-                    .pds_json(
-                        &self.config.pds_endpoint,
-                        "POST",
-                        "/xrpc/com.atproto.repo.deleteRecord".into(),
-                        Some(bytes),
+        {
+            let mut enrolled_map = std::collections::BTreeMap::new();
+            enrolled_map.insert(own_device_id.clone(), actor_signer.public().to_vec());
+            for item in Self::extract_own_device_views(&own_devices) {
+                if let Some(dev_id) = item["deviceId"].as_str() {
+                    let pk = Self::decode_device_pubkey_field(&item["signaturePublicKey"]);
+                    if pk.len() == 32 {
+                        enrolled_map.insert(dev_id.to_owned(), pk);
+                    }
+                }
+            }
+            let created_at = self.hooks.now_rfc3339_millis();
+            if let Ok(body) = super::chat_wire::build_pds_device_revocation_create_record_body_at(
+                &self.normalized_did,
+                &own_device_id,
+                target_trimmed,
+                &created_at,
+                &actor_signer,
+                Some("revoked_by_sibling"),
+            ) {
+                pds_record_deleted = self
+                    .publish_pds_record_create_only(
+                        "blue.catbird.chat.deviceRevocation",
+                        target_trimmed,
+                        body,
+                        |existing_val| {
+                            super::chat_wire::verify_pds_device_revocation_record(
+                                &self.normalized_did,
+                                target_trimmed,
+                                existing_val,
+                                &enrolled_map,
+                            )
+                            .is_ok()
+                        },
                     )
                     .is_ok();
             }
+            let own_cache_key = format!("authorized_device_keys:{}", self.normalized_did);
+            let _ = self.db.write_tx(|tx| tx.delete_account_meta(&own_cache_key));
         }
 
         let now_ms = self.hooks.now_ms();

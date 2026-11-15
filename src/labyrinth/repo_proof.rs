@@ -349,12 +349,12 @@ pub fn verify_canonical_dagcbor(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn is_valid_tid(tid: &str) -> bool {
+pub fn is_valid_tid(tid: &str) -> bool {
     if tid.len() != 13 {
         return false;
     }
     let bytes = tid.as_bytes();
-    if !matches!(bytes[0], b'2'..=b'9' | b'a'..=b'j') {
+    if !matches!(bytes[0], b'2'..=b'7' | b'a'..=b'j') {
         return false;
     }
     bytes
@@ -433,11 +433,11 @@ pub fn parse_verified_car_v1(car_bytes: &[u8]) -> Result<(Cid, HashMap<Cid, Vec<
     Ok((root_cid, blocks))
 }
 
-pub fn verify_atproto_v3_commit(
+pub fn verify_atproto_v3_commit_with_rev(
     commit_bytes: &[u8],
     expected_did: &str,
     atproto_key: &SpaceVerifyingKey,
-) -> Result<Cid, String> {
+) -> Result<(Cid, String), String> {
     let commit: SignedAtprotoCommitV3 = serde_ipld_dagcbor::from_slice(commit_bytes)
         .map_err(|_| "malformed ATProto v3 commit".to_owned())?;
     if commit.version != 3 {
@@ -464,7 +464,16 @@ pub fn verify_atproto_v3_commit(
     if !atproto_key.verify_raw(atproto_key.expected_alg(), &unsigned_bytes, &commit.sig) {
         return Err("ATProto commit signature failed verification under #atproto key".to_owned());
     }
-    Ok(commit.data)
+    Ok((commit.data, commit.rev))
+}
+
+pub fn verify_atproto_v3_commit(
+    commit_bytes: &[u8],
+    expected_did: &str,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<Cid, String> {
+    verify_atproto_v3_commit_with_rev(commit_bytes, expected_did, atproto_key)
+        .map(|(mst_root_cid, _)| mst_root_cid)
 }
 
 fn walk_mst_proof(
@@ -585,22 +594,21 @@ fn walk_mst_proof(
     }
 }
 
-/// Verify a CARv1 repository proof (`com.atproto.sync.getRecord`) against `atproto_key`.
-///
-/// Returns `Ok(Some((record_cid, canonical_record_dagcbor)))` on verified inclusion, or
-/// `Ok(None)` on verified MST exclusion.
-pub fn verify_car_record_proof(
+/// Verify a CARv1 repository proof (`com.atproto.sync.getRecord`) against `atproto_key`,
+/// returning both the inclusion/exclusion result and the signed commit `rev` TID.
+pub fn verify_car_record_proof_with_rev(
     car_bytes: &[u8],
     expected_did: &str,
     collection: &str,
     rkey: &str,
     atproto_key: &SpaceVerifyingKey,
-) -> Result<Option<(Cid, Vec<u8>)>, String> {
+) -> Result<(Option<(Cid, Vec<u8>)>, String), String> {
     let (root_cid, mut blocks) = parse_verified_car_v1(car_bytes)?;
     let commit_bytes = blocks
         .get(&root_cid)
         .ok_or_else(|| "missing root commit block".to_owned())?;
-    let mst_root_cid = verify_atproto_v3_commit(commit_bytes, expected_did, atproto_key)?;
+    let (mst_root_cid, commit_rev) =
+        verify_atproto_v3_commit_with_rev(commit_bytes, expected_did, atproto_key)?;
     let mst_key = format!("{collection}/{rkey}");
     let mut visited = HashSet::new();
     let Some(record_cid) = walk_mst_proof(
@@ -613,12 +621,27 @@ pub fn verify_car_record_proof(
         0,
     )?
     else {
-        return Ok(None);
+        return Ok((None, commit_rev));
     };
     let record_bytes = blocks
         .remove(&record_cid)
         .ok_or_else(|| "MST included record CID but CAR omitted record block".to_owned())?;
-    Ok(Some((record_cid, record_bytes)))
+    Ok((Some((record_cid, record_bytes)), commit_rev))
+}
+
+/// Verify a CARv1 repository proof (`com.atproto.sync.getRecord`) against `atproto_key`.
+///
+/// Returns `Ok(Some((record_cid, canonical_record_dagcbor)))` on verified inclusion, or
+/// `Ok(None)` on verified MST exclusion.
+pub fn verify_car_record_proof(
+    car_bytes: &[u8],
+    expected_did: &str,
+    collection: &str,
+    rkey: &str,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<Option<(Cid, Vec<u8>)>, String> {
+    verify_car_record_proof_with_rev(car_bytes, expected_did, collection, rkey, atproto_key)
+        .map(|(proved, _)| proved)
 }
 
 /// Encode an ATProto JSON record value to canonical DAG-CBOR via `catbird_atproto::types::value::Data`
@@ -635,8 +658,9 @@ pub fn encode_atproto_json_record_dagcbor(
 }
 
 /// Verify that `car_bytes` proves inclusion of `(collection, rkey)` in `expected_did`'s repository
-/// under `atproto_key`, and that the proved record matches `expected_value_json` (and optional `expected_cid`).
-pub fn verify_car_record_json_match(
+/// under `atproto_key`, that the proved record matches `expected_value_json` (and optional `expected_cid`),
+/// and return `(proved_cid, signed_commit_rev)`.
+pub fn verify_car_record_json_match_with_rev(
     car_bytes: &[u8],
     expected_did: &str,
     collection: &str,
@@ -644,12 +668,11 @@ pub fn verify_car_record_json_match(
     expected_cid: Option<&str>,
     expected_value_json: &serde_json::Value,
     atproto_key: &SpaceVerifyingKey,
-) -> Result<Cid, String> {
-    let (proved_cid, proved_dagcbor) =
-        verify_car_record_proof(car_bytes, expected_did, collection, rkey, atproto_key)?
-            .ok_or_else(|| {
-                format!("CARv1 proof excluded {collection}/{rkey} for {expected_did}")
-            })?;
+) -> Result<(Cid, String), String> {
+    let (proved_opt, commit_rev) =
+        verify_car_record_proof_with_rev(car_bytes, expected_did, collection, rkey, atproto_key)?;
+    let (proved_cid, proved_dagcbor) = proved_opt
+        .ok_or_else(|| format!("CARv1 proof excluded {collection}/{rkey} for {expected_did}"))?;
     let (expected_calc_cid, expected_dagcbor) =
         encode_atproto_json_record_dagcbor(expected_value_json)?;
     if proved_cid != expected_calc_cid || proved_dagcbor != expected_dagcbor {
@@ -662,7 +685,66 @@ pub fn verify_car_record_json_match(
             return Err("returned record CID disagrees with CARv1 proved CID".to_owned());
         }
     }
-    Ok(proved_cid)
+    Ok((proved_cid, commit_rev))
+}
+
+/// Verify that `car_bytes` proves inclusion of `(collection, rkey)` in `expected_did`'s repository
+/// under `atproto_key`, and that the proved record matches `expected_value_json` (and optional `expected_cid`).
+pub fn verify_car_record_json_match(
+    car_bytes: &[u8],
+    expected_did: &str,
+    collection: &str,
+    rkey: &str,
+    expected_cid: Option<&str>,
+    expected_value_json: &serde_json::Value,
+    atproto_key: &SpaceVerifyingKey,
+) -> Result<Cid, String> {
+    verify_car_record_json_match_with_rev(
+        car_bytes,
+        expected_did,
+        collection,
+        rkey,
+        expected_cid,
+        expected_value_json,
+        atproto_key,
+    )
+    .map(|(cid, _)| cid)
+}
+
+/// Persist and enforce a monotonic signed commit `rev` floor per target DID so a stale
+/// repository snapshot cannot replay retired records below the highest verified commit revision.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn observe_pds_repo_rev_floor(
+    db: &crate::storage::MlsAccountDb,
+    did: &str,
+    rev: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    if !is_valid_tid(rev) {
+        return Err(format!("invalid ATProto commit rev TID `{rev}`"));
+    }
+    let meta_key = format!("pds_repo_rev_floor:{did}");
+    db.write_tx(|tx| {
+        if let Some(existing) = tx.get_account_meta(&meta_key)? {
+            if !is_valid_tid(&existing) {
+                return Err(crate::error::MLSError::Cryptography(format!(
+                    "corrupt pinned repository commit rev floor for `{did}`"
+                )));
+            }
+            if rev < existing.as_str() {
+                return Err(crate::error::MLSError::Cryptography(format!(
+                    "ATProto commit rev rolled back for `{did}`: `{rev}` < `{existing}`"
+                )));
+            }
+            if rev > existing.as_str() {
+                tx.put_account_meta(&meta_key, rev, now_ms)?;
+            }
+        } else {
+            tx.put_account_meta(&meta_key, rev, now_ms)?;
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Build a canonical single-branch CARv1 inclusion (or empty-MST exclusion) proof signed by `signing_key`.
@@ -846,5 +928,77 @@ mod tests {
         assert!(parse_verified_car_v1(&[]).is_err());
         assert!(parse_verified_car_v1(&[0xff; 12]).is_err());
         assert!(parse_verified_car_v1(&car[..car.len() - 3]).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn car_v1_commit_rev_is_extracted_and_monotonic_floor_rejects_rollback() {
+        let did = "did:plc:proofpeer222222222222222";
+        let signing_key = SpaceSigningKey::random_p256();
+        let verifying_key = signing_key.verifying_key();
+        let record_json = json!({
+            "$type": "blue.catbird.chat.device",
+            "deviceId": "11111111-1111-4111-8111-111111111111",
+            "signingPublicKey": { "$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" },
+            "createdAt": "2026-11-12T00:00:00.000Z",
+        });
+        let (record_cid, record_cbor) = encode_atproto_json_record_dagcbor(&record_json).unwrap();
+        let entries = [(
+            "blue.catbird.chat.device/11111111-1111-4111-8111-111111111111".into(),
+            record_cbor,
+        )];
+        let (_, car_v1) =
+            build_repo_proof_car_v1(did, "3lb2zzzzzzzzd", &entries, &signing_key).unwrap();
+        let (_, car_v2) =
+            build_repo_proof_car_v1(did, "3lb2zzzzzzzzf", &entries, &signing_key).unwrap();
+        let (_, car_old) =
+            build_repo_proof_car_v1(did, "3lb2zzzzzzzzb", &entries, &signing_key).unwrap();
+
+        let (cid1, rev1) = verify_car_record_json_match_with_rev(
+            &car_v1,
+            did,
+            "blue.catbird.chat.device",
+            "11111111-1111-4111-8111-111111111111",
+            Some(&record_cid.to_string()),
+            &record_json,
+            &verifying_key,
+        )
+        .unwrap();
+        assert_eq!(cid1, record_cid);
+        assert_eq!(rev1, "3lb2zzzzzzzzd");
+
+        let db = crate::storage::MlsAccountDb::open_in_memory_for_test().unwrap();
+        observe_pds_repo_rev_floor(&db, did, &rev1, 1000).unwrap();
+        // Equal revision from the same commit snapshot remains valid.
+        observe_pds_repo_rev_floor(&db, did, &rev1, 1001).unwrap();
+
+        // Higher revision advances the pinned floor.
+        let (_, rev2) = verify_car_record_json_match_with_rev(
+            &car_v2,
+            did,
+            "blue.catbird.chat.device",
+            "11111111-1111-4111-8111-111111111111",
+            Some(&record_cid.to_string()),
+            &record_json,
+            &verifying_key,
+        )
+        .unwrap();
+        assert_eq!(rev2, "3lb2zzzzzzzzf");
+        observe_pds_repo_rev_floor(&db, did, &rev2, 1002).unwrap();
+
+        // Stale CARv1 proof signed at an older commit rev is rejected by the monotonic floor.
+        let (_, rev_old) = verify_car_record_json_match_with_rev(
+            &car_old,
+            did,
+            "blue.catbird.chat.device",
+            "11111111-1111-4111-8111-111111111111",
+            Some(&record_cid.to_string()),
+            &record_json,
+            &verifying_key,
+        )
+        .unwrap();
+        assert_eq!(rev_old, "3lb2zzzzzzzzb");
+        assert!(observe_pds_repo_rev_floor(&db, did, &rev_old, 1003).is_err());
+        assert!(observe_pds_repo_rev_floor(&db, did, "~~~~", 1004).is_err());
     }
 }

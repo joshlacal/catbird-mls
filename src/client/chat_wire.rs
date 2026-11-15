@@ -35,6 +35,10 @@ pub const CHAT_READ_HEADER: &str = "catbird-chat-read";
 pub const CHAT_READ_SIG_HEADER: &str = "catbird-chat-read-signature";
 const CHAT_READ_DOMAIN: &[u8] = b"CATBIRD-CHAT-READ\0";
 const ACK_ENTRIES_DOMAIN: &[u8] = b"CATBIRD-CHAT-ACK-ENTRIES\0";
+pub const PDS_DEVICE_REVOCATION_DOMAIN: &[u8] = b"CATBIRD-CHAT-PDS-DEVICE-REVOCATION-V1\0";
+pub const PDS_LIST_RECORDS_PAGE_LIMIT: usize = 100;
+pub const MAX_PDS_LIST_RECORDS_PAGES: usize = 10;
+pub const MAX_PDS_LIST_RECORDS_ITEMS: usize = 1_000;
 
 /// Decode a base64 field in either bare string or ATProto `{"$bytes": "..."}` JSON form.
 pub fn json_bytes(v: &Value) -> Result<Vec<u8>, MLSError> {
@@ -1721,28 +1725,49 @@ pub fn build_pds_chat_declaration_put_record_body_at(
     })
 }
 
-/// Parse `com.atproto.repo.listRecords?collection=blue.catbird.chat.device` into `(device_id, pubkey_32)`.
-pub fn parse_pds_device_list_records(
+/// Parse a single `com.atproto.repo.listRecords` JSON page into `(records, optional_cursor)`.
+pub fn parse_pds_list_records_page(
     did: &str,
+    collection: &str,
     body_bytes: &[u8],
-) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
-    let val: Value = serde_json::from_slice(body_bytes)
-        .map_err(|e| MLSError::Internal(format!("invalid listRecords JSON for `{did}`: {e}")))?;
+) -> Result<(Vec<Value>, Option<String>), MLSError> {
+    let val: Value = serde_json::from_slice(body_bytes).map_err(|e| {
+        MLSError::Internal(format!(
+            "invalid listRecords({collection}) JSON for `{did}`: {e}"
+        ))
+    })?;
     let records = val
         .get("records")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             MLSError::insufficient_permissions(format!(
-                "I4: PDS listRecords({did}) has no records array"
+                "I4: PDS listRecords({did}, {collection}) has no records array"
             ))
-        })?;
+        })?
+        .clone();
+    let cursor = val
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Ok((records, cursor))
+}
+
+/// Extract valid `(device_id, pubkey_32, raw_entry)` tuples from `listRecords` entries for `blue.catbird.chat.device`.
+pub fn parse_pds_device_entries(did: &str, records: &[Value]) -> Vec<(String, Vec<u8>, Value)> {
+    let expected_prefix = format!("at://{did}/blue.catbird.chat.device/");
     let mut out = Vec::with_capacity(records.len());
     for rec in records {
         let Some(uri) = rec.get("uri").and_then(Value::as_str) else {
             continue;
         };
-        let rkey = uri.rsplit('/').next().unwrap_or("").trim();
-        if rkey.is_empty() {
+        let rkey = if let Some(rest) = uri.strip_prefix(&expected_prefix) {
+            rest.trim()
+        } else {
+            uri.rsplit('/').next().unwrap_or("").trim()
+        };
+        if rkey.is_empty() || rkey.contains('/') {
             continue;
         }
         let Some(value) = rec.get("value").and_then(Value::as_object) else {
@@ -1763,9 +1788,216 @@ pub fn parse_pds_device_list_records(
         if pk_bytes.len() != 32 {
             continue;
         }
-        out.push((rkey.to_string(), pk_bytes));
+        out.push((rkey.to_string(), pk_bytes, rec.clone()));
     }
-    Ok(out)
+    out
+}
+
+/// Check whether an existing `blue.catbird.chat.device` record value matches `expected_pubkey` under Ed25519.
+pub fn pds_device_record_matches(record_val: &Value, expected_pubkey: &[u8]) -> bool {
+    let Some(obj) = record_val.as_object() else {
+        return false;
+    };
+    let Some(alg) = obj.get("algorithm").and_then(Value::as_str) else {
+        return false;
+    };
+    if !alg.eq_ignore_ascii_case("ed25519") {
+        return false;
+    }
+    let Some(pk_val) = obj.get("mlsSignaturePublicKey") else {
+        return false;
+    };
+    json_bytes(pk_val).is_ok_and(|pk| pk.as_slice() == expected_pubkey)
+}
+
+/// Check whether an existing `blue.catbird.chat.declaration` record value declares `expected_ds_did`.
+pub fn pds_chat_declaration_matches(record_val: &Value, expected_ds_did: &str) -> bool {
+    record_val
+        .get("deliveryService")
+        .or_else(|| record_val.get("homeDsDid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|ds| ds == expected_ds_did.trim())
+}
+
+#[derive(Serialize)]
+struct PdsDeviceRevocationTranscriptPayload<'a> {
+    // Ordered strictly by DAG-CBOR map key `(byte_len, utf8_bytes)`:
+    // "repoDid" (7), "createdAt" (9), "actorDeviceId" (13), "targetDeviceId" (14).
+    #[serde(rename = "repoDid")]
+    repo_did: &'a str,
+    #[serde(rename = "createdAt")]
+    created_at: &'a str,
+    #[serde(rename = "actorDeviceId")]
+    actor_device_id: &'a str,
+    #[serde(rename = "targetDeviceId")]
+    target_device_id: &'a str,
+}
+
+/// Build the canonical signing bytes `CATBIRD-CHAT-PDS-DEVICE-REVOCATION-V1\0 || dag_cbor(...)`
+/// for an append-only `blue.catbird.chat.deviceRevocation` record.
+pub fn pds_device_revocation_signing_bytes(
+    repo_did: &str,
+    actor_device_id: &str,
+    target_device_id: &str,
+    created_at: &str,
+) -> Result<Vec<u8>, MLSError> {
+    let payload = PdsDeviceRevocationTranscriptPayload {
+        repo_did,
+        created_at,
+        actor_device_id,
+        target_device_id,
+    };
+    let cbor = serde_ipld_dagcbor::to_vec(&payload).map_err(|e| {
+        MLSError::Internal(format!(
+            "encode PdsDeviceRevocationTranscriptPayload CBOR: {e}"
+        ))
+    })?;
+    #[cfg(feature = "labyrinth")]
+    crate::labyrinth::repo_proof::verify_canonical_dagcbor(&cbor)
+        .map_err(|e| MLSError::Internal(format!("non-canonical deviceRevocation DAG-CBOR: {e}")))?;
+    let mut transcript = Vec::with_capacity(PDS_DEVICE_REVOCATION_DOMAIN.len() + cbor.len());
+    transcript.extend_from_slice(PDS_DEVICE_REVOCATION_DOMAIN);
+    transcript.extend_from_slice(&cbor);
+    Ok(transcript)
+}
+
+/// Build `com.atproto.repo.createRecord` JSON body for `blue.catbird.chat.deviceRevocation/{target_device_id}`.
+pub fn build_pds_device_revocation_create_record_body_at(
+    repo_did: &str,
+    actor_device_id: &str,
+    target_device_id: &str,
+    created_at: &str,
+    signer: &SignatureKeyPair,
+    reason: Option<&str>,
+) -> Result<Vec<u8>, MLSError> {
+    let transcript = pds_device_revocation_signing_bytes(
+        repo_did,
+        actor_device_id,
+        target_device_id,
+        created_at,
+    )?;
+    let sig = signer.sign(&transcript).map_err(|e| {
+        MLSError::Cryptography(format!("sign blue.catbird.chat.deviceRevocation: {e:?}"))
+    })?;
+    let mut record = json!({
+        "$type": "blue.catbird.chat.deviceRevocation",
+        "targetDeviceId": target_device_id,
+        "actorDeviceId": actor_device_id,
+        "signerPublicKey": { "$bytes": STANDARD.encode(signer.public()) },
+        "signature": { "$bytes": STANDARD.encode(&sig) },
+        "algorithm": "ed25519",
+        "createdAt": created_at,
+    });
+    if let Some(reason_str) = reason {
+        record["reason"] = json!(reason_str);
+    }
+    serde_json::to_vec(&json!({
+        "repo": repo_did,
+        "collection": "blue.catbird.chat.deviceRevocation",
+        "rkey": target_device_id,
+        "record": record,
+    }))
+    .map_err(|e| {
+        MLSError::Internal(format!(
+            "serialize blue.catbird.chat.deviceRevocation createRecord: {e}"
+        ))
+    })
+}
+
+/// Verify an append-only `blue.catbird.chat.deviceRevocation/{rkey}` record against the account's
+/// enrolled `blue.catbird.chat.device` Ed25519 public keys (`enrolled_devices`).
+pub fn verify_pds_device_revocation_record(
+    repo_did: &str,
+    rkey: &str,
+    record_val: &Value,
+    enrolled_devices: &BTreeMap<String, Vec<u8>>,
+) -> Result<String, MLSError> {
+    let target_device_id = record_val
+        .get("targetDeviceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            MLSError::Cryptography("deviceRevocation missing targetDeviceId".to_string())
+        })?;
+    if target_device_id != rkey.trim() {
+        return Err(MLSError::Cryptography(format!(
+            "deviceRevocation targetDeviceId `{target_device_id}` does not match rkey `{rkey}`"
+        )));
+    }
+    let actor_device_id = record_val
+        .get("actorDeviceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            MLSError::Cryptography("deviceRevocation missing actorDeviceId".to_string())
+        })?;
+    if let Some(alg) = record_val.get("algorithm").and_then(Value::as_str) {
+        if !alg.eq_ignore_ascii_case("ed25519") {
+            return Err(MLSError::Cryptography(format!(
+                "unsupported deviceRevocation algorithm `{alg}`"
+            )));
+        }
+    }
+    let created_at = record_val
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .filter(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+        .ok_or_else(|| {
+            MLSError::Cryptography("deviceRevocation invalid RFC3339 createdAt".to_string())
+        })?;
+    let enrolled_pk = enrolled_devices.get(actor_device_id).ok_or_else(|| {
+        MLSError::Cryptography(format!(
+            "deviceRevocation signer `{actor_device_id}` is not an enrolled chat.device for `{repo_did}`"
+        ))
+    })?;
+    let signer_pk = json_bytes(record_val.get("signerPublicKey").ok_or_else(|| {
+        MLSError::Cryptography("deviceRevocation missing signerPublicKey".into())
+    })?)?;
+    if signer_pk.len() != 32 || signer_pk.as_slice() != enrolled_pk.as_slice() {
+        return Err(MLSError::Cryptography(
+            "deviceRevocation signerPublicKey does not match enrolled actorDeviceId key".into(),
+        ));
+    }
+    let sig_vec = json_bytes(
+        record_val
+            .get("signature")
+            .ok_or_else(|| MLSError::Cryptography("deviceRevocation missing signature".into()))?,
+    )?;
+    let sig_64: [u8; 64] = sig_vec.as_slice().try_into().map_err(|_| {
+        MLSError::Cryptography("deviceRevocation Ed25519 signature must be 64 bytes".into())
+    })?;
+    let pk_32: [u8; 32] = signer_pk.as_slice().try_into().map_err(|_| {
+        MLSError::Cryptography("deviceRevocation Ed25519 public key must be 32 bytes".into())
+    })?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_32).map_err(|e| {
+        MLSError::Cryptography(format!("deviceRevocation invalid Ed25519 key: {e}"))
+    })?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_64);
+    let transcript = pds_device_revocation_signing_bytes(
+        repo_did,
+        actor_device_id,
+        target_device_id,
+        created_at,
+    )?;
+    vk.verify_strict(&transcript, &sig).map_err(|e| {
+        MLSError::Cryptography(format!("deviceRevocation signature verify failed: {e}"))
+    })?;
+    Ok(target_device_id.to_owned())
+}
+
+/// Parse `com.atproto.repo.listRecords?collection=blue.catbird.chat.device` into `(device_id, pubkey_32)`.
+pub fn parse_pds_device_list_records(
+    did: &str,
+    body_bytes: &[u8],
+) -> Result<Vec<(String, Vec<u8>)>, MLSError> {
+    let (records, _) = parse_pds_list_records_page(did, "blue.catbird.chat.device", body_bytes)?;
+    Ok(parse_pds_device_entries(did, &records)
+        .into_iter()
+        .map(|(id, pk, _)| (id, pk))
+        .collect())
 }
 
 /// Unwrap either `{ "didDoc": { ... } }` (`com.atproto.identity.resolveDid`) or a direct DID document.
@@ -3021,12 +3253,16 @@ pub fn build_space_apply_writes_for_queue_payload(
         &format!("batch:{}:{}", payload.conversation_id, payload.message_id),
     );
     let rkey = format!("{item_seq_u64:016x}-{tid}");
-    let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
-        format!(
-            "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
-            payload.sequencer_did, payload.conversation_id
+    let convo_space = match payload.space_uri.clone() {
+        Some(uri) => uri,
+        None => atproto_spaces::SpaceUri::new(
+            &payload.sequencer_did,
+            "blue.catbird.labyrinth.conversation",
+            &format!("{}-0", payload.conversation_id),
         )
-    });
+        .map(|u| u.as_str().to_owned())
+        .map_err(|e| MLSError::invalid_input(format!("invalid conversation Space URI: {e}")))?,
+    };
     let apply_body = serde_json::to_vec(&json!({
         "space": convo_space,
         "repo": repo_did,
@@ -3542,5 +3778,581 @@ mod tests {
             &["did:plc:alice".into()]
         )
         .is_err());
+    }
+
+    #[test]
+    fn peer_send_counter_boundaries_reject_replay_rollback_corruption_and_safe_int_overflow() {
+        const MAX_SAFE: u64 = 9_007_199_254_740_991;
+        verify_next_peer_send_counter(None, 0).unwrap();
+        verify_next_peer_send_counter(None, 1).unwrap();
+        verify_next_peer_send_counter(None, MAX_SAFE).unwrap();
+        assert!(matches!(
+            verify_next_peer_send_counter(None, MAX_SAFE + 1),
+            Err(MLSError::Cryptography(_))
+        ));
+
+        verify_next_peer_send_counter(Some("5"), 6).unwrap();
+        verify_next_peer_send_counter(Some("5"), MAX_SAFE).unwrap();
+        assert!(matches!(
+            verify_next_peer_send_counter(Some("5"), 5),
+            Err(MLSError::Cryptography(_))
+        ));
+        assert!(matches!(
+            verify_next_peer_send_counter(Some("5"), 4),
+            Err(MLSError::Cryptography(_))
+        ));
+        assert!(matches!(
+            verify_next_peer_send_counter(Some("5"), MAX_SAFE + 1),
+            Err(MLSError::Cryptography(_))
+        ));
+        assert!(matches!(
+            verify_next_peer_send_counter(Some("corrupt"), 6),
+            Err(MLSError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn control_sequencer_receipt_rejects_every_field_and_signature_mismatch() {
+        let signer = receipt_signer(3);
+        let key = sec1(&signer);
+        let actor_did = "did:plc:sender";
+        let actor_dev = "device";
+        let request_digest = [9u8; 32];
+        let receipt = signed_receipt(&signer, &format!("{SEQUENCER}#mls-receipt-1"), 4);
+        let coord = json!({
+            "conversationId": CONVERSATION,
+            "generation": 0,
+            "stateVersion": 1,
+            "groupId": { "$bytes": STANDARD.encode([7u8; 32]) },
+            "epoch": 3,
+            "groupContextHash": { "$bytes": STANDARD.encode([2u8; 32]) },
+            "confirmationTag": { "$bytes": STANDARD.encode([3u8; 32]) },
+            "lifecycle": "active",
+        });
+
+        verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .unwrap();
+
+        // Wrong sequencer, conversation, entry_id, entry_seq, actor_did, actor_device_id, digest.
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            "did:web:other.example.com",
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            "44444444-4444-4444-8444-444444444444",
+            4,
+            actor_did,
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            5,
+            actor_did,
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            "did:plc:other",
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            "other-device",
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &coord,
+            &[8u8; 32],
+        )
+        .is_err());
+
+        // Coordinate generation, epoch, and groupId mismatches fail closed.
+        let mut wrong_gen = coord.clone();
+        wrong_gen["generation"] = json!(1);
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &wrong_gen,
+            &request_digest,
+        )
+        .is_err());
+
+        let mut wrong_epoch = coord.clone();
+        wrong_epoch["epoch"] = json!(4);
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &wrong_epoch,
+            &request_digest,
+        )
+        .is_err());
+
+        let mut wrong_group = coord.clone();
+        wrong_group["groupId"] = json!({ "$bytes": STANDARD.encode([6u8; 32]) });
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &key,
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &wrong_group,
+            &request_digest,
+        )
+        .is_err());
+
+        // Wrong P-256 verifying key fails closed.
+        assert!(verify_control_sequencer_receipt(
+            &receipt,
+            &sec1(&receipt_signer(9)),
+            SEQUENCER,
+            CONVERSATION,
+            ENTRY,
+            4,
+            actor_did,
+            actor_dev,
+            &coord,
+            &request_digest,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn own_commit_body_verification_rejects_wrong_signer_missing_kind_and_tampered_fields() {
+        use openmls_traits::types::SignatureScheme;
+
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let other_signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let cid = "00000000-0000-4000-8000-00000000c501";
+        let dev = "00000000-0000-4000-8000-00000000d501";
+        let op_id = "00000000-0000-4000-8000-00000000e501";
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
+        let key_id = derive_key_id(signer.public());
+        let next = json!({
+            "conversationId": cid,
+            "generation": 0,
+            "stateVersion": 0,
+            "groupId": { "$bytes": STANDARD.encode([0x11u8; 32]) },
+            "epoch": 0,
+            "groupContextHash": { "$bytes": STANDARD.encode([0x22u8; 32]) },
+            "confirmationTag": { "$bytes": STANDARD.encode([0x33u8; 32]) },
+            "lifecycle": "active",
+        });
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#creationBody",
+            "signatureDomain": "CATBIRD-CHAT-CREATE\0",
+            "conversationId": cid,
+            "transitionId": op_id,
+            "conversationKind": "group",
+            "absence": true,
+            "actorDid": did,
+            "actorDeviceId": dev,
+            "authGeneration": 1,
+            "idempotencyKey": op_id,
+            "keyId": key_id,
+            "signedAt": "2026-11-13T00:00:00.000Z",
+            "next": next,
+            "manifest": {
+                "actorLeaf": {
+                    "userDid": did,
+                    "deviceId": dev,
+                    "leafOrigin": "genesis",
+                },
+                "participants": [{
+                    "userDid": did,
+                    "status": "active",
+                    "role": "admin",
+                }],
+            },
+            "genesisGroupInfo": {
+                "framing": "mlsMessage",
+                "contentType": "groupInfo",
+                "bytes": { "$bytes": STANDARD.encode([0x44u8; 16]) },
+                "sha256": STANDARD.encode(Sha256::digest([0x44u8; 16])),
+            },
+            "metadataSnapshot": {
+                "coordinate": {
+                    "conversationId": { "$bytes": STANDARD.encode(uuid::Uuid::parse_str(cid).unwrap().as_bytes()) },
+                    "generation": 0,
+                    "groupId": { "$bytes": STANDARD.encode([0x11u8; 32]) },
+                    "epoch": 0,
+                    "groupContextHash": { "$bytes": STANDARD.encode([0x22u8; 32]) },
+                    "confirmationTag": { "$bytes": STANDARD.encode([0x33u8; 32]) },
+                },
+                "originTransitionId": op_id,
+                "metadataVersion": 1,
+                "nonce": { "$bytes": STANDARD.encode([0x55u8; 12]) },
+                "ciphertext": { "$bytes": STANDARD.encode([0x66u8; 32]) },
+                "ciphertextSha256": STANDARD.encode(Sha256::digest([0x66u8; 32])),
+                "ciphertextSize": 32,
+                "authorProof": {
+                    "authorDid": did,
+                    "authorDeviceId": dev,
+                    "authorKeyId": key_id,
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(signer.public()) },
+                    "authGenerationAtOrigin": 1,
+                    "originTransitionId": op_id,
+                    "originSeq": 1,
+                    "roleAtOrigin": "admin",
+                    "deviceStatusAtOrigin": "active",
+                },
+            },
+        });
+        let prepared = sign_clean_chat_mutation(
+            did,
+            dev,
+            Some(1),
+            CanonicalOperation::CreateConversation,
+            &body,
+            &signer,
+        )
+        .unwrap();
+        let submitted: Value = serde_json::from_slice(&prepared.body.unwrap()).unwrap();
+        let signed = &submitted["signedRequest"];
+
+        let verified = verify_own_commit_body(signed, signer.public()).unwrap();
+        assert_eq!(verified["conversationId"], cid);
+        assert_eq!(verified["actorDid"], did);
+        assert_eq!(verified["actorDeviceId"], dev);
+
+        assert!(verify_own_commit_body(signed, other_signer.public()).is_err());
+
+        let mut missing_kind = signed.clone();
+        missing_kind["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("$type");
+        assert!(verify_own_commit_body(&missing_kind, signer.public()).is_err());
+
+        let mut unknown_kind = signed.clone();
+        unknown_kind["body"]["$type"] = json!("blue.catbird.chat.defs#unknownKind");
+        assert!(verify_own_commit_body(&unknown_kind, signer.public()).is_err());
+
+        let mut tampered_actor = signed.clone();
+        tampered_actor["body"]["actorDeviceId"] = json!("00000000-0000-4000-8000-00000000d999");
+        assert!(verify_own_commit_body(&tampered_actor, signer.public()).is_err());
+
+        let mut tampered_epoch = signed.clone();
+        tampered_epoch["body"]["next"]["epoch"] = json!(1);
+        assert!(verify_own_commit_body(&tampered_epoch, signer.public()).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn leaf_slice_verification_requires_exact_authorized_did_device_and_key() {
+        let did = "did:plc:aliceaaaaaaaaaaaaaaaaaaa";
+        let dev = "11111111-1111-4111-8111-111111111111";
+        let key = vec![0x42u8; 32];
+        let cred = format!("{did}#{dev}");
+        let authorized = vec![crate::push::AuthorizedPeerDeviceKey {
+            did: did.to_owned(),
+            device_id: dev.to_owned(),
+            signature_public_key: key.clone(),
+        }];
+
+        let (out_did, out_dev) = verify_leaf_slice_i4(cred.as_bytes(), &key, &authorized).unwrap();
+        assert_eq!(out_did, did);
+        assert_eq!(out_dev, dev);
+
+        // Empty authorized list fails closed when TOFU calibration bug is not enabled.
+        assert!(verify_leaf_slice_i4(cred.as_bytes(), &key, &[]).is_err());
+        // Wrong key, wrong device, wrong DID, and un-scoped credential all fail closed.
+        assert!(verify_leaf_slice_i4(cred.as_bytes(), &[0x99u8; 32], &authorized).is_err());
+        assert!(verify_leaf_slice_i4(
+            format!("{did}#22222222-2222-4222-8222-222222222222").as_bytes(),
+            &key,
+            &authorized
+        )
+        .is_err());
+        assert!(verify_leaf_slice_i4(
+            format!("did:plc:bobbbbbbbbbbbbbbbbbbbbbb#{dev}").as_bytes(),
+            &key,
+            &authorized
+        )
+        .is_err());
+        assert_eq!(
+            verify_leaf_slice_i4(did.as_bytes(), &key, &authorized).unwrap(),
+            (did.to_string(), String::new())
+        );
+        assert!(verify_leaf_slice_i4(b"not-a-did", &key, &authorized).is_err());
+        assert!(verify_leaf_slice_i4(&[0xff, 0xfe], &key, &authorized).is_err());
+    }
+
+    #[test]
+    fn account_deleted_entry_key_id_and_signature_reject_all_boundary_mutations() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let key = SigningKey::from_slice(&[5u8; 32]).unwrap();
+        let pub_sec1 = key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let other_sec1 = SigningKey::from_slice(&[6u8; 32])
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let deleted = "did:plc:deleteduseraaaaaaaaaaaaa";
+        let received_at = "2026-11-15T00:00:00.000Z";
+        let key_id = format!("{SEQUENCER}#mls-receipt-1");
+        let fields = [SEQUENCER, CONVERSATION, deleted, "1", ENTRY, received_at];
+        let transcript = account_deletion_authority_signing_bytes(&key_id, &fields).unwrap();
+        let sig: Signature = key.sign(&transcript);
+        let sig_bytes = sig.normalize_s().unwrap_or(sig).to_bytes().to_vec();
+
+        let valid = json!({
+            "$type": crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND,
+            "conversationId": CONVERSATION,
+            "sequencerDid": SEQUENCER,
+            "seq": 1,
+            "deletedDid": deleted,
+            "entryId": ENTRY,
+            "receivedAt": received_at,
+            "sequencerAuthority": {
+                "sequencerDid": SEQUENCER,
+                "keyId": key_id,
+                "signature": { "$bytes": STANDARD.encode(&sig_bytes) },
+            }
+        });
+
+        assert_eq!(
+            account_deleted_entry_key_id(CONVERSATION, SEQUENCER, &valid),
+            Some(key_id.as_str())
+        );
+        assert_eq!(
+            verify_account_deleted_entry_signature(
+                CONVERSATION,
+                &format!("{SEQUENCER}#atproto_mls"),
+                &valid,
+                &pub_sec1,
+            ),
+            Some((deleted.to_owned(), 1))
+        );
+
+        let mut without_type = valid.clone();
+        without_type.as_object_mut().unwrap().remove("$type");
+        assert_eq!(
+            verify_account_deleted_entry_signature(
+                CONVERSATION,
+                SEQUENCER,
+                &without_type,
+                &pub_sec1
+            ),
+            Some((deleted.to_owned(), 1))
+        );
+
+        for invalid_seq in [json!(0), json!(-1)] {
+            let mut bad = valid.clone();
+            bad["seq"] = invalid_seq;
+            assert!(account_deleted_entry_key_id(CONVERSATION, SEQUENCER, &bad).is_none());
+            assert!(verify_account_deleted_entry_signature(
+                CONVERSATION,
+                SEQUENCER,
+                &bad,
+                &pub_sec1
+            )
+            .is_none());
+        }
+
+        let mut wrong_type = valid.clone();
+        wrong_type["$type"] = json!("blue.catbird.chat.defs#applicationEntry");
+        assert!(account_deleted_entry_key_id(CONVERSATION, SEQUENCER, &wrong_type).is_none());
+
+        for field in ["deletedDid", "entryId", "receivedAt"] {
+            let mut empty_field = valid.clone();
+            empty_field[field] = json!("");
+            assert!(account_deleted_entry_key_id(CONVERSATION, SEQUENCER, &empty_field).is_none());
+        }
+
+        let mut wrong_auth_seq = valid.clone();
+        wrong_auth_seq["sequencerAuthority"]["sequencerDid"] = json!("did:web:other.example.com");
+        assert!(account_deleted_entry_key_id(CONVERSATION, SEQUENCER, &wrong_auth_seq).is_none());
+
+        assert!(verify_account_deleted_entry_signature(
+            CONVERSATION,
+            SEQUENCER,
+            &valid,
+            &other_sec1
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn pds_device_revocation_record_signs_canonical_dagcbor_and_verifies_enrolled_actors() {
+        use openmls_traits::types::SignatureScheme;
+
+        let repo_did = "did:plc:aliceaaaaaaaaaaaaaaaaaaa";
+        let dev1 = "11111111-1111-4111-8111-111111111111";
+        let dev2 = "22222222-2222-4222-8222-222222222222";
+        let signer1 = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let signer2 = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let rogue_signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+
+        let mut enrolled = BTreeMap::new();
+        enrolled.insert(dev1.to_owned(), signer1.public().to_vec());
+        enrolled.insert(dev2.to_owned(), signer2.public().to_vec());
+
+        // Sibling revocation (dev1 revoking dev2) verifies cleanly.
+        let body_bytes = build_pds_device_revocation_create_record_body_at(
+            repo_did,
+            dev1,
+            dev2,
+            "2026-11-15T00:00:00.000Z",
+            &signer1,
+            Some("revoked_by_sibling"),
+        )
+        .unwrap();
+        let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body_json["collection"],
+            "blue.catbird.chat.deviceRevocation"
+        );
+        assert_eq!(body_json["rkey"], dev2);
+        let record_val = &body_json["record"];
+        assert_eq!(
+            verify_pds_device_revocation_record(repo_did, dev2, record_val, &enrolled).unwrap(),
+            dev2
+        );
+
+        // Self-retirement (dev2 retiring dev2) also verifies cleanly.
+        let self_bytes = build_pds_device_revocation_create_record_body_at(
+            repo_did,
+            dev2,
+            dev2,
+            "2026-11-15T00:01:00.000Z",
+            &signer2,
+            Some("retired"),
+        )
+        .unwrap();
+        let self_json: Value = serde_json::from_slice(&self_bytes).unwrap();
+        assert_eq!(
+            verify_pds_device_revocation_record(repo_did, dev2, &self_json["record"], &enrolled)
+                .unwrap(),
+            dev2
+        );
+
+        // Wrong rkey, wrong repo_did, rogue signer, or tampered createdAt all fail closed.
+        assert!(
+            verify_pds_device_revocation_record(repo_did, dev1, record_val, &enrolled).is_err()
+        );
+        assert!(verify_pds_device_revocation_record(
+            "did:plc:bobbbbbbbbbbbbbbbbbbbbbb",
+            dev2,
+            record_val,
+            &enrolled
+        )
+        .is_err());
+
+        let rogue_bytes = build_pds_device_revocation_create_record_body_at(
+            repo_did,
+            dev1,
+            dev2,
+            "2026-11-15T00:00:00.000Z",
+            &rogue_signer,
+            None,
+        )
+        .unwrap();
+        let rogue_json: Value = serde_json::from_slice(&rogue_bytes).unwrap();
+        assert!(verify_pds_device_revocation_record(
+            repo_did,
+            dev2,
+            &rogue_json["record"],
+            &enrolled
+        )
+        .is_err());
+
+        let mut tampered_ts = record_val.clone();
+        tampered_ts["createdAt"] = json!("2026-11-15T00:00:01.000Z");
+        assert!(
+            verify_pds_device_revocation_record(repo_did, dev2, &tampered_ts, &enrolled).is_err()
+        );
     }
 }

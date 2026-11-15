@@ -755,14 +755,131 @@ impl CatbirdMlsClient {
             .map_err(|e| MLSError::Internal(format!("parse {nsid} JSON: {e}")))
     }
 
+    pub(crate) fn plc_directory_url_for_did(bare_did: &str) -> Result<String, MLSError> {
+        let plc_id = bare_did.strip_prefix("did:plc:").ok_or_else(|| {
+            MLSError::invalid_input(format!("expected did:plc identifier, got `{bare_did}`"))
+        })?;
+        if !(8..=64).contains(&plc_id.len())
+            || !plc_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            return Err(MLSError::invalid_input(format!(
+                "invalid did:plc identifier `{bare_did}`"
+            )));
+        }
+        Ok(format!("https://plc.directory/did:plc:{plc_id}"))
+    }
+
+    pub(crate) fn did_web_well_known_url(bare_did: &str) -> Option<String> {
+        let rest = bare_did.strip_prefix("did:web:")?;
+        if rest.is_empty() {
+            return None;
+        }
+        let mut segments = rest.split(':');
+        let raw_authority = segments.next()?;
+        let authority = raw_authority.replace("%3A", ":").replace("%3a", ":");
+        if authority.is_empty()
+            || authority.contains('/')
+            || authority.contains('@')
+            || authority.contains('?')
+            || authority.contains('#')
+        {
+            return None;
+        }
+        let host_only = if let Some(bracketed) = authority.strip_prefix('[') {
+            bracketed.split(']').next().unwrap_or("")
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        let is_loopback = matches!(
+            host_only.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        );
+        let scheme = if is_loopback { "http" } else { "https" };
+        let sub_segments: Vec<&str> = segments.collect();
+        if sub_segments.is_empty() {
+            Some(format!("{scheme}://{authority}/.well-known/did.json"))
+        } else {
+            if sub_segments.iter().any(|s| {
+                s.is_empty() || *s == "." || *s == ".." || s.contains('%') || s.contains('/')
+            }) {
+                return None;
+            }
+            Some(format!(
+                "{scheme}://{authority}/{}/did.json",
+                sub_segments.join("/")
+            ))
+        }
+    }
+
+    fn verify_did_doc_matches_target(doc_bytes: &[u8], expected_did: &str) -> Result<(), MLSError> {
+        let val: Value = serde_json::from_slice(doc_bytes)
+            .map_err(|e| MLSError::Cryptography(format!("invalid DID document JSON: {e}")))?;
+        if val.get("id").and_then(Value::as_str) != Some(expected_did) {
+            return Err(MLSError::Cryptography(format!(
+                "resolved DID document id {:?} does not match expected `{expected_did}`",
+                val.get("id")
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError> {
-        // 1. Try com.atproto.identity.resolveDid on PDS, then .well-known/did.json for did:web / home_ds_did.
+        let bare = did.split('#').next().unwrap_or(did).trim();
+        let mut resolution_error = None;
+
+        // `did:plc:*` MUST resolve from the authoritative PLC directory rather than trusting own PDS.
+        if bare.starts_with("did:plc:") {
+            let plc_url = Self::plc_directory_url_for_did(bare)?;
+            match self.transport.execute_http(PlatformHttpRequest {
+                method: "GET".to_string(),
+                url: plc_url,
+                headers: Vec::new(),
+                body: None,
+            }) {
+                Ok(resp) if resp.status == 200 => {
+                    let doc_bytes = chat_wire::extract_did_doc_from_resolve_response(&resp.body)
+                        .and_then(|doc_bytes| {
+                            Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
+                            Ok(doc_bytes)
+                        })?;
+                    let now_ms = self.hooks.now_ms();
+                    let _ = self.db.write_tx(|tx| {
+                        tx.put_account_meta(
+                            &format!("did_doc:{bare}"),
+                            &String::from_utf8_lossy(&doc_bytes),
+                            now_ms,
+                        )
+                    });
+                    return Ok(Some(doc_bytes));
+                }
+                Ok(resp) if resp.status == 404 => return Ok(None),
+                Ok(resp) => {
+                    resolution_error = Some(MLSError::Internal(format!(
+                        "PLC directory resolve({bare}) failed with HTTP {}",
+                        resp.status
+                    )));
+                }
+                Err(error) => resolution_error = Some(error),
+            }
+
+            let cached = self
+                .db
+                .read_tx(|tx| tx.get_account_meta(&format!("did_doc:{bare}")))?;
+            return match (cached, resolution_error) {
+                (Some(cached), _) => Ok(Some(cached.into_bytes())),
+                (None, Some(error)) => Err(error),
+                (None, None) => Ok(None),
+            };
+        }
+
+        // For `did:web:*` (such as sequencer / home DS DIDs), try PDS `resolveDid` then `.well-known/did.json`.
         let pds_resolve_url = format!(
             "{}/xrpc/com.atproto.identity.resolveDid?did={}",
             self.pds_base(),
-            chat_wire::urlencode_form_component(did)
+            chat_wire::urlencode_form_component(bare)
         );
-        let mut resolution_error = None;
         match self.transport.execute_http(PlatformHttpRequest {
             method: "GET".to_string(),
             url: pds_resolve_url,
@@ -770,12 +887,17 @@ impl CatbirdMlsClient {
             body: None,
         }) {
             Ok(resp) if resp.status == 200 => {
-                match chat_wire::extract_did_doc_from_resolve_response(&resp.body) {
+                match chat_wire::extract_did_doc_from_resolve_response(&resp.body).and_then(
+                    |doc_bytes| {
+                        Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
+                        Ok(doc_bytes)
+                    },
+                ) {
                     Ok(doc_bytes) => {
                         let now_ms = self.hooks.now_ms();
                         let _ = self.db.write_tx(|tx| {
                             tx.put_account_meta(
-                                &format!("did_doc:{did}"),
+                                &format!("did_doc:{bare}"),
                                 &String::from_utf8_lossy(&doc_bytes),
                                 now_ms,
                             )
@@ -789,15 +911,7 @@ impl CatbirdMlsClient {
             Err(error) => resolution_error = Some(error),
         }
 
-        if let Some(rest) = did.strip_prefix("did:web:") {
-            let authority = rest.replace("%3A", ":").replace("%3a", ":");
-            let scheme = if authority.starts_with("127.0.0.1") || authority.starts_with("localhost")
-            {
-                "http"
-            } else {
-                "https"
-            };
-            let wk_url = format!("{scheme}://{authority}/.well-known/did.json");
+        if let Some(wk_url) = Self::did_web_well_known_url(bare) {
             if let Ok(resp) = self.transport.execute_http(PlatformHttpRequest {
                 method: "GET".to_string(),
                 url: wk_url,
@@ -805,13 +919,17 @@ impl CatbirdMlsClient {
                 body: None,
             }) {
                 if resp.status == 200 {
-                    if let Ok(doc_bytes) =
-                        chat_wire::extract_did_doc_from_resolve_response(&resp.body)
-                    {
+                    if let Ok(doc_bytes) = chat_wire::extract_did_doc_from_resolve_response(
+                        &resp.body,
+                    )
+                    .and_then(|doc_bytes| {
+                        Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
+                        Ok(doc_bytes)
+                    }) {
                         let now_ms = self.hooks.now_ms();
                         let _ = self.db.write_tx(|tx| {
                             tx.put_account_meta(
-                                &format!("did_doc:{did}"),
+                                &format!("did_doc:{bare}"),
                                 &String::from_utf8_lossy(&doc_bytes),
                                 now_ms,
                             )
@@ -822,7 +940,7 @@ impl CatbirdMlsClient {
             }
         }
 
-        if did == self.config.home_ds_did {
+        if bare == self.config.home_ds_did {
             let wk_url = format!("{}/.well-known/did.json", self.ds_base());
             if let Ok(resp) = self.transport.execute_http(PlatformHttpRequest {
                 method: "GET".to_string(),
@@ -831,9 +949,13 @@ impl CatbirdMlsClient {
                 body: None,
             }) {
                 if resp.status == 200 {
-                    if let Ok(doc_bytes) =
-                        chat_wire::extract_did_doc_from_resolve_response(&resp.body)
-                    {
+                    if let Ok(doc_bytes) = chat_wire::extract_did_doc_from_resolve_response(
+                        &resp.body,
+                    )
+                    .and_then(|doc_bytes| {
+                        Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
+                        Ok(doc_bytes)
+                    }) {
                         return Ok(Some(doc_bytes));
                     }
                 }
@@ -842,7 +964,7 @@ impl CatbirdMlsClient {
 
         let cached = self
             .db
-            .read_tx(|tx| tx.get_account_meta(&format!("did_doc:{did}")))?;
+            .read_tx(|tx| tx.get_account_meta(&format!("did_doc:{bare}")))?;
         match (cached, resolution_error) {
             (Some(cached), _) => Ok(Some(cached.into_bytes())),
             (None, Some(error)) => Err(error),
@@ -874,6 +996,165 @@ impl CatbirdMlsClient {
         )
     }
 
+    fn paginate_pds_list_records(
+        &self,
+        pds_endpoint: &str,
+        target_did: &str,
+        collection: &str,
+        allow_404_empty: bool,
+    ) -> Result<Option<Vec<Value>>, MLSError> {
+        let mut all_records = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let base = pds_endpoint.trim_end_matches('/');
+
+        for page_idx in 0..chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+            let mut list_url = format!(
+                "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit=100",
+                chat_wire::urlencode_form_component(target_did),
+                chat_wire::urlencode_form_component(collection),
+            );
+            if let Some(ref c) = cursor {
+                list_url.push_str(&format!(
+                    "&cursor={}",
+                    chat_wire::urlencode_form_component(c)
+                ));
+            }
+            let resp = self.transport.execute_http(PlatformHttpRequest {
+                method: "GET".to_string(),
+                url: list_url,
+                headers: Vec::new(),
+                body: None,
+            })?;
+            if page_idx == 0
+                && resp.status == 503
+                && collection == "blue.catbird.chat.device"
+                && crate::planted::is_planted_bug_active(
+                    crate::planted::PlantedBug::P14TofuOnDeviceDirectory503,
+                )
+            {
+                return Ok(None);
+            }
+            if page_idx == 0 && resp.status == 404 && allow_404_empty {
+                return Ok(Some(Vec::new()));
+            }
+            if resp.status >= 400 {
+                return Err(MLSError::Internal(format!(
+                    "I4 PDS listRecords({target_did}, {collection}) failed with HTTP {}",
+                    resp.status
+                )));
+            }
+            let (page_records, next_cursor) =
+                chat_wire::parse_pds_list_records_page(target_did, collection, &resp.body)?;
+            all_records.extend(page_records);
+            if all_records.len() > chat_wire::MAX_PDS_LIST_RECORDS_ITEMS {
+                return Err(MLSError::Cryptography(format!(
+                    "I4 PDS listRecords({target_did}, {collection}) exceeded {} record ceiling",
+                    chat_wire::MAX_PDS_LIST_RECORDS_ITEMS
+                )));
+            }
+            match next_cursor {
+                None => return Ok(Some(all_records)),
+                Some(next) => {
+                    if !seen_cursors.insert(next.clone()) {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 PDS listRecords({target_did}, {collection}) repeated pagination cursor"
+                        )));
+                    }
+                    if page_idx + 1 == chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+                        return Err(MLSError::Cryptography(format!(
+                            "I4 PDS listRecords({target_did}, {collection}) truncated past {} pages",
+                            chat_wire::MAX_PDS_LIST_RECORDS_PAGES
+                        )));
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+        Ok(Some(all_records))
+    }
+
+    #[cfg(feature = "labyrinth")]
+    fn verify_pds_record_car_proof_and_pin_rev(
+        &self,
+        pds_endpoint: &str,
+        target_did: &str,
+        collection: &str,
+        rkey: &str,
+        record_entry: &Value,
+        atproto_key: &atproto_spaces::tokens::SpaceVerifyingKey,
+    ) -> Result<(), MLSError> {
+        let expected_uri = format!("at://{target_did}/{collection}/{rkey}");
+        let Some(expected_cid) = record_entry["cid"].as_str().filter(|c| !c.is_empty()) else {
+            return Err(MLSError::Cryptography(format!(
+                "I4 missing record CID for `{expected_uri}`"
+            )));
+        };
+        let Some(record_val) = record_entry.get("value") else {
+            return Err(MLSError::Cryptography(format!(
+                "I4 missing record value for `{expected_uri}`"
+            )));
+        };
+        let inline_proof = record_entry.get("proof").and_then(|p| {
+            p.as_str()
+                .or_else(|| p.get("$bytes").and_then(Value::as_str))
+        });
+        let car_bytes = if let Some(b64) = inline_proof {
+            STANDARD.decode(b64).map_err(|error| {
+                MLSError::Cryptography(format!(
+                    "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {error}"
+                ))
+            })?
+        } else {
+            let proof_url = format!(
+                "{}/xrpc/com.atproto.sync.getRecord?did={}&collection={}&rkey={}",
+                pds_endpoint.trim_end_matches('/'),
+                chat_wire::urlencode_form_component(target_did),
+                chat_wire::urlencode_form_component(collection),
+                chat_wire::urlencode_form_component(rkey),
+            );
+            let proof_resp = self.transport.execute_http(PlatformHttpRequest {
+                method: "GET".to_string(),
+                url: proof_url,
+                headers: Vec::new(),
+                body: None,
+            })?;
+            if proof_resp.status >= 400 {
+                return Err(MLSError::Cryptography(format!(
+                    "I4 sync.getRecord({expected_uri}) failed with HTTP {}",
+                    proof_resp.status
+                )));
+            }
+            proof_resp.body
+        };
+        let (_, commit_rev) = crate::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+            &car_bytes,
+            target_did,
+            collection,
+            rkey,
+            Some(expected_cid),
+            record_val,
+            atproto_key,
+        )
+        .map_err(|error| {
+            MLSError::Cryptography(format!(
+                "I4 CARv1 repo proof failed for `{expected_uri}`: {error}"
+            ))
+        })?;
+        crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+            &self.db,
+            target_did,
+            &commit_rev,
+            self.hooks.now_ms(),
+        )
+        .map_err(|error| {
+            MLSError::Cryptography(format!(
+                "I4 repository commit rev check failed for `{expected_uri}`: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn fetch_and_cache_authorized_pds_device_keys_checked(
         &self,
         target_did: &str,
@@ -901,47 +1182,25 @@ impl CatbirdMlsClient {
             .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc, target_did))
             .unwrap_or_else(|| self.pds_base());
 
-        let list_url = format!(
-            "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.chat.device&limit=100",
-            pds_endpoint.trim_end_matches('/'),
-            chat_wire::urlencode_form_component(target_did),
-        );
-        let resp = match self.transport.execute_http(PlatformHttpRequest {
-            method: "GET".to_string(),
-            url: list_url,
-            headers: Vec::new(),
-            body: None,
-        }) {
-            Ok(resp) => resp,
+        let raw_device_records = match self.paginate_pds_list_records(
+            &pds_endpoint,
+            target_did,
+            "blue.catbird.chat.device",
+            false,
+        ) {
+            Ok(Some(records)) => records,
+            Ok(None) => {
+                // P14 calibration: an empty directory is interpreted by the leaf verifier as TOFU.
+                return Ok(Vec::new());
+            }
             Err(error) => {
                 invalidate()?;
                 return Err(error);
             }
         };
-        if resp.status == 503
-            && crate::planted::is_planted_bug_active(
-                crate::planted::PlantedBug::P14TofuOnDeviceDirectory503,
-            )
-        {
-            // P14 calibration: an empty directory is interpreted by the leaf verifier as TOFU.
-            return Ok(Vec::new());
-        }
-        if resp.status >= 400 {
-            invalidate()?;
-            return Err(MLSError::Internal(format!(
-                "I4 PDS listRecords({target_did}) failed with HTTP {}",
-                resp.status
-            )));
-        }
 
-        let pairs = match chat_wire::parse_pds_device_list_records(target_did, &resp.body) {
-            Ok(pairs) => pairs,
-            Err(error) => {
-                invalidate()?;
-                return Err(error);
-            }
-        };
-        if pairs.is_empty() {
+        let entries = chat_wire::parse_pds_device_entries(target_did, &raw_device_records);
+        if entries.is_empty() {
             invalidate()?;
             return Err(MLSError::insufficient_permissions(format!(
                 "I4: zero valid blue.catbird.chat.device records on PDS for `{target_did}`"
@@ -949,115 +1208,117 @@ impl CatbirdMlsClient {
         }
         #[cfg(feature = "labyrinth")]
         if require_repo_proof {
-            if let Some(ref atproto_key) = atproto_key {
-                let parsed_list: Value = match serde_json::from_slice(&resp.body) {
-                    Ok(val) => val,
-                    Err(error) => {
-                        invalidate()?;
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 listRecords JSON parse failed for `{target_did}`: {error}"
-                        )));
-                    }
-                };
-                let records = parsed_list
-                    .get("records")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                for (device_id, _) in &pairs {
-                    let expected_uri =
-                        format!("at://{target_did}/blue.catbird.chat.device/{device_id}");
-                    let Some(record_entry) = records
-                        .iter()
-                        .find(|entry| entry["uri"].as_str() == Some(expected_uri.as_str()))
-                    else {
-                        invalidate()?;
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 missing canonical record entry for `{expected_uri}`"
-                        )));
-                    };
-                    let Some(expected_cid) = record_entry["cid"].as_str().filter(|c| !c.is_empty())
-                    else {
-                        invalidate()?;
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 missing record CID for `{expected_uri}`"
-                        )));
-                    };
-                    let Some(record_val) = record_entry.get("value") else {
-                        invalidate()?;
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 missing record value for `{expected_uri}`"
-                        )));
-                    };
-                    let inline_proof = record_entry.get("proof").and_then(|p| {
-                        p.as_str()
-                            .or_else(|| p.get("$bytes").and_then(Value::as_str))
-                    });
-                    let car_bytes = if let Some(b64) = inline_proof {
-                        match STANDARD.decode(b64) {
-                            Ok(bytes) => bytes,
-                            Err(error) => {
-                                invalidate()?;
-                                return Err(MLSError::Cryptography(format!(
-                                "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {error}"
-                            )));
-                            }
-                        }
-                    } else {
-                        let proof_url = format!(
-                        "{}/xrpc/com.atproto.sync.getRecord?did={}&collection=blue.catbird.chat.device&rkey={}",
-                        pds_endpoint.trim_end_matches('/'),
-                        chat_wire::urlencode_form_component(target_did),
-                        chat_wire::urlencode_form_component(device_id),
-                    );
-                        let proof_resp = match self.transport.execute_http(PlatformHttpRequest {
-                            method: "GET".to_string(),
-                            url: proof_url,
-                            headers: Vec::new(),
-                            body: None,
-                        }) {
-                            Ok(resp) => resp,
-                            Err(error) => {
-                                invalidate()?;
-                                return Err(error);
-                            }
-                        };
-                        if proof_resp.status >= 400 {
-                            invalidate()?;
-                            return Err(MLSError::Cryptography(format!(
-                                "I4 sync.getRecord({expected_uri}) failed with HTTP {}",
-                                proof_resp.status
-                            )));
-                        }
-                        proof_resp.body
-                    };
-                    if let Err(error) = crate::labyrinth::repo_proof::verify_car_record_json_match(
-                        &car_bytes,
-                        target_did,
-                        "blue.catbird.chat.device",
-                        device_id,
-                        Some(expected_cid),
-                        record_val,
-                        atproto_key,
-                    ) {
-                        invalidate()?;
-                        return Err(MLSError::Cryptography(format!(
-                            "I4 CARv1 repo proof failed for `{expected_uri}`: {error}"
-                        )));
-                    }
+            let Some(ref atproto_key) = atproto_key else {
+                invalidate()?;
+                return Err(MLSError::Cryptography(format!(
+                    "I4 missing #atproto repository signing key in DID document for `{target_did}`"
+                )));
+            };
+            for (device_id, _, record_entry) in &entries {
+                if let Err(error) = self.verify_pds_record_car_proof_and_pin_rev(
+                    &pds_endpoint,
+                    target_did,
+                    "blue.catbird.chat.device",
+                    device_id,
+                    record_entry,
+                    atproto_key,
+                ) {
+                    invalidate()?;
+                    return Err(error);
                 }
             }
         }
-        let authorized: Vec<AuthorizedPeerDeviceKey> = pairs
+
+        let mut enrolled_map = BTreeMap::new();
+        for (device_id, pk, _) in &entries {
+            enrolled_map.insert(device_id.clone(), pk.clone());
+        }
+
+        let raw_revocation_records = match self.paginate_pds_list_records(
+            &pds_endpoint,
+            target_did,
+            "blue.catbird.chat.deviceRevocation",
+            !require_repo_proof,
+        ) {
+            Ok(Some(records)) => records,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                invalidate()?;
+                return Err(error);
+            }
+        };
+        let revocation_prefix = format!("at://{target_did}/blue.catbird.chat.deviceRevocation/");
+        let mut revoked_device_ids = std::collections::BTreeSet::new();
+        for rev_entry in &raw_revocation_records {
+            let Some(uri) = rev_entry.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(rkey) = uri
+                .strip_prefix(&revocation_prefix)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains('/'))
+            else {
+                continue;
+            };
+            let Some(record_val) = rev_entry.get("value") else {
+                invalidate()?;
+                return Err(MLSError::Cryptography(format!(
+                    "I4 missing value on `{uri}`"
+                )));
+            };
+            #[cfg(feature = "labyrinth")]
+            if require_repo_proof {
+                let Some(ref atproto_key) = atproto_key else {
+                    invalidate()?;
+                    return Err(MLSError::Cryptography(format!(
+                        "I4 missing #atproto key for `{target_did}`"
+                    )));
+                };
+                if let Err(error) = self.verify_pds_record_car_proof_and_pin_rev(
+                    &pds_endpoint,
+                    target_did,
+                    "blue.catbird.chat.deviceRevocation",
+                    rkey,
+                    rev_entry,
+                    atproto_key,
+                ) {
+                    invalidate()?;
+                    return Err(error);
+                }
+            }
+            match chat_wire::verify_pds_device_revocation_record(
+                target_did,
+                rkey,
+                record_val,
+                &enrolled_map,
+            ) {
+                Ok(target_id) => {
+                    revoked_device_ids.insert(target_id);
+                }
+                Err(error) => {
+                    invalidate()?;
+                    return Err(error);
+                }
+            }
+        }
+
+        let authorized: Vec<AuthorizedPeerDeviceKey> = entries
             .into_iter()
+            .filter(|(device_id, _, _)| !revoked_device_ids.contains(device_id))
             .map(
-                |(device_id, signature_public_key)| AuthorizedPeerDeviceKey {
+                |(device_id, signature_public_key, _)| AuthorizedPeerDeviceKey {
                     did: target_did.to_string(),
                     device_id,
                     signature_public_key,
                 },
             )
             .collect();
+        if authorized.is_empty() {
+            invalidate()?;
+            return Err(MLSError::insufficient_permissions(format!(
+                "I4: all blue.catbird.chat.device records on PDS for `{target_did}` are revoked"
+            )));
+        }
 
         let now_ms = self.hooks.now_ms();
         let encoded =
@@ -1315,22 +1576,28 @@ impl CatbirdMlsClient {
         };
         let is_pending_approval = enrolled_status == "pending_approval";
 
-        // 3. Publish ADR-009 PDS `blue.catbird.chat.device/{device_id}` + `blue.catbird.chat.declaration/self`.
-        let put_record_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
+        // 3. Publish ADR-009 PDS `blue.catbird.chat.device/{device_id}` + `blue.catbird.chat.declaration/self`
+        //    via `com.atproto.repo.createRecord` (append-only; `nest` forbids `putRecord`/`deleteRecord`).
         let dev_record_body = chat_wire::build_pds_device_put_record_body_at(
             &self.normalized_did,
             canonical_device_id,
             pub_key,
             &self.hooks.now_rfc3339_millis(),
         )?;
-        let _ = self.execute_json_post(put_record_url.clone(), dev_record_body)?;
+        self.publish_pds_record_create_only(
+            "blue.catbird.chat.device",
+            canonical_device_id,
+            dev_record_body,
+            |existing_val| chat_wire::pds_device_record_matches(existing_val, pub_key),
+        )?;
 
         let decl_body = chat_wire::build_pds_chat_declaration_put_record_body_at(
             &self.normalized_did,
             &self.config.home_ds_did,
             &self.hooks.now_rfc3339_millis(),
         )?;
-        let _ = self.execute_json_post(put_record_url, decl_body)?;
+        let put_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
+        let _ = self.execute_json_post(put_url, decl_body)?;
 
         // 4. Generate + publish the C33 DirectRequestKeyPublication once the device is active and
         //    the DS does not yet hold it (real `mls-ds` rejects `pending_approval` callers with
@@ -1382,6 +1649,73 @@ impl CatbirdMlsClient {
             self.replenish_key_packages(4)?;
         }
         Ok(())
+    }
+
+    pub(super) fn publish_pds_record_create_only(
+        &self,
+        collection: &str,
+        rkey: &str,
+        create_body: Vec<u8>,
+        matches_expected: impl FnOnce(&Value) -> bool,
+    ) -> Result<(), MLSError> {
+        let create_url = format!("{}/xrpc/com.atproto.repo.createRecord", self.pds_base());
+        let resp = self.transport.execute_http(PlatformHttpRequest {
+            method: "POST".to_string(),
+            url: create_url.clone(),
+            headers: vec![PlatformHttpHeader {
+                name: "Content-Type".to_string(),
+                value: "application/json".to_string(),
+            }],
+            body: Some(create_body),
+        })?;
+        if resp.status < 400 {
+            return Ok(());
+        }
+        if matches!(resp.status, 400 | 409) {
+            let get_url = format!(
+                "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+                self.pds_base(),
+                chat_wire::urlencode_form_component(&self.normalized_did),
+                chat_wire::urlencode_form_component(collection),
+                chat_wire::urlencode_form_component(rkey),
+            );
+            let get_resp = self.transport.execute_http(PlatformHttpRequest {
+                method: "GET".to_string(),
+                url: get_url,
+                headers: Vec::new(),
+                body: None,
+            })?;
+            if get_resp.status == 200 {
+                let parsed: Value = serde_json::from_slice(&get_resp.body).map_err(|e| {
+                    MLSError::Cryptography(format!(
+                        "parse existing PDS {collection}/{rkey} getRecord JSON: {e}"
+                    ))
+                })?;
+                let expected_uri = format!("at://{}/{collection}/{rkey}", self.normalized_did);
+                if let Some(uri) = parsed.get("uri").and_then(Value::as_str) {
+                    if uri != expected_uri {
+                        return Err(MLSError::Cryptography(format!(
+                            "PDS getRecord({collection}/{rkey}) returned mismatched URI `{uri}`"
+                        )));
+                    }
+                }
+                let Some(existing_val) = parsed.get("value") else {
+                    return Err(MLSError::Cryptography(format!(
+                        "PDS getRecord({collection}/{rkey}) missing record value"
+                    )));
+                };
+                if matches_expected(existing_val) {
+                    return Ok(());
+                }
+                return Err(MLSError::InvalidState(format!(
+                    "EnrollmentPdsRecordConflict:{collection}/{rkey}"
+                )));
+            }
+        }
+        Err(chat_response_error(
+            format_args!("POST {create_url}"),
+            &resp,
+        ))
     }
 
     /// Whether this device's latest DS enrollment recorded `status == "pending_approval"`.
@@ -2314,9 +2648,8 @@ impl CatbirdMlsClient {
         let opening = bootstrap.opening.as_ref().ok_or_else(|| {
             MLSError::Cryptography("C33 sender missing authenticated opening frame".into())
         })?;
-        let space_uri = Some(format!(
-            "at://{effective_sequencer}/space/blue.catbird.labyrinth.conversation/{effective_convo_id}-0"
-        ));
+        let space_uri =
+            super::live_sync::conversation_space_uri(effective_sequencer, effective_convo_id, 0);
         let now_ms = self.hooks.now_ms();
         let display_json = json!({ "text": intro_text }).to_string();
         let frame_json = String::from_utf8(opening.canonical_payload_bytes.clone())
@@ -2358,7 +2691,7 @@ impl CatbirdMlsClient {
                 epoch: 1,
                 last_seq: opening_seq,
                 sequencer_did: effective_sequencer.clone(),
-                space_uri: space_uri.clone(),
+                space_uri: Some(space_uri.clone()),
                 title: None,
                 unread_count: 0,
                 updated_at_ms: now_ms,
@@ -2406,7 +2739,7 @@ impl CatbirdMlsClient {
                 sender_did: self.normalized_did.clone(),
                 sender_device_id: canonical_dev_id.to_string(),
                 sequencer_did: effective_sequencer.clone(),
-                space_uri,
+                space_uri: Some(space_uri),
                 plaintext_json: display_json,
                 labyrinth_frame_json: frame_json,
                 mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
@@ -2429,6 +2762,11 @@ impl CatbirdMlsClient {
                     staged_opening.message_id
                 ),
                 &serde_json::to_vec(&staged_opening)?,
+                now_ms,
+            )?;
+            tx.put_labyrinth_state(
+                &format!("push.verified_receipt:{effective_convo_id}:{first_message_id}"),
+                b"1",
                 now_ms,
             )?;
             tx.put_account_meta(
@@ -3342,10 +3680,11 @@ impl CatbirdMlsClient {
             chat_wire::roster_from_participants(&attempt.body["manifest"]["participants"])?;
         let generation = next["generation"].as_i64().unwrap_or_default();
         let epoch = next["epoch"].as_i64().unwrap_or_default();
-        let space_uri = Some(format!(
-            "at://{}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}",
-            pending.sequencer_did
-        ));
+        let space_uri = super::live_sync::conversation_space_uri(
+            &pending.sequencer_did,
+            conversation_id,
+            generation,
+        );
         let coords = serde_json::to_string(&next)?;
         let snapshot = serde_json::to_string(metadata_snapshot)?;
         let title_str = pending.title.clone().unwrap_or_default();
@@ -3394,7 +3733,7 @@ impl CatbirdMlsClient {
                 epoch,
                 last_seq: server_seq,
                 sequencer_did: pending.sequencer_did.clone(),
-                space_uri,
+                space_uri: Some(space_uri),
                 title: pending.title.clone(),
                 unread_count: 0,
                 updated_at_ms: now_ms,
@@ -4617,6 +4956,14 @@ impl CatbirdMlsClient {
                     queued.conversation_id, queued.message_id
                 ),
                 &serde_json::to_vec(&queued)?,
+                self.hooks.now_ms(),
+            )?;
+            tx.put_labyrinth_state(
+                &format!(
+                    "push.verified_receipt:{}:{}",
+                    queued.conversation_id, queued.message_id
+                ),
+                b"1",
                 self.hooks.now_ms(),
             )?;
             let mut gap = false;
@@ -7517,9 +7864,11 @@ impl CatbirdMlsClient {
 }
 
 #[cfg(test)]
-mod r4_mutant_kill_tests {
+mod verification_boundary_tests {
     use super::*;
+    use crate::client::{CatbirdMlsClientConfig, PlatformKeyStore, PlatformTransport};
     use openmls_traits::types::SignatureScheme;
+    use std::sync::Arc;
 
     #[test]
     fn verify_own_answer_rejects_kind_conversation_and_request_mismatches_independently() {
@@ -7663,5 +8012,178 @@ mod r4_mutant_kill_tests {
             verify_own_answer(&wrong_request, signed, cid, CREATION_ENTRY_KIND).is_err(),
             "mismatched signedRequest alone must fail verify_own_answer"
         );
+    }
+
+    #[test]
+    fn did_web_url_and_plc_resolution_enforce_exact_loopback_host_and_plc_directory_authority() {
+        use std::sync::Mutex;
+
+        // 1. Exact host check on `did:web:*` prevents `localhost.attacker.example` HTTP downgrade.
+        assert_eq!(
+            CatbirdMlsClient::did_web_well_known_url("did:web:localhost%3A8080").as_deref(),
+            Some("http://localhost:8080/.well-known/did.json")
+        );
+        assert_eq!(
+            CatbirdMlsClient::did_web_well_known_url("did:web:127.0.0.1%3A9000").as_deref(),
+            Some("http://127.0.0.1:9000/.well-known/did.json")
+        );
+        assert_eq!(
+            CatbirdMlsClient::did_web_well_known_url("did:web:localhost.attacker.example")
+                .as_deref(),
+            Some("https://localhost.attacker.example/.well-known/did.json")
+        );
+        assert_eq!(
+            CatbirdMlsClient::did_web_well_known_url("did:web:127.0.0.1.attacker.example")
+                .as_deref(),
+            Some("https://127.0.0.1.attacker.example/.well-known/did.json")
+        );
+        assert!(CatbirdMlsClient::plc_directory_url_for_did("did:plc:short").is_err());
+
+        // 2. `resolve_did_document` for `did:plc:*` queries `https://plc.directory/{did}` directly
+        //    and ignores any forged response from own PDS `resolveDid`.
+        struct MockKeyStore;
+        impl PlatformKeyStore for MockKeyStore {
+            fn load_or_create_db_key(&self, _: String) -> Result<Vec<u8>, MLSError> {
+                Ok(vec![0x33u8; 32])
+            }
+            fn store_signature_keypair(&self, _: String, _: Vec<u8>) -> Result<(), MLSError> {
+                Ok(())
+            }
+            fn load_signature_keypair(&self, _: String) -> Result<Option<Vec<u8>>, MLSError> {
+                Ok(None)
+            }
+            fn delete_account_keys(&self, _: String) -> Result<(), MLSError> {
+                Ok(())
+            }
+            fn load_cached_chat_dpop_token(&self, _: String) -> Result<Option<String>, MLSError> {
+                Ok(None)
+            }
+            fn store_cached_chat_dpop_token(
+                &self,
+                _: String,
+                _: String,
+                _: i64,
+            ) -> Result<(), MLSError> {
+                Ok(())
+            }
+        }
+        struct RecordingTransport {
+            urls: Mutex<Vec<String>>,
+            mismatched_id: bool,
+        }
+        impl PlatformTransport for RecordingTransport {
+            fn execute_http(
+                &self,
+                request: PlatformHttpRequest,
+            ) -> Result<PlatformHttpResponse, MLSError> {
+                self.urls.lock().unwrap().push(request.url.clone());
+                if request
+                    .url
+                    .contains("/xrpc/com.atproto.identity.resolveDid")
+                {
+                    // Poisoned own-PDS answer that must never be trusted for `did:plc:*`.
+                    return Ok(PlatformHttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: serde_json::to_vec(&json!({
+                            "didDoc": {
+                                "id": "did:plc:targetpeer22222222222222",
+                                "service": [{
+                                    "id": "#atproto_pds",
+                                    "type": "AtprotoPersonalDataServer",
+                                    "serviceEndpoint": "https://forged.attacker.example"
+                                }]
+                            }
+                        }))
+                        .unwrap(),
+                    });
+                }
+                if let Some(did) = request.url.strip_prefix("https://plc.directory/") {
+                    let doc_id = if self.mismatched_id {
+                        "did:plc:wrongidentity33333333333"
+                    } else {
+                        did
+                    };
+                    return Ok(PlatformHttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: serde_json::to_vec(&json!({
+                            "id": doc_id,
+                            "service": [{
+                                "id": "#atproto_pds",
+                                "type": "AtprotoPersonalDataServer",
+                                "serviceEndpoint": "https://authoritative.pds.example"
+                            }]
+                        }))
+                        .unwrap(),
+                    });
+                }
+                Ok(PlatformHttpResponse {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                })
+            }
+            fn connect_realtime_stream(&self, _: String, _: Option<i64>) -> Result<(), MLSError> {
+                Ok(())
+            }
+            fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(RecordingTransport {
+            urls: Mutex::new(Vec::new()),
+            mismatched_id: false,
+        });
+        let client = CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: dir.path().to_string_lossy().into_owned(),
+                account_did: "did:plc:ownaccount22222222222222".to_string(),
+                device_id: "00000000-0000-4000-8000-00000000d777".to_string(),
+                home_ds_did: "did:web:ds.catbird.test".to_string(),
+                home_ds_endpoint: "https://ds.catbird.test".to_string(),
+                pds_endpoint: "https://own.pds.example".to_string(),
+            },
+            Arc::new(MockKeyStore),
+            transport.clone(),
+            None,
+        )
+        .unwrap();
+
+        let target = "did:plc:targetpeer22222222222222";
+        let doc_bytes = client
+            .resolve_did_document(target)
+            .unwrap()
+            .expect("plc doc");
+        let ep = chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, target).unwrap();
+        assert_eq!(ep, "https://authoritative.pds.example");
+        let urls = transport.urls.lock().unwrap().clone();
+        assert_eq!(urls, vec![format!("https://plc.directory/{target}")]);
+
+        // Mismatched DID document `id` fails closed with `Cryptography`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let bad_client = CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: dir2.path().to_string_lossy().into_owned(),
+                account_did: "did:plc:ownaccount22222222222222".to_string(),
+                device_id: "00000000-0000-4000-8000-00000000d778".to_string(),
+                home_ds_did: "did:web:ds.catbird.test".to_string(),
+                home_ds_endpoint: "https://ds.catbird.test".to_string(),
+                pds_endpoint: "https://own.pds.example".to_string(),
+            },
+            Arc::new(MockKeyStore),
+            Arc::new(RecordingTransport {
+                urls: Mutex::new(Vec::new()),
+                mismatched_id: true,
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            bad_client.resolve_did_document(target),
+            Err(MLSError::Cryptography(_))
+        ));
     }
 }

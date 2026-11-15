@@ -36,6 +36,10 @@ name = "push_processor_memory_and_gap"
 required-features = ["sim"]
 
 [[test]]
+name = "adversarial_m1_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
 name = "adversarial_suite77_tests"
 required-features = ["legacy-orchestrator"]
 
@@ -253,6 +257,46 @@ required-features = ["legacy-orchestrator"]
 
 [[test]]
 name = "welcome_reissue_responder"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_crypto"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_preview"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_direct_request_restart"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "clean_chat_welcome_ack_atomicity_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "create_group_with_id_test"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "key_package_batch_test"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "member_removal_test"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "proposal_authorization_staging_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "public_api_compat_tests"
+required-features = ["legacy-orchestrator"]
+
+[[test]]
+name = "welcome_recovery_decision_test"
 required-features = ["legacy-orchestrator"]
 
 [[test]]

@@ -181,15 +181,13 @@ impl LabyrinthSpaceGateway for MockMacSpaceGateway {
     async fn submit_space(
         &self,
         _request: LabyrinthSpaceRequest,
-    ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse, String> {
+    ) -> Result<catbird_mls::canonical_transport::GatewayResponse, String> {
         let r = self.response.lock().unwrap().clone();
-        Ok(
-            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-                status: r.status,
-                content_type: r.content_type,
-                body: r.body,
-            },
-        )
+        Ok(catbird_mls::canonical_transport::GatewayResponse {
+            status: r.status,
+            content_type: r.content_type,
+            body: r.body,
+        })
     }
 
     async fn submit_space_with_headers(

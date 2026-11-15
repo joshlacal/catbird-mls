@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
+use catbird_mls::canonical_transport::{GatewayResponse, PreparedRequest};
 use catbird_mls::ffi::circles_ffi::{
     circle_key_generate_bytes, circle_post_key_bytes, open_circle_key_for_session,
     open_circle_post_for_session, seal_circle_post_for_session, wrap_circle_key_for_session,
@@ -22,7 +23,6 @@ use catbird_mls::labyrinth::{
     ChatKeySigner, GatewayXrpcTransport, LabyrinthGateway, LabyrinthRequest, LabyrinthSession,
     SessionDeps, StateVault,
 };
-use catbird_mls::orchestrator::canonical_transport::{GatewayResponse, PreparedRequest};
 use catbird_mls::MLSError;
 use ed25519_dalek::{Signer as _, SigningKey};
 use labyrinth::mailbox::{EpochPublic, MailboxKeys};

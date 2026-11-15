@@ -67,13 +67,17 @@ mod local_delete_persistence_tests;
 mod quarantine_persistence_tests;
 
 // Re-exports for convenience
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use api_client::MLSAPIClient;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use canonical_transport::canonical_application_aad_bytes;
 #[cfg(any(test, feature = "test-utils"))]
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use canonical_transport::{
     canonical_application_content, canonical_cbor_for_schema, canonical_metadata_aad_bytes,
     canonical_metadata_content_signing_input, canonical_metadata_exporter_context_bytes,
 };
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use canonical_transport::{
     canonical_commit_aad_bytes, canonical_route, map_wire_error, prepare_get_conversations,
     prepare_get_entries, prepare_replenishment, route_for_nsid, CanonicalOperation,
@@ -82,19 +86,27 @@ pub use canonical_transport::{
     ReplenishKeyPackagesInput, TransportError,
 };
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use canonical_transport::{
     decode_clean_chat_error, decode_clean_chat_response, prepare_clean_chat_request,
     prepare_clean_chat_signed_request, CleanChatAuthContextFfi, CleanChatOperationFfi,
     CleanChatPreparedRequestFfi, CleanChatSigningContextFfi, CleanChatTransportFfiError,
 };
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use constants::*;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
 };
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use credentials::{CleanChatSigningAuthority, CredentialStore};
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use direct_request_types::*;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use error::{OrchestratorError, Result};
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use event_observer::EngineEvent;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use mls_provider::{
     MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof, ReservedApplicationSend,
 };
@@ -104,8 +116,11 @@ pub(crate) use orchestrator::{with_batch_inventory_scope, with_batch_recovery_in
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 #[cfg(feature = "legacy-orchestrator")]
 pub use recovery::DeferredRecoveryOutcome;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use storage::MLSStorageBackend;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use types::*;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use welcome_recovery::*;
 
 pub mod authenticated_inventory;

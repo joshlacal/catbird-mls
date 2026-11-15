@@ -255,7 +255,9 @@ pub struct QueuedLabyrinthArchivePayload {
 
 /// Canonical personal mailbox Space URI for an account (`Spec §6.4`, `D4`).
 pub fn personal_mailbox_space_uri(account_did: &str) -> String {
-    format!("at://{account_did}/space/blue.catbird.labyrinth.mailbox/self")
+    atproto_spaces::SpaceUri::new(account_did, "blue.catbird.labyrinth.mailbox", "self")
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("at://{account_did}/space/blue.catbird.labyrinth.mailbox/self"))
 }
 
 /// Generate a 40-character GF(32) Labyrinth recovery code and derive its 16-byte virtual device ID (`Spec §6.7`, `D4`).
@@ -358,6 +360,7 @@ pub(crate) mod native_client {
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_traits::signatures::Signer as _;
     use openmls_traits::OpenMlsProvider;
+    use rusqlite::OptionalExtension as _;
     use serde::Serialize;
     use sha2::{Digest as _, Sha256};
     use zeroize::Zeroizing;
@@ -1138,9 +1141,6 @@ pub(crate) mod native_client {
             if let Ok(mut guard) = self.cached_groups.lock() {
                 guard.clear();
             }
-            if !preview.fallback_generic && preview.receipt_verified && preview.seq >= 1 {
-                let _ = self.acknowledge_entries_up_to(&conv_id, preview.seq);
-            }
             self.notify(PlatformChangeEvent::MessagesUpdated {
                 conversation_id: conv_id,
             });
@@ -1248,8 +1248,10 @@ pub(crate) mod native_client {
             let group_id_bytes = self.hooks.random_array::<32>().to_vec();
             let now_ms = self.hooks.now_ms();
             let now_secs = self.hooks.now_secs();
-            let space_uri = Some(format!(
-                "at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
+            let space_uri = Some(crate::client::live_sync::conversation_space_uri(
+                sequencer_did,
+                conversation_id,
+                0,
             ));
 
             let convo = self.db.write_tx(|tx| {
@@ -1783,6 +1785,7 @@ pub(crate) mod native_client {
             let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(pub_key));
 
             let conv_id_db = canonical_conv_id.clone();
+            let normalized_did = self.normalized_did.clone();
             let ack_meta = Arc::new(Mutex::new((0_i64, 1_i64)));
             let ack_meta_tx = Arc::clone(&ack_meta);
             let transport = Arc::clone(&self.transport);
@@ -1791,25 +1794,128 @@ pub(crate) mod native_client {
             crate::async_runtime::block_on(persist_entries_then_acknowledge(
                 &self.db,
                 move |tx| {
+                    let row_opt: Option<(i64, i64, i64)> = tx
+                        .conn()
+                        .query_row(
+                            "SELECT last_seq, acked_seq, generation FROM conversations WHERE conversation_id = ?1;",
+                            rusqlite::params![conv_id_db],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()
+                        .map_err(|e| {
+                            MLSError::Internal(format!("query conversation ack bounds: {e}"))
+                        })?;
+                    let Some((last_seq, current_acked_seq, generation)) = row_opt else {
+                        return Ok(Vec::new());
+                    };
+
+                    let mut safe_seq = up_to_seq.min(last_seq);
+
+                    // Clamp strictly below any NSE/push entry still awaiting canonical foreground I13 receipt verification.
+                    {
+                        let mut stmt = tx
+                            .conn()
+                            .prepare(
+                                "SELECT payload_json FROM pending_ops WHERE op_kind = 'native_archive_receipt';",
+                            )
+                            .map_err(|e| {
+                                MLSError::Internal(format!("prepare pending_ops ack clamp: {e}"))
+                            })?;
+                        let rows = stmt
+                            .query_map([], |row| row.get::<_, String>(0))
+                            .map_err(|e| {
+                                MLSError::Internal(format!("query pending_ops ack clamp: {e}"))
+                            })?;
+                        for row in rows {
+                            let raw = row.map_err(|e| {
+                                MLSError::Internal(format!("read pending_ops ack clamp: {e}"))
+                            })?;
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                                if val["conversation_id"].as_str() == Some(conv_id_db.as_str()) {
+                                    if let Some(p_seq) = val["seq"].as_i64().filter(|s| *s >= 1) {
+                                        safe_seq = safe_seq.min(p_seq - 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Clamp strictly below any un-archived undecryptable entry gap so transient DS retention is preserved.
+                    {
+                        let prefix = format!("native.undecryptable:{conv_id_db}:");
+                        let mut stmt = tx
+                            .conn()
+                            .prepare(
+                                "SELECT state_key, value_bytes FROM labyrinth_state \
+                                 WHERE state_key >= ?1 AND state_key < ?2;",
+                            )
+                            .map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "prepare undecryptable gap ack clamp: {e}"
+                                ))
+                            })?;
+                        let upper = format!("native.undecryptable:{conv_id_db};");
+                        let rows = stmt
+                            .query_map(rusqlite::params![prefix, upper], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                            })
+                            .map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "query undecryptable gap ack clamp: {e}"
+                                ))
+                            })?;
+                        for row in rows {
+                            let (_, bytes) = row.map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "read undecryptable gap ack clamp: {e}"
+                                ))
+                            })?;
+                            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                if let Some(gap_seq) = val["seq"].as_i64().filter(|s| *s >= 1) {
+                                    safe_seq = safe_seq.min(gap_seq - 1);
+                                }
+                            }
+                        }
+                    }
+
+                    // When an active Labyrinth Space mailbox session is established on this account,
+                    // clamp to durable archived watermark (strictly below the lowest unflushed
+                    // `labyrinth_queue` item for this conversation).
+                    let backup_active = tx
+                        .get_labyrinth_state("status_json")?
+                        .and_then(|raw| serde_json::from_slice::<LabyrinthBackupStatus>(&raw).ok())
+                        .is_some_and(|st| st.backup_enabled)
+                        && tx
+                            .get_labyrinth_state(&format!("native.session:{normalized_did}"))?
+                            .is_some();
+                    if backup_active {
+                        let min_unflushed: Option<i64> = tx
+                            .conn()
+                            .query_row(
+                                "SELECT MIN(seq) FROM labyrinth_queue WHERE conversation_id = ?1 AND seq >= 1;",
+                                rusqlite::params![conv_id_db],
+                                |row| row.get(0),
+                            )
+                            .map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "query labyrinth_queue ack clamp: {e}"
+                                ))
+                            })?;
+                        if let Some(q_seq) = min_unflushed {
+                            safe_seq = safe_seq.min(q_seq - 1);
+                        }
+                    }
+
+                    if safe_seq < 1 || safe_seq <= current_acked_seq {
+                        return Ok(Vec::new());
+                    }
+
                     tx.conn()
                         .execute(
                             "UPDATE conversations SET acked_seq = MAX(acked_seq, ?1) WHERE conversation_id = ?2;",
-                            rusqlite::params![up_to_seq, conv_id_db],
+                            rusqlite::params![safe_seq, conv_id_db],
                         )
                         .map_err(|e| MLSError::Internal(format!("update acked_seq: {e}")))?;
-                    let generation: i64 = match tx.conn().query_row(
-                        "SELECT generation FROM conversations WHERE conversation_id = ?1;",
-                        rusqlite::params![conv_id_db],
-                        |row| row.get(0),
-                    ) {
-                        Ok(gen_val) => gen_val,
-                        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
-                        Err(e) => {
-                            return Err(MLSError::Internal(format!(
-                                "query conversation generation: {e}"
-                            )))
-                        }
-                    };
                     let auth_gen = tx
                         .get_account_meta("auth_generation")?
                         .and_then(|s| s.parse::<i64>().ok())
@@ -1818,7 +1924,7 @@ pub(crate) mod native_client {
                     if let Ok(mut guard) = ack_meta_tx.lock() {
                         *guard = (generation.max(0), auth_gen);
                     }
-                    Ok(vec![up_to_seq])
+                    Ok(vec![safe_seq])
                 },
                 move |seqs| async move {
                     let effective_seq = seqs.into_iter().max().unwrap_or(up_to_seq);

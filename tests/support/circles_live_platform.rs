@@ -262,6 +262,29 @@ impl LiveTransport {
     ) -> Result<PlatformHttpResponse, MLSError> {
         let mut st = self.state.lock().unwrap();
         match nsid {
+            "com.atproto.repo.createRecord" => {
+                let key = (
+                    body["repo"].as_str().unwrap_or_default().to_owned(),
+                    body["collection"].as_str().unwrap_or_default().to_owned(),
+                    body["rkey"].as_str().unwrap_or_default().to_owned(),
+                );
+                if key.0 != self.did {
+                    return reply(
+                        401,
+                        json!({ "error": "AuthRequired", "message": "not your repo" }),
+                    );
+                }
+                if st.repo.contains_key(&key) {
+                    return reply(
+                        400,
+                        json!({ "error": "InvalidRequest", "message": "record already exists" }),
+                    );
+                }
+                let cid = canonical_record_cid(&body["record"])?;
+                let uri = format!("at://{}/{}/{}", key.0, key.1, key.2);
+                st.repo.insert(key, (body["record"].clone(), cid.clone()));
+                ok(json!({ "uri": uri, "cid": cid }))
+            }
             "com.atproto.repo.putRecord" => {
                 let key = (
                     body["repo"].as_str().unwrap_or_default().to_owned(),
@@ -347,7 +370,7 @@ impl LiveTransport {
                 let b = &body["signedRequest"]["body"];
                 let dev = b["deviceId"].as_str().unwrap_or_default().to_owned();
                 let pk_raw = catbird_mls::client::chat_wire::json_bytes(&b["signaturePublicKey"])?;
-                let key_id = catbird_mls::orchestrator::canonical_transport::derive_key_id(&pk_raw);
+                let key_id = catbird_mls::canonical_transport::derive_key_id(&pk_raw);
                 let pk = if b["signaturePublicKey"].is_string() {
                     json!({ "$bytes": b["signaturePublicKey"] })
                 } else {

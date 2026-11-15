@@ -503,6 +503,12 @@ impl MailboxStore for SpaceMailbox {
     ) -> labyrinth::Result<Option<(ReadStateRecord, Option<String>)>> {
         self.space.get_read_state(conversation_id).await
     }
+    async fn get_read_state_versioned(
+        &self,
+        conversation_id: &str,
+    ) -> labyrinth::Result<Option<(ReadStateRecord, Option<String>, u64)>> {
+        self.space.get_read_state_versioned(conversation_id).await
+    }
     async fn put_read_state(
         &self,
         conversation_id: &str,
@@ -518,11 +524,22 @@ impl MailboxStore for SpaceMailbox {
     ) -> labyrinth::Result<Vec<(String, ReadStateRecord, Option<String>)>> {
         self.space.list_read_states().await
     }
+    async fn list_read_states_versioned(
+        &self,
+    ) -> labyrinth::Result<Vec<(String, ReadStateRecord, Option<String>, u64)>> {
+        self.space.list_read_states_versioned().await
+    }
     async fn get_circle_owner_state(
         &self,
         circle_id: &str,
     ) -> labyrinth::Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
         self.space.get_circle_owner_state(circle_id).await
+    }
+    async fn get_circle_owner_state_versioned(
+        &self,
+        circle_id: &str,
+    ) -> labyrinth::Result<Option<(CircleOwnerStateRecord, Option<String>, u64)>> {
+        self.space.get_circle_owner_state_versioned(circle_id).await
     }
     async fn put_circle_owner_state(
         &self,
@@ -538,6 +555,28 @@ impl MailboxStore for SpaceMailbox {
         &self,
     ) -> labyrinth::Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
         self.space.list_circle_owner_states().await
+    }
+    async fn list_circle_owner_states_versioned(
+        &self,
+    ) -> labyrinth::Result<Vec<(String, CircleOwnerStateRecord, Option<String>, u64)>> {
+        self.space.list_circle_owner_states_versioned().await
+    }
+    fn seed_owner_state_version_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), u64>,
+    ) {
+        self.space.seed_owner_state_version_floors(floors);
+    }
+    fn replace_owner_state_version_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), u64>,
+    ) {
+        self.space.replace_owner_state_version_floors(floors);
+    }
+    fn export_owner_state_version_floors(
+        &self,
+    ) -> std::collections::BTreeMap<(String, String), u64> {
+        self.space.export_owner_state_version_floors()
     }
     fn seed_writer_rev_floors(
         &self,
@@ -795,9 +834,10 @@ impl ResolvingSpaceThreadStore {
                 .or_else(|| entry["uri"].as_str())
                 .or_else(|| entry["space"].as_str());
             if let Some(u) = uri {
-                if u.contains("/space/blue.catbird.labyrinth.conversation/") {
-                    labyrinth::store::space::SpaceRef::parse(u)?;
-                    out.push(u.to_owned());
+                if let Ok(parsed) = atproto_spaces::SpaceUri::parse_hedged(u) {
+                    if parsed.space_type == "blue.catbird.labyrinth.conversation" {
+                        out.push(parsed.to_string());
+                    }
                 }
             }
         }

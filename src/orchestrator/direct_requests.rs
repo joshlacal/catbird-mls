@@ -23,6 +23,7 @@ mod projection;
 #[cfg(feature = "legacy-orchestrator")]
 #[path = "direct_request_receive.rs"]
 mod receive;
+#[cfg_attr(not(feature = "legacy-orchestrator"), allow(unused_imports))]
 pub use intent::DirectRequestIntent;
 #[cfg(feature = "legacy-orchestrator")]
 pub(crate) use projection::normalized_close_entry;

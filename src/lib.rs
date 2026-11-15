@@ -35,7 +35,10 @@ pub mod metadata;
 mod mls_context;
 #[cfg(not(target_arch = "wasm32"))]
 mod mls_engine_context;
+#[cfg(feature = "legacy-orchestrator")]
 pub mod orchestrator;
+#[cfg(not(feature = "legacy-orchestrator"))]
+pub(crate) mod orchestrator;
 pub mod planted;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform_lifecycle;
@@ -81,8 +84,15 @@ pub use orchestrator::direct_request_types::{
     RequestCapabilities, RequestConsent, RequestCrypto, RequestIntroductionMetadata,
     RequestPreview,
 };
+pub use orchestrator::types::{
+    MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload, MLSMessageType, ReactionAction,
+};
 #[cfg(not(all(feature = "legacy-orchestrator", not(target_arch = "wasm32"))))]
 pub use orchestrator::MessageProcessingResult;
+pub use orchestrator::{
+    canonical_transport, constants, direct_request_bootstrap, direct_request_keys,
+    direct_request_shared_crypto, direct_request_types, types as payload_types,
+};
 #[cfg(all(feature = "sim", not(target_arch = "wasm32")))]
 pub use planted::SimGroupState;
 pub use planted::{is_planted_bug_active, set_planted_bug, with_planted_bug, PlantedBug};

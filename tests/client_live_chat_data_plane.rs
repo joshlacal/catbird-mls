@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
+use catbird_mls::canonical_transport::{derive_key_id, CanonicalOperation};
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
 use catbird_mls::chat_v2::transcript::SignedMutationKind;
 use catbird_mls::client::chat_wire;
-use catbird_mls::orchestrator::canonical_transport::{derive_key_id, CanonicalOperation};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
@@ -632,6 +632,26 @@ impl SharedMockDs {
         if url.ends_with("/.well-known/did.json") {
             return ok_json(self.receipt_did_doc());
         }
+        if let Some(raw_did) = url.strip_prefix("https://plc.directory/") {
+            let did = raw_did.split('?').next().unwrap_or(raw_did).to_string();
+            {
+                let mut state = self.inner.lock().unwrap();
+                if state.transport_error_next_resolve_for.as_deref() == Some(did.as_str()) {
+                    state.transport_error_next_resolve_for = None;
+                    return Err(MLSError::Internal(
+                        "injected DID resolution transport error".into(),
+                    ));
+                }
+            }
+            return ok_json(json!({
+                "id": did,
+                "service": [{
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": PDS_URL
+                }]
+            }));
+        }
         if url.contains("/xrpc/com.atproto.identity.resolveDid") {
             let did = q.get("did").cloned().unwrap_or_default();
             let mut state = self.inner.lock().unwrap();
@@ -677,6 +697,27 @@ impl SharedMockDs {
                 });
             }
             return Ok(resp);
+        }
+
+        if url.contains("/xrpc/com.atproto.repo.createRecord") {
+            let repo = body_json["repo"].as_str().unwrap_or_default().to_string();
+            let coll = body_json["collection"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let rkey = body_json["rkey"].as_str().unwrap_or_default().to_string();
+            if g.pds_records
+                .contains_key(&(repo.clone(), coll.clone(), rkey.clone()))
+            {
+                return xrpc_error(400, "InvalidRequest", "record already exists");
+            }
+            let rec = body_json["record"].clone();
+            g.pds_records
+                .insert((repo.clone(), coll.clone(), rkey.clone()), rec);
+            return ok_json(json!({
+                "uri": format!("at://{repo}/{coll}/{rkey}"),
+                "cid": "bafyreimock"
+            }));
         }
 
         if url.contains("/xrpc/com.atproto.repo.putRecord") {
@@ -732,7 +773,16 @@ impl SharedMockDs {
         if url.contains("/xrpc/com.atproto.repo.listRecords") {
             let repo = q.get("repo").cloned().unwrap_or_default();
             let coll = q.get("collection").cloned().unwrap_or_default();
-            let records: Vec<Value> = g
+            let limit = q
+                .get("limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100)
+                .max(1);
+            let offset = q
+                .get("cursor")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            let all_records: Vec<Value> = g
                 .pds_records
                 .iter()
                 .filter(|((r, c, _), _)| r == &repo && c == &coll)
@@ -744,7 +794,20 @@ impl SharedMockDs {
                     })
                 })
                 .collect();
-            return ok_json(json!({ "records": records }));
+            let page: Vec<Value> = all_records
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect();
+            let next_offset = offset + page.len();
+            if next_offset < all_records.len() && !page.is_empty() {
+                return ok_json(json!({
+                    "records": page,
+                    "cursor": next_offset.to_string(),
+                }));
+            }
+            return ok_json(json!({ "records": page }));
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getMailboxKeysRecord") {
@@ -7216,7 +7279,9 @@ fn a_key_mismatch_refuses_before_any_pds_write() {
             .http_log
             .iter()
             .filter(|(account, url, _)| {
-                account == ALICE_DID && url.ends_with("/xrpc/com.atproto.repo.putRecord")
+                account == ALICE_DID
+                    && (url.ends_with("/xrpc/com.atproto.repo.putRecord")
+                        || url.ends_with("/xrpc/com.atproto.repo.createRecord"))
             })
             .count()
     };
@@ -8748,7 +8813,7 @@ fn undecryptable_current_epoch_entry_is_tombstoned_and_a_later_commit_applies() 
     );
     assert_eq!(
         gap.plaintext_json,
-        serde_json::to_string(&catbird_mls::orchestrator::MLSMessagePayload::system(
+        serde_json::to_string(&catbird_mls::MLSMessagePayload::system(
             chat_wire::UNDECRYPTABLE_MESSAGE_NOTICE
         ))
         .unwrap()
@@ -14020,7 +14085,9 @@ fn enroll_device_only_adopts_own_device_on_device_already_exists_refusal() {
         .http_log
         .iter()
         .filter(|(account, url, _)| {
-            account == ALICE_DID && url.ends_with("/xrpc/com.atproto.repo.putRecord")
+            account == ALICE_DID
+                && (url.ends_with("/xrpc/com.atproto.repo.putRecord")
+                    || url.ends_with("/xrpc/com.atproto.repo.createRecord"))
         })
         .count();
     assert_eq!(

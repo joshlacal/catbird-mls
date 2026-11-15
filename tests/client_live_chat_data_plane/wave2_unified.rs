@@ -396,7 +396,7 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
 
     // 3. Push wake on sibling device (alice_d2) vs peer device (bob):
     //    - sets `is_own_sibling_sender = true` on alice_d2 and `false` on bob;
-    //    - auto-acknowledges `acked_watermarks` for both devices after SQLite commit!
+    //    - does NOT prematurely acknowledge `acked_watermarks` before foreground sync + archive flush!
     let push_msg_id = new_id();
     alice_d1
         .send_message(&dm_cid, &push_msg_id, "Live push wake from d1")
@@ -426,14 +426,14 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
         preview_d2.is_own_sibling_sender,
         "sibling device sender must set is_own_sibling_sender = true: {preview_d2:?}"
     );
-    assert_eq!(
+    assert_ne!(
         ds.inner
             .lock()
             .unwrap()
             .acked_watermarks
             .get(&(dm_cid.clone(), alice_d2_dev.clone())),
         Some(&push_seq),
-        "process_push_wake must auto-acknowledge watermark for alice_d2"
+        "process_push_wake must not advance acked_watermarks before foreground sync and archive flush"
     );
 
     let wake_bob = PushWakePayload {
@@ -456,6 +456,40 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
         !preview_bob.is_own_sibling_sender,
         "peer sender must set is_own_sibling_sender = false: {preview_bob:?}"
     );
+    assert_ne!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(dm_cid.clone(), bob_dev.clone())),
+        Some(&push_seq),
+        "process_push_wake must not advance acked_watermarks before foreground sync and archive flush"
+    );
+
+    alice_d2
+        .sync()
+        .expect("alice_d2 foreground sync completes receipt");
+    alice_d2
+        .flush_labyrinth_queue()
+        .expect("alice_d2 flushes archive queue");
+    alice_d2
+        .acknowledge_entries_up_to(&dm_cid, push_seq)
+        .expect("alice_d2 acknowledges after sync + archive flush");
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(dm_cid.clone(), alice_d2_dev.clone())),
+        Some(&push_seq),
+        "acked_watermarks advances once foreground sync and archive flush commit"
+    );
+
+    bob.sync().expect("bob foreground sync completes receipt");
+    bob.flush_labyrinth_queue()
+        .expect("bob flushes archive queue");
+    bob.acknowledge_entries_up_to(&dm_cid, push_seq)
+        .expect("bob acknowledges after sync + archive flush");
     assert_eq!(
         ds.inner
             .lock()
@@ -463,7 +497,7 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
             .acked_watermarks
             .get(&(dm_cid.clone(), bob_dev.clone())),
         Some(&push_seq),
-        "process_push_wake must auto-acknowledge watermark for bob"
+        "acked_watermarks advances for bob once foreground sync and archive flush commit"
     );
 
     // 4. `verify_and_reindex_history` purges unverified forged SQLite message rows while keeping verified rows.
@@ -847,4 +881,517 @@ fn d5_flush_requires_signed_space_denial_jwt_fc07_group_leaves_and_attachment_pe
         .leave_conversation(&dm_cid)
         .expect("bob leaves 1:1 DM immediately");
     assert!(dm_leave.left_immediately);
+}
+
+#[test]
+fn acknowledge_entries_clamps_to_durable_contiguous_and_archived_watermarks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice_dev = new_id();
+    let bob_dev = new_id();
+
+    let alice = enrolled(&tmp, &ds, "ack-clamp-alice", ALICE_DID, &alice_dev);
+    let bob = enrolled(&tmp, &ds, "ack-clamp-bob", BOB_DID, &bob_dev);
+    alice.setup_recovery_code().expect("alice mailbox");
+    bob.setup_recovery_code().expect("bob mailbox");
+
+    let cid = new_id();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into()],
+            Some("Ack Clamp Group".into()),
+            Some("init".into()),
+        )
+        .expect("create group");
+    join_invited_group(&alice, &[&bob]);
+    bob.flush_labyrinth_queue().expect("bob initial flush");
+
+    let base_seq = bob
+        .db()
+        .read_tx(|tx| Ok(tx.get_conversation(&cid)?.unwrap().last_seq))
+        .unwrap();
+    bob.acknowledge_entries_up_to(&cid, base_seq + 500)
+        .expect("over-watermark ack request clamps to last_seq");
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.clone(), bob_dev.clone())),
+        Some(&base_seq),
+        "acknowledge_entries_up_to must clamp to durable conversations.last_seq"
+    );
+
+    // Unflushed Labyrinth queue item clamps `acknowledge_entries_up_to` strictly below `msg1_seq`.
+    let msg1_id = new_id();
+    alice
+        .send_message(&cid, &msg1_id, "must be archived before DS pruning")
+        .expect("alice send msg1");
+    bob.sync().expect("bob syncs msg1");
+    let msg1_seq = bob
+        .db()
+        .read_tx(|tx| Ok(tx.get_conversation(&cid)?.unwrap().last_seq))
+        .unwrap();
+    assert!(msg1_seq > base_seq);
+    bob.acknowledge_entries_up_to(&cid, msg1_seq)
+        .expect("ack clamped below unflushed queue item");
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.clone(), bob_dev.clone())),
+        Some(&base_seq),
+        "unflushed labyrinth_queue item must hold acked_seq strictly below msg1_seq"
+    );
+
+    // Pending `native_archive_receipt` marker also clamps strictly below `msg1_seq` even after flush.
+    bob.flush_labyrinth_queue().expect("bob flushes msg1");
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_pending_op(
+                "native_archive_receipt",
+                &msg1_id,
+                &serde_json::to_string(&json!({
+                    "conversation_id": cid,
+                    "seq": msg1_seq,
+                }))
+                .unwrap(),
+                1_700_000_000_000,
+            )
+        })
+        .unwrap();
+    bob.acknowledge_entries_up_to(&cid, msg1_seq)
+        .expect("ack clamped below pending receipt op");
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.clone(), bob_dev.clone())),
+        Some(&base_seq),
+        "pending native_archive_receipt op must hold acked_seq strictly below msg1_seq"
+    );
+    bob.db()
+        .write_tx(|tx| tx.delete_pending_op("native_archive_receipt", &msg1_id))
+        .unwrap();
+
+    // Un-archived undecryptable gap (`native.undecryptable:{cid}:...`) also clamps strictly below `msg1_seq`.
+    let gap_key = format!("native.undecryptable:{cid}:gap-test");
+    bob.db()
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &gap_key,
+                serde_json::to_vec(&json!({ "seq": msg1_seq }))
+                    .unwrap()
+                    .as_slice(),
+                1_700_000_000_000,
+            )
+        })
+        .unwrap();
+    bob.acknowledge_entries_up_to(&cid, msg1_seq)
+        .expect("ack clamped below un-archived undecryptable gap");
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.clone(), bob_dev.clone())),
+        Some(&base_seq),
+        "un-archived undecryptable gap must hold acked_seq strictly below gap seq"
+    );
+    bob.db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute(
+                    "DELETE FROM labyrinth_state WHERE state_key = ?1;",
+                    rusqlite::params![gap_key],
+                )
+                .map(|_| ())
+                .map_err(|e| MLSError::Internal(e.to_string()))
+        })
+        .unwrap();
+
+    // Once receipt, archive queue, and undecryptable gaps are all clear, watermark advances to `msg1_seq`.
+    bob.acknowledge_entries_up_to(&cid, msg1_seq)
+        .expect("ack advances once all blockers clear");
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.clone(), bob_dev.clone())),
+        Some(&msg1_seq)
+    );
+}
+
+#[test]
+fn pending_receipt_cursor_rewind_skips_already_applied_mls_ratchet_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice_dev = new_id();
+    let bob_dev = new_id();
+    let carol_dev = new_id();
+
+    let alice = enrolled(&tmp, &ds, "rewind-alice", ALICE_DID, &alice_dev);
+    let bob = enrolled(&tmp, &ds, "rewind-bob", BOB_DID, &bob_dev);
+    let carol = enrolled(&tmp, &ds, "rewind-carol", CAROL_DID, &carol_dev);
+
+    let cid = new_id();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into(), CAROL_DID.into()],
+            Some("Rewind Safety".into()),
+            None,
+        )
+        .expect("create group");
+    join_invited_group(&alice, &[&bob, &carol]);
+    bob.sync().expect("bob catches up roster commits");
+    carol.sync().expect("carol catches up roster commits");
+
+    let (msg1_id, msg2_id) = (new_id(), new_id());
+    let sent1 = alice
+        .send_message(&cid, &msg1_id, "first message from alice")
+        .expect("alice send msg1");
+    let sent2 = carol
+        .send_message(
+            &cid,
+            &msg2_id,
+            "second message whose ratchet is already consumed",
+        )
+        .expect("carol send msg2");
+    bob.sync().expect("bob decrypts msg1 and msg2");
+    assert_eq!(
+        bob.db()
+            .read_tx(|tx| Ok(tx.get_conversation(&cid)?.unwrap().last_seq))
+            .unwrap(),
+        sent2.seq
+    );
+
+    // Simulate NSE having decrypted Alice's `msg1` at `sent1.seq` without a foreground receipt yet
+    // (`peer_send_counter` for Alice not yet recorded, `native_archive_receipt` pending at `sent1.seq`)
+    // while `convo.last_seq` already advanced to `sent2.seq` (Carol's `msg2` already consumed in MLS):
+    // rewinding `fetch_after` below `sent1.seq` re-fetches `sent2.seq`, which MUST NOT be re-fed
+    // into `group.process_message` (`SecretReuseError`) or downgraded to undecryptable.
+    let alice_counter_key = {
+        let state = ds.inner.lock().unwrap();
+        let body = &state
+            .entries
+            .get(&cid)
+            .unwrap()
+            .iter()
+            .find(|entry| entry["signedRequest"]["body"]["messageId"] == msg1_id)
+            .unwrap()["signedRequest"]["body"];
+        chat_wire::peer_send_counter_key(
+            &cid,
+            body["prior"]["generation"].as_i64().unwrap(),
+            body["prior"]["epoch"].as_i64().unwrap(),
+            body["actorDid"].as_str().unwrap(),
+            body["actorDeviceId"].as_str().unwrap(),
+        )
+    };
+    let archive_key_1 = format!("native.message:{cid}:{msg1_id}");
+    bob.db()
+        .write_tx(|tx| {
+            let mut ev: Value =
+                serde_json::from_slice(&tx.get_labyrinth_state(&archive_key_1)?.unwrap()).unwrap();
+            ev["sequencer_receipt_json"] = Value::Null;
+            tx.put_labyrinth_state(
+                &archive_key_1,
+                &serde_json::to_vec(&ev).unwrap(),
+                1_700_000_000_000,
+            )?;
+            tx.delete_account_meta(&alice_counter_key)?;
+            tx.put_pending_op(
+                "native_archive_receipt",
+                &msg1_id,
+                &serde_json::to_string(&json!({
+                    "conversation_id": cid,
+                    "seq": sent1.seq,
+                }))
+                .unwrap(),
+                1_700_000_000_000,
+            )
+        })
+        .unwrap();
+
+    bob.sync()
+        .expect("cursor rewind completes pending receipt without SecretReuse failure on msg2");
+    assert!(
+        bob.db()
+            .read_tx(|tx| tx.get_pending_op("native_archive_receipt", &msg1_id))
+            .unwrap()
+            .is_none(),
+        "pending receipt at sent1.seq must be completed"
+    );
+    let msgs = bob.list_messages(&cid, None, 20).expect("bob messages");
+    let m2 = msgs
+        .iter()
+        .find(|m| m.message_id == msg2_id)
+        .expect("msg2 present");
+    assert!(
+        m2.plaintext_json
+            .contains("second message whose ratchet is already consumed"),
+        "msg2 plaintext must remain intact and never be overwritten by undecryptable notice: {}",
+        m2.plaintext_json
+    );
+    let gap_key_2 = format!("native.undecryptable:{cid}:{msg2_id}");
+    assert!(
+        bob.db()
+            .read_tx(|tx| tx.get_labyrinth_state(&gap_key_2))
+            .unwrap()
+            .is_none(),
+        "already-applied entry must never record native.undecryptable evidence on cursor rewind"
+    );
+}
+
+#[test]
+fn enrollment_revocation_pagination_and_car_proof_fail_closed_boundaries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert!(
+        scopes.contains(&"repo:blue.catbird.chat.deviceRevocation?action=create".to_string()),
+        "REQUIRED_LABYRINTH_OAUTH_SCOPES must declare deviceRevocation create scope"
+    );
+
+    let alice_d1_dev = new_id();
+    let alice_d2_dev = new_id();
+    let bob_dev = new_id();
+
+    let alice_d1_keys = Arc::new(MemKeyStore::new());
+    let alice_d1 = live_client(
+        tmp.path(),
+        &ds,
+        "dir-alice-1",
+        ALICE_DID,
+        &alice_d1_dev,
+        &alice_d1_keys,
+    );
+    alice_d1.enroll_device(&scopes).expect("enroll alice_d1");
+    // Idempotent re-enrollment when `createRecord` returns 400 and `getRecord` matches our key.
+    alice_d1
+        .enroll_device(&scopes)
+        .expect("idempotent re-enrollment on matching existing PDS device record");
+
+    // Conflicting PDS `blue.catbird.chat.device/{rkey}` key fails closed on duplicate `createRecord`.
+    let conflict_dev = new_id();
+    ds.inner.lock().unwrap().pds_records.insert(
+        (
+            ALICE_DID.to_string(),
+            "blue.catbird.chat.device".to_string(),
+            conflict_dev.clone(),
+        ),
+        json!({
+            "$type": "blue.catbird.chat.device",
+            "mlsSignaturePublicKey": { "$bytes": STANDARD.encode([0xAAu8; 32]) },
+            "homeDeliveryServiceDid": DS_DID,
+            "algorithm": "ed25519",
+            "createdAt": "2026-11-15T00:00:00.000Z",
+        }),
+    );
+    let conflict_client = live_client(
+        tmp.path(),
+        &ds,
+        "dir-alice-conflict",
+        ALICE_DID,
+        &conflict_dev,
+        &Arc::new(MemKeyStore::new()),
+    );
+    let conflict_err = conflict_client
+        .enroll_device(&scopes)
+        .expect_err("mismatched existing PDS device record must fail closed");
+    assert!(
+        format!("{conflict_err:?}").contains("EnrollmentPdsRecordConflict"),
+        "expected EnrollmentPdsRecordConflict, got {conflict_err:?}"
+    );
+    ds.inner.lock().unwrap().pds_records.remove(&(
+        ALICE_DID.to_string(),
+        "blue.catbird.chat.device".to_string(),
+        conflict_dev,
+    ));
+
+    let alice_d2 = enrolled(&tmp, &ds, "dir-alice-2", ALICE_DID, &alice_d2_dev);
+    let bob = enrolled(&tmp, &ds, "dir-bob", BOB_DID, &bob_dev);
+
+    let code = alice_d1.setup_recovery_code().expect("alice setup mailbox");
+    alice_d2
+        .restore_with_recovery_code(&code)
+        .expect("alice_d2 join mailbox");
+    bob.setup_recovery_code().expect("bob setup mailbox");
+
+    // Revoking `alice_d2` publishes `blue.catbird.chat.deviceRevocation/{alice_d2_dev}` via `createRecord`,
+    // with zero `putRecord` or `deleteRecord` calls on `blue.catbird.chat.device*`!
+    let rev_report = alice_d1
+        .revoke_device(&alice_d2_dev)
+        .expect("revoke alice_d2");
+    assert!(rev_report.pds_record_deleted);
+    {
+        let g = ds.inner.lock().unwrap();
+        assert!(
+            g.pds_records.contains_key(&(
+                ALICE_DID.to_string(),
+                "blue.catbird.chat.deviceRevocation".to_string(),
+                alice_d2_dev.clone(),
+            )),
+            "deviceRevocation record must be published on PDS"
+        );
+        let forbidden_mutations = g
+            .http_log
+            .iter()
+            .filter(|(_, url, body)| {
+                (url.contains("/xrpc/com.atproto.repo.putRecord")
+                    || url.contains("/xrpc/com.atproto.repo.deleteRecord"))
+                    && String::from_utf8_lossy(body).contains("blue.catbird.chat.device")
+            })
+            .count();
+        assert_eq!(
+            forbidden_mutations, 0,
+            "zero putRecord/deleteRecord mutations may target blue.catbird.chat.device*"
+        );
+        let plc_fetches = g
+            .http_log
+            .iter()
+            .filter(|(_, url, _)| url.starts_with("https://plc.directory/did:plc:"))
+            .count();
+        assert!(
+            plc_fetches >= 1,
+            "did:plc resolution must query https://plc.directory/"
+        );
+    }
+
+    // Multi-page `listRecords` (`140` synthetic sibling devices across 2 pages) succeeds, while
+    // `>1,000` records (exceeding the 10-page cap) fails closed!
+    for i in 0..140 {
+        let extra_dev = format!("00000000-0000-4000-8000-{i:012}");
+        ds.inner.lock().unwrap().pds_records.insert(
+            (
+                ALICE_DID.to_string(),
+                "blue.catbird.chat.device".to_string(),
+                extra_dev,
+            ),
+            json!({
+                "$type": "blue.catbird.chat.device",
+                "mlsSignaturePublicKey": { "$bytes": STANDARD.encode([0x42u8; 32]) },
+                "homeDeliveryServiceDid": DS_DID,
+                "algorithm": "ed25519",
+                "createdAt": "2026-11-15T00:00:00.000Z",
+            }),
+        );
+    }
+    let cid = new_id();
+    alice_d1
+        .create_group(&cid, DS_DID, vec![BOB_DID.into()], None, Some("hi".into()))
+        .expect("create DM across >100 paginated PDS device records");
+    bob.sync().expect("bob syncs paginated DM");
+    let pending = bob.list_requests(Some("incomingPending")).expect("reqs");
+    assert_eq!(pending.len(), 1);
+
+    // Missing `#atproto` key in DID document MUST fail closed during peer CARv1 verification.
+    let carol_dev = new_id();
+    let _carol = enrolled(&tmp, &ds, "car-carol", CAROL_DID, &carol_dev);
+    ds.archive_auth.set_omit_atproto_key_for(Some(CAROL_DID));
+    let missing_key_cid = new_id();
+    let missing_key_err = alice_d1
+        .create_group(
+            &missing_key_cid,
+            DS_DID,
+            vec![CAROL_DID.into()],
+            None,
+            Some("must fail closed without #atproto key".into()),
+        )
+        .expect_err("missing #atproto key must fail closed");
+    assert!(
+        format!("{missing_key_err:?}").contains("atproto")
+            || format!("{missing_key_err:?}").contains("CAR")
+            || format!("{missing_key_err:?}").contains("proof")
+            || format!("{missing_key_err:?}").contains("Pds"),
+        "unexpected error for missing #atproto key: {missing_key_err:?}"
+    );
+    ds.archive_auth.set_omit_atproto_key_for(None);
+
+    // MST commit `rev` rollback in CARv1 proof MUST fail closed once a higher `rev` was pinned!
+    let ok_carol_cid = new_id();
+    alice_d1
+        .create_group(
+            &ok_carol_cid,
+            DS_DID,
+            vec![CAROL_DID.into()],
+            None,
+            Some("pins initial commit rev 3lb2zzzzzzzzz".into()),
+        )
+        .expect("initial Carol DM pins commit rev");
+    ds.archive_auth.set_repo_proof_fault(Some((
+        CAROL_DID,
+        "blue.catbird.chat.device",
+        "rev_rollback",
+    )));
+    // Expire or clear Alice's short-lived directory cache so she re-verifies Carol's PDS CAR proof.
+    alice_d1
+        .db()
+        .write_tx(|tx| tx.delete_account_meta(&format!("pds_device_keys:{CAROL_DID}")))
+        .unwrap();
+    let rollback_cid = new_id();
+    let rollback_err = alice_d1
+        .create_group(
+            &rollback_cid,
+            DS_DID,
+            vec![CAROL_DID.into()],
+            None,
+            Some("must reject rolled-back commit rev".into()),
+        )
+        .expect_err("rolled-back MST commit rev must fail closed");
+    assert!(
+        format!("{rollback_err:?}").contains("rollback")
+            || format!("{rollback_err:?}").contains("rev"),
+        "expected rev rollback error, got {rollback_err:?}"
+    );
+    ds.archive_auth.set_repo_proof_fault(None);
+
+    // Overflowing `listRecords` beyond 10 pages (`>1,000` records) fails closed (`DirectoryPaginationExceeded`).
+    for i in 0..1005 {
+        let extra_dev = format!("00000000-0000-4000-8000-{i:012}");
+        ds.inner.lock().unwrap().pds_records.insert(
+            (
+                CAROL_DID.to_string(),
+                "blue.catbird.chat.device".to_string(),
+                extra_dev,
+            ),
+            json!({
+                "$type": "blue.catbird.chat.device",
+                "mlsSignaturePublicKey": { "$bytes": STANDARD.encode([0x43u8; 32]) },
+                "homeDeliveryServiceDid": DS_DID,
+                "algorithm": "ed25519",
+                "createdAt": "2026-11-15T00:00:00.000Z",
+            }),
+        );
+    }
+    alice_d1
+        .db()
+        .write_tx(|tx| tx.delete_account_meta(&format!("pds_device_keys:{CAROL_DID}")))
+        .unwrap();
+    let cap_cid = new_id();
+    let cap_err = alice_d1
+        .create_group(
+            &cap_cid,
+            DS_DID,
+            vec![CAROL_DID.into()],
+            None,
+            Some("must fail closed past 10 pages".into()),
+        )
+        .expect_err("listRecords truncation past 10 pages must fail closed");
+    assert!(
+        format!("{cap_err:?}").contains("Pagination")
+            || format!("{cap_err:?}").contains("pagination")
+            || format!("{cap_err:?}").contains("exceeded")
+            || format!("{cap_err:?}").contains("10"),
+        "expected pagination cap failure, got {cap_err:?}"
+    );
 }

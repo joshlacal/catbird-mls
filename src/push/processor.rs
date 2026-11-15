@@ -980,6 +980,8 @@ pub fn process_push_notification_with_hooks(
                 &sender_did,
                 &sender_device_id,
             );
+            let receipt_verified =
+                has_persisted_verified_receipt(tx.conn(), &wake.conversation_id, &message_id, seq)?;
 
             return Ok(PreflightState {
                 cached_preview: Some(NotificationPreview {
@@ -993,7 +995,7 @@ pub fn process_push_notification_with_hooks(
                     seq,
                     from_cache: true,
                     fallback_generic: false,
-                    receipt_verified: true,
+                    receipt_verified,
                     darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
                     is_own_sibling_sender,
                 }),
@@ -1223,6 +1225,12 @@ pub fn process_push_notification_with_hooks(
                 &sender_did,
                 &sender_device_id,
             );
+            let receipt_verified = has_persisted_verified_receipt(
+                tx.conn(),
+                &wake.conversation_id,
+                &wake.message_id,
+                seq,
+            )?;
             return Ok(NotificationPreview {
                 message_id: wake.message_id.clone(),
                 conversation_id: wake.conversation_id.clone(),
@@ -1234,7 +1242,7 @@ pub fn process_push_notification_with_hooks(
                 seq,
                 from_cache: true,
                 fallback_generic: false,
-                receipt_verified: true,
+                receipt_verified,
                 darwin_notification_name: DARWIN_NSE_DID_COMMIT_NOTIFICATION.to_string(),
                 is_own_sibling_sender,
             });
@@ -1621,6 +1629,11 @@ pub fn process_push_notification_with_hooks(
                         &format!("native.message:{}:{message_id}", wake.conversation_id),
                         &serde_json::to_vec(&evidence)?, now_ms,
                     )?;
+                    tx.put_labyrinth_state(
+                        &format!("push.verified_receipt:{}:{message_id}", wake.conversation_id),
+                        b"1",
+                        now_ms,
+                    )?;
                     // `entryId` is sequencer-local and federation may rebind it. The authenticated
                     // message ID is the cross-sequencer identity; foreground sync verifies the
                     // canonical sequencer's I13 receipt before archiving.
@@ -1822,4 +1835,75 @@ pub fn process_push_notification_with_hooks(
         post_darwin_nse_commit_notification();
     }
     Ok(preview)
+}
+
+fn has_persisted_verified_receipt(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    message_id: &str,
+    seq: i64,
+) -> Result<bool, MLSError> {
+    let push_key = format!("push.verified_receipt:{conversation_id}:{message_id}");
+    let has_push_marker: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM labyrinth_state WHERE state_key = ?1);",
+            rusqlite::params![push_key],
+            |row| row.get(0),
+        )
+        .map_err(|e| MLSError::Internal(format!("query push.verified_receipt: {e}")))?;
+    if has_push_marker {
+        return Ok(true);
+    }
+
+    let native_key = format!("native.message:{conversation_id}:{message_id}");
+    let native_bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value_bytes FROM labyrinth_state WHERE state_key = ?1;",
+            rusqlite::params![native_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| MLSError::Internal(format!("query native.message receipt: {e}")))?;
+    if let Some(bytes) = native_bytes {
+        if serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v["sequencer_receipt_json"].as_str().map(|s| !s.is_empty()))
+            == Some(true)
+        {
+            return Ok(true);
+        }
+    }
+
+    if seq >= 1 {
+        let has_seq_rcpt: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sequencer_receipts WHERE conversation_id = ?1 AND seq = ?2);",
+                rusqlite::params![conversation_id, seq],
+                |row| row.get(0),
+            )
+            .map_err(|e| MLSError::Internal(format!("query sequencer_receipts: {e}")))?;
+        if has_seq_rcpt {
+            return Ok(true);
+        }
+
+        let queue_bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT payload_bytes FROM labyrinth_queue WHERE conversation_id = ?1 AND seq = ?2 LIMIT 1;",
+                rusqlite::params![conversation_id, seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MLSError::Internal(format!("query labyrinth_queue receipt: {e}")))?;
+        if let Some(bytes) = queue_bytes {
+            if serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v["sequencer_receipt_json"].as_str().map(|s| !s.is_empty()))
+                == Some(true)
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }

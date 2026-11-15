@@ -68,12 +68,10 @@ fn set_push_commit_aad<P: OpenMlsProvider>(
     let mut prior = push_coordinates(group, provider, cid, state_version);
     let cid_bytes = STANDARD.encode(uuid::Uuid::parse_str(cid).unwrap().as_bytes());
     prior["conversationId"] = serde_json::json!(cid_bytes);
-    let aad = catbird_mls::orchestrator::canonical_transport::canonical_commit_aad_bytes(
-        &serde_json::json!({
-            "protocolVersion": "1", "conversationId": cid_bytes, "generation": 0,
-            "transitionId": STANDARD.encode(uuid::Uuid::new_v4().as_bytes()), "prior": prior,
-        }),
-    )
+    let aad = catbird_mls::canonical_transport::canonical_commit_aad_bytes(&serde_json::json!({
+        "protocolVersion": "1", "conversationId": cid_bytes, "generation": 0,
+        "transitionId": STANDARD.encode(uuid::Uuid::new_v4().as_bytes()), "prior": prior,
+    }))
     .unwrap();
     group.set_aad(aad);
 }
@@ -488,7 +486,7 @@ fn seal_bob_application_message<P: OpenMlsProvider>(
         original_sender_attestation: Some(attestation),
     })
     .map_err(|error| MLSError::Internal(format!("serialize push plaintext: {error}")))?;
-    let aad = catbird_mls::orchestrator::canonical_transport::canonical_application_aad_bytes(&aad)
+    let aad = catbird_mls::canonical_transport::canonical_application_aad_bytes(&aad)
         .map_err(|error| MLSError::Cryptography(format!("canonical application AAD: {error}")))?;
     Ok((inner_plaintext, aad))
 }
@@ -499,8 +497,7 @@ fn bob_encrypt_app_message(
     message_id: &str,
     tamper: impl FnOnce(&mut OriginalSenderArchiveAttestationEnvelope, &mut serde_json::Value),
 ) -> Vec<u8> {
-    let payload_json =
-        serde_json::to_string(&catbird_mls::orchestrator::MLSMessagePayload::text(text)).unwrap();
+    let payload_json = serde_json::to_string(&catbird_mls::MLSMessagePayload::text(text)).unwrap();
 
     fixture
         .bob_db
@@ -875,9 +872,9 @@ fn fetch_required_defers_peer_commits_and_their_tail_to_foreground_sync() {
             )
             .map_err(|e| MLSError::Internal(format!("encrypt meta: {e}")))?;
 
-            let payload_json = serde_json::to_string(
-                &catbird_mls::orchestrator::MLSMessagePayload::text("Caught up 2 epochs in NSE!"),
-            )
+            let payload_json = serde_json::to_string(&catbird_mls::MLSMessagePayload::text(
+                "Caught up 2 epochs in NSE!",
+            ))
             .unwrap();
             let (inner_plaintext, aad) = seal_bob_application_message(
                 &fixture,
@@ -1781,7 +1778,24 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                     body: br#"{"error":"InvalidRequest"}"#.to_vec(),
                 });
             }
-            if request.url.contains("/xrpc/com.atproto.repo.putRecord") {
+            if let Some(did) = request.url.strip_prefix("https://plc.directory/") {
+                let did_doc = serde_json::json!({
+                    "id": did,
+                    "service": [{
+                        "id": "#atproto_pds",
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": "https://swan.place",
+                    }]
+                });
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&did_doc).unwrap(),
+                });
+            }
+            if request.url.contains("/xrpc/com.atproto.repo.createRecord")
+                || request.url.contains("/xrpc/com.atproto.repo.putRecord")
+            {
                 if let Some(body) = request.body.as_deref() {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
                         if v.get("collection").and_then(|c| c.as_str())
@@ -1804,6 +1818,13 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                 });
             }
             if request.url.contains("/xrpc/com.atproto.repo.listRecords") {
+                if request.url.contains("deviceRevocation") {
+                    return Ok(PlatformHttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: br#"{"records":[]}"#.to_vec(),
+                    });
+                }
                 let records = self.pds_records.lock().unwrap().clone();
                 return Ok(PlatformHttpResponse {
                     status: 200,
@@ -1871,7 +1892,7 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
                     headers: Vec::new(),
                     body: serde_json::to_vec(&serde_json::json!({ "device": {
                         "deviceId": b["deviceId"],
-                        "keyId": catbird_mls::orchestrator::canonical_transport::derive_key_id(&key),
+                        "keyId": catbird_mls::canonical_transport::derive_key_id(&key),
                         "signaturePublicKey": b["signaturePublicKey"],
                         "authGeneration": 1,
                         "status": "active",
@@ -2090,14 +2111,14 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
     assert_eq!(ack["actorDeviceId"], device_id);
     assert_eq!(ack["keyId"], expected_key_id);
     assert_eq!(ack["authGeneration"], 1);
-    assert_eq!(ack["upToSeq"], 7);
+    assert_eq!(ack["upToSeq"], 1);
     let ack_sig_bytes = STANDARD
         .decode(ack["signature"]["$bytes"].as_str().unwrap())
         .unwrap();
     let ack_sig = Signature::from_slice(&ack_sig_bytes).unwrap();
     let ack_cbor = serde_ipld_dagcbor::to_vec(&serde_json::json!({
         "keyId": expected_key_id,
-        "upToSeq": 7,
+        "upToSeq": 1,
         "signedAt": ack["signedAt"].as_str().unwrap(),
         "generation": ack["generation"].as_i64().unwrap(),
         "actorDeviceId": device_id,
@@ -2279,7 +2300,7 @@ fn receipt_bound_transport(
     ciphertext: Vec<u8>,
 ) -> Arc<ReceiptBoundTransport> {
     let canonical_payload =
-        serde_json::to_vec(&catbird_mls::orchestrator::MLSMessagePayload::text(text)).unwrap();
+        serde_json::to_vec(&catbird_mls::MLSMessagePayload::text(text)).unwrap();
     let archive_commitment =
         labyrinth_protocol::receipt::compute_archive_commitment(&[0x5A; 32], &canonical_payload);
     let payload = labyrinth_protocol::receipt::SequencerReceiptPayload {
@@ -2520,4 +2541,80 @@ fn push_cache_recheck_answers_only_the_cached_conversation_and_seq() {
         Ok(())
     })
     .unwrap();
+}
+
+#[test]
+fn push_cache_hit_requires_persisted_verified_receipt_marker() {
+    let fixture = setup_alice_and_bob_group(true);
+    let keystore = Arc::new(MemoryPushKeystore::new(
+        &fixture.alice_hash,
+        fixture.alice_db_key,
+        Some("cached-chat-dpop-jwt".into()),
+    ));
+    let ciphertext = bob_encrypt_app_message(
+        &fixture,
+        "verified then re-read",
+        INLINE_MESSAGE_ID,
+        |_, _| {},
+    );
+    let transport = receipt_bound_transport(
+        &fixture,
+        INLINE_MESSAGE_ID,
+        "verified then re-read",
+        ciphertext.clone(),
+    );
+    let wake = inline_wake(&fixture, INLINE_MESSAGE_ID, ciphertext);
+    let first = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        Some(transport),
+        &wake,
+    )
+    .expect("initial verified decrypt");
+    assert!(first.receipt_verified, "{first:?}");
+
+    // Cache hit with persisted `push.verified_receipt:{cid}:{msg_id}` preserves `receipt_verified = true`.
+    let cached_verified = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        None,
+        &wake,
+    )
+    .expect("cache hit with verified marker");
+    assert!(cached_verified.receipt_verified, "{cached_verified:?}");
+
+    // Removing the persisted verified-receipt proof from `labyrinth_state` causes `from_cache` to report `receipt_verified = false`.
+    let db =
+        MlsAccountDb::open_native(&fixture.alice_db_path, &fixture.alice_db_key, OpenMode::App)
+            .unwrap();
+    let marker_key = format!(
+        "push.verified_receipt:{}:{}",
+        fixture.conversation_id, INLINE_MESSAGE_ID
+    );
+    db.write_tx(|tx| {
+        tx.conn()
+            .execute(
+                "DELETE FROM labyrinth_state WHERE state_key = ?1;",
+                rusqlite::params![marker_key],
+            )
+            .map(|_| ())
+            .map_err(|e| MLSError::Internal(e.to_string()))
+    })
+    .unwrap();
+    drop(db);
+
+    let cached_unverified = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore,
+        None,
+        &wake,
+    )
+    .expect("cache hit without verified marker");
+    assert!(
+        !cached_unverified.receipt_verified,
+        "from_cache must not synthesize receipt_verified without persisted proof: {cached_unverified:?}"
+    );
 }

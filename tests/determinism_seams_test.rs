@@ -184,6 +184,66 @@ impl DeterministicMockTransport {
         };
         let json_ok = |val: serde_json::Value| json_resp(200, val);
 
+        if let Some(did) = url.strip_prefix("https://plc.directory/") {
+            return Ok(json_ok(serde_json::json!({
+                "id": did,
+                "service": [{
+                    "id": format!("{did}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds.catbird.test",
+                }]
+            })));
+        }
+
+        if url.contains("/xrpc/com.atproto.repo.createRecord") {
+            if let Some(ref b) = request.body {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(b) {
+                    let repo = val["repo"].as_str().unwrap_or("").to_string();
+                    let collection = val["collection"].as_str().unwrap_or("").to_string();
+                    let rkey = val["rkey"].as_str().unwrap_or("").to_string();
+                    let record = val["record"].clone();
+                    let mut store = self.pds_records.lock().unwrap();
+                    if store
+                        .iter()
+                        .any(|r| r.repo == repo && r.collection == collection && r.rkey == rkey)
+                    {
+                        return Ok(json_resp(
+                            400,
+                            serde_json::json!({ "error": "RecordAlreadyExists" }),
+                        ));
+                    }
+                    store.push(PdsRepoRecord {
+                        repo: repo.clone(),
+                        collection: collection.clone(),
+                        rkey: rkey.clone(),
+                        value: record,
+                    });
+                    return Ok(json_ok(serde_json::json!({
+                        "uri": format!("at://{repo}/{collection}/{rkey}"),
+                        "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    })));
+                }
+            }
+        }
+
+        if url.contains("/xrpc/com.atproto.repo.getRecord") {
+            let store = self.pds_records.lock().unwrap();
+            if let Some(found) = store
+                .iter()
+                .find(|r| url.contains(&r.collection) && url.contains(&format!("rkey={}", r.rkey)))
+            {
+                return Ok(json_ok(serde_json::json!({
+                    "uri": format!("at://{}/{}/{}", found.repo, found.collection, found.rkey),
+                    "cid": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "value": found.value,
+                })));
+            }
+            return Ok(json_resp(
+                400,
+                serde_json::json!({ "error": "RecordNotFound" }),
+            ));
+        }
+
         if url.contains("/xrpc/com.atproto.repo.putRecord") {
             if let Some(ref b) = request.body {
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(b) {
@@ -282,7 +342,7 @@ impl DeterministicMockTransport {
             let key = catbird_mls::client::chat_wire::json_bytes(pk).unwrap_or_default();
             return Ok(json_ok(serde_json::json!({ "device": {
                 "deviceId": sbody["deviceId"],
-                "keyId": catbird_mls::orchestrator::canonical_transport::derive_key_id(&key),
+                "keyId": catbird_mls::canonical_transport::derive_key_id(&key),
                 "signaturePublicKey": wrapped_pk,
                 "authGeneration": 1,
                 "status": "active",
@@ -910,7 +970,7 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // carry `membersHash`.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "8ac31cbd01d61954b48b633c9eff45b3b09484b383636da44443ef10369d0733",
+        "90c0855c75a5cc960e9ea6a1694a27cc97889901ab774938fd86d80cee2ba071",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -989,7 +1049,7 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
     // `EpochPublic` / `mailboxKeys` `membersHash`.
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "5e0097ef752f0f9c4780e087e7c1794420e4a25adb730de10f4551ac7a48c27e",
+        "53b9626df78f22e3dd2e2a2e7c3138d02fa19c89351d08f8487fb8c54e1b2d67",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }
@@ -1482,6 +1542,7 @@ fn list_requests_breaks_equal_updated_at_ties_by_request_id_whatever_the_inserti
     }
 }
 
+#[cfg(feature = "legacy-orchestrator")]
 #[tokio::test]
 async fn stored_conversations_list_breaks_equal_updated_at_ties_by_conversation_id() {
     use catbird_mls::orchestrator::MLSStorageBackend;

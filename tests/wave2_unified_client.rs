@@ -75,6 +75,7 @@ fn spaces_eligibility_requires_full_wave2_oauth_scopes_and_rejects_partial_grant
         "repo:blue.catbird.labyrinth.mailboxKeys?action=delete&action=update&action=create"
             .to_owned(),
         "repo:blue.catbird.chat.device?action=create&action=delete".to_owned(),
+        "repo:blue.catbird.chat.deviceRevocation?action=create".to_owned(),
         "space:blue.catbird.labyrinth.mailbox?manage=delete&manage=create&collection=blue.catbird.labyrinth.virtualDevice&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.attachmentManifest&action=update&action=read&action=delete&action=create".to_owned(),
         "space:blue.catbird.labyrinth.conversation?collection=blue.catbird.labyrinth.mek&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.attachmentManifest&authority=*&action=update&action=read&action=delete&action=create".to_owned(),
     ];
@@ -110,7 +111,7 @@ fn spaces_eligibility_requires_full_wave2_oauth_scopes_and_rejects_partial_grant
     let delete_only_device: Vec<String> = all_scopes()
         .into_iter()
         .map(|s| {
-            if s.starts_with("repo:blue.catbird.chat.device") {
+            if s.starts_with("repo:blue.catbird.chat.device?") {
                 "repo:blue.catbird.chat.device?action=delete".to_owned()
             } else {
                 s
@@ -897,8 +898,12 @@ fn concurrent_two_device_circle_owner_state_create_cas_preserves_acl_tombstone_a
     );
     assert_eq!(
         remaining_rkeys,
-        vec![format!("{CIRCLE_ID}-000000000003")],
-        "lazy post-commit cleanup must delete superseded `< version` rows"
+        vec![
+            format!("{CIRCLE_ID}-000000000001"),
+            format!("{CIRCLE_ID}-000000000002"),
+            format!("{CIRCLE_ID}-000000000003"),
+        ],
+        "append-only versioned CAS retains prior version rows without deleting history"
     );
 
     // Also verify true mid-flight `#create` conflict on `readState` merges monotonic `MAX(readThroughSeq)`.

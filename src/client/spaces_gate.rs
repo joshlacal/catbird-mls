@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::MLSError;
 
 /// OAuth requests explicitly state delegation read, record verbs, and declared collections.
-pub const REQUIRED_LABYRINTH_OAUTH_SCOPES: &[&str; 6] = &[
+pub const REQUIRED_LABYRINTH_OAUTH_SCOPES: &[&str; 7] = &[
     "atproto",
     "blob:*/*",
     "repo:blue.catbird.labyrinth.mailboxKeys",
     "repo:blue.catbird.chat.device?action=create",
+    "repo:blue.catbird.chat.deviceRevocation?action=create",
     "space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete",
     "space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
 ];
@@ -302,7 +303,7 @@ mod tests {
     #[test]
     fn delegation_scope_gate_requires_explicit_actions_and_collection_coverage() {
         let did = "did:plc:scopeuser";
-        for required in &REQUIRED_LABYRINTH_OAUTH_SCOPES[4..] {
+        for required in &REQUIRED_LABYRINTH_OAUTH_SCOPES[5..] {
             assert!(scope_granted(&[required.to_string()], required, did));
             let (family, query) = required.split_once('?').unwrap();
             let mut pairs: Vec<_> = query.split('&').collect();
@@ -327,14 +328,14 @@ mod tests {
             "space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete",
             "space:blue.catbird.labyrinth.conversation?authority=*",
         ] {
-            assert!(!REQUIRED_LABYRINTH_OAUTH_SCOPES[4..]
+            assert!(!REQUIRED_LABYRINTH_OAUTH_SCOPES[5..]
                 .iter()
                 .any(|required| scope_granted(&[legacy.into()], required, did)));
         }
 
         // Verify repo scope rules & subsumption (`Y-6` / `D-12`):
         // `mailboxKeys` requires full CRUD (`putRecord` updates on epoch rotation),
-        // while `chat.device` is create-only (`?action=create`).
+        // while `chat.device` and `chat.deviceRevocation` are create-only (`?action=create`).
         let mailbox_req = REQUIRED_LABYRINTH_OAUTH_SCOPES[2];
         assert_eq!(mailbox_req, "repo:blue.catbird.labyrinth.mailboxKeys");
         assert!(scope_granted(&[mailbox_req.to_string()], mailbox_req, did));
@@ -360,6 +361,26 @@ mod tests {
             !scope_granted(
                 &["repo:blue.catbird.chat.device?action=delete".to_string()],
                 device_req,
+                did
+            ),
+            "delete-only scope must not satisfy create requirement"
+        );
+
+        let rev_req = REQUIRED_LABYRINTH_OAUTH_SCOPES[4];
+        assert_eq!(
+            rev_req,
+            "repo:blue.catbird.chat.deviceRevocation?action=create"
+        );
+        assert!(scope_granted(&[rev_req.to_string()], rev_req, did));
+        assert!(scope_granted(
+            &["repo:blue.catbird.chat.deviceRevocation".to_string()],
+            rev_req,
+            did
+        ));
+        assert!(
+            !scope_granted(
+                &["repo:blue.catbird.chat.deviceRevocation?action=delete".to_string()],
+                rev_req,
                 did
             ),
             "delete-only scope must not satisfy create requirement"

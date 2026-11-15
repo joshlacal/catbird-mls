@@ -1675,9 +1675,10 @@ impl CatbirdMlsClient {
                         }
                     };
                     let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
-                        format!(
-                            "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
-                            payload.sequencer_did, payload.conversation_id
+                        super::live_sync::conversation_space_uri(
+                            &payload.sequencer_did,
+                            &payload.conversation_id,
+                            0,
                         )
                     });
 
