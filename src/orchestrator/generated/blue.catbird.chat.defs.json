@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "26380cefa2e4734925efabb178d83052e10a46c7",
-    "sourceSha256": "992206c3cfba8db1733c5795d75aacb8352d68d187fe4c793dfc8fe73adfc2a4",
-    "sourceTree": "0f8bcc02c7f70a14de01b7b60a3a5f329bb7143f"
+    "sourceRevision": "59117054d8fc309ad07ab33ea05c6ad4abdff05e",
+    "sourceSha256": "81b7cc0835421b583d2449e7f0a8dfe5f647393a353b649a08fe6c1dba9b3cf5",
+    "sourceTree": "85e59f9ab1e1ea6135a9107a92d98fc6f405fc4b"
   },
   "defs": {
     "accessEndedEvent": {
@@ -45,6 +45,11 @@
     "accountDeletedEntry": {
       "description": "[I13] Sequencer-recorded control entry indicating that deletedDid deleted their account and removed their writer repo from the conversation Space. sequencerAuthority is the sequencer's signed evidence of exactly this entry; every home stores and returns it verbatim.",
       "properties": {
+        "actorWrite": {
+          "description": "Optional. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The deleting device's own signed deleteAccountData request, copied verbatim. It sits beside sequencerAuthority, whose transcript does not cover it.",
+          "ref": "#accountDeletionActorWrite",
+          "type": "ref"
+        },
         "conversationId": {
           "ref": "#operationId",
           "type": "ref"
@@ -56,6 +61,12 @@
         "entryId": {
           "ref": "#operationId",
           "type": "ref"
+        },
+        "keyProof": {
+          "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for blue.catbird.chat.device/{actorDeviceId}, where actorDeviceId comes from actorWrite.writeBody. It verifies under the #atproto key of deletedDid's DID document, so a reader can check the signing device's key after deletedDid's repository is gone. It is captured before the repository is deleted and copied verbatim into every copy of the entry.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "bytes"
         },
         "receivedAt": {
           "ref": "#canonicalDatetime",
@@ -88,6 +99,26 @@
         "sequencerDid",
         "sequencerAuthority",
         "receivedAt"
+      ],
+      "type": "object"
+    },
+    "accountDeletionActorWrite": {
+      "description": "Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The signed request with which a device of deletedDid called blue.catbird.labyrinth.deleteAccountData. writeBody is the exact labyrinthWriteBody JSON bytes the device sent, {operationId, actorDeviceId, endpointNsid, payloadSha256, signedAt}, never re-encoded. signature is the device's 64-byte Ed25519 signature over UTF8(CATBIRD-LABYRINTH-WRITE\\0) followed by writeBody. endpointNsid is blue.catbird.labyrinth.deleteAccountData, actorDeviceId names the signing device of deletedDid, and signedAt is the device-signed deletion instant. Every direct, relayed and mirrored copy of the entry carries the same bytes.",
+      "properties": {
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        },
+        "writeBody": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "writeBody",
+        "signature"
       ],
       "type": "object"
     },
@@ -1670,7 +1701,7 @@
       "type": "object"
     },
     "deviceCapability": {
-      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures.",
+      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures. This exact profile, including the empty KeyPackage, LeafNode and GroupContext extension lists, is fixed for protocol versions 1 and 2. A later protocol version may define optional LeafNode extensions in the RFC 9420 private-use range; such leaves appear only in conversations of that version, which the service never returns to a session whose supportedProtocolVersions does not list it. GroupContext extensions, GroupContextExtensions proposals and RequiredCapabilities stay unused. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon.",
       "properties": {
         "addByValue": {
           "const": "supported",
