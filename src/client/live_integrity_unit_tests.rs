@@ -811,6 +811,84 @@ fn a_device_signed_deletion_purges_only_messages_up_to_its_signed_instant() {
 }
 
 #[test]
+fn deletion_uses_stored_receipt_time_for_message_and_queued_copy() {
+    let db = crate::storage::MlsAccountDb::open_in_memory_for_test().unwrap();
+    let bound = SIGNED_AT_MS + authority::DELETION_CLOCK_SKEW_MS;
+    let stored = |issued_at_ms| {
+        serde_json::to_string(&chat_wire::StoredArchivedReceipt {
+            sequencer_did: SEQUENCER_DID.into(),
+            conversation_id: CONVO_ID.into(),
+            group_id: vec![1; 32],
+            epoch: 0,
+            sender_device_did_url: format!("{BOB_DID}#device"),
+            entry_id: BOB_M1.into(),
+            archive_commitment: vec![2; 32],
+            seq: 3,
+            issued_at_ms,
+            key_id: "test".into(),
+            signature: vec![3; 64],
+            generation: 0,
+            original_sender_attestation: None,
+        })
+        .unwrap()
+    };
+    let marker = authority::StoredAccountDeletion::Signed(authority::AppliedAccountDeletion {
+        seq: 6,
+        signed_at_ms: SIGNED_AT_MS,
+        operation_id: DELETION_OP.into(),
+    });
+    db.write_tx(|tx| {
+        for (id, local_at, receipt_at) in
+            [(BOB_M1, bound + 1, bound), (BOB_M2, bound - 1, bound + 1)]
+        {
+            tx.insert_message(&MessageRow {
+                message_id: id.into(),
+                conversation_id: CONVO_ID.into(),
+                group_id: vec![1; 32],
+                epoch: 0,
+                seq: 3,
+                sender_did: BOB_DID.into(),
+                sender_device_id: DEV_B1.into(),
+                plaintext_json: "{}".into(),
+                created_at_ms: local_at,
+                is_own: false,
+            })?;
+            tx.put_labyrinth_state(
+                &format!("native.message:{CONVO_ID}:{id}"),
+                &serde_json::to_vec(&json!({ "sequencer_receipt_json": stored(receipt_at) }))?,
+                local_at,
+            )?;
+            let queued_id = format!("queue:{id}");
+            tx.enqueue_labyrinth_item(&crate::storage::LabyrinthQueueRow {
+                item_id: queued_id,
+                conversation_id: CONVO_ID.into(),
+                group_id_hex: "01".into(),
+                seq: 3,
+                payload_bytes: serde_json::to_vec(&json!({
+                    "sender_did": BOB_DID,
+                    "created_at_ms": local_at,
+                    "sequencer_receipt_json": stored(receipt_at),
+                }))?,
+                created_at_ms: local_at,
+            })?;
+        }
+        assert_eq!(
+            crate::client::live_sync::live_integrity::purge_covered_messages(
+                tx, CONVO_ID, BOB_DID, &marker,
+            )?,
+            1,
+        );
+        assert!(tx.get_message(BOB_M1)?.is_none());
+        assert!(tx.get_message(BOB_M2)?.is_some());
+        let remaining = tx.list_labyrinth_queue(Some(CONVO_ID), 10)?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].item_id, format!("queue:{BOB_M2}"));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn forged_unsigned_and_replayed_deletions_are_kept_as_evidence_and_purge_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let (client, state, alice_signer, bob_signer, group_id) = client_with_bob_leaf(&tmp);

@@ -127,54 +127,18 @@ impl crate::labyrinth::LabyrinthGateway for NativeArchiveGateway {
         self.execute(&self.config.home_ds_endpoint, request.method, request.path, headers, request.body).map(Self::response)
     }
     async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
-        let bare = did.split('#').next().unwrap_or(did).trim();
-        if bare.is_empty() {
-            return Err("empty DID".into());
-        }
-        if bare.starts_with("did:plc:") {
-            let url = crate::labyrinth::transport::did_document_url(bare)?;
-            if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-            let response = self.transport.execute_http(PlatformHttpRequest { method: "GET".into(), url, headers: vec![], body: None }).map_err(|e| e.to_string())?;
-            if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-            if response.status == 404 { return Ok(None); }
-            if response.status != 200 { return Err(format!("resolve archive DID returned HTTP {}", response.status)); }
-            let doc = super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map_err(|e| e.to_string())?;
-            let parsed: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| e.to_string())?;
-            if parsed.get("id").and_then(serde_json::Value::as_str) != Some(bare) {
-                return Err(format!("resolved DID document id mismatch for `{bare}`"));
-            }
-            return Ok(Some(doc));
-        }
-        let path = format!("/xrpc/com.atproto.identity.resolveDid?did={}", super::chat_wire::urlencode_form_component(bare));
-        match self.execute(&self.config.pds_endpoint, "GET".into(), path, vec![], None) {
-            Ok(response) if response.status == 200 => {
-                match super::chat_wire::extract_did_doc_from_resolve_response(&response.body) {
-                    Ok(doc) => {
-                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&doc) {
-                            if parsed.get("id").and_then(serde_json::Value::as_str) == Some(bare) {
-                                return Ok(Some(doc));
-                            }
-                        }
-                        tracing::debug!("own-PDS resolveDid returned mismatched DID document id; falling back");
-                    }
-                    Err(e) => tracing::debug!("own-PDS resolveDid returned no DID document ({e}); falling back"),
-                }
-            }
-            Ok(response) => tracing::debug!("own-PDS resolveDid returned HTTP {}; falling back", response.status),
-            Err(e) => tracing::debug!("own-PDS resolveDid failed ({e}); falling back"),
-        }
-        let url = crate::labyrinth::transport::did_document_url(bare)?;
+        // The crate's one strict resolver: PLC directory or the `did:web` host, never an
+        // account PDS, sharing the provenance-tagged `did_doc:` cache with the live plane.
         if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-        let response = self.transport.execute_http(PlatformHttpRequest { method: "GET".into(), url, headers: vec![], body: None }).map_err(|e| e.to_string())?;
+        let resolved = super::did_resolution::resolve_did_document_strict(
+            &self.db,
+            self.transport.as_ref(),
+            self.hooks.now_ms(),
+            did,
+        )
+        .map_err(|e| e.to_string());
         if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-        if response.status == 404 { return Ok(None); }
-        if response.status != 200 { return Err(format!("resolve archive DID returned HTTP {}", response.status)); }
-        let doc = super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map_err(|e| e.to_string())?;
-        let parsed: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| e.to_string())?;
-        if parsed.get("id").and_then(serde_json::Value::as_str) != Some(bare) {
-            return Err(format!("resolved DID document id mismatch for `{bare}`"));
-        }
-        Ok(Some(doc))
+        resolved
     }
 }
 
@@ -706,15 +670,21 @@ impl NativeLocalAuthority {
         use crate::labyrinth::LabyrinthGateway as _;
 
         if did == self.account_did {
-            let doc_opt = self.gateway.resolve_did_document(did).await.ok().flatten();
-            let parsed_doc = doc_opt
-                .as_deref()
-                .and_then(|b| atproto_spaces::did_resolver::DidDocument::parse_json(did, b).ok());
+            let doc_bytes = self
+                .gateway
+                .resolve_did_document(did)
+                .await
+                .map_err(crate::orchestrator::error::OrchestratorError::Credential)?
+                .ok_or_else(|| crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("DID document not found for own account `{did}`"),
+                ))?;
+            let parsed_doc =
+                atproto_spaces::did_resolver::DidDocument::parse_json(did, &doc_bytes).ok();
             let atproto_key = parsed_doc.as_ref().and_then(|d| d.atproto_key.clone());
-            let pds_endpoint = doc_opt
-                .as_deref()
-                .and_then(|b| super::chat_wire::extract_pds_endpoint_from_did_doc(b, did))
-                .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
+            let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
+                .ok_or_else(|| crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("no #atproto_pds service in the DID document of own account `{did}`"),
+                ))?;
 
             let raw_devices = match self.paginate_pds_collection(
                 &pds_endpoint,
@@ -832,8 +802,13 @@ impl NativeLocalAuthority {
                 format!("missing #atproto repository signing key in DID document for `{did}`"),
             ));
         }
+        // Another account's records come only from the PDS its own DID document names.
         let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
-            .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
+            .ok_or_else(|| {
+                crate::orchestrator::error::OrchestratorError::Credential(format!(
+                    "no #atproto_pds service in the DID document of peer `{did}`"
+                ))
+            })?;
 
         let allow_test_fallback = cfg!(test) && atproto_key.is_none();
         let raw_devices = match self.paginate_pds_collection(
@@ -1757,8 +1732,9 @@ impl CatbirdMlsClient {
         })
     }
 
-    /// Native/UI unsend publishes a durable Labyrinth author redaction rather
-    /// than sending a mutable delete-control frame.
+    /// Hide the sender's local timeline row and, when the frame was eligible for backup,
+    /// publish a durable Labyrinth author redaction. A live peer's MLS timeline still needs
+    /// its own authenticated tombstone to hide its copy.
     pub fn unsend_message(
         &self,
         conversation_id: &str,
@@ -1779,6 +1755,13 @@ impl CatbirdMlsClient {
             return Err(MLSError::invalid_input(
                 "only the original sender may unsend this message",
             ));
+        }
+        if self.db.read_tx(|tx| {
+            Ok(tx
+                .get_labyrinth_state(&unsent_message_key(conversation_id, message_id))?
+                .is_some())
+        })? {
+            return Ok(0);
         }
         let local_only = self.db.read_tx(|tx| {
             let evidence = tx.get_labyrinth_state(&format!(
@@ -1806,6 +1789,9 @@ impl CatbirdMlsClient {
                     self.hooks.now_ms(),
                 )
             })?;
+            self.notify(PlatformChangeEvent::MessagesUpdated {
+                conversation_id: conversation_id.to_owned(),
+            });
             return Ok(0);
         }
         if !self.labyrinth_status()?.backup_enabled {
@@ -1814,7 +1800,7 @@ impl CatbirdMlsClient {
             ));
         }
         self.pin_native_conversation(conversation_id)?;
-        self.native_archive_run(async {
+        let count = self.native_archive_run(async {
             let mut session = self
                 .native_archive_deps()?
                 .enable()
@@ -1841,7 +1827,11 @@ impl CatbirdMlsClient {
             })?;
             u32::try_from(count)
                 .map_err(|_| MLSError::Internal("unsend count overflow".into()))
-        })
+        })?;
+        self.notify(PlatformChangeEvent::MessagesUpdated {
+            conversation_id: conversation_id.to_owned(),
+        });
+        Ok(count)
     }
 
     pub fn rescue_conversation_on_kick(
@@ -2695,6 +2685,12 @@ impl CatbirdMlsClient {
             let mut chosen_by_id = std::collections::BTreeMap::new();
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
+                if tx
+                    .get_labyrinth_state(&unsent_message_key(conversation_id, message_id))?
+                    .is_some()
+                {
+                    continue;
+                }
                 let local = tx.get_message(message_id)?;
                 let has_local_evidence = tx
                     .get_labyrinth_state(&format!("native.message:{conversation_id}:{message_id}"))?
@@ -3315,12 +3311,28 @@ impl CatbirdMlsClient {
             .canonical_uuid_v4_device_id()
             .ok_or_else(|| MLSError::invalid_input("list_devices requires UUIDv4 device_id"))?;
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
-        let ds_resp = self.query_signed_chat_ds(
+        // Compare the home DS inventory with the account's independently resolved PDS records.
+        // A PDS-only chat.device is surfaced as a row so the UI can alert on a ghost device even
+        // when the home DS omits it or is temporarily unavailable. Every record and revocation
+        // must have a CAR proof under the account DID's #atproto key; a bare PDS list is not
+        // authoritative enough to decide whether a device is unrecognized.
+        let mut pds_by_device: std::collections::BTreeMap<String, Vec<u8>> = self
+            .fetch_and_cache_authorized_pds_device_keys_checked(&self.normalized_did, true)?
+            .into_iter()
+            .map(|record| (record.device_id, record.signature_public_key))
+            .collect();
+        let ds_resp = match self.query_signed_chat_ds(
             "blue.catbird.chat.getOwnDevices",
             &[("actorDeviceId", &own_device_id), ("limit", "100")],
             &own_device_id,
             &signer,
-        )?;
+        ) {
+            Ok(response) => Some(response),
+            Err(error) => {
+                tracing::warn!(%error, "home DS device inventory unavailable; showing verified PDS records");
+                None
+            }
+        };
         let mailbox_by_transport: std::collections::BTreeMap<[u8; 32], String> =
             if self.is_device_pending_approval()? {
                 std::collections::BTreeMap::new()
@@ -3348,7 +3360,11 @@ impl CatbirdMlsClient {
                 })
             };
         let mut out = Vec::new();
-        for item in Self::extract_own_device_views(&ds_resp) {
+        for item in ds_resp
+            .as_ref()
+            .map(Self::extract_own_device_views)
+            .unwrap_or_default()
+        {
             let Some(device_id) = item["deviceId"].as_str().map(str::to_owned) else {
                 continue;
             };
@@ -3362,24 +3378,69 @@ impl CatbirdMlsClient {
                 .unwrap_or_else(|| {
                     crate::orchestrator::canonical_transport::derive_key_id(&pubkey_bytes)
                 });
-            let is_current = item["isCurrentDevice"]
-                .as_bool()
-                .unwrap_or_else(|| device_id == own_device_id);
+            // The home DS cannot label an arbitrary row as this device to suppress the alert.
+            let is_current = device_id == own_device_id;
+            let pds_key = pds_by_device.remove(&device_id);
+            let recognized_key = self.db.read_tx(|tx| {
+                tx.get_account_meta(&format!("recognized_own_device:{device_id}"))
+            })?;
+            let status = item["status"].as_str().unwrap_or("unknown").to_owned();
+            let unrecognized = if status == "revoked" {
+                // A still-authorized PDS record contradicts a revoked DS row.
+                pds_key.is_some()
+            } else {
+                pds_key.as_deref() != Some(pubkey_bytes.as_slice())
+                    || (is_current && pubkey_bytes.as_slice() != signer.public())
+                    || (!is_current
+                        && recognized_key.as_deref()
+                            != Some(hex::encode(&pubkey_bytes).as_str()))
+            };
             out.push(RegisteredDeviceInfo {
                 device_id,
                 device_name: item["deviceName"].as_str().map(str::to_owned),
                 signature_public_key: pubkey_bytes,
                 key_id,
                 auth_generation: item["authGeneration"].as_i64().unwrap_or(1),
-                status: item["status"]
-                    .as_str()
-                    .unwrap_or("active")
-                    .to_owned(),
+                status,
                 created_at: item["createdAt"].as_str().unwrap_or("").to_owned(),
                 last_active_at: item["lastActiveAt"].as_str().map(str::to_owned),
                 dormant_at: item["dormantAt"].as_str().map(str::to_owned),
                 labyrinth_device_key_hex,
                 is_current_device: is_current,
+                unrecognized,
+            });
+        }
+        for (device_id, signature_public_key) in pds_by_device {
+            let key_id =
+                crate::orchestrator::canonical_transport::derive_key_id(&signature_public_key);
+            let is_current_device = device_id == own_device_id;
+            let recognized_key = self.db.read_tx(|tx| {
+                tx.get_account_meta(&format!("recognized_own_device:{device_id}"))
+            })?;
+            let unrecognized = if is_current_device {
+                signature_public_key.as_slice() != signer.public()
+            } else {
+                recognized_key.as_deref()
+                    != Some(hex::encode(&signature_public_key).as_str())
+            };
+            out.push(RegisteredDeviceInfo {
+                is_current_device,
+                device_id,
+                device_name: None,
+                signature_public_key,
+                key_id,
+                auth_generation: 0,
+                status: if ds_resp.is_some() {
+                    "pds_only"
+                } else {
+                    "ds_unavailable"
+                }
+                .to_owned(),
+                created_at: String::new(),
+                last_active_at: None,
+                dormant_at: None,
+                labyrinth_device_key_hex: None,
+                unrecognized: ds_resp.is_some() || unrecognized,
             });
         }
         Ok(out)

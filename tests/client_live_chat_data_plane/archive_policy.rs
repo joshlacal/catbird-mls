@@ -104,12 +104,27 @@ fn either_direct_peer_can_turn_backup_off_and_explicitly_back_on() {
     assert_eq!(f.alice.unsend_message(cid, &hidden).unwrap(), 0);
     assert!(
         f.alice
+            .list_messages(cid, None, 100)
+            .unwrap()
+            .iter()
+            .all(|row| row.message_id != hidden),
+        "the unsent message leaves the visible timeline"
+    );
+    assert!(
+        f.alice
             .db()
             .read_tx(|tx| tx.get_labyrinth_state(&format!("native.unsent:{cid}:{hidden}")))
             .unwrap()
             .is_some(),
         "opted-out unsend leaves a local marker without a remote redaction"
     );
+    f.alice.sync().unwrap();
+    assert!(f
+        .alice
+        .list_messages(cid, None, 100)
+        .unwrap()
+        .iter()
+        .all(|row| row.message_id != hidden));
 
     let on = f.bob.set_history_backup_enabled(cid, true).unwrap();
     f.alice.sync().unwrap();
@@ -124,4 +139,17 @@ fn either_direct_peer_can_turn_backup_off_and_explicitly_back_on() {
     assert!(queued(&f.alice, &visible));
     assert!(queued(&f.bob, &visible));
     assert!(!queued(&f.alice, &hidden));
+}
+
+#[test]
+fn joining_member_inherits_effective_backup_off_in_commit_snapshot() {
+    let f = send_order_fixture(true);
+    let cid = f.cid.as_str();
+    f.bob.set_history_backup_enabled(cid, false).unwrap();
+    f.alice.sync().unwrap();
+    assert!(!f.alice.history_backup_enabled(cid).unwrap());
+
+    admit_eve(&f);
+    assert!(!f.eve.history_backup_enabled(cid).unwrap());
+    assert_eq!(stored_metadata(&f.eve, cid)["historyBackup"], json!(false));
 }

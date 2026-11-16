@@ -285,6 +285,26 @@ impl NativeArchiveAuthFixture {
         })
     }
 
+    /// A signed repository proof that holds no record (a proven absence).
+    fn build_signed_exclusion_response(&self, did: &str) -> Result<PlatformHttpResponse, MLSError> {
+        let signing_key = SpaceSigningKey::from_p256_secret(&key(did, b"sign"), "#atproto");
+        let (_, car_bytes) = catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1(
+            did,
+            "3lb2zzzzzzzzz",
+            &[],
+            &signing_key,
+        )
+        .map_err(failure)?;
+        Ok(PlatformHttpResponse {
+            status: 200,
+            headers: vec![PlatformHttpHeader {
+                name: "content-type".into(),
+                value: "application/vnd.ipld.car".into(),
+            }],
+            body: car_bytes,
+        })
+    }
+
     #[allow(dead_code)]
     pub fn mailbox_keys_record(&self, did: &str, rkey: &str) -> Option<(Value, String)> {
         self.world
@@ -379,6 +399,30 @@ impl NativeArchiveAuthFixture {
             let did = required(&params, "did")?;
             let collection = required(&params, "collection")?;
             let rkey = required(&params, "rkey")?;
+            if collection == "blue.catbird.chat.declaration" {
+                // The declaration lives in the underlying mock PDS store: prove what it holds.
+                let base = request.url.split("/xrpc/").next().unwrap_or_default();
+                let read = raw(&PlatformHttpRequest {
+                    method: "GET".into(),
+                    url: format!(
+                        "{base}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={rkey}"
+                    ),
+                    headers: Vec::new(),
+                    body: None,
+                })?;
+                let stored = if read.status == 200 {
+                    parse(&read.body)?.get("value").cloned()
+                } else {
+                    None
+                };
+                return match stored {
+                    Some(value) => {
+                        self.build_signed_car_response(did, collection, rkey, Some(&value))
+                    }
+                    // A missing declaration is proven absent.
+                    None => self.build_signed_exclusion_response(did),
+                };
+            }
             let stored = {
                 let world = self.world.lock().unwrap();
                 if collection == labyrinth::records::nsid::MAILBOX_KEYS {

@@ -747,237 +747,46 @@ impl CatbirdMlsClient {
             .map_err(|e| MLSError::Internal(format!("parse {nsid} JSON: {e}")))
     }
 
-    pub(crate) fn plc_directory_url_for_did(bare_did: &str) -> Result<String, MLSError> {
-        let plc_id = bare_did.strip_prefix("did:plc:").ok_or_else(|| {
-            MLSError::invalid_input(format!("expected did:plc identifier, got `{bare_did}`"))
-        })?;
-        if !(8..=64).contains(&plc_id.len())
-            || !plc_id
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        {
-            return Err(MLSError::invalid_input(format!(
-                "invalid did:plc identifier `{bare_did}`"
-            )));
-        }
-        Ok(format!("https://plc.directory/did:plc:{plc_id}"))
-    }
-
-    pub(crate) fn did_web_well_known_url(bare_did: &str) -> Option<String> {
-        let rest = bare_did.strip_prefix("did:web:")?;
-        if rest.is_empty() {
-            return None;
-        }
-        let mut segments = rest.split(':');
-        let raw_authority = segments.next()?;
-        let authority = raw_authority.replace("%3A", ":").replace("%3a", ":");
-        if authority.is_empty()
-            || authority.contains('/')
-            || authority.contains('@')
-            || authority.contains('?')
-            || authority.contains('#')
-        {
-            return None;
-        }
-        let host_only = if let Some(bracketed) = authority.strip_prefix('[') {
-            bracketed.split(']').next().unwrap_or("")
-        } else {
-            authority.split(':').next().unwrap_or("")
-        };
-        let is_loopback = matches!(
-            host_only.to_ascii_lowercase().as_str(),
-            "localhost" | "127.0.0.1" | "::1"
-        );
-        let scheme = if is_loopback { "http" } else { "https" };
-        let sub_segments: Vec<&str> = segments.collect();
-        if sub_segments.is_empty() {
-            Some(format!("{scheme}://{authority}/.well-known/did.json"))
-        } else {
-            if sub_segments.iter().any(|s| {
-                s.is_empty() || *s == "." || *s == ".." || s.contains('%') || s.contains('/')
-            }) {
-                return None;
-            }
-            Some(format!(
-                "{scheme}://{authority}/{}/did.json",
-                sub_segments.join("/")
-            ))
-        }
-    }
-
-    fn verify_did_doc_matches_target(doc_bytes: &[u8], expected_did: &str) -> Result<(), MLSError> {
-        let val: Value = serde_json::from_slice(doc_bytes)
-            .map_err(|e| MLSError::Cryptography(format!("invalid DID document JSON: {e}")))?;
-        if val.get("id").and_then(Value::as_str) != Some(expected_did) {
-            return Err(MLSError::Cryptography(format!(
-                "resolved DID document id {:?} does not match expected `{expected_did}`",
-                val.get("id")
-            )));
-        }
-        Ok(())
-    }
-
+    /// Resolve `did`'s DID document through the crate's one strict resolver
+    /// ([`super::did_resolution::resolve_did_document_strict`]): PLC directory or the `did:web`
+    /// host only, never an account PDS, with a bounded, provenance-tagged cache.
     pub(crate) fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError> {
-        let bare = did.split('#').next().unwrap_or(did).trim();
-        // Every source that does not return a document records why, so an unresolved DID with
-        // nothing cached fails closed instead of reading as "no document".
-        let mut resolution_error: Option<MLSError>;
-
-        // `did:plc:*` MUST resolve from the authoritative PLC directory rather than trusting own PDS.
-        if bare.starts_with("did:plc:") {
-            let plc_url = Self::plc_directory_url_for_did(bare)?;
-            match self.transport.execute_http(PlatformHttpRequest {
-                method: "GET".to_string(),
-                url: plc_url,
-                headers: Vec::new(),
-                body: None,
-            }) {
-                Ok(resp) if resp.status == 200 => {
-                    let doc_bytes = chat_wire::extract_did_doc_from_resolve_response(&resp.body)
-                        .and_then(|doc_bytes| {
-                            Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
-                            Ok(doc_bytes)
-                        })?;
-                    let now_ms = self.hooks.now_ms();
-                    let _ = self.db.write_tx(|tx| {
-                        tx.put_account_meta(
-                            &format!("did_doc:{bare}"),
-                            &String::from_utf8_lossy(&doc_bytes),
-                            now_ms,
-                        )
-                    });
-                    return Ok(Some(doc_bytes));
-                }
-                Ok(resp) if resp.status == 404 => return Ok(None),
-                Ok(resp) => {
-                    resolution_error = Some(MLSError::Internal(format!(
-                        "PLC directory resolve({bare}) failed with HTTP {}",
-                        resp.status
-                    )));
-                }
-                Err(error) => resolution_error = Some(error),
-            }
-
-            let cached = self
-                .db
-                .read_tx(|tx| tx.get_account_meta(&format!("did_doc:{bare}")))?;
-            return match (cached, resolution_error) {
-                (Some(cached), _) => Ok(Some(cached.into_bytes())),
-                (None, Some(error)) => Err(error),
-                (None, None) => Ok(None),
-            };
+        let (doc, observation) = super::did_resolution::resolve_did_document_observed(
+            &self.db,
+            self.transport.as_ref(),
+            self.hooks.now_ms(),
+            did,
+        )?;
+        if let Some(observation) = observation {
+            self.observe_did_document(&observation)?;
         }
+        Ok(doc)
+    }
 
-        // For `did:web:*` (such as sequencer / home DS DIDs), try PDS `resolveDid` then `.well-known/did.json`.
-        let pds_resolve_url = format!(
-            "{}/xrpc/com.atproto.identity.resolveDid?did={}",
-            self.pds_base(),
-            chat_wire::urlencode_form_component(bare)
-        );
-        match self.transport.execute_http(PlatformHttpRequest {
-            method: "GET".to_string(),
-            url: pds_resolve_url,
-            headers: Vec::new(),
-            body: None,
-        }) {
-            Ok(resp) if resp.status == 200 => {
-                match chat_wire::extract_did_doc_from_resolve_response(&resp.body).and_then(
-                    |doc_bytes| {
-                        Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
-                        Ok(doc_bytes)
-                    },
-                ) {
-                    Ok(doc_bytes) => {
-                        let now_ms = self.hooks.now_ms();
-                        let _ = self.db.write_tx(|tx| {
-                            tx.put_account_meta(
-                                &format!("did_doc:{bare}"),
-                                &String::from_utf8_lossy(&doc_bytes),
-                                now_ms,
-                            )
-                        });
-                        return Ok(Some(doc_bytes));
-                    }
-                    Err(error) => resolution_error = Some(error),
-                }
-            }
-            Ok(resp) => {
-                resolution_error = Some(MLSError::Internal(format!(
-                    "PDS resolveDid({bare}) failed with HTTP {}",
-                    resp.status
-                )));
-            }
-            Err(error) => resolution_error = Some(error),
+    /// The PDS that hosts `target_did`'s repository: the `#atproto_pds` service of its
+    /// independently resolved DID document. No account PDS fallback is allowed, including for
+    /// this account's own repository.
+    pub(crate) fn repo_pds_endpoint(
+        &self,
+        target_did: &str,
+        resolved_doc: Option<&[u8]>,
+    ) -> Result<String, MLSError> {
+        if let Some(endpoint) = resolved_doc
+            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(doc, target_did))
+        {
+            return Ok(endpoint);
         }
+        Err(MLSError::Cryptography(format!(
+            "no #atproto_pds service in the DID document of `{target_did}`"
+        )))
+    }
 
-        if let Some(wk_url) = Self::did_web_well_known_url(bare) {
-            match self.transport.execute_http(PlatformHttpRequest {
-                method: "GET".to_string(),
-                url: wk_url,
-                headers: Vec::new(),
-                body: None,
-            }) {
-                Ok(resp) if resp.status == 200 => {
-                    match chat_wire::extract_did_doc_from_resolve_response(&resp.body).and_then(
-                        |doc_bytes| {
-                            Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
-                            Ok(doc_bytes)
-                        },
-                    ) {
-                        Ok(doc_bytes) => {
-                            let now_ms = self.hooks.now_ms();
-                            let _ = self.db.write_tx(|tx| {
-                                tx.put_account_meta(
-                                    &format!("did_doc:{bare}"),
-                                    &String::from_utf8_lossy(&doc_bytes),
-                                    now_ms,
-                                )
-                            });
-                            return Ok(Some(doc_bytes));
-                        }
-                        Err(error) => resolution_error = Some(error),
-                    }
-                }
-                Ok(resp) => {
-                    resolution_error = Some(MLSError::Internal(format!(
-                        "did:web document fetch for {bare} failed with HTTP {}",
-                        resp.status
-                    )));
-                }
-                Err(error) => resolution_error = Some(error),
-            }
-        }
-
-        if bare == self.config.home_ds_did {
-            let wk_url = format!("{}/.well-known/did.json", self.ds_base());
-            if let Ok(resp) = self.transport.execute_http(PlatformHttpRequest {
-                method: "GET".to_string(),
-                url: wk_url,
-                headers: Vec::new(),
-                body: None,
-            }) {
-                if resp.status == 200 {
-                    if let Ok(doc_bytes) = chat_wire::extract_did_doc_from_resolve_response(
-                        &resp.body,
-                    )
-                    .and_then(|doc_bytes| {
-                        Self::verify_did_doc_matches_target(&doc_bytes, bare)?;
-                        Ok(doc_bytes)
-                    }) {
-                        return Ok(Some(doc_bytes));
-                    }
-                }
-            }
-        }
-
-        let cached = self
-            .db
-            .read_tx(|tx| tx.get_account_meta(&format!("did_doc:{bare}")))?;
-        match (cached, resolution_error) {
-            (Some(cached), _) => Ok(Some(cached.into_bytes())),
-            (None, Some(error)) => Err(error),
-            (None, None) => Ok(None),
-        }
+    /// Hook for identity observations made while resolving a DID document.
+    pub(crate) fn observe_did_document(
+        &self,
+        _observation: &super::did_resolution::DidDocObservation,
+    ) -> Result<(), MLSError> {
+        Ok(())
     }
 
     pub(crate) fn resolve_sequencer_receipt_key(
@@ -1186,9 +995,15 @@ impl CatbirdMlsClient {
             .and_then(|d| d.atproto_key);
         #[cfg(not(feature = "labyrinth"))]
         let _ = require_repo_proof;
-        let pds_endpoint = resolved
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc, target_did))
-            .unwrap_or_else(|| self.pds_base());
+        let pds_endpoint = match self.repo_pds_endpoint(target_did, resolved.as_deref()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                // A missing repository host cannot authorize a chat device. Service DIDs are
+                // excluded before device-directory prefetch; they do not justify an empty set.
+                invalidate()?;
+                return Err(error);
+            }
+        };
 
         let raw_device_records = match self.paginate_pds_list_records(
             &pds_endpoint,
@@ -1358,39 +1173,6 @@ impl CatbirdMlsClient {
         self.db
             .write_tx(|tx| tx.put_account_meta(&cache_key, &encoded, now_ms))?;
         Ok(authorized)
-    }
-
-    pub(crate) fn resolve_peer_home_ds_did(&self, target_did: &str) -> Option<String> {
-        let pds_endpoint = self
-            .resolve_did_document(target_did)
-            .ok()
-            .flatten()
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc, target_did))
-            .unwrap_or_else(|| self.pds_base());
-        let url = format!(
-            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.declaration&rkey=self",
-            pds_endpoint.trim_end_matches('/'),
-            chat_wire::urlencode_form_component(target_did),
-        );
-        let resp = self
-            .transport
-            .execute_http(PlatformHttpRequest {
-                method: "GET".to_string(),
-                url,
-                headers: Vec::new(),
-                body: None,
-            })
-            .ok()?;
-        if resp.status != 200 {
-            return None;
-        }
-        let val: Value = serde_json::from_slice(&resp.body).ok()?;
-        val.pointer("/value/deliveryService")
-            .or_else(|| val.pointer("/value/homeDsDid"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
     }
 
     /// `mls-ds` bootstrap: `enrollDevice`, PDS device + declaration records, request keys and
@@ -1628,8 +1410,16 @@ impl CatbirdMlsClient {
             &self.config.home_ds_did,
             &self.hooks.now_rfc3339_millis(),
         )?;
-        let put_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
-        let _ = self.execute_json_post(put_url, decl_body)?;
+        // Create-only, like the device record: the session's OAuth scope grants no update.
+        // An existing declaration naming this home DS is success; one naming another DS is a
+        // conflict this device cannot resolve on its own.
+        let home_ds_did = self.config.home_ds_did.clone();
+        self.publish_pds_record_create_only(
+            super::declaration_proof::DECLARATION_COLLECTION,
+            "self",
+            decl_body,
+            |existing_val| chat_wire::pds_chat_declaration_matches(existing_val, &home_ds_did),
+        )?;
 
         // 4. Generate + publish the C33 DirectRequestKeyPublication once the device is active and
         //    the DS does not yet hold it (real `mls-ds` rejects `pending_approval` callers with
@@ -1881,6 +1671,15 @@ impl CatbirdMlsClient {
             &body,
             &signer,
         )?;
+        // The explicit approval is the only automatic recognition of another device. A
+        // getOwnDevices read by itself never silently accepts a new or changed key.
+        self.db.write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("recognized_own_device:{canonical_target}"),
+                &hex::encode(target_signature_public_key),
+                self.hooks.now_ms(),
+            )
+        })?;
         Ok(())
     }
 
@@ -2266,7 +2065,7 @@ impl CatbirdMlsClient {
         let prep_outer: Value = serde_json::from_slice(&prepare_http.body)
             .map_err(|e| MLSError::Internal(format!("parse prepareDirectRequest: {e}")))?;
         // The coordinator signs both a preparation and a terminal receipt.
-        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
+        let peer_ds = self.resolve_peer_home_ds_did(peer_did)?.ok_or_else(|| {
             MLSError::Cryptography("C33 peer home DS authority unavailable".into())
         })?;
         let effective_sequencer = dr_transcript::derive_deterministic_coordinator(
@@ -8076,29 +7875,26 @@ mod verification_boundary_tests {
     }
 
     #[test]
-    fn did_web_url_and_plc_resolution_enforce_exact_loopback_host_and_plc_directory_authority() {
+    fn did_web_url_refuses_loopback_and_plc_resolution_uses_plc_directory_authority() {
         use std::sync::Mutex;
 
-        // 1. Exact host check on `did:web:*` prevents `localhost.attacker.example` HTTP downgrade.
+        // 1. The shared builder refuses loopback, IP literals and lookalike local names, and
+        //    never downgrades to plaintext HTTP.
+        use crate::client::did_url::did_document_url;
+        for loopback in [
+            "did:web:localhost%3A8080",
+            "did:web:127.0.0.1%3A9000",
+            "did:web:localhost",
+            "did:web:127.0.0.1",
+        ] {
+            assert!(did_document_url(loopback).is_err(), "{loopback}");
+        }
         assert_eq!(
-            CatbirdMlsClient::did_web_well_known_url("did:web:localhost%3A8080").as_deref(),
-            Some("http://localhost:8080/.well-known/did.json")
+            did_document_url("did:web:127.0.0.1.attacker.example").as_deref(),
+            Ok("https://127.0.0.1.attacker.example/.well-known/did.json")
         );
-        assert_eq!(
-            CatbirdMlsClient::did_web_well_known_url("did:web:127.0.0.1%3A9000").as_deref(),
-            Some("http://127.0.0.1:9000/.well-known/did.json")
-        );
-        assert_eq!(
-            CatbirdMlsClient::did_web_well_known_url("did:web:localhost.attacker.example")
-                .as_deref(),
-            Some("https://localhost.attacker.example/.well-known/did.json")
-        );
-        assert_eq!(
-            CatbirdMlsClient::did_web_well_known_url("did:web:127.0.0.1.attacker.example")
-                .as_deref(),
-            Some("https://127.0.0.1.attacker.example/.well-known/did.json")
-        );
-        assert!(CatbirdMlsClient::plc_directory_url_for_did("did:plc:short").is_err());
+        assert!(did_document_url("did:web:localhost.attacker.example").is_err());
+        assert!(did_document_url("did:plc:short").is_err());
 
         // 2. `resolve_did_document` for `did:plc:*` queries `https://plc.directory/{did}` directly
         //    and ignores any forged response from own PDS `resolveDid`.

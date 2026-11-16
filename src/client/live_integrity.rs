@@ -56,31 +56,35 @@ pub(crate) fn list_state_prefix(
         .map_err(|e| MLSError::Internal(format!("read labyrinth state: {e}")))
 }
 
-/// Issue time of a stored message: its sequencer receipt's `issuedAtMs` when this device holds
-/// one, else the local receive time.
+/// A retained I13 receipt is serialized from `StoredArchivedReceipt`, whose persisted field is
+/// `issued_at_ms` (the wire receipt instead uses `issuedAtMs`).
+fn stored_receipt_issued_at_ms(raw: &str) -> Option<i64> {
+    serde_json::from_str::<chat_wire::StoredArchivedReceipt>(raw)
+        .ok()
+        .map(|receipt| receipt.issued_at_ms)
+}
+
+/// Issue time of a stored message: its sequencer receipt when this device holds one, else the
+/// local receive time.
 fn message_issued_at_ms(
     tx: &SqlTx<'_>,
     cid: &str,
     message_id: &str,
     created_at_ms: i64,
 ) -> Result<i64, MLSError> {
-    let receipt_issued = |raw: Option<Vec<u8>>, field: &str| -> Option<i64> {
-        let evidence: Value = serde_json::from_slice(&raw?).ok()?;
-        let receipt = &evidence[field];
-        let receipt: Value = match receipt {
-            Value::String(text) => serde_json::from_str(text).ok()?,
-            other => other.clone(),
-        };
-        receipt["issuedAtMs"].as_i64()
-    };
-    let issued = receipt_issued(
-        tx.get_labyrinth_state(&format!("native.message:{cid}:{message_id}"))?,
-        "sequencer_receipt_json",
-    )
-    .or(receipt_issued(
-        tx.get_labyrinth_state(&chat_wire::unavailable_message_key(cid, message_id))?,
-        "receipt",
-    ));
+    let native = tx
+        .get_labyrinth_state(&format!("native.message:{cid}:{message_id}"))?
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|evidence| {
+            evidence["sequencer_receipt_json"]
+                .as_str()
+                .and_then(stored_receipt_issued_at_ms)
+        });
+    let unavailable = tx
+        .get_labyrinth_state(&chat_wire::unavailable_message_key(cid, message_id))?
+        .and_then(|raw| serde_json::from_slice::<chat_wire::UnavailableEntryEvidence>(&raw).ok())
+        .and_then(|evidence| evidence.receipt["issuedAtMs"].as_i64());
+    let issued = native.or(unavailable);
     Ok(issued.unwrap_or(created_at_ms))
 }
 
@@ -144,8 +148,7 @@ pub(crate) fn purge_covered_messages(
         let payload: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
         let issued = payload["sequencer_receipt_json"]
             .as_str()
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .and_then(|receipt| receipt["issuedAtMs"].as_i64())
+            .and_then(stored_receipt_issued_at_ms)
             .or(payload["created_at_ms"].as_i64());
         if marker.covers(seq, issued) {
             tx.dequeue_labyrinth_item(&item_id)?;

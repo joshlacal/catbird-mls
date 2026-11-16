@@ -1872,9 +1872,24 @@ pub fn pds_device_record_matches(record_val: &Value, expected_pubkey: &[u8]) -> 
 
 /// Check whether an existing `blue.catbird.chat.declaration` record value declares `expected_ds_did`.
 pub fn pds_chat_declaration_matches(record_val: &Value, expected_ds_did: &str) -> bool {
+    if record_val.get("$type").and_then(Value::as_str) != Some("blue.catbird.chat.declaration")
+        || !matches!(
+            record_val.get("allowIncoming").and_then(Value::as_str),
+            Some("all" | "none" | "following")
+        )
+        || !matches!(
+            record_val.get("protocolVersion").and_then(Value::as_str),
+            Some("1" | "2")
+        )
+        || !record_val
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok())
+    {
+        return false;
+    }
     record_val
         .get("deliveryService")
-        .or_else(|| record_val.get("homeDsDid"))
         .and_then(Value::as_str)
         .map(str::trim)
         .is_some_and(|ds| ds == expected_ds_did.trim())

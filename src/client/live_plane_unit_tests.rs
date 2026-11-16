@@ -738,10 +738,13 @@ fn live_plane_primitives_did_resolution_and_enrollment_boundaries() {
         .entry(plc_url)
         .or_default()
         .push_back(http_json(404, &json!({ "error": "NotFound" })));
-    assert_eq!(client.resolve_did_document(fake_plc).unwrap(), None);
+    assert!(
+        client.resolve_did_document(fake_plc).is_err(),
+        "a PLC 404 without a cached document is an error, never \"no document\""
+    );
 
-    // 8. did:web:127.0.0.1%3A18080 and did:web:localhost%3A18081 MUST use http://, not https://.
-    for (did_web, expected_wk) in [
+    // 8. Loopback and port-bearing did:web identifiers are refused before any request.
+    for (did_web, would_be_wk) in [
         (
             "did:web:127.0.0.1%3A18080",
             "http://127.0.0.1:18080/.well-known/did.json",
@@ -750,20 +753,25 @@ fn live_plane_primitives_did_resolution_and_enrollment_boundaries() {
             "did:web:localhost%3A18081",
             "http://localhost:18081/.well-known/did.json",
         ),
+        (
+            "did:web:localhost",
+            "https://localhost/.well-known/did.json",
+        ),
     ] {
         state
             .lock()
             .unwrap()
             .exact_get
-            .entry(expected_wk.to_string())
+            .entry(would_be_wk.to_string())
             .or_default()
             .push_back(http_json(200, &json!({ "id": did_web })));
-        let doc = client
-            .resolve_did_document(did_web)
-            .unwrap()
-            .expect("http well-known must resolve");
-        let parsed: Value = serde_json::from_slice(&doc).unwrap();
-        assert_eq!(parsed["id"], did_web);
+        let seen_before = state.lock().unwrap().seen_urls.len();
+        assert!(client.resolve_did_document(did_web).is_err(), "{did_web}");
+        assert_eq!(
+            state.lock().unwrap().seen_urls.len(),
+            seen_before,
+            "{did_web} must not be fetched"
+        );
     }
 
     // 9. Remote did:web well-known requires status == 200 (not 503 with JSON body).
@@ -776,8 +784,8 @@ fn live_plane_primitives_did_resolution_and_enrollment_boundaries() {
         .entry(remote_wk.to_string())
         .or_default()
         .push_back(http_json(503, &json!({ "id": remote_web })));
-    // Non-200 from both PDS resolveDid (mock 404) and the did:web document, with nothing
-    // cached, fails closed instead of reporting "no document".
+    // Non-200 from the did:web document, with nothing cached, fails closed instead of
+    // reporting "no document".
     assert!(client.resolve_did_document(remote_web).is_err());
     let cached_key = format!("did_doc:{remote_web}");
     assert!(client
@@ -824,7 +832,7 @@ fn live_plane_primitives_did_resolution_and_enrollment_boundaries() {
         ));
     assert!(client.resolve_did_document(mismatched_web).is_err());
 
-    // 10. Home DS fallback ds_base()/.well-known/did.json requires status == 200.
+    // 10. The home DS's did:web resolves only from its own host, never from ds_base().
     let (home_transport, home_state) = PlaneMockTransport::new();
     home_state.lock().unwrap().authority_mls_keys.clear();
     home_state.lock().unwrap().authority_dr_keys.clear();
@@ -844,17 +852,21 @@ fn live_plane_primitives_did_resolution_and_enrollment_boundaries() {
         .entry(ds_wk.clone())
         .or_default()
         .push_back(http_json(
-            500,
+            200,
             &json!({ "id": "did:web:custom-home.example.com" }),
         ));
     assert!(home_client
         .resolve_did_document("did:web:custom-home.example.com")
         .is_err());
+    assert!(
+        !home_state.lock().unwrap().seen_urls.contains(&ds_wk),
+        "the configured DS endpoint is never asked for the DS DID document"
+    );
     home_state
         .lock()
         .unwrap()
         .exact_get
-        .entry(ds_wk)
+        .entry("https://custom-home.example.com/.well-known/did.json".to_string())
         .or_default()
         .push_back(http_json(
             200,
@@ -3917,10 +3929,6 @@ fn did_web_resolution_fails_closed_on_non_success_without_cached_document() {
     let (transport, state) = PlaneMockTransport::new();
     let (_dir, client, _signer) = new_plane_client(ALICE_DID, DEV_A1, transport);
     let peer_web = "did:web:closed-check.example.com";
-    let resolve_url = format!(
-        "{PDS_URL}/xrpc/com.atproto.identity.resolveDid?did={}",
-        chat_wire::urlencode_form_component(peer_web)
-    );
     let well_known = "https://closed-check.example.com/.well-known/did.json".to_string();
     let queue = |url: &str, status: u16, body: Value| {
         state
@@ -3932,42 +3940,37 @@ fn did_web_resolution_fails_closed_on_non_success_without_cached_document() {
             .push_back(http_json(status, &body));
     };
 
-    // Non-200 from resolveDid AND from the did:web document: an error, never `Ok(None)`.
-    queue(&resolve_url, 502, json!({ "error": "BadGateway" }));
+    // Non-200 from the did:web document: an error, never `Ok(None)`.
     queue(&well_known, 404, json!({ "error": "NotFound" }));
     let err = client
         .resolve_did_document(peer_web)
-        .expect_err("non-200 from every source without a cached document must fail closed");
+        .expect_err("non-200 without a cached document must fail closed");
     assert!(
         err.to_string().contains("404"),
-        "the last failing source's status is reported: {err}"
+        "the failing status is reported: {err}"
     );
 
-    // Same for every status pairing: a 200 alone is a document.
-    for (resolve_status, well_known_status) in [(500, 503), (404, 500), (429, 410)] {
-        queue(&resolve_url, resolve_status, json!({ "error": "x" }));
-        queue(&well_known, well_known_status, json!({ "error": "y" }));
+    // Same for every status: a 200 alone is a document.
+    for status in [503, 500, 410, 429] {
+        queue(&well_known, status, json!({ "error": "y" }));
         assert!(client.resolve_did_document(peer_web).is_err());
     }
 
     // The sequencer receipt key lookup inherits the failure instead of reporting no key.
-    queue(&resolve_url, 503, json!({ "error": "Unavailable" }));
     queue(&well_known, 503, json!({ "error": "Unavailable" }));
     assert!(client
         .resolve_sequencer_receipt_key(peer_web, &format!("{peer_web}#mls-receipt-1"))
         .is_err());
 
     // A successful did:web document is cached and then outlives later failures.
-    queue(&resolve_url, 404, json!({ "error": "DidNotFound" }));
     queue(&well_known, 200, json!({ "id": peer_web }));
     assert!(client.resolve_did_document(peer_web).unwrap().is_some());
-    queue(&resolve_url, 500, json!({ "error": "x" }));
     queue(&well_known, 500, json!({ "error": "y" }));
     let cached: Value =
         serde_json::from_slice(&client.resolve_did_document(peer_web).unwrap().unwrap()).unwrap();
     assert_eq!(cached["id"], peer_web);
 
-    // The home sequencer still resolves through ds_base() when both earlier sources fail.
+    // The home sequencer is never resolved through ds_base() when its own host fails.
     let (home_transport, home_state) = PlaneMockTransport::new();
     home_state.lock().unwrap().authority_mls_keys.clear();
     home_state.lock().unwrap().authority_dr_keys.clear();
@@ -3982,8 +3985,11 @@ fn did_web_resolution_fails_closed_on_non_success_without_cached_document() {
         .entry(format!("{custom_ds}/.well-known/did.json"))
         .or_default()
         .push_back(http_json(200, &json!({ "id": home_did })));
-    let home_doc: Value =
-        serde_json::from_slice(&home_client.resolve_did_document(home_did).unwrap().unwrap())
-            .unwrap();
-    assert_eq!(home_doc["id"], home_did);
+    assert!(home_client.resolve_did_document(home_did).is_err());
+    assert!(home_state
+        .lock()
+        .unwrap()
+        .seen_urls
+        .iter()
+        .all(|url| !url.starts_with(custom_ds) && !url.contains("resolveDid")));
 }

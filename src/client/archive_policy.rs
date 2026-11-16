@@ -84,7 +84,10 @@ fn record_flip(
     enabled: bool,
     now_ms: i64,
 ) -> Result<bool, MLSError> {
-    if seq <= 0 {
+    // Sequence zero is the baseline for a restored metadata snapshot whose
+    // sequencer position is unavailable. It must survive a later verbatim row
+    // overwrite, or an unauthorized ON snapshot would silently re-enable backup.
+    if seq < 0 {
         return Ok(false);
     }
     let mut log = flips(tx, conversation_id)?;
@@ -122,6 +125,10 @@ pub(crate) fn accept_snapshot(
     let requested = metadata_enabled(metadata);
     let explicit_on = metadata.extra.get(HISTORY_BACKUP) == Some(&json!(true));
     if !before && requested && !(signed_metadata_transition && explicit_on) {
+        // The caller still stores the authenticated snapshot verbatim. Preserve
+        // the stricter effective policy in the sequenced log even if this is
+        // the first flip this device has ever observed.
+        record_flip(tx, conversation_id, seq, false, now_ms)?;
         return Ok(());
     }
     if before != requested {
@@ -416,6 +423,42 @@ mod tests {
             assert!(current_enabled(tx, CID)?);
             assert!(!enabled_at_seq(tx, CID, 3)?);
             assert!(enabled_at_seq(tx, CID, 4)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn restored_off_metadata_without_flip_log_cannot_be_loosened_by_snapshot() {
+        let (_dir, db) = db();
+        db.write_tx(|tx| {
+            let mut off = GroupMetadataV1::new("Chat", "");
+            set_metadata_enabled(&mut off, false);
+            tx.upsert_group_metadata(&super::super::chat_wire::group_metadata_row_from_v1(
+                CID, 1, 0, &off, 1,
+            )?)?;
+            assert!(flips(tx, CID)?.is_empty());
+
+            let mut carried = off.clone();
+            set_metadata_enabled(&mut carried, true);
+            accept_snapshot(tx, CID, 0, &carried, false, 2)?;
+            tx.upsert_group_metadata(&super::super::chat_wire::group_metadata_row_from_v1(
+                CID, 2, 0, &carried, 2,
+            )?)?;
+            assert_eq!(
+                flips(tx, CID)?,
+                vec![Flip {
+                    seq: 0,
+                    enabled: false
+                }]
+            );
+            assert!(!current_enabled(tx, CID)?);
+            assert!(!enabled_at_seq(tx, CID, 1)?);
+            assert!(frame_no_backup(&stamp_outgoing(
+                tx,
+                CID,
+                r#"{"version":1,"messageType":"text"}"#,
+            )?));
             Ok(())
         })
         .unwrap();

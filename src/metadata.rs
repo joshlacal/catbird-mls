@@ -97,7 +97,6 @@ impl GroupMetadataV1 {
             avatar_blob_locator: None,
             avatar_content_type: None,
             space_avatar: None,
-            extra: Default::default(),
             extra: serde_json::Map::new(),
         }
     }

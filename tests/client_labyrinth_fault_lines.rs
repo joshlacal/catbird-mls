@@ -886,6 +886,17 @@ fn offline_committed_owner_frames_authenticate_before_open_or_restore() {
                 &format!("did_doc:{ds_did}"),
                 &did_doc.to_string(),
                 timestamp_ms,
+            )?;
+            // The document as the strict resolver caches it: fetched just now.
+            let fetched_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            tx.put_account_meta(
+                &format!("did_doc_meta:{ds_did}"),
+                &serde_json::json!({ "source": "strict-v1", "fetchedAtMs": fetched_at_ms })
+                    .to_string(),
+                fetched_at_ms,
             )
         })
         .unwrap();

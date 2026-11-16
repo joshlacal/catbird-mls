@@ -8,7 +8,12 @@
 pub(crate) mod archive_policy;
 pub mod chat_wire;
 pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
+mod declaration_proof;
 pub mod deletion_authority;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod did_resolution;
+pub mod did_url;
 #[cfg(not(target_arch = "wasm32"))]
 mod live_plane;
 #[cfg(not(target_arch = "wasm32"))]
@@ -151,6 +156,8 @@ pub struct RegisteredDeviceInfo {
     pub dormant_at: Option<String>,
     pub labyrinth_device_key_hex: Option<String>,
     pub is_current_device: bool,
+    /// An active PDS/DS device not explicitly recognized on this client, or a directory mismatch.
+    pub unrecognized: bool,
 }
 
 /// Per-step result of unified `revoke_device`, including atomic recovery-method rotation outputs.

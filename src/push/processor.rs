@@ -1693,6 +1693,7 @@ pub fn process_push_notification_with_hooks(
                         ),
                         created_at_ms: now_ms,
                     };
+                    crate::client::archive_policy::observe_frame_tighten_only(tx, &evidence)?;
                     let mut evidence = serde_json::to_value(&evidence)?;
                     if let Some(recorded) = recorded_send_counter {
                         evidence[chat_wire::NSE_SEND_COUNTER_RECORDED] = recorded;
@@ -1701,7 +1702,6 @@ pub fn process_push_notification_with_hooks(
                         &format!("native.message:{}:{message_id}", wake.conversation_id),
                         &serde_json::to_vec(&evidence)?, now_ms,
                     )?;
-                    crate::client::archive_policy::observe_frame_tighten_only(tx, &evidence)?;
                     tx.put_labyrinth_state(
                         &format!("push.verified_receipt:{}:{message_id}", wake.conversation_id),
                         b"1",

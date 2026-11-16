@@ -1159,6 +1159,8 @@ impl<'a> SqlReadTx<'a> {
                 "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, \
                         sender_device_id, plaintext_json, created_at_ms, is_own \
                  FROM messages WHERE conversation_id = ?1 AND seq < ?2 \
+                 AND NOT EXISTS (SELECT 1 FROM labyrinth_state AS state \
+                     WHERE state.state_key = 'native.unsent:' || messages.conversation_id || ':' || messages.message_id) \
                  ORDER BY {order_clause} LIMIT ?3"
             );
             let mut stmt = self
@@ -1175,6 +1177,8 @@ impl<'a> SqlReadTx<'a> {
                 "SELECT message_id, conversation_id, group_id, epoch, seq, sender_did, \
                         sender_device_id, plaintext_json, created_at_ms, is_own \
                  FROM messages WHERE conversation_id = ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM labyrinth_state AS state \
+                     WHERE state.state_key = 'native.unsent:' || messages.conversation_id || ':' || messages.message_id) \
                  ORDER BY {order_clause} LIMIT ?2"
             );
             let mut stmt = self
