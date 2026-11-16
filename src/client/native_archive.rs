@@ -127,54 +127,18 @@ impl crate::labyrinth::LabyrinthGateway for NativeArchiveGateway {
         self.execute(&self.config.home_ds_endpoint, request.method, request.path, headers, request.body).map(Self::response)
     }
     async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
-        let bare = did.split('#').next().unwrap_or(did).trim();
-        if bare.is_empty() {
-            return Err("empty DID".into());
-        }
-        if bare.starts_with("did:plc:") {
-            let url = crate::labyrinth::transport::did_document_url(bare)?;
-            if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-            let response = self.transport.execute_http(PlatformHttpRequest { method: "GET".into(), url, headers: vec![], body: None }).map_err(|e| e.to_string())?;
-            if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-            if response.status == 404 { return Ok(None); }
-            if response.status != 200 { return Err(format!("resolve archive DID returned HTTP {}", response.status)); }
-            let doc = super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map_err(|e| e.to_string())?;
-            let parsed: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| e.to_string())?;
-            if parsed.get("id").and_then(serde_json::Value::as_str) != Some(bare) {
-                return Err(format!("resolved DID document id mismatch for `{bare}`"));
-            }
-            return Ok(Some(doc));
-        }
-        let path = format!("/xrpc/com.atproto.identity.resolveDid?did={}", super::chat_wire::urlencode_form_component(bare));
-        match self.execute(&self.config.pds_endpoint, "GET".into(), path, vec![], None) {
-            Ok(response) if response.status == 200 => {
-                match super::chat_wire::extract_did_doc_from_resolve_response(&response.body) {
-                    Ok(doc) => {
-                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&doc) {
-                            if parsed.get("id").and_then(serde_json::Value::as_str) == Some(bare) {
-                                return Ok(Some(doc));
-                            }
-                        }
-                        tracing::debug!("own-PDS resolveDid returned mismatched DID document id; falling back");
-                    }
-                    Err(e) => tracing::debug!("own-PDS resolveDid returned no DID document ({e}); falling back"),
-                }
-            }
-            Ok(response) => tracing::debug!("own-PDS resolveDid returned HTTP {}; falling back", response.status),
-            Err(e) => tracing::debug!("own-PDS resolveDid failed ({e}); falling back"),
-        }
-        let url = crate::labyrinth::transport::did_document_url(bare)?;
+        // The crate's one strict resolver: PLC directory or the `did:web` host, never an
+        // account PDS, sharing the provenance-tagged `did_doc:` cache with the live plane.
         if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-        let response = self.transport.execute_http(PlatformHttpRequest { method: "GET".into(), url, headers: vec![], body: None }).map_err(|e| e.to_string())?;
+        let resolved = super::did_resolution::resolve_did_document_strict(
+            &self.db,
+            self.transport.as_ref(),
+            self.hooks.now_ms(),
+            did,
+        )
+        .map_err(|e| e.to_string());
         if !self.db.is_open() { return Err("native_archive_context_closed".into()); }
-        if response.status == 404 { return Ok(None); }
-        if response.status != 200 { return Err(format!("resolve archive DID returned HTTP {}", response.status)); }
-        let doc = super::chat_wire::extract_did_doc_from_resolve_response(&response.body).map_err(|e| e.to_string())?;
-        let parsed: serde_json::Value = serde_json::from_slice(&doc).map_err(|e| e.to_string())?;
-        if parsed.get("id").and_then(serde_json::Value::as_str) != Some(bare) {
-            return Err(format!("resolved DID document id mismatch for `{bare}`"));
-        }
-        Ok(Some(doc))
+        resolved
     }
 }
 
@@ -832,8 +796,13 @@ impl NativeLocalAuthority {
                 format!("missing #atproto repository signing key in DID document for `{did}`"),
             ));
         }
+        // Another account's records come only from the PDS its own DID document names.
         let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
-            .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
+            .ok_or_else(|| {
+                crate::orchestrator::error::OrchestratorError::Credential(format!(
+                    "no #atproto_pds service in the DID document of peer `{did}`"
+                ))
+            })?;
 
         let allow_test_fallback = cfg!(test) && atproto_key.is_none();
         let raw_devices = match self.paginate_pds_collection(

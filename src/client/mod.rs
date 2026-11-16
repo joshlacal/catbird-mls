@@ -7,6 +7,9 @@
 pub mod chat_wire;
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod did_resolution;
+pub mod did_url;
+#[cfg(not(target_arch = "wasm32"))]
 mod live_plane;
 #[cfg(not(target_arch = "wasm32"))]
 mod live_sync;

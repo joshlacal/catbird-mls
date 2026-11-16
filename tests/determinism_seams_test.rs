@@ -968,9 +968,11 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
     // unchanged, while `flush_labyrinth_queue()` now speaks Nov-12 Spaces (`listWriters` +
     // RFC 9421 `Accept-Signature` in `native_archive_space.rs`) and `EpochPublic` / `mailboxKeys`
     // carry `membersHash`.
+    // Moved again (two separate processes agree): DID documents resolve only from PLC or the
+    // did:web host's did.json, never through the account PDS or the DS endpoint.
     assert_eq!(
         hash_recorded_calls(&t1),
-        "90c0855c75a5cc960e9ea6a1694a27cc97889901ab774938fd86d80cee2ba071",
+        "fa90714947b1a703d085dd4d0cf7865aa07c481863313acbab4dde8ddc14c482",
         "cross-process HTTP wire transcript blake3 digest drifted"
     );
 }
@@ -1047,9 +1049,11 @@ fn two_seeded_clients_produce_byte_identical_recovery_code_and_mailbox_epoch_wri
     // Moved in Wave 2 (two separate processes agree): live 2-device CPace+ML-KEM-768 OTC pairing
     // over `OwnerMailbox` (`otcSession`), Nov-12 Spaces `Accept-Signature` + `listWriters`, and
     // `EpochPublic` / `mailboxKeys` `membersHash`.
+    // Moved again with strict DID resolution (two separate processes agree; the base revision
+    // reproduced the previous digest).
     assert_eq!(
         hasher.finalize().to_hex().to_string(),
-        "53b9626df78f22e3dd2e2a2e7c3138d02fa19c89351d08f8487fb8c54e1b2d67",
+        "ef378930c3db7a79fa6a0f0bb0b66558adb0fa6ca2d3886ad1a2d2ec9c1760a9",
         "cross-process Labyrinth recovery code + EpochPublic XEdDSA applyWrites digest drifted"
     );
 }
