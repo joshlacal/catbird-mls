@@ -32,8 +32,7 @@ use crate::client::traits::PlatformChangeEvent;
 use crate::client::QueuedLabyrinthArchivePayload;
 use crate::error::{ConversationSyncFailure, MLSError};
 use crate::messaging::receive::{
-    extract_plaintext_body_and_verify_aad, handle_account_deleted_event,
-    verify_application_aad_archive_evidence,
+    extract_plaintext_body_and_verify_aad, verify_application_aad_archive_evidence,
 };
 use crate::metadata::derive_metadata_key_from_group;
 use crate::orchestrator::canonical_transport::{
@@ -98,9 +97,12 @@ struct EntryPass {
     was_retired: bool,
 }
 
-/// Records an applied, sequenced `accountDeletedEntry`. Archive history loads and restores hide
-/// every copy of `deleted_did`'s messages that orders before it: no server redaction covers the
-/// witness and owner copies other members already published.
+#[path = "live_integrity.rs"]
+pub(crate) mod live_integrity;
+
+/// Writes the earlier marker form, the deletion's seq alone, which readers still honour: archive
+/// history loads and restores hide every copy of `deleted_did`'s messages ordered before it.
+#[cfg(test)]
 pub(super) fn record_account_deletion(
     tx: &crate::storage::SqlTx<'_>,
     cid: &str,
@@ -297,22 +299,6 @@ impl CatbirdMlsClient {
             );
         }
         Ok(verified)
-    }
-
-    /// Effects of a verified account deletion: no more archive duty for the account, its local
-    /// messages go, and archive loads and restores hide its copies ordered before `seq`.
-    pub(super) fn apply_verified_account_deletion(
-        &self,
-        cid: &str,
-        deleted_did: &str,
-        seq: i64,
-    ) -> Result<(), MLSError> {
-        let now_ms = self.hooks.now_ms();
-        self.db
-            .write_tx(|tx| record_account_deletion(tx, cid, deleted_did, seq, now_ms))?;
-        handle_account_deleted_event(&self.db, cid, deleted_did)?;
-        self.clear_cached_groups();
-        Ok(())
     }
 }
 
@@ -916,21 +902,20 @@ impl CatbirdMlsClient {
                 && (message.sender_did != self.normalized_did
                     || message.sender_device_id != canonical_device_id)
             {
-                let key = chat_wire::peer_send_counter_key(
-                    cid,
-                    convo.generation,
-                    bound_epoch as i64,
-                    &message.sender_did,
-                    &message.sender_device_id,
-                );
-                let last = tx.get_account_meta(&key)?;
-                if let Some(send_counter) = send_counter {
-                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
-                    tx.put_account_meta(&key, &send_counter.to_string(), now_ms)?;
-                } else if entry_seq > convo.last_seq || last.is_none() {
-                    return Err(MLSError::Cryptography(
-                        "applicationSendBody missing sendCounter".into(),
-                    ));
+                // The extension records the counter in the transaction that stores the
+                // message; completing that entry here must not count it a second time.
+                if evidence[chat_wire::NSE_SEND_COUNTER_RECORDED].is_null() {
+                    super::send_counter::record_peer_send_counter(
+                        tx,
+                        cid,
+                        convo.generation,
+                        bound_epoch as i64,
+                        &message.sender_did,
+                        &message.sender_device_id,
+                        send_counter,
+                        entry_seq,
+                        now_ms,
+                    )?;
                 }
             }
             evidence["sequencer_receipt_json"] = json!(stored_receipt);
@@ -1051,18 +1036,17 @@ impl CatbirdMlsClient {
             if evidence.sender_did != self.normalized_did
                 || evidence.sender_device_id != self.config.device_id
             {
-                if let Some(send_counter) = evidence.send_counter {
-                    let key = chat_wire::peer_send_counter_key(
-                        cid,
-                        convo.generation,
-                        evidence.epoch,
-                        &evidence.sender_did,
-                        &evidence.sender_device_id,
-                    );
-                    let last = tx.get_account_meta(&key)?;
-                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
-                    tx.put_account_meta(&key, &send_counter.to_string(), evidence.recorded_at_ms)?;
-                }
+                super::send_counter::record_peer_send_counter(
+                    tx,
+                    cid,
+                    convo.generation,
+                    evidence.epoch,
+                    &evidence.sender_did,
+                    &evidence.sender_device_id,
+                    evidence.send_counter,
+                    evidence.seq,
+                    evidence.recorded_at_ms,
+                )?;
             }
             if tx.get_message(&evidence.message_id)?.is_none() {
                 let is_own = evidence.sender_did == self.normalized_did;
@@ -3364,6 +3348,24 @@ impl CatbirdMlsClient {
                 kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
                 self.clear_cached_groups();
                 if let Some(mut c) = current {
+                    if (next_epoch as i64) > c.epoch {
+                        let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                        let provider = self.hooks.openmls_provider(storage);
+                        if let Some(group) =
+                            MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
+                                .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                        {
+                            super::send_counter::advance_send_counter_epoch_chain(
+                                tx,
+                                cid,
+                                c.generation,
+                                c.epoch,
+                                next_epoch as i64,
+                                &super::send_counter::group_leaf_devices(&group),
+                                now_ms,
+                            )?;
+                        }
+                    }
                     c.epoch = next_epoch as i64;
                     if authoritative_seq == c.last_seq + 1 {
                         c.last_seq = authoritative_seq;
@@ -3718,6 +3720,14 @@ impl CatbirdMlsClient {
         // Pre-fetch PDS `blue.catbird.chat.device` keys (`I4`) for all DIDs referenced in batch
         // plus all current local `MlsGroup` members.
         let mut candidate_dids = BTreeMap::new();
+        let deleting_dids: BTreeSet<String> = sorted_entries
+            .iter()
+            .filter(|entry| {
+                entry.get("$type").and_then(Value::as_str)
+                    == Some(crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND)
+            })
+            .filter_map(|entry| entry["deletedDid"].as_str().map(str::to_owned))
+            .collect();
         for entry in &sorted_entries {
             chat_wire::collect_dids_from_json(entry, &mut candidate_dids);
         }
@@ -3744,7 +3754,17 @@ impl CatbirdMlsClient {
         }
         let mut auth_keys_by_did: BTreeMap<String, Vec<AuthorizedPeerDeviceKey>> = BTreeMap::new();
         for did in candidate_dids.keys() {
-            let keys = self.fetch_and_cache_authorized_pds_device_keys(did)?;
+            // Deletion can arrive after the actor's PDS repository is gone. Its actorWrite
+            // verifies through the self-contained keyProof below; a prior application entry
+            // still has to prove its own sender key and will fail without one.
+            let keys = match self.fetch_and_cache_authorized_pds_device_keys(did) {
+                Ok(keys) => keys,
+                Err(error) if deleting_dids.contains(did) => {
+                    tracing::warn!(%did, %error, "deleted account PDS keys unavailable; verifying deletion keyProof");
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
             auth_keys_by_did.insert(did.clone(), keys);
         }
         let flat_auth_keys: Vec<AuthorizedPeerDeviceKey> = auth_keys_by_did
@@ -3794,6 +3814,24 @@ impl CatbirdMlsClient {
                         "non-contiguous conversation sequence: expected {expected_next_seq}, received {entry_seq}"
                     )));
                 }
+                // An own message the sequencer already receipted at this seq must be this entry.
+                let entry_message_id = is_application
+                    .then(|| {
+                        body.get("messageId")
+                            .or_else(|| entry.get("messageId"))
+                            .or_else(|| entry.get("entryId"))
+                            .and_then(Value::as_str)
+                    })
+                    .flatten();
+                self.db.write_tx(|tx| {
+                    super::send_counter::check_own_receipt_at_entry(
+                        tx,
+                        cid,
+                        entry_seq,
+                        entry_message_id,
+                        now_ms,
+                    )
+                })?;
                 expected_next_seq = expected_next_seq.checked_add(1).ok_or_else(|| {
                     MLSError::Cryptography("conversation sequence exhausted".into())
                 })?;
@@ -3807,14 +3845,31 @@ impl CatbirdMlsClient {
             // Every entry below verifies before any effect. One that does not stops this
             // conversation's sync with the cursor below it: no later entry carries it past.
             if label == Some(crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND) {
-                let (deleted_did, seq) = self
-                    .verify_account_deleted_entry(cid, &convo.sequencer_did, entry)?
-                    .ok_or_else(|| {
-                        MLSError::Cryptography(
-                            "I13: account deletion authority does not verify".into(),
-                        )
-                    })?;
-                self.apply_verified_account_deletion(cid, &deleted_did, seq)?;
+                // A deletion takes effect only under its deleting device's own signature. One
+                // this conversation's sequencer did not sign stops the sync below it; any other
+                // that does not verify is kept as evidence and shown, and the cursor moves on.
+                let decision = self.authorize_account_deletion(cid, &convo.sequencer_did, entry)?;
+                if matches!(
+                    decision,
+                    live_integrity::AccountDeletionDecision::Unverified {
+                        reason: crate::client::deletion_authority::UnverifiedDeletionReason::SequencerUnverified,
+                        ..
+                    }
+                ) {
+                    return Err(MLSError::Cryptography(
+                        "I13: account deletion authority does not verify".into(),
+                    ));
+                }
+                self.apply_account_deletion_decision(cid, entry, &decision)?;
+                let now_ms = self.hooks.now_ms();
+                self.db.write_tx(|tx| {
+                    if let Some(mut c) = tx.get_conversation(cid)? {
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = now_ms;
+                        tx.upsert_conversation(&c)?;
+                    }
+                    Ok(())
+                })?;
                 pass.applied = pass.applied.saturating_add(1);
                 pass.max_seq = pass.max_seq.max(entry_seq);
                 continue;
@@ -4401,6 +4456,7 @@ impl CatbirdMlsClient {
                         return Ok(false);
                     };
                     let mut removed_self = false;
+                    let epoch_before_commit = c.epoch;
                     // This sync merges the Commit: a peer's, or an own one from its journal.
                     let mut merged = false;
                     if is_own_echo {
@@ -4686,6 +4742,26 @@ impl CatbirdMlsClient {
                             apply_verified_roster_effects(tx, cid, kind, body, now_ms)?;
                         }
                     }
+                    if c.epoch > epoch_before_commit && !removed_self {
+                        // This device applied the Commit itself: counters of the leaves that
+                        // stay remain comparable across it.
+                        let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                        let provider = self.hooks.openmls_provider(storage);
+                        if let Some(group) =
+                            MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
+                                .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                        {
+                            super::send_counter::advance_send_counter_epoch_chain(
+                                tx,
+                                cid,
+                                c.generation,
+                                epoch_before_commit,
+                                c.epoch,
+                                &super::send_counter::group_leaf_devices(&group),
+                                now_ms,
+                            )?;
+                        }
+                    }
                     // Epoch-key erasure is atomic with accepted MLS state and its cursor.
                     Self::prune_pending_commit_transitions(
                         tx,
@@ -4827,6 +4903,14 @@ impl CatbirdMlsClient {
                         .get("entryId")
                         .and_then(Value::as_str)
                         .unwrap_or(msg_id);
+                    // A verified signed body always names its counter; only a pruned entry,
+                    // whose body is gone, completes without one.
+                    let send_counter = body.get("sendCounter").and_then(Value::as_u64);
+                    if verified_application_body.is_some() && send_counter.is_none() {
+                        return Err(MLSError::Cryptography(
+                            "applicationSendBody missing sendCounter".into(),
+                        ));
+                    }
                     self.finish_received_archive_evidence(
                         cid,
                         msg_id,
@@ -4834,7 +4918,7 @@ impl CatbirdMlsClient {
                         entry_id,
                         receipt,
                         outer_sender,
-                        body.get("sendCounter").and_then(Value::as_u64),
+                        send_counter,
                         canonical_dev_id,
                     )?;
                     pass.max_seq = pass.max_seq.max(entry_seq);
@@ -4886,29 +4970,46 @@ impl CatbirdMlsClient {
                                 "I13: pruned receipt generation mismatch".into(),
                             ));
                         }
-                        if pruned.sender_did != self.normalized_did
-                            || pruned.sender_device_id != canonical_dev_id
-                        {
-                            let key = chat_wire::peer_send_counter_key(
+                        let own_device = pruned.sender_did == self.normalized_did
+                            && pruned.sender_device_id == canonical_dev_id;
+                        if tx.get_message(msg_id)?.is_none() {
+                            // Pruned before this device ever held it: keep the signed receipt as
+                            // durable evidence and show a neutral placeholder at its seq.
+                            let evidence = chat_wire::UnavailableEntryEvidence {
+                                version: 1,
+                                conversation_id: cid.to_owned(),
+                                message_id: msg_id.to_owned(),
+                                entry_id: expected_rcpt_entry_id.to_owned(),
+                                seq: entry_seq,
+                                generation: pruned.generation,
+                                epoch: pruned.epoch,
+                                sender_did: pruned.sender_did.clone(),
+                                sender_device_id: pruned.sender_device_id.clone(),
+                                reason: chat_wire::PAYLOAD_PRUNED_REASON.to_owned(),
+                                receipt: rcpt_val.clone(),
+                                recorded_at_ms: now_ms,
+                            };
+                            tx.insert_message(&evidence.placeholder_row(&c.group_id, own_device)?)?;
+                            tx.put_labyrinth_state(
+                                &chat_wire::unavailable_message_key(cid, msg_id),
+                                &serde_json::to_vec(&evidence)?,
+                                now_ms,
+                            )?;
+                        }
+                        if !own_device {
+                            // Its counter is unknowable here: count the entry so the sender's
+                            // next counter is still compared exactly, without inventing one.
+                            super::send_counter::record_peer_send_counter(
+                                tx,
                                 cid,
                                 pruned.generation,
                                 pruned.epoch,
                                 &pruned.sender_did,
                                 &pruned.sender_device_id,
-                            );
-                            if let Some(last) = tx.get_account_meta(&key)? {
-                                let next = last
-                                    .parse::<u64>()
-                                    .ok()
-                                    .and_then(|counter| counter.checked_add(1))
-                                    .ok_or_else(|| {
-                                        MLSError::Cryptography(
-                                            "peer sendCounter exhausted at pruned entry".into(),
-                                        )
-                                    })?;
-                                chat_wire::verify_next_peer_send_counter(Some(&last), next)?;
-                                tx.put_account_meta(&key, &next.to_string(), now_ms)?;
-                            }
+                                None,
+                                entry_seq,
+                                now_ms,
+                            )?;
                         }
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = now_ms;
@@ -5012,16 +5113,24 @@ impl CatbirdMlsClient {
                         let epoch = body["prior"]["epoch"].as_i64().ok_or_else(|| {
                             MLSError::Cryptography("applicationSendBody prior missing epoch".into())
                         })?;
-                        let key = chat_wire::peer_send_counter_key(
-                            cid,
+                        self.db.read_tx(|tx| {
+                            super::send_counter::check_peer_send_counter(
+                                tx,
+                                cid,
+                                generation,
+                                epoch,
+                                sender_did,
+                                sender_device_id,
+                                send_counter,
+                            )
+                        })?;
+                        Some((
                             generation,
                             epoch,
-                            sender_did,
-                            sender_device_id,
-                        );
-                        let last = self.db.read_tx(|tx| tx.get_account_meta(&key))?;
-                        chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
-                        Some((key, send_counter))
+                            sender_did.to_owned(),
+                            sender_device_id.to_owned(),
+                            send_counter,
+                        ))
                     }
                 } else {
                     None
@@ -5099,10 +5208,20 @@ impl CatbirdMlsClient {
                     let mut c = tx
                         .get_conversation(cid)?
                         .ok_or_else(|| MLSError::group_not_found(cid))?;
-                    if let Some((key, send_counter)) = &peer_counter {
-                        let last = tx.get_account_meta(key)?;
-                        chat_wire::verify_next_peer_send_counter(last.as_deref(), *send_counter)?;
-                        tx.put_account_meta(key, &send_counter.to_string(), now_ms)?;
+                    if let Some((generation, epoch, sender_did, sender_device_id, send_counter)) =
+                        &peer_counter
+                    {
+                        super::send_counter::record_peer_send_counter(
+                            tx,
+                            cid,
+                            *generation,
+                            *epoch,
+                            sender_did,
+                            sender_device_id,
+                            Some(*send_counter),
+                            entry_seq,
+                            now_ms,
+                        )?;
                     }
                     let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
                     let provider = self.hooks.openmls_provider(storage);
@@ -5361,7 +5480,7 @@ impl CatbirdMlsClient {
                                 .to_owned(),
                             send_counter: peer_counter
                                 .as_ref()
-                                .map(|(_, send_counter)| *send_counter),
+                                .map(|(_, _, _, _, send_counter)| *send_counter),
                             reason: reason.to_owned(),
                             recorded_at_ms: now_ms,
                         },

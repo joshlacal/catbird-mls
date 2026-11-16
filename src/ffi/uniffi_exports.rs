@@ -471,6 +471,14 @@ impl CatbirdMlsClient {
         self.delete_account_data()
     }
 
+    #[uniffi::method(name = "export_conversation_integrity_evidence_json")]
+    pub fn ffi_export_conversation_integrity_evidence_json(
+        &self,
+        conversation_id: String,
+    ) -> Result<String, MLSError> {
+        self.export_conversation_integrity_evidence_json(&conversation_id)
+    }
+
     #[uniffi::method(name = "start_otc_pairing")]
     pub fn ffi_start_otc_pairing(
         &self,

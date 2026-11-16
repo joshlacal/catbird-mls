@@ -1301,6 +1301,30 @@ impl CatbirdMlsClient {
                 &enrolled_map,
             ) {
                 Ok(target_id) => {
+                    // Preserve positive, repository-proven revocation evidence after the PDS
+                    // disappears. Account deletion later checks it at the device-signed instant.
+                    #[cfg(feature = "labyrinth")]
+                    if require_repo_proof {
+                        let revoked_at_ms = record_val["createdAt"]
+                            .as_str()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|at| at.timestamp_millis())
+                            .ok_or_else(|| {
+                                MLSError::Cryptography(
+                                    "I4 verified revocation has invalid createdAt".into(),
+                                )
+                            })?;
+                        let key = super::deletion_authority::verified_device_revocation_key(
+                            target_did, &target_id,
+                        );
+                        self.db.write_tx(|tx| {
+                            let earliest = tx
+                                .get_account_meta(&key)?
+                                .and_then(|raw| raw.parse::<i64>().ok())
+                                .map_or(revoked_at_ms, |old| old.min(revoked_at_ms));
+                            tx.put_account_meta(&key, &earliest.to_string(), self.hooks.now_ms())
+                        })?;
+                    }
                     revoked_device_ids.insert(target_id);
                 }
                 Err(error) => {
@@ -4962,6 +4986,13 @@ impl CatbirdMlsClient {
                 send_counter,
             )?;
             tx.put_account_meta(&counter_key, &confirmed.to_string(), self.hooks.now_ms())?;
+            super::send_counter::check_own_receipt_slot(
+                tx,
+                &queued.conversation_id,
+                seq,
+                &queued.message_id,
+                self.hooks.now_ms(),
+            )?;
             tx.insert_message(&row)?;
             tx.put_labyrinth_state(
                 &format!(

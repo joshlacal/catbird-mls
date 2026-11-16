@@ -8,10 +8,12 @@
 pub(crate) mod archive_policy;
 pub mod chat_wire;
 pub mod config;
+pub mod deletion_authority;
 #[cfg(not(target_arch = "wasm32"))]
 mod live_plane;
 #[cfg(not(target_arch = "wasm32"))]
 mod live_sync;
+pub mod send_counter;
 pub mod spaces_gate;
 pub mod traits;
 
@@ -2380,11 +2382,14 @@ pub(crate) mod native_client {
                     if let Some(raw_del) = tx.get_labyrinth_state(
                         &super::chat_wire::account_deletion_key(conversation_id, &msg.sender_did),
                     )? {
-                        let deleted_seq = std::str::from_utf8(&raw_del)
-                            .ok()
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(i64::MAX);
-                        if msg.seq <= deleted_seq {
+                        let marker =
+                            super::deletion_authority::AppliedAccountDeletion::decode(&raw_del)
+                                .unwrap_or(
+                                    super::deletion_authority::StoredAccountDeletion::SeqOnly(
+                                        i64::MAX,
+                                    ),
+                                );
+                        if marker.covers(msg.seq, Some(msg.created_at_ms)) {
                             continue;
                         }
                     }
@@ -2405,10 +2410,14 @@ pub(crate) mod native_client {
                             ));
                         }
                     }
-                    let gap_key = super::chat_wire::undecryptable_evidence_key(
+                    let mut gap_key = super::chat_wire::undecryptable_evidence_key(
                         conversation_id,
                         &msg.message_id,
                     );
+                    if tx.get_labyrinth_state(&gap_key)?.is_none() {
+                        gap_key =
+                            super::chat_wire::unavailable_message_key(conversation_id, &msg.message_id);
+                    }
                     let local = tx.get_message(&msg.message_id)?;
                     let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
                     if local.is_some() && !gap {

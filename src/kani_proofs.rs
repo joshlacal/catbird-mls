@@ -21,7 +21,8 @@
 //! | `kani_padme_len_overflow_and_overhead_bounds` | `labyrinth::padding::padme_len` (`MIN_LEN = 10`, monotonicity, idempotence, `<= 12.5%` overhead) |
 //! | `kani_pad_unpad_roundtrip` | `labyrinth::padding::{pad, unpad, padme_len}` |
 //! | `kani_unpad_arbitrary_strict_canonical` | `labyrinth::padding::{unpad, padme_len}` |
-//! | `kani_epoch_and_send_counter_overflow_bounds` | `labyrinth::records::check_epoch_number`, `catbird_mls::client::chat_wire::{verify_next_peer_send_counter, next_send_counter, confirmed_send_counter}` |
+//! | `kani_epoch_and_send_counter_overflow_bounds` | `labyrinth::records::check_epoch_number`, `catbird_mls::client::chat_wire::{next_send_counter, confirmed_send_counter}` |
+//! | `kani_peer_send_counter_strict_continuity` | `catbird_mls::client::send_counter::{classify_peer_send_counter, select_peer_counter_prior, advance_epoch_chain, EpochChain::covers}` |
 //! | `kani_atproto_spaces_uri_and_hedged_normalization` | `atproto_spaces::{SpaceUri::record_uri, is_atproto_did, is_valid_did, is_valid_nsid, is_valid_rkey}` |
 //! | `kani_atproto_spaces_accept_signature_sf_roundtrip` | `atproto_spaces::mac::{format_accept_signature, MacProfile}` (`parse_accept_signature` round-trip in `kani_proofs::tests`) |
 
@@ -30,8 +31,11 @@
 use thiserror::Error;
 
 #[cfg(any(kani, test))]
-use crate::client::chat_wire::{
-    confirmed_send_counter, next_send_counter, verify_next_peer_send_counter,
+use crate::client::chat_wire::{confirmed_send_counter, next_send_counter};
+#[cfg(any(kani, test))]
+use crate::client::send_counter::{
+    advance_epoch_chain, classify_peer_send_counter, select_peer_counter_prior, EpochChain,
+    PeerCounterPrior, PeerCounterVerdict,
 };
 #[cfg(test)]
 use crate::storage::derive_sqlcipher_96hex_key_spec;
@@ -1222,7 +1226,7 @@ mod proofs {
     #[kani::stub(std::fmt::format, kani_err_fmt_stub)]
     fn kani_epoch_and_send_counter_overflow_bounds() {
         // Directly exercises `labyrinth::records::check_epoch_number` over full 64-bit `u64`
-        // and `catbird_mls::client::chat_wire::{verify_next_peer_send_counter, next_send_counter, confirmed_send_counter}`
+        // and `catbird_mls::client::chat_wire::{next_send_counter, confirmed_send_counter}`
         // across boundary send-counter regimes (`0`, `1`, `2`, `MAX - 1`, `MAX`, `MAX + 1`, `u64::MAX`).
         let current_epoch: u64 = kani::any();
         let delta: u64 = kani::any();
@@ -1256,32 +1260,11 @@ mod proofs {
 
         let has_prev: bool = kani::any();
         let prev_idx: usize = kani::any();
-        let recv_idx: usize = kani::any();
         kani::assume(prev_idx < COUNTER_BOUNDARIES.len());
-        kani::assume(recv_idx < COUNTER_BOUNDARIES.len());
 
         let (prev_raw, prev_val) = COUNTER_BOUNDARIES[prev_idx];
         kani::assume(prev_raw.len() <= 20);
-        let (_, recv_counter) = COUNTER_BOUNDARIES[recv_idx];
         let prev_str = if has_prev { Some(prev_raw) } else { None };
-
-        let peer_res = verify_next_peer_send_counter(prev_str, recv_counter);
-        let peer_ok = peer_res.is_ok();
-        core::mem::forget(peer_res);
-        kani::cover!(peer_ok && has_prev, "increasing peer send counter accepted");
-        kani::cover!(
-            !peer_ok && has_prev,
-            "non-increasing/overflow peer counter rejected"
-        );
-
-        if peer_ok {
-            assert!(recv_counter <= MAX_SAFE_SEND_COUNTER);
-            if prev_str.is_some() {
-                assert!(recv_counter > prev_val);
-            }
-        } else {
-            assert!(recv_counter > MAX_SAFE_SEND_COUNTER || (has_prev && recv_counter <= prev_val));
-        }
 
         let next_res = next_send_counter(prev_str);
         match next_res {
@@ -1300,6 +1283,112 @@ mod proofs {
                 core::mem::forget(e);
                 assert!(has_prev && prev_val >= MAX_SAFE_SEND_COUNTER);
             }
+        }
+    }
+
+    #[kani::proof]
+    #[kani::stub(std::fmt::format, kani_err_fmt_stub)]
+    fn kani_peer_send_counter_strict_continuity() {
+        // Directly exercises `catbird_mls::client::send_counter::{classify_peer_send_counter,
+        // select_peer_counter_prior, advance_epoch_chain}` over symbolic 64-bit inputs.
+        let next: u64 = kani::any();
+        let has_prior: bool = kani::any();
+        let prior = PeerCounterPrior {
+            last: kani::any(),
+            skipped: kani::any(),
+            same_epoch: kani::any(),
+        };
+        let verdict = classify_peer_send_counter(has_prior.then_some(prior), next);
+        match &verdict {
+            Err(_) => {
+                // Valid counters are evidence only; only an invalid wire range is refused.
+                assert!(next == 0 || next > MAX_SAFE_SEND_COUNTER);
+            }
+            Ok(PeerCounterVerdict::Baseline) => assert!(!has_prior),
+            Ok(PeerCounterVerdict::Contiguous) => {
+                // Exactly one past the last counter plus every entry counted without one.
+                assert!(has_prior && next > prior.last);
+                assert!(prior.last.saturating_add(1).saturating_add(prior.skipped) == next);
+            }
+            Ok(PeerCounterVerdict::Gap { expected, received }) => {
+                assert!(has_prior && next > prior.last && *received == next);
+                assert!(*expected == prior.last.saturating_add(1).saturating_add(prior.skipped));
+                assert!(*expected != next);
+            }
+            Ok(PeerCounterVerdict::Regressed { last, received }) => {
+                assert!(has_prior);
+                assert!(*last == prior.last && *received == next && next <= prior.last);
+            }
+        }
+        if next > 0 && next <= MAX_SAFE_SEND_COUNTER && has_prior && next > prior.last {
+            // Strictness: any increasing counter other than the expected one is a gap.
+            assert!(verdict.as_ref().is_ok_and(|v| match v {
+                PeerCounterVerdict::Contiguous => {
+                    next == prior.last.saturating_add(1).saturating_add(prior.skipped)
+                }
+                PeerCounterVerdict::Gap { .. } => {
+                    next != prior.last.saturating_add(1).saturating_add(prior.skipped)
+                }
+                _ => false,
+            }));
+        }
+        kani::cover!(
+            matches!(verdict, Ok(PeerCounterVerdict::Gap { .. })),
+            "gap recorded"
+        );
+        kani::cover!(
+            matches!(verdict, Ok(PeerCounterVerdict::Contiguous)),
+            "contiguous accepted"
+        );
+        core::mem::forget(verdict);
+
+        // The chain only grows by one applied Commit at a time; anything else restarts it.
+        let has_chain: bool = kani::any();
+        let chain = EpochChain {
+            start: kani::any(),
+            current: kani::any(),
+        };
+        kani::assume(chain.start <= chain.current);
+        let prior_epoch: u64 = kani::any();
+        let next_epoch: u64 = kani::any();
+        let advanced = advance_epoch_chain(has_chain.then_some(chain), prior_epoch, next_epoch);
+        assert!(advanced.current == next_epoch && advanced.start <= advanced.current);
+        if has_chain
+            && chain.current == prior_epoch
+            && prior_epoch.checked_add(1) == Some(next_epoch)
+        {
+            assert!(advanced.start == chain.start);
+        } else if prior_epoch.checked_add(1) == Some(next_epoch) {
+            assert!(advanced.start == prior_epoch);
+        } else {
+            assert!(advanced.start == next_epoch);
+        }
+
+        // A counter from another epoch is compared only when the chain covers both epochs.
+        let epoch: u64 = kani::any();
+        let has_epoch_last: bool = kani::any();
+        let epoch_last: u64 = kani::any();
+        let has_continuity: bool = kani::any();
+        let continuity: (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let selected = select_peer_counter_prior(
+            has_epoch_last.then_some(epoch_last),
+            has_continuity.then_some(continuity),
+            has_chain.then_some(chain),
+            epoch,
+        );
+        match selected {
+            Some(p) if p.same_epoch => assert!(has_epoch_last && p.last == epoch_last),
+            Some(p) => {
+                assert!(!has_epoch_last && has_continuity && p.last == continuity.0);
+                assert!(
+                    continuity.2 == epoch
+                        || (has_chain
+                            && chain.start <= continuity.2
+                            && continuity.2 <= epoch
+                            && epoch <= chain.current)
+                );
+            }
+            None => assert!(!has_epoch_last),
         }
     }
 
@@ -1612,9 +1701,67 @@ mod tests {
 
         assert_eq!(next_send_counter(None).unwrap(), 1);
         assert!(next_send_counter(Some(&MAX_SAFE_SEND_COUNTER.to_string())).is_err());
-        assert!(verify_next_peer_send_counter(Some("10"), 10).is_err());
-        assert!(verify_next_peer_send_counter(Some("10"), 11).is_ok());
-        assert!(verify_next_peer_send_counter(None, MAX_SAFE_SEND_COUNTER + 1).is_err());
+        let prior = |last, skipped, same_epoch| {
+            Some(PeerCounterPrior {
+                last,
+                skipped,
+                same_epoch,
+            })
+        };
+        assert_eq!(
+            classify_peer_send_counter(prior(10, 0, true), 10).unwrap(),
+            PeerCounterVerdict::Regressed {
+                last: 10,
+                received: 10
+            }
+        );
+        assert_eq!(
+            classify_peer_send_counter(prior(10, 0, true), 11).unwrap(),
+            PeerCounterVerdict::Contiguous
+        );
+        assert_eq!(
+            classify_peer_send_counter(prior(10, 0, true), 13).unwrap(),
+            PeerCounterVerdict::Gap {
+                expected: 11,
+                received: 13
+            }
+        );
+        assert_eq!(
+            classify_peer_send_counter(prior(10, 2, false), 13).unwrap(),
+            PeerCounterVerdict::Contiguous
+        );
+        assert_eq!(
+            classify_peer_send_counter(prior(10, 0, false), 9).unwrap(),
+            PeerCounterVerdict::Regressed {
+                last: 10,
+                received: 9
+            }
+        );
+        assert!(classify_peer_send_counter(None, MAX_SAFE_SEND_COUNTER + 1).is_err());
+        let chain = advance_epoch_chain(None, 4, 5);
+        assert_eq!(
+            chain,
+            EpochChain {
+                start: 4,
+                current: 5
+            }
+        );
+        assert_eq!(
+            advance_epoch_chain(Some(chain), 5, 6),
+            EpochChain {
+                start: 4,
+                current: 6
+            }
+        );
+        assert_eq!(
+            advance_epoch_chain(Some(chain), 7, 8),
+            EpochChain {
+                start: 7,
+                current: 8
+            }
+        );
+        assert!(select_peer_counter_prior(None, Some((3, 0, 4)), Some(chain), 5).is_some());
+        assert!(select_peer_counter_prior(None, Some((3, 0, 3)), Some(chain), 5).is_none());
         assert_eq!(confirmed_send_counter(Some("10"), 11).unwrap(), 11);
 
         let uri = SpaceUri::parse_hedged("at:space/did:plc:abc123xyz/app.bsky.space/3lb7skey")

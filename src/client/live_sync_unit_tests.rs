@@ -1158,32 +1158,14 @@ fn finish_received_archive_evidence_validates_outer_sender_own_device_and_counte
         Some("1".to_string())
     );
 
-    // 4. `send_counter = None` boundary matrix (`convo.last_seq == 5`):
-    // - `entry_seq = 4 < last_seq` with `last = None` -> `Err`
-    let m_no_last = "33333333-3333-4333-8333-333333333334";
-    let r_no_last = stage_cached_message(m_no_last, CAROL_DID, DEV_C1, 4);
-    assert!(client
-        .finish_received_archive_evidence(
-            CONVO_ID,
-            m_no_last,
-            4,
-            m_no_last,
-            &r_no_last,
-            Some((CAROL_DID, DEV_C1)),
-            None,
-            DEV_A1,
-        )
-        .is_err());
-
-    // Seed `last = Some("3")` for `(BOB_DID, DEV_B1)`:
+    // 4. `send_counter = None` (a counter this device cannot learn) completes the entry and
+    // counts it, so the device's next counter is still compared exactly; it never refuses.
     let bob_counter_key = chat_wire::peer_send_counter_key(CONVO_ID, 0, 0, BOB_DID, DEV_B1);
     client
         .db
         .write_tx(|tx| tx.put_account_meta(&bob_counter_key, "3", 1_000))
         .unwrap();
-
-    // - `entry_seq = 6 > last_seq` with `last = Some("3")` -> `Err`
-    assert!(client
+    client
         .finish_received_archive_evidence(
             CONVO_ID,
             m1,
@@ -1194,23 +1176,44 @@ fn finish_received_archive_evidence_validates_outer_sender_own_device_and_counte
             None,
             DEV_A1,
         )
-        .is_err());
-
-    // - `entry_seq = 5 == last_seq` with `last = Some("3")` -> `Ok(())`
-    let m_eq = "33333333-3333-4333-8333-333333333335";
-    let r_eq = stage_cached_message(m_eq, BOB_DID, DEV_B1, 5);
+        .unwrap();
+    let m_next = "33333333-3333-4333-8333-333333333335";
+    let r_next = stage_cached_message(m_next, BOB_DID, DEV_B1, 7);
     client
         .finish_received_archive_evidence(
             CONVO_ID,
-            m_eq,
-            5,
-            m_eq,
-            &r_eq,
+            m_next,
+            7,
+            m_next,
+            &r_next,
             Some((BOB_DID, DEV_B1)),
-            None,
+            Some(5),
             DEV_A1,
         )
         .unwrap();
+    assert_eq!(
+        client
+            .db
+            .read_tx(|tx| crate::client::send_counter::list_send_counter_evidence(tx, CONVO_ID))
+            .unwrap(),
+        vec![],
+        "3, one uncounted entry, then 5 is contiguous"
+    );
+    // Within the epoch a counter that does not increase is still refused.
+    let m_back = "33333333-3333-4333-8333-333333333336";
+    let r_back = stage_cached_message(m_back, BOB_DID, DEV_B1, 8);
+    assert!(client
+        .finish_received_archive_evidence(
+            CONVO_ID,
+            m_back,
+            8,
+            m_back,
+            &r_back,
+            Some((BOB_DID, DEV_B1)),
+            Some(5),
+            DEV_A1,
+        )
+        .is_err());
 }
 
 #[test]
@@ -2079,9 +2082,40 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
             .db
             .read_tx(|tx| tx.get_account_meta(&sib_counter_key))
             .unwrap(),
-        Some("4".to_string()),
-        "pruned entry from sibling device must advance peer_send_counter_key"
+        Some("3".to_string()),
+        "a pruned entry never invents a counter for the sibling device"
     );
+    // Never received here: each pruned entry leaves receipt evidence and a neutral placeholder,
+    // and counts once toward the sibling's next counter.
+    for pruned_id in [pruned_own_id, pruned_sib_id] {
+        assert!(alice
+            .db
+            .read_tx(|tx| tx
+                .get_labyrinth_state(&chat_wire::unavailable_message_key(CONVO_ID, pruned_id)))
+            .unwrap()
+            .is_some());
+        let row = alice
+            .db
+            .read_tx(|tx| tx.get_message(pruned_id))
+            .unwrap()
+            .expect("placeholder row");
+        assert!(row
+            .plaintext_json
+            .contains(chat_wire::UNAVAILABLE_MESSAGE_NOTICE));
+    }
+    let continuity: crate::client::send_counter::PeerCounterContinuity = serde_json::from_str(
+        &alice
+            .db
+            .read_tx(|tx| {
+                tx.get_account_meta(&crate::client::send_counter::peer_send_continuity_key(
+                    CONVO_ID, 0, ALICE_DID, DEV_A2,
+                ))
+            })
+            .unwrap()
+            .expect("sibling continuity"),
+    )
+    .unwrap();
+    assert_eq!((continuity.counter, continuity.skipped), (3, 1));
 
     // Helper to build a signed `applicationMessageEntry` at `seq` (before ciphertext decryption).
     let make_signed_app_entry = |msg_id: &str,
@@ -2269,10 +2303,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         None
     );
 
-    // 4. Stale `sendCounter` enforcement (`L4865`) for `(BOB_DID, DEV_A1)` AND `(ALICE_DID, DEV_A2)`:
-    // Pre-seed both counters to `"10"`; an entry with `sendCounter: 1` MUST fail with stale-counter
-    // error BEFORE reaching `deserialize app msg` (`[0u8; 8]` would fail with `"deserialize app msg"`
-    // if `L4865` skipped the counter check!).
+    // 4. Stale `sendCounter` on both a peer and an own sibling is evidence only. These two
+    // malformed MLS bodies still fail at deserialization; no message is delivered.
     let bob_same_dev_key = chat_wire::peer_send_counter_key(CONVO_ID, 0, epoch, BOB_DID, DEV_A1);
     alice
         .db
@@ -2307,10 +2339,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
         .unwrap_err();
     assert!(
-        err_stale_bob
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "peer sharing device UUID string must check sendCounter before decrypt: {err_stale_bob}"
+        err_stale_bob.to_string().contains("deserialize app msg"),
+        "peer sharing device UUID string still rejects malformed MLS bytes: {err_stale_bob}"
     );
 
     let stale_sib = make_signed_app_entry(
@@ -2338,10 +2368,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
         .unwrap_err();
     assert!(
-        err_stale_sib
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "own sibling device must check sendCounter before decrypt: {err_stale_sib}"
+        err_stale_sib.to_string().contains("deserialize app msg"),
+        "own sibling device still rejects malformed MLS bytes: {err_stale_sib}"
     );
 
     // 5. Re-delivery at `entry_seq == current.last_seq`:
@@ -2407,3 +2435,6 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         "entry at current.last_seq must bypass fresh sendCounter monotonicity check: {err_redeliver}"
     );
 }
+
+#[path = "live_integrity_unit_tests.rs"]
+mod live_integrity_unit_tests;

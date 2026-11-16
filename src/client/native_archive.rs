@@ -1990,20 +1990,29 @@ impl CatbirdMlsClient {
     /// copy stays only if its sequencer receipt orders it after the deletion. Returns how many it hid.
     fn hide_deleted_accounts(db: &MlsAccountDb, conversation_id: &str, messages: &mut Vec<labyrinth::client::LoadedMessage>) -> Result<usize, MLSError> {
         let senders: std::collections::BTreeSet<String> = messages.iter().filter_map(|m| m.sender.clone()).collect();
-        let deleted: std::collections::BTreeMap<String, u64> = db.read_tx(|tx| {
+        use super::deletion_authority::{AppliedAccountDeletion, StoredAccountDeletion};
+        let deleted: std::collections::BTreeMap<String, StoredAccountDeletion> = db.read_tx(|tx| {
             let mut deleted = std::collections::BTreeMap::new();
             for did in &senders {
                 if let Some(raw) = tx.get_labyrinth_state(&super::chat_wire::account_deletion_key(conversation_id, did))? {
                     // An unreadable marker still hides: it can only widen what the deletion covers.
-                    let seq = std::str::from_utf8(&raw).ok().and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
-                    deleted.insert(did.clone(), seq);
+                    let marker = AppliedAccountDeletion::decode(&raw).unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
+                    deleted.insert(did.clone(), marker);
                 }
             }
             Ok(deleted)
         })?;
         let before = messages.len();
+        // A copy stays unless the deletion covers it: ordered before the deletion and, for a
+        // device-signed deletion, issued no later than its signed instant. A copy without a
+        // receipt cannot show either and is hidden.
         messages.retain(|m| match m.sender.as_deref().and_then(|s| deleted.get(s)) {
-            Some(&at) => m.archived_receipt.as_ref().is_some_and(|r| r.signed.payload.seq > at),
+            Some(marker) => m.archived_receipt.as_ref().is_some_and(|r| {
+                !marker.covers(
+                    i64::try_from(r.signed.payload.seq).unwrap_or(i64::MAX),
+                    i64::try_from(r.signed.payload.issued_at_ms).ok(),
+                )
+            }),
             None => true,
         });
         Ok(before - messages.len())
@@ -2027,10 +2036,11 @@ impl CatbirdMlsClient {
         };
         let deletions = state["accountDeletions"].as_array()
             .ok_or_else(|| MLSError::Cryptography("getConversationState is missing accountDeletions".into()))?;
+        // Each listed deletion applies only under its deleting device's signature, verified
+        // through the deletion's key proof when this device holds no leaf of it.
         for entry in deletions {
-            if let Some((did, seq)) = self.verify_account_deleted_entry(conversation_id, &sequencer, entry)? {
-                self.apply_verified_account_deletion(conversation_id, &did, seq)?;
-            }
+            let decision = self.authorize_account_deletion(conversation_id, &sequencer, entry)?;
+            self.apply_account_deletion_decision(conversation_id, entry, &decision)?;
         }
         Ok(())
     }
@@ -2152,10 +2162,15 @@ impl CatbirdMlsClient {
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
                 let local = tx.get_message(message_id)?;
-                let gap_key = super::chat_wire::undecryptable_evidence_key(conversation_id, message_id);
-                let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
+                // An undecryptable or unavailable placeholder yields to a verified copy.
+                let mut gap_key = None;
+                for key in [super::chat_wire::undecryptable_evidence_key(conversation_id, message_id),
+                    super::chat_wire::unavailable_message_key(conversation_id, message_id)] {
+                    if gap_key.is_none() && tx.get_labyrinth_state(&key)?.is_some() { gap_key = Some(key); }
+                }
+                let gap = local.is_some() && gap_key.is_some();
                 match select_restore_copy(group, local.as_ref(), gap) {
-                    Some(copy) => chosen.push((copy, local.is_none() || gap, gap.then_some(gap_key))),
+                    Some(copy) => chosen.push((copy, local.is_none() || gap, if gap { gap_key } else { None })),
                     None => skipped += 1,
                 }
             }

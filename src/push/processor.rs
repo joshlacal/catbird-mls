@@ -491,6 +491,30 @@ fn verify_push_application_receipt(
     })
 }
 
+/// The `sendCounter` of an application entry's signed request, when the request verifies under
+/// the sender's MLS leaf key and names exactly this sender device, generation and epoch.
+fn verified_push_send_counter(
+    entry: &FetchedPushEntry,
+    leaf_key: &[u8],
+    sender_did: &str,
+    sender_device_id: &str,
+    generation: i64,
+    epoch: i64,
+) -> Option<u64> {
+    let signed: Value = serde_json::from_slice(entry.signed_request.as_deref()?).ok()?;
+    let body = chat_wire::verify_signed_mutation_body(
+        &signed,
+        SignedMutationKind::ApplicationSend,
+        leaf_key,
+    )
+    .ok()?;
+    let binds = body["actorDid"].as_str() == Some(sender_did)
+        && body["actorDeviceId"].as_str() == Some(sender_device_id)
+        && body["prior"]["generation"].as_i64() == Some(generation)
+        && body["prior"]["epoch"].as_i64() == Some(epoch);
+    binds.then(|| body["sendCounter"].as_u64()).flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_push_commit_control<P: OpenMlsProvider>(
     tx: &SqlTx<'_>,
@@ -1408,6 +1432,17 @@ pub fn process_push_notification_with_hooks(
                         now_ms,
                     )?;
                 }
+                if !removed_self {
+                    crate::client::send_counter::advance_send_counter_epoch_chain(
+                        tx,
+                        &wake.conversation_id,
+                        current_convo.generation,
+                        current_convo.epoch,
+                        staged_epoch as i64,
+                        &crate::client::send_counter::group_leaf_devices(&group),
+                        now_ms,
+                    )?;
+                }
                 current_convo.epoch = staged_epoch as i64;
                 current_convo.last_seq = current_convo.last_seq.max(entry.seq);
                 if verified.actor_is_own {
@@ -1587,6 +1622,39 @@ pub fn process_push_notification_with_hooks(
                     {
                         return Err(foreground_sync_required());
                     }
+                    // Count this entry for its sender device in the transaction that applies
+                    // it, so foreground completion does not count it again.
+                    let own_device = preflight.owner_did.as_deref()
+                        == Some(verified_sender_did.as_str())
+                        && preflight.own_device_id.as_deref() == Some(verified_device_id.as_str());
+                    let recorded_send_counter = if own_device {
+                        None
+                    } else {
+                        let counter = verified_push_send_counter(
+                            &entry,
+                            sender_member.signature_key.as_slice(),
+                            &verified_sender_did,
+                            &verified_device_id,
+                            current_convo.generation,
+                            msg_epoch,
+                        );
+                        if crate::client::send_counter::record_peer_send_counter(
+                            tx,
+                            &wake.conversation_id,
+                            current_convo.generation,
+                            msg_epoch,
+                            &verified_sender_did,
+                            &verified_device_id,
+                            counter,
+                            entry.seq,
+                            now_ms,
+                        )
+                        .is_err()
+                        {
+                            return Err(foreground_sync_required());
+                        }
+                        Some(counter.map_or_else(|| json!("unknown"), |counter| json!(counter)))
+                    };
                     // The full archive payload with the authenticated receive-time roster; the
                     // app enqueues it once the entry's I13 receipt verifies.
                     let evidence = crate::client::QueuedLabyrinthArchivePayload {
@@ -1625,6 +1693,10 @@ pub fn process_push_notification_with_hooks(
                         ),
                         created_at_ms: now_ms,
                     };
+                    let mut evidence = serde_json::to_value(&evidence)?;
+                    if let Some(recorded) = recorded_send_counter {
+                        evidence[chat_wire::NSE_SEND_COUNTER_RECORDED] = recorded;
+                    }
                     tx.put_labyrinth_state(
                         &format!("native.message:{}:{message_id}", wake.conversation_id),
                         &serde_json::to_vec(&evidence)?, now_ms,

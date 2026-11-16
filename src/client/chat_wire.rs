@@ -94,25 +94,28 @@ pub fn peer_send_counter_key(
     )
 }
 
-/// Require a verified peer sender's counter to increase once initialized.
+/// Field of retained `native.message` evidence present once the notification extension
+/// recorded the entry for its sender's counter continuity: the verified `sendCounter`, or
+/// `"unknown"` when the extension could not learn it. Foreground completion never counts such an
+/// entry a second time.
+pub const NSE_SEND_COUNTER_RECORDED: &str = "send_counter_recorded";
+
+/// Refuse only a counter outside the lexicon's positive safe-integer range. A duplicate,
+/// rewind or jump is accepted for delivery and recorded as evidence by
+/// [`crate::client::send_counter`].
 pub fn verify_next_peer_send_counter(last: Option<&str>, next: u64) -> Result<(), MLSError> {
-    if next > 9_007_199_254_740_991 {
-        return Err(MLSError::Cryptography(
-            "peer sendCounter exceeds the canonical safe-integer range".into(),
-        ));
-    }
-    let Some(last) = last else {
-        return Ok(());
-    };
-    let last = last
-        .parse::<u64>()
-        .map_err(|_| MLSError::Internal(format!("corrupt peer send counter {last:?}")))?;
-    if next <= last {
-        return Err(MLSError::Cryptography(format!(
-            "non-increasing peer sendCounter: last {last}, received {next}"
-        )));
-    }
-    Ok(())
+    let prior = last
+        .map(|last| {
+            last.parse::<u64>()
+                .map_err(|_| MLSError::Internal(format!("corrupt peer send counter {last:?}")))
+        })
+        .transpose()?
+        .map(|last| crate::client::send_counter::PeerCounterPrior {
+            last,
+            skipped: 0,
+            same_epoch: true,
+        });
+    crate::client::send_counter::classify_peer_send_counter(prior, next).map(|_| ())
 }
 
 /// Durable fork evidence for a conversation whose peer signed a different current-epoch prior.
@@ -207,6 +210,59 @@ pub struct UndecryptableEntryEvidence {
     pub send_counter: Option<u64>,
     pub reason: String,
     pub recorded_at_ms: i64,
+}
+
+/// System notice of a sequenced message whose payload was pruned before this device held it.
+pub const UNAVAILABLE_MESSAGE_NOTICE: &str = "message.unavailable";
+/// [`UnavailableEntryEvidence::reason`] of a `payloadPruned` entry.
+pub const PAYLOAD_PRUNED_REASON: &str = "payload-pruned";
+
+/// `labyrinth_state` key of the evidence kept for a sequenced message whose payload was pruned
+/// before this device received it.
+pub fn unavailable_message_key(cid: &str, message_id: &str) -> String {
+    format!("native.unavailable:{cid}:{message_id}")
+}
+
+/// Durable evidence of a sequenced application entry this device never received: the verified
+/// sequencer receipt exactly as served, and who sent it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnavailableEntryEvidence {
+    pub version: u32,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub entry_id: String,
+    pub seq: i64,
+    pub generation: i64,
+    pub epoch: i64,
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub reason: String,
+    pub receipt: Value,
+    pub recorded_at_ms: i64,
+}
+
+impl UnavailableEntryEvidence {
+    /// The timeline row marking the entry: a neutral system notice at its seq.
+    pub fn placeholder_row(
+        &self,
+        group_id: &[u8],
+        is_own: bool,
+    ) -> Result<crate::storage::MessageRow, MLSError> {
+        Ok(crate::storage::MessageRow {
+            message_id: self.message_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            group_id: group_id.to_vec(),
+            epoch: self.epoch,
+            seq: self.seq,
+            sender_did: self.sender_did.clone(),
+            sender_device_id: self.sender_device_id.clone(),
+            plaintext_json: serde_json::to_string(
+                &crate::orchestrator::MLSMessagePayload::system(UNAVAILABLE_MESSAGE_NOTICE),
+            )?,
+            created_at_ms: self.recorded_at_ms,
+            is_own,
+        })
+    }
 }
 
 impl UndecryptableEntryEvidence {
@@ -1369,7 +1425,10 @@ fn append_account_deletion_text(bytes: &mut Vec<u8>, text: &str) -> Option<()> {
 }
 
 /// Server transcript: v2 domain, key ID, then the complete v1 deletion record transcript.
-fn account_deletion_authority_signing_bytes(key_id: &str, fields: &[&str]) -> Option<Vec<u8>> {
+pub(crate) fn account_deletion_authority_signing_bytes(
+    key_id: &str,
+    fields: &[&str],
+) -> Option<Vec<u8>> {
     let fields_len = fields.iter().try_fold(0usize, |len, field| {
         len.checked_add(4)?.checked_add(field.len())
     })?;
@@ -1408,7 +1467,8 @@ fn account_deletion_signature_valid(
         })
 }
 
-/// `labyrinth_state` key: `cid` sequenced `did`'s account deletion; the value is its seq.
+/// `labyrinth_state` key: `cid` sequenced `did`'s account deletion. The value is the applied
+/// deletion (`AppliedAccountDeletion` JSON), or its seq alone for a marker written earlier.
 pub fn account_deletion_key(cid: &str, did: &str) -> String {
     format!("native.account_deleted:{cid}:{did}")
 }
@@ -3847,9 +3907,9 @@ mod tests {
     }
 
     #[test]
-    fn peer_send_counter_boundaries_reject_replay_rollback_corruption_and_safe_int_overflow() {
+    fn peer_send_counter_boundaries_record_replay_and_rollback_but_reject_invalid_inputs() {
         const MAX_SAFE: u64 = 9_007_199_254_740_991;
-        verify_next_peer_send_counter(None, 0).unwrap();
+        assert!(verify_next_peer_send_counter(None, 0).is_err());
         verify_next_peer_send_counter(None, 1).unwrap();
         verify_next_peer_send_counter(None, MAX_SAFE).unwrap();
         assert!(matches!(
@@ -3858,15 +3918,26 @@ mod tests {
         ));
 
         verify_next_peer_send_counter(Some("5"), 6).unwrap();
+        // A skipped counter is not refused here; the strict comparison records it as a gap.
         verify_next_peer_send_counter(Some("5"), MAX_SAFE).unwrap();
-        assert!(matches!(
-            verify_next_peer_send_counter(Some("5"), 5),
-            Err(MLSError::Cryptography(_))
-        ));
-        assert!(matches!(
-            verify_next_peer_send_counter(Some("5"), 4),
-            Err(MLSError::Cryptography(_))
-        ));
+        let strict = crate::client::send_counter::classify_peer_send_counter(
+            Some(crate::client::send_counter::PeerCounterPrior {
+                last: 5,
+                skipped: 0,
+                same_epoch: true,
+            }),
+            MAX_SAFE,
+        )
+        .unwrap();
+        assert_eq!(
+            strict,
+            crate::client::send_counter::PeerCounterVerdict::Gap {
+                expected: 6,
+                received: MAX_SAFE
+            }
+        );
+        verify_next_peer_send_counter(Some("5"), 5).unwrap();
+        verify_next_peer_send_counter(Some("5"), 4).unwrap();
         assert!(matches!(
             verify_next_peer_send_counter(Some("5"), MAX_SAFE + 1),
             Err(MLSError::Cryptography(_))
