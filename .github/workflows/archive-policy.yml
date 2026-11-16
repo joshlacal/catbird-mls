@@ -1,0 +1,16 @@
+name: Archive policy guard
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  direct-enqueue-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - run: bash scripts/check_archive_policy_enqueues.sh

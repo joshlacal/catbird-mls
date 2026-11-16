@@ -860,6 +860,7 @@ fn fetch_required_defers_peer_commits_and_their_tail_to_foreground_sync() {
                 description: "Updated across 2 epochs".to_string(),
                 avatar_blob_locator: None,
                 avatar_content_type: None,
+                extra: Default::default(),
                 space_avatar: None,
             };
             let meta_ct = encrypt_metadata_snapshot_with_nonce(

@@ -2802,6 +2802,7 @@ impl MLSContext {
                         description: config.group_description.clone().unwrap_or_default(),
                         avatar_blob_locator: None,
                         avatar_content_type: None,
+                        extra: Default::default(),
                         space_avatar: None,
                     };
                     let metadata_version: u64 = 1;
@@ -3383,6 +3384,12 @@ impl MLSContext {
         self.with_group(&gid, |group, provider, signer| {
             // 1. Compute next metadata version + fresh blob locator.
             let current_ref = metadata::current_metadata_reference(group);
+            if current_ref.is_some() {
+                return Err(MLSError::InvalidState(
+                    "FullMetadataSnapshotRequired: legacy metadata update only accepts display fields"
+                        .into(),
+                ));
+            }
             let had_metadata = current_ref.is_some();
             let next_version = metadata::next_metadata_version(
                 current_ref.as_ref(),
@@ -3438,6 +3445,7 @@ impl MLSContext {
                 description: description.unwrap_or_default(),
                 avatar_blob_locator,
                 avatar_content_type,
+                extra: Default::default(),
                 space_avatar: None,
             };
             let ciphertext = metadata::encrypt_metadata_blob(

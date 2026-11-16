@@ -615,6 +615,7 @@ async fn stale_bootstrap_completion_cannot_mask_newer_reset_generation() {
         description: String::new(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        extra: Default::default(),
         space_avatar: None,
     };
     assert_eq!(

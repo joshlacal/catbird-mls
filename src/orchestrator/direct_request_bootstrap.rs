@@ -853,6 +853,7 @@ pub fn decode_request_metadata(
         description: signed.content.description.unwrap_or_default(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        extra: Default::default(),
         space_avatar: None,
     })
 }

@@ -146,6 +146,7 @@ async fn setup_with_inventory_padding(padding: usize) -> (TestWorld, String, Vec
         description: "Keep this title encrypted".into(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        extra: Default::default(),
         space_avatar: None,
     };
     let key: [u8; 32] = alice

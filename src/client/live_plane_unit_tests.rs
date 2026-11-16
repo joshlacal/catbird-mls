@@ -1053,6 +1053,7 @@ fn live_plane_c33_retry_and_publication_outcome_binding_boundaries() {
                             description: String::new(),
                             avatar_blob_locator: None,
                             avatar_content_type: None,
+                            extra: Default::default(),
                             space_avatar: None,
                         },
                     },

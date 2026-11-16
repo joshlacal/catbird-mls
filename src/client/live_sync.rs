@@ -480,9 +480,17 @@ impl CatbirdMlsClient {
                     MlsGroup::load(provider.storage(), &GroupId::from_slice(&successor_group))
                         .map_err(|e| MLSError::Internal(format!("load successor group: {e:?}")))?
                         .ok_or_else(|| MLSError::group_not_found(cid))?;
-                if let Some((epoch, version, meta)) =
+                if let Some((epoch, version, mut meta)) =
                     chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snapshot)
                 {
+                    super::archive_policy::accept_snapshot(
+                        tx,
+                        cid,
+                        cursor.unwrap_or(0),
+                        &mut meta,
+                        false,
+                        now_ms,
+                    )?;
                     let row =
                         chat_wire::group_metadata_row_from_v1(cid, version, epoch, &meta, now_ms)?;
                     convo.title = row.title.clone();
@@ -930,12 +938,15 @@ impl CatbirdMlsClient {
                 evidence["seq"] = json!(entry_seq);
             }
             tx.put_labyrinth_state(&state_key, &serde_json::to_vec(&evidence)?, now_ms)?;
-            if completes && message.sender_did != self.normalized_did {
+            if completes {
                 let archive: QueuedLabyrinthArchivePayload = serde_json::from_value(evidence)
                     .map_err(|e| {
                         MLSError::Cryptography(format!("retained archive payload: {e}"))
                     })?;
-                super::live_plane::enqueue_labyrinth_archive(tx, &archive)?;
+                super::archive_policy::observe_frame(tx, &archive)?;
+                if message.sender_did != self.normalized_did {
+                    super::live_plane::enqueue_labyrinth_archive(tx, &archive)?;
+                }
             }
             tx.delete_pending_op(NATIVE_ARCHIVE_RECEIPT_OP, message_id)?;
             tx.conn()
@@ -2614,9 +2625,12 @@ impl CatbirdMlsClient {
 
             let mut decrypted_title: Option<String> = None;
             if let Some(snap) = meta_snap_opt {
-                if let Some((m_epoch, m_ver, meta)) =
+                if let Some((m_epoch, m_ver, mut meta)) =
                     chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snap)
                 {
+                    super::archive_policy::accept_snapshot(
+                        tx, cid, entry_seq, &mut meta, false, now_ms,
+                    )?;
                     let meta_row =
                         chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, now_ms)?;
                     decrypted_title = meta_row.title.clone();
@@ -3984,11 +3998,14 @@ impl CatbirdMlsClient {
                             MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
                                 .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
                         {
-                            if let Some((m_epoch, m_ver, meta)) =
+                            if let Some((m_epoch, m_ver, mut meta)) =
                                 chat_wire::try_decrypt_group_metadata_snapshot(
                                     &mut group, &provider, snap,
                                 )
                             {
+                                super::archive_policy::accept_snapshot(
+                                    tx, cid, entry_seq, &mut meta, true, now_ms,
+                                )?;
                                 let meta_row = chat_wire::group_metadata_row_from_v1(
                                     cid, m_ver, m_epoch, &meta, now_ms,
                                 )?;
@@ -4615,11 +4632,14 @@ impl CatbirdMlsClient {
                             merged = true;
                         }
                         if let Some(snap) = snap_opt {
-                            if let Some((m_epoch, m_ver, meta)) =
+                            if let Some((m_epoch, m_ver, mut meta)) =
                                 chat_wire::try_decrypt_group_metadata_snapshot(
                                     &mut group, &provider, snap,
                                 )
                             {
+                                super::archive_policy::accept_snapshot(
+                                    tx, cid, entry_seq, &mut meta, false, now_ms,
+                                )?;
                                 let meta_row = chat_wire::group_metadata_row_from_v1(
                                     cid, m_ver, m_epoch, &meta, now_ms,
                                 )?;
@@ -5277,6 +5297,7 @@ impl CatbirdMlsClient {
                         &serde_json::to_vec(&archive)?,
                         now_ms,
                     )?;
+                    super::archive_policy::observe_frame(tx, &archive)?;
                     tx.put_labyrinth_state(
                         &format!("push.verified_receipt:{cid}:{msg_id}"),
                         b"1",

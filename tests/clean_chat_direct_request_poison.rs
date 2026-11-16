@@ -182,6 +182,7 @@ async fn proof(world: &TestWorld) -> Proof {
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            extra: Default::default(),
             space_avatar: None,
         },
     };

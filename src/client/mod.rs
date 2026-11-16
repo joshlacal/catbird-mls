@@ -4,6 +4,8 @@
 //! Tauri desktop (`catmos`), CLI (`catmos-cli`), `BIRDaemon`, and (via shared DTOs +
 //! `WasmMlsClient`) browser WASM (`catbird-mls-web`).
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod archive_policy;
 pub mod chat_wire;
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1199,6 +1201,14 @@ pub(crate) mod native_client {
             self.db.read_tx(|tx| tx.get_group_metadata(conversation_id))
         }
 
+        /// Effective policy after sequenced controls and any stricter authenticated frame.
+        /// The cached metadata JSON remains the exact decrypted snapshot, so callers should use
+        /// this accessor for a toggle's state rather than reading `metadata_json` directly.
+        pub fn history_backup_enabled(&self, conversation_id: &str) -> Result<bool, MLSError> {
+            self.db
+                .read_tx(|tx| super::archive_policy::current_enabled(tx, conversation_id))
+        }
+
         // ---------------------------------------------------------------------
         // Group, Message, Metadata (`1A`), and Request Mutations
         // ---------------------------------------------------------------------
@@ -1310,6 +1320,7 @@ pub(crate) mod native_client {
                         description: description.clone().unwrap_or_default(),
                         avatar_blob_locator: None,
                         avatar_content_type: None,
+                        extra: Default::default(),
                         space_avatar: None,
                     };
                     let meta_key = derive_metadata_key_from_group(
@@ -1385,6 +1396,33 @@ pub(crate) mod native_client {
             self.send_message_live(conversation_id, message_id, text)
         }
 
+        /// Publish an MLS-authenticated, sequenced policy change visible to every member.
+        /// The control frame itself opts out of history backup; any active group member may
+        /// tighten the setting, and re-enabling is a separate signed action.
+        pub fn set_history_backup_enabled(
+            &self,
+            conversation_id: &str,
+            enabled: bool,
+        ) -> Result<MessageRow, MLSError> {
+            let frame = serde_json::json!({
+                "version": 1,
+                "messageType": "system",
+                "text": if enabled {
+                    "History backup turned on"
+                } else {
+                    "History backup turned off"
+                },
+                "historyBackupChange": enabled,
+                "backupPolicy": 1,
+                "noBackup": true,
+            });
+            self.send_message(
+                conversation_id,
+                &self.hooks.uuid_v4().to_string(),
+                &frame.to_string(),
+            )
+        }
+
         /// Test-harness send: a local MLS message and a receiptless queue row that only
         /// `offline_flush_labyrinth_queue` can archive.
         #[cfg(any(test, feature = "test-utils", feature = "sim"))]
@@ -1396,6 +1434,9 @@ pub(crate) mod native_client {
         ) -> Result<MessageRow, MLSError> {
             let (display_json, frame_json) =
                 super::live_plane::canonical_labyrinth_frame_for_text(text);
+            let frame_json = self.db.read_tx(|tx| {
+                super::archive_policy::stamp_outgoing(tx, conversation_id, &frame_json)
+            })?;
             let frame_nonce = self.hooks.random_array::<32>();
             let now_ms = self.hooks.now_ms();
             let (inner_plaintext, aad_bytes) =
@@ -1498,18 +1539,7 @@ pub(crate) mod native_client {
                     original_sender_attestation_json: None,
                     created_at_ms: now_ms,
                 };
-                let queued_bytes = serde_json::to_vec(&queued_payload).map_err(|e| {
-                    MLSError::Internal(format!("serialize QueuedLabyrinthArchivePayload: {e}"))
-                })?;
-
-                tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                    item_id: message_id.to_string(),
-                    conversation_id: conversation_id.to_string(),
-                    group_id_hex,
-                    seq: next_seq,
-                    payload_bytes: queued_bytes,
-                    created_at_ms: now_ms,
-                })?;
+                super::archive_policy::enqueue(tx, &queued_payload)?;
 
                 Ok(row)
             })?;

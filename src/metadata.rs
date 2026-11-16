@@ -76,6 +76,31 @@ pub struct GroupMetadataV1 {
     /// `1A` encrypted avatar blob pointer in `setter_did`'s conversation Space repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_avatar: Option<crate::groups::metadata_v1::SpaceAvatarPointer>,
+    /// Every field this build does not know, kept so a rebuild of the snapshot (re-title,
+    /// add/remove, leaf recovery, reset, re-encryption for a new epoch) carries it unchanged.
+    /// `disappearingTtlSecs` and `retentionDays` are reserved names: kept, never interpreted.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Reserved group-setting names this build preserves in [`GroupMetadataV1::extra`] and never
+/// interprets.
+pub const RESERVED_GROUP_SETTING_NAMES: [&str; 2] = ["disappearingTtlSecs", "retentionDays"];
+
+impl GroupMetadataV1 {
+    /// A version-1 snapshot with only a title and description set.
+    pub fn new(title: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            version: 1,
+            title: title.into(),
+            description: description.into(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+            space_avatar: None,
+            extra: Default::default(),
+            extra: serde_json::Map::new(),
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -482,6 +507,7 @@ mod tests {
             avatar_blob_locator: Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string()),
             avatar_content_type: Some("image/jpeg".to_string()),
             space_avatar: None,
+            extra: Default::default(),
         }
     }
 

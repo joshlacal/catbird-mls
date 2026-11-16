@@ -50,6 +50,14 @@ use crate::orchestrator::types::{MLSMessagePayload, Message};
 #[cfg(feature = "legacy-orchestrator")]
 use crate::orchestrator::MLSOrchestrator;
 
+#[cfg(feature = "legacy-orchestrator")]
+fn frame_allows_history_backup(frame: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(frame)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|value| value.get("noBackup").is_none_or(|flag| flag == false))
+}
+
 /// Active MLS member DIDs from `getConversationState` (`[CB-16]`).
 pub(crate) fn roster_members(conversation_state: &Value) -> labyrinth::Result<Vec<String>> {
     let participants = conversation_state["state"]["participants"]
@@ -705,6 +713,9 @@ where
                     "labyrinth: local OpenMLS roster snapshot is empty".into(),
                 ));
             }
+            if !frame_allows_history_backup(frame) {
+                return Ok(());
+            }
             let row =
                 PendingArchive::new(&deps.did, conversation_id, message_id, timestamp_ms, frame)
                     .with_mls_snapshot(group_id_hex, mls_epoch, expected_member_dids);
@@ -798,6 +809,9 @@ where
                 } else {
                     continue;
                 };
+                if !frame_allows_history_backup(&frame) {
+                    continue;
+                }
                 let ts_ms = u64::try_from(msg.timestamp.timestamp_millis().max(0)).unwrap_or(0);
                 candidates
                     .entry(msg.id.clone())
@@ -819,6 +833,9 @@ where
                 continue;
             }
             if let Ok(frame) = row.frame_bytes() {
+                if !frame_allows_history_backup(&frame) {
+                    continue;
+                }
                 queued_ids.push(row.message_id.clone());
                 candidates.entry(row.message_id).or_insert((
                     row.timestamp_ms,

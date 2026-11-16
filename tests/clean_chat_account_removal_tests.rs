@@ -128,6 +128,7 @@ async fn setup() -> (TestWorld, String, Vec<u8>, Value) {
         description: "Keep this title encrypted".into(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        extra: Default::default(),
         space_avatar: None,
     };
     let key: [u8; 32] = alice

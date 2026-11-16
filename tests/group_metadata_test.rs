@@ -131,6 +131,59 @@ fn update_group_metadata_encrypted_returns_artifacts() {
     );
 }
 
+#[test]
+fn display_only_engine_rewrites_refuse_an_existing_full_snapshot() {
+    let (alice, _adir) = make_context();
+    let (bob, _bdir) = make_context();
+    let (carol, _cdir) = make_context();
+    let created = alice.create_group(b"did:plc:alice".to_vec(), None).unwrap();
+    let group_id = created.group_id;
+    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
+    alice
+        .add_members_with_metadata(
+            group_id.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bob_kp.key_package_data,
+            }],
+            Some("Full snapshot".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    alice.merge_pending_commit(group_id.clone()).unwrap();
+
+    let rewrite = alice.update_group_metadata_encrypted(
+        group_id.clone(),
+        Some("Dropped unknown settings".into()),
+        None,
+        None,
+        None,
+    );
+    assert!(rewrite
+        .err()
+        .expect("rewrite must fail")
+        .to_string()
+        .contains("FullMetadataSnapshotRequired"));
+
+    let carol_kp = carol.create_key_package(b"did:plc:carol".to_vec()).unwrap();
+    let reseal = alice.add_members_with_metadata(
+        group_id,
+        vec![catbird_mls::KeyPackageData {
+            data: carol_kp.key_package_data,
+        }],
+        Some("Full snapshot".into()),
+        None,
+        None,
+        None,
+    );
+    assert!(reseal
+        .err()
+        .expect("reseal must fail")
+        .to_string()
+        .contains("FullMetadataSnapshotRequired"));
+}
+
 /// Regression for Android H4 epoch drift: `commit_pending_proposals` must not
 /// build a commit when the proposal store is empty. Previously it unconditionally
 /// created an empty (or metadata-only) commit every sync tick, advancing the

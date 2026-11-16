@@ -607,6 +607,38 @@ mod tests {
         assert!(try_open_as(&body, "not-a-uri", OWNER, &owner, &members[0]).is_err());
     }
 
+    /// The owner check reads the Space authority through the shared strict Space URI parser:
+    /// the hedged spelling names the same authority, and a URI that is not a Space URI names
+    /// none.
+    ///
+    /// Fail-before: a hand-split `at://` prefix refused the hedged spelling and accepted any
+    /// `at://<did>/...` string.
+    #[test]
+    fn space_authority_comes_from_the_shared_space_uri_parser() {
+        for space in [
+            "at://did:plc:owner/space/blue.catbird.circle.encrypted/3kcircle",
+            "at:space/did:plc:owner/blue.catbird.circle.encrypted/3kcircle",
+        ] {
+            assert_eq!(
+                require_owner_is_space_authority(space, OWNER),
+                Ok(()),
+                "{space}"
+            );
+        }
+        for malformed in [
+            "at://did:plc:owner",
+            "at://did:plc:owner/space/blue.catbird.circle.encrypted",
+            "at://did:plc:owner/space/blue.catbird.circle.encrypted/3kcircle?x=1",
+            "at://did:plc:owner/notspace/blue.catbird.circle.encrypted/3kcircle",
+            "at://did:plc:owner/space/not an nsid/3kcircle",
+        ] {
+            assert!(
+                require_owner_is_space_authority(malformed, OWNER).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
     #[test]
     fn open_refuses_wrong_space_aad() {
         let (_, body, owner, members) = wrap_four();
