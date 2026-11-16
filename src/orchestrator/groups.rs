@@ -684,6 +684,7 @@ mod tests {
             description: "".to_string(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            extra: Default::default(),
             space_avatar: None,
         };
         let nonce = [1u8; 12];
@@ -816,6 +817,7 @@ mod tests {
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            extra: Default::default(),
             space_avatar: None,
         };
         let nonce = [1u8; 12];
@@ -3834,6 +3836,7 @@ where
             description: _description.unwrap_or("").to_string(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            extra: Default::default(),
             space_avatar: None,
         };
         let mut nonce = [0u8; 12];
@@ -6597,14 +6600,16 @@ where
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
 
-        let payload = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: title.unwrap_or_default().to_string(),
-            description: description.unwrap_or_default().to_string(),
-            avatar_blob_locator: avatar_blob_locator.map(|s| s.to_string()),
-            avatar_content_type: avatar_content_type.map(|s| s.to_string()),
-            space_avatar: None,
-        };
+        // A metadata rewrite may only start from the authenticated full snapshot. Rebuilding
+        // from the display columns would erase settings this client does not understand.
+        let mut payload = self
+            .decrypt_current_metadata_snapshot(conversation_id, &group_id_bytes)
+            .await?
+            .metadata;
+        payload.title = title.unwrap_or_default().to_string();
+        payload.description = description.unwrap_or_default().to_string();
+        payload.avatar_blob_locator = avatar_blob_locator.map(|s| s.to_string());
+        payload.avatar_content_type = avatar_content_type.map(|s| s.to_string());
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];

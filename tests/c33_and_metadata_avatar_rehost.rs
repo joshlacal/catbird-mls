@@ -211,6 +211,7 @@ async fn metadata_1a_space_avatar_rehost_on_setter_leave_and_d3_admin_only_remov
         description: "100% PQ + Spaces".into(),
         avatar_blob_locator: None,
         avatar_content_type: Some("image/webp".into()),
+        extra: Default::default(),
         space_avatar: Some(SpaceAvatarPointer {
             setter_did: "did:plc:admina000000000000000000".into(),
             space_blob_cid: "bafkreiavatarfromadmina".into(),

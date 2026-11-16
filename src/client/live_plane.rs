@@ -51,8 +51,8 @@ use crate::push::{AuthorizedPeerDeviceKey, NSE_DEFERRED_CONTROL_OP};
 const ORDINARY_KP_LIFETIME_SECS: u64 = 29 * 86_400;
 use crate::storage::driver_native::map_rusqlite_err;
 use crate::storage::{
-    ConversationRow, GroupMetadataRow, KvWriteBatch, KvWriteOverlay, LabyrinthQueueRow, MessageRow,
-    OpenMlsKvStorage, RequestRow, RusqliteKvBackend,
+    ConversationRow, GroupMetadataRow, KvWriteBatch, KvWriteOverlay, MessageRow, OpenMlsKvStorage,
+    RequestRow, RusqliteKvBackend,
 };
 
 use super::native_client::CatbirdMlsClient;
@@ -393,15 +393,7 @@ pub(super) fn enqueue_labyrinth_archive(
     tx: &crate::storage::SqlTx<'_>,
     payload: &QueuedLabyrinthArchivePayload,
 ) -> Result<(), MLSError> {
-    tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-        item_id: payload.message_id.clone(),
-        conversation_id: payload.conversation_id.clone(),
-        group_id_hex: payload.group_id_hex.clone(),
-        seq: payload.seq,
-        payload_bytes: serde_json::to_vec(payload)
-            .map_err(|e| MLSError::Internal(format!("serialize queue payload: {e}")))?,
-        created_at_ms: payload.created_at_ms,
-    })
+    super::archive_policy::enqueue(tx, payload).map(drop)
 }
 
 pub(super) fn canonical_labyrinth_frame_for_text(input: &str) -> (String, String) {
@@ -2421,6 +2413,7 @@ impl CatbirdMlsClient {
                             description: String::new(),
                             avatar_blob_locator: None,
                             avatar_content_type: None,
+                            extra: Default::default(),
                             space_avatar: None,
                         },
                     },
@@ -3732,6 +3725,7 @@ impl CatbirdMlsClient {
                     description: description_str.clone(),
                     avatar_blob_locator: None,
                     avatar_content_type: None,
+                    extra: Default::default(),
                     space_avatar: None,
                 };
                 tx.upsert_group_metadata(&chat_wire::group_metadata_row_from_v1(
@@ -4657,10 +4651,6 @@ impl CatbirdMlsClient {
         frame_json: &str,
     ) -> Result<(SignatureKeyPair, i64, PendingApplicationSend, bool), MLSError> {
         let frame_nonce = self.hooks.random_array::<32>();
-        let archive_commitment = labyrinth_protocol::receipt::compute_archive_commitment(
-            &frame_nonce,
-            frame_json.as_bytes(),
-        );
         let now_ms = self.hooks.now_ms();
 
         let canonical_convo_id = convo_uuid.hyphenated().to_string();
@@ -4721,6 +4711,13 @@ impl CatbirdMlsClient {
             let counter_key = chat_wire::send_counter_key(&canonical_convo_id);
             let send_counter =
                 chat_wire::next_send_counter(tx.get_account_meta(&counter_key)?.as_deref())?;
+
+            let frame_json =
+                super::archive_policy::stamp_outgoing(tx, &canonical_convo_id, frame_json)?;
+            let archive_commitment = labyrinth_protocol::receipt::compute_archive_commitment(
+                &frame_nonce,
+                frame_json.as_bytes(),
+            );
 
             let attestation_transcript =
                 labyrinth_protocol::transcripts::original_sender_archive_transcript(
@@ -4852,7 +4849,7 @@ impl CatbirdMlsClient {
                     sequencer_did: convo.sequencer_did,
                     space_uri: convo.space_uri,
                     plaintext_json: display_json.to_owned(),
-                    labyrinth_frame_json: frame_json.to_owned(),
+                    labyrinth_frame_json: frame_json,
                     mls_ciphertext_b64: STANDARD.encode(&ciphertext.0),
                     frame_nonce_b64: Some(STANDARD.encode(frame_nonce)),
                     sequencer_receipt_json: None,
@@ -4974,6 +4971,7 @@ impl CatbirdMlsClient {
                 &serde_json::to_vec(&queued)?,
                 self.hooks.now_ms(),
             )?;
+            super::archive_policy::observe_frame(tx, &queued)?;
             tx.put_labyrinth_state(
                 &format!(
                     "push.verified_receipt:{}:{}",
@@ -5769,14 +5767,13 @@ impl CatbirdMlsClient {
                     .to_string();
                 let author_proof = prev_snap.get("authorProof").cloned();
                 let nonce = self.hooks.random_array::<12>();
-                let payload = GroupMetadataV1 {
-                    version: 1,
-                    title: title.to_string(),
-                    description: description.to_string(),
-                    avatar_blob_locator: None,
-                    avatar_content_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-                    space_avatar: space_avatar.clone(),
-                };
+                let payload = Self::rebuilt_group_metadata(
+                    tx,
+                    conversation_id,
+                    title,
+                    description,
+                    space_avatar.clone(),
+                )?;
                 let ct = encrypt_metadata_snapshot_with_nonce(
                     metadata_key,
                     group_id,
@@ -5806,7 +5803,9 @@ impl CatbirdMlsClient {
                 }
             }
         }
-        chat_wire::build_encrypted_metadata_snapshot_json_with_nonce(
+        let payload =
+            Self::rebuilt_group_metadata(tx, conversation_id, title, description, space_avatar)?;
+        chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
             metadata_key,
             group_id,
             convo_uuid,
@@ -5821,11 +5820,36 @@ impl CatbirdMlsClient {
             actor_device_id,
             auth_generation,
             public_key,
-            title,
-            description,
-            space_avatar,
+            &payload,
             self.hooks.random_array::<12>(),
         )
+    }
+
+    /// The conversation's stored metadata with `title`, `description` and the avatar replaced:
+    /// every other field the last applied snapshot carried, known or not, is kept.
+    pub(crate) fn rebuilt_group_metadata(
+        tx: &crate::storage::SqlReadTx<'_>,
+        conversation_id: &str,
+        title: &str,
+        description: &str,
+        space_avatar: Option<SpaceAvatarPointer>,
+    ) -> Result<GroupMetadataV1, MLSError> {
+        let mut meta = tx
+            .get_group_metadata(conversation_id)?
+            .as_ref()
+            .map(chat_wire::group_metadata_v1_from_row)
+            .unwrap_or_else(|| GroupMetadataV1::new("", ""));
+        meta.version = 1;
+        meta.title = title.to_string();
+        meta.description = description.to_string();
+        meta.avatar_blob_locator = None;
+        meta.avatar_content_type = space_avatar.as_ref().and_then(|a| a.mime_type.clone());
+        meta.space_avatar = space_avatar;
+        super::archive_policy::set_metadata_enabled(
+            &mut meta,
+            super::archive_policy::current_enabled(tx, conversation_id)?,
+        );
+        Ok(meta)
     }
 
     pub(crate) fn update_group_metadata_live_or_offline(
@@ -5853,14 +5877,13 @@ impl CatbirdMlsClient {
                     .and_then(chat_wire::space_avatar_from_metadata_row)
             });
 
-            let meta_v1 = GroupMetadataV1 {
-                version: 1,
-                title: title.clone(),
-                description: description.clone(),
-                avatar_blob_locator: None,
-                avatar_content_type: effective_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-                space_avatar: effective_avatar,
-            };
+            let meta_v1 = Self::rebuilt_group_metadata(
+                tx,
+                conversation_id,
+                &title,
+                &description,
+                effective_avatar,
+            )?;
             let serialized = serde_json::to_vec(&meta_v1)
                 .map_err(|e| MLSError::Internal(format!("serialize GroupMetadataV1: {e}")))?;
             validate_metadata_snapshot_size(&serialized)?;
@@ -6342,16 +6365,7 @@ impl CatbirdMlsClient {
             }
             let staged: QueuedLabyrinthArchivePayload = serde_json::from_str(&staged_str)
                 .map_err(|e| MLSError::Internal(format!("parse c33_pending_opening: {e}")))?;
-            let payload_bytes = serde_json::to_vec(&staged)
-                .map_err(|e| MLSError::Internal(format!("serialize c33_pending_opening: {e}")))?;
-            tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
-                item_id: staged.message_id.clone(),
-                conversation_id: conversation_id.to_string(),
-                group_id_hex: staged.group_id_hex.clone(),
-                seq: staged.seq,
-                payload_bytes,
-                created_at_ms: now_ms,
-            })?;
+            super::archive_policy::enqueue(tx, &staged)?;
             tx.put_account_meta(&key, "archived", now_ms)?;
             Ok(true)
         })?;

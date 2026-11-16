@@ -2582,6 +2582,36 @@ pub fn space_avatar_from_metadata_row(
         .and_then(|m| m.space_avatar)
 }
 
+/// The complete stored [`GroupMetadataV1`] of a conversation, every field the decrypted snapshot
+/// carried included. A row whose JSON does not decode falls back to its columns.
+pub fn group_metadata_v1_from_row(row: &crate::storage::GroupMetadataRow) -> GroupMetadataV1 {
+    if let Ok(meta) = serde_json::from_str::<GroupMetadataV1>(&row.metadata_json) {
+        return meta;
+    }
+    let mut meta = GroupMetadataV1::new(
+        row.title.clone().unwrap_or_default(),
+        row.description.clone().unwrap_or_default(),
+    );
+    meta.space_avatar = space_avatar_from_metadata_row(row);
+    meta.avatar_content_type = meta.space_avatar.as_ref().and_then(|a| a.mime_type.clone());
+    if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&row.metadata_json) {
+        for (key, value) in fields {
+            if !matches!(
+                key.as_str(),
+                "version"
+                    | "title"
+                    | "description"
+                    | "avatar_blob_locator"
+                    | "avatar_content_type"
+                    | "space_avatar"
+            ) {
+                meta.extra.insert(key, value);
+            }
+        }
+    }
+    meta
+}
+
 /// Convert a decrypted [`GroupMetadataV1`] into a [`GroupMetadataRow`](crate::storage::GroupMetadataRow),
 /// preserving all `SpaceAvatarPointer` columns (`1A`).
 pub fn group_metadata_row_from_v1(
@@ -2678,21 +2708,57 @@ pub fn build_encrypted_metadata_snapshot_json_with_nonce(
     space_avatar: Option<crate::groups::metadata_v1::SpaceAvatarPointer>,
     nonce: [u8; 12],
 ) -> Result<Value, MLSError> {
-    let payload = GroupMetadataV1 {
-        version: 1,
-        title: title.to_string(),
-        description: description.to_string(),
-        avatar_blob_locator: None,
-        avatar_content_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-        space_avatar,
-    };
+    let mut payload = GroupMetadataV1::new(title, description);
+    payload.avatar_content_type = space_avatar.as_ref().and_then(|a| a.mime_type.clone());
+    payload.space_avatar = space_avatar;
+    build_encrypted_metadata_snapshot_json_for_metadata(
+        metadata_key,
+        group_id,
+        convo_uuid,
+        generation,
+        target_epoch,
+        group_context_hash,
+        confirmation_tag,
+        transition_id,
+        metadata_version,
+        origin_seq,
+        actor_did,
+        actor_device_id,
+        auth_generation,
+        public_key,
+        &payload,
+        nonce,
+    )
+}
+
+/// Build an encrypted `metadataSnapshot` JSON object for a complete [`GroupMetadataV1`]: every
+/// field, including ones this build does not know, is encrypted as given.
+#[allow(clippy::too_many_arguments)]
+pub fn build_encrypted_metadata_snapshot_json_for_metadata(
+    metadata_key: &[u8; 32],
+    group_id: &[u8],
+    convo_uuid: &uuid::Uuid,
+    generation: i64,
+    target_epoch: u64,
+    group_context_hash: &[u8],
+    confirmation_tag: &[u8],
+    transition_id: &str,
+    metadata_version: u64,
+    origin_seq: u64,
+    actor_did: &str,
+    actor_device_id: &str,
+    auth_generation: i64,
+    public_key: &[u8],
+    payload: &GroupMetadataV1,
+    nonce: [u8; 12],
+) -> Result<Value, MLSError> {
     let ciphertext = encrypt_metadata_snapshot_with_nonce(
         metadata_key,
         group_id,
         target_epoch,
         metadata_version,
         &nonce,
-        &payload,
+        payload,
     )?;
     let key_id = derive_key_id(public_key);
     Ok(json!({

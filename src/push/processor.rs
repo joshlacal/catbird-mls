@@ -1629,6 +1629,7 @@ pub fn process_push_notification_with_hooks(
                         &format!("native.message:{}:{message_id}", wake.conversation_id),
                         &serde_json::to_vec(&evidence)?, now_ms,
                     )?;
+                    crate::client::archive_policy::observe_frame_tighten_only(tx, &evidence)?;
                     tx.put_labyrinth_state(
                         &format!("push.verified_receipt:{}:{message_id}", wake.conversation_id),
                         b"1",
@@ -1724,7 +1725,7 @@ pub fn process_push_notification_with_hooks(
                 )
                 .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
 
-                let decrypted_meta = decrypt_metadata_snapshot(
+                let mut decrypted_meta = decrypt_metadata_snapshot(
                     &meta_key,
                     &current_convo.group_id,
                     snapshot.epoch as u64,
@@ -1733,6 +1734,15 @@ pub fn process_push_notification_with_hooks(
                     &snapshot.ciphertext,
                 )
                 .map_err(|e| MLSError::Cryptography(format!("decrypt metadata snapshot: {e}")))?;
+
+                crate::client::archive_policy::accept_snapshot(
+                    tx,
+                    &wake.conversation_id,
+                    wake.entry_seq,
+                    &mut decrypted_meta,
+                    false,
+                    now_ms,
+                )?;
 
                 let meta_json = serde_json::to_string(&decrypted_meta)
                     .map_err(|e| MLSError::Internal(format!("serialize GroupMetadataV1: {e}")))?;

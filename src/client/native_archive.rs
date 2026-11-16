@@ -1584,6 +1584,19 @@ impl CatbirdMlsClient {
                 if tx.get_labyrinth_state(&unsent_message_key(conversation_id, &item.message_id))?.is_some() {
                     continue;
                 }
+                let Some(message) = tx.get_message(&item.message_id)? else {
+                    continue;
+                };
+                if message.conversation_id != conversation_id
+                    || !super::archive_policy::should_archive_frame(
+                        tx,
+                        conversation_id,
+                        message.seq,
+                        &item.labyrinth_frame_json,
+                    )?
+                {
+                    continue;
+                }
                 crate::orchestrator::MLSMessagePayload::decode(item.labyrinth_frame_json.as_bytes())
                     .map_err(|e| MLSError::Cryptography(format!("invalid canonical owner frame: {e}")))?;
                 let bytes = serde_json::to_vec(item).map_err(|e| MLSError::Internal(e.to_string()))?;
@@ -1665,7 +1678,8 @@ impl CatbirdMlsClient {
                         let payloads = self.db.read_tx(|tx| {
                             let mut kept = Vec::with_capacity(payloads.len());
                             for payload in payloads {
-                                if tx.get_labyrinth_state(&unsent_message_key(&cid, &payload.message_id))?.is_none() {
+                                if tx.get_labyrinth_state(&unsent_message_key(&cid, &payload.message_id))?.is_none()
+                                    && super::archive_policy::should_enqueue(tx, &payload)? {
                                     kept.push(payload);
                                 }
                             }
@@ -1754,11 +1768,6 @@ impl CatbirdMlsClient {
             .outbox_flush_lock
             .lock()
             .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
-        if !self.labyrinth_status()?.backup_enabled {
-            return Err(MLSError::InvalidState(
-                "LabyrinthBackupDisabled".to_string(),
-            ));
-        }
         let message = self
             .db
             .read_tx(|tx| tx.get_message(message_id))?
@@ -1769,6 +1778,39 @@ impl CatbirdMlsClient {
         {
             return Err(MLSError::invalid_input(
                 "only the original sender may unsend this message",
+            ));
+        }
+        let local_only = self.db.read_tx(|tx| {
+            let evidence = tx.get_labyrinth_state(&format!(
+                "native.message:{conversation_id}:{message_id}"
+            ))?;
+            let frame = evidence
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<NativeArchiveEvidence>(bytes).ok());
+            match frame {
+                Some(frame) => Ok(!super::archive_policy::should_archive_frame(
+                    tx,
+                    conversation_id,
+                    message.seq,
+                    &frame.labyrinth_frame_json,
+                )?),
+                None => Ok(true),
+            }
+        })?;
+        if local_only {
+            self.db.write_tx(|tx| {
+                tx.dequeue_labyrinth_item(message_id)?;
+                tx.put_labyrinth_state(
+                    &unsent_message_key(conversation_id, message_id),
+                    b"unsent-local",
+                    self.hooks.now_ms(),
+                )
+            })?;
+            return Ok(0);
+        }
+        if !self.labyrinth_status()?.backup_enabled {
+            return Err(MLSError::InvalidState(
+                "LabyrinthBackupDisabled".to_string(),
             ));
         }
         self.pin_native_conversation(conversation_id)?;

@@ -5392,44 +5392,16 @@ where
         &self,
         convo_id: &str,
     ) -> Result<crate::metadata::GroupMetadataV1> {
-        let cached = self
-            .conversations()
-            .lock()
-            .await
-            .get(convo_id)
-            .and_then(|conversation| conversation.metadata.clone());
-        let metadata = match cached {
-            Some(metadata) => Some(metadata),
-            None => {
-                let user_did = self.require_user_did().await?;
-                self.storage()
-                    .get_conversation(&user_did, convo_id)
-                    .await?
-                    .and_then(|conversation| conversation.metadata)
-            }
-        };
-        let (title, description, avatar_blob_locator) = match metadata {
-            Some(metadata) => (
-                metadata.name.unwrap_or_default(),
-                metadata.description.unwrap_or_default(),
-                metadata.avatar_url,
-            ),
-            None => {
-                tracing::warn!(
-                    convo_id,
-                    "no locally cached conversation metadata available; sealing an empty snapshot"
-                );
-                (String::new(), String::new(), None)
-            }
-        };
-        Ok(crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title,
-            description,
-            avatar_blob_locator,
-            avatar_content_type: None,
-            space_avatar: None,
-        })
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id = hex::decode(&resolved.group_id).map_err(|_| {
+            OrchestratorError::InvalidInput("Invalid hex group ID for metadata snapshot".into())
+        })?;
+        // External recovery and reset both re-seal metadata. A display-only cache contains no
+        // unknown settings; if the prior full snapshot cannot be opened, refuse the rewrite.
+        Ok(self
+            .decrypt_current_metadata_snapshot(convo_id, &group_id)
+            .await?
+            .metadata)
     }
 
     async fn submit_external_commit_prepared(

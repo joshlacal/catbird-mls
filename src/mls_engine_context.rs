@@ -1554,6 +1554,14 @@ impl MLSContext {
 
         let (commit_data, welcome_data, metadata_reseal_out, next_confirmation_tag, next_group_context_hash) =
             inner.with_group(&gid, |group, provider, signer| {
+            if metadata_reseal.is_some()
+                && crate::metadata::current_metadata_reference(group).is_some()
+            {
+                return Err(MLSError::InvalidState(
+                    "FullMetadataSnapshotRequired: legacy member-add reseal only accepts display fields"
+                        .into(),
+                ));
+            }
             // Log only structural metadata. Credentials can contain user
             // identifiers and must not be copied into diagnostics.
             crate::debug_log!("[MLS-FFI] Current group member metadata:");
@@ -1823,6 +1831,7 @@ impl MLSContext {
                         description: reseal.description.clone().unwrap_or_default(),
                         avatar_blob_locator: reseal.avatar_blob_locator.clone(),
                         avatar_content_type: reseal.avatar_content_type.clone(),
+                        extra: Default::default(),
                         space_avatar: None,
                     };
                     let ciphertext = crate::metadata::encrypt_metadata_blob(
