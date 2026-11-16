@@ -2075,7 +2075,8 @@ impl CatbirdMlsClient {
     }
 
     /// Hides every copy (sender, witness or owner) attributed to an account whose deletion
-    /// `conversation_id` sequenced. Live sync and restore record each verified `accountDeletedEntry`; no
+    /// was previously applied for `conversation_id`. Live sync and restore quarantine new
+    /// deletions until historical non-revocation is proven; no
     /// server redaction covers the witness and owner copies other members already published. A
     /// copy stays only if its sequencer receipt orders it after the deletion. Returns how many it hid.
     fn hide_deleted_accounts(db: &MlsAccountDb, conversation_id: &str, messages: &mut Vec<labyrinth::client::LoadedMessage>) -> Result<usize, MLSError> {
@@ -2108,29 +2109,52 @@ impl CatbirdMlsClient {
         Ok(before - messages.len())
     }
 
-    /// A fresh device never sees `accountDeletedEntry` in `getEntries`, so restore applies each
-    /// deletion the conversation state lists whose sequencer authority verifies: under the pinned
-    /// sequencer, or without local state the one whose receipts authenticated the restored copies.
+    /// A fresh device never sees `accountDeletedEntry` in `getEntries`, so archive reads verify
+    /// every deletion the conversation state lists under the pinned sequencer, or without local
+    /// state under the sequencer authenticated by restored receipts. Inaccessible state holds
+    /// nonempty history because the local deletion-marker set may be incomplete.
     fn apply_listed_account_deletions(&self, conversation_id: &str, history: &[labyrinth::client::LoadedMessage]) -> Result<(), MLSError> {
+        if history.is_empty() {
+            return Ok(());
+        }
         let pinned = self.db.read_tx(|tx| tx.get_conversation(conversation_id))?.map(|row| row.sequencer_did).filter(|did| !did.is_empty());
         let Some(sequencer) = pinned.or_else(|| history.iter().filter_map(|m| m.archived_receipt.as_ref())
-            .max_by_key(|r| r.signed.payload.seq).map(|r| r.signed.payload.sequencer_did.clone())) else { return Ok(()) };
+            .max_by_key(|r| r.signed.payload.seq).map(|r| r.signed.payload.sequencer_did.clone())) else {
+                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
+            };
         let device = self.canonical_uuid_v4_device_id().ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
         let state = match self.query_signed_chat_ds("blue.catbird.chat.getConversationState",
             &[("actorDeviceId", &device), ("conversationId", conversation_id)], &device, &signer) {
             Ok(state) => state,
-            // This device may not read the state; deletions live sync recorded still apply.
-            Err(MLSError::InvalidState(code)) if matches!(code.as_str(), "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval") => return Ok(()),
+            // A denied or forgotten conversation state cannot prove which deletions preceded
+            // this archive. Local markers may be incomplete on a restored device, so stop before
+            // returning or importing any plaintext copies.
+            Err(MLSError::InvalidState(code)) if matches!(code.as_str(), "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval") => {
+                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
+            }
             Err(error) => return Err(error),
         };
         let deletions = state["accountDeletions"].as_array()
             .ok_or_else(|| MLSError::Cryptography("getConversationState is missing accountDeletions".into()))?;
-        // Each listed deletion applies only under its deleting device's signature, verified
-        // through the deletion's key proof when this device holds no leaf of it.
+        // Each listed deletion needs the deleting device's signature and historical status.
+        // A key proof can verify the device key when this device holds no leaf of it.
         for entry in deletions {
             let decision = self.authorize_account_deletion(conversation_id, &sequencer, entry)?;
             self.apply_account_deletion_decision(conversation_id, entry, &decision)?;
+            if let super::live_sync::live_integrity::AccountDeletionDecision::Unverified {
+                reason,
+                ..
+            } = decision
+            {
+                if reason == super::deletion_authority::UnverifiedDeletionReason::OtherConversation {
+                    continue;
+                }
+                // No archived row is made visible while a sequencer-listed deletion remains
+                // unauthorised, including after DID-key rotation or missing revocation proof.
+                tracing::warn!(conversation_id, ?reason, "archive restore blocked on unverified account deletion");
+                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+            }
         }
         Ok(())
     }
@@ -2145,6 +2169,7 @@ impl CatbirdMlsClient {
             let mut session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
             session.open_owner_record(batch).await.map_err(native_archive_error)
         })?;
+        self.apply_listed_account_deletions(&conversation_id, &messages)?;
         Self::hide_deleted_accounts(&self.db, &conversation_id, &mut messages)?;
         messages.into_iter().map(|message| {
             if message.archived_receipt.is_none() || message.frame_nonce.is_none() {

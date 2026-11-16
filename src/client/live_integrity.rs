@@ -125,6 +125,49 @@ pub(crate) fn purge_covered_messages(
                 )
                 .map_err(|e| MLSError::Internal(format!("purge deleted sender message: {e}")))?;
             delete_state(tx, &chat_wire::unavailable_message_key(cid, &message_id))?;
+            // The retained native archive evidence carries the same canonical plaintext frame.
+            // A verified deletion must erase it with the display row, not leave a restorable copy.
+            delete_state(tx, &format!("native.message:{cid}:{message_id}"))?;
+        }
+    }
+    // A restore or local cleanup can remove a display row while retaining its authenticated
+    // archive frame. Scan that evidence independently so a later applied deletion cannot leave
+    // an orphan plaintext copy behind.
+    let native_prefix = format!("native.message:{cid}:");
+    let native_rows: Vec<(String, Vec<u8>)> = {
+        let mut statement = tx
+            .conn()
+            .prepare(
+                "SELECT state_key, value_bytes FROM labyrinth_state \
+                 WHERE substr(state_key, 1, length(?1)) = ?1 ORDER BY state_key",
+            )
+            .map_err(|e| MLSError::Internal(format!("select archived message evidence: {e}")))?;
+        let mapped = statement
+            .query_map([&native_prefix], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| MLSError::Internal(format!("select archived message evidence: {e}")))?;
+        mapped
+            .collect::<Result<_, _>>()
+            .map_err(|e| MLSError::Internal(format!("read archived message evidence: {e}")))?
+    };
+    for (key, raw) in native_rows {
+        let receipt = serde_json::from_slice::<Value>(&raw)
+            .ok()
+            .and_then(|evidence| {
+                evidence["sequencer_receipt_json"].as_str().and_then(|raw| {
+                    serde_json::from_str::<chat_wire::StoredArchivedReceipt>(raw).ok()
+                })
+            });
+        let Some(receipt) = receipt else { continue };
+        if receipt
+            .sender_device_did_url
+            .split_once('#')
+            .is_some_and(|(did, _)| did == deleted_did)
+            && marker.covers(
+                i64::try_from(receipt.seq).unwrap_or(i64::MAX),
+                Some(receipt.issued_at_ms),
+            )
+        {
+            delete_state(tx, &key)?;
         }
     }
     let queued: Vec<(String, i64, Vec<u8>)> = {
@@ -213,7 +256,8 @@ impl CatbirdMlsClient {
     /// Decide what a sequenced `accountDeletedEntry` does here: verify the sequencer's
     /// signature for this conversation, then the deleting device's own signed request under a
     /// key of that device, then that this signed request was not already applied at another
-    /// seq of this conversation.
+    /// seq of this conversation. A new deletion remains unverified until signed historical
+    /// non-revocation evidence is available.
     pub(crate) fn authorize_account_deletion(
         &self,
         cid: &str,
@@ -275,9 +319,10 @@ impl CatbirdMlsClient {
                     keys.push(key);
                 }
                 Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(cid, %error, "account deletion key proof unavailable");
-                }
+                // A sequencer-verified deletion cannot be treated as permanently unverified
+                // merely because the deleting DID is temporarily unreachable. Let live sync
+                // retry at the same entry and abort archive restore before importing copies.
+                Err(error) => return Err(error),
             }
         }
         if !verified {
@@ -330,11 +375,14 @@ impl CatbirdMlsClient {
                         Ok(AccountDeletionDecision::AlreadyApplied)
                     }
                     Some(_) => unverified(UnverifiedDeletionReason::Replayed, Some(&write)),
-                    None => Ok(AccountDeletionDecision::Apply {
-                        deleted_did,
-                        seq,
-                        write,
-                    }),
+                    // Neither a local MLS leaf nor a chat.device inclusion CAR proves that
+                    // the signer was unrevoked at the historical signed instant. Until the
+                    // protocol carries signed non-revocation evidence, quarantine every new
+                    // deletion rather than purge or expose its archived content.
+                    None => unverified(
+                        UnverifiedDeletionReason::RevocationStatusUnproven,
+                        Some(&write),
+                    ),
                 }
             }
         }

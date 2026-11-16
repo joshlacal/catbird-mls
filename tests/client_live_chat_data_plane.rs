@@ -2569,7 +2569,6 @@ fn device_key_proof(
 ) -> Vec<u8> {
     let record = json!({
         "$type": "blue.catbird.chat.device",
-        "deviceId": device_id,
         "algorithm": "Ed25519",
         "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(device_key) },
         "createdAt": "2026-11-03T00:00:00.000Z",
@@ -5032,7 +5031,7 @@ fn close_conversation_retires_coordinate_wipes_mock_ds_and_keeps_local_history_u
 /// accepts only a cursor-complete, MAC-committed writer snapshot whose STAR and
 /// oplog heads all reconcile.
 #[test]
-fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory() {
+fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_inventory() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
     let historical_receipt_sk = P256SigningKey::from_slice(&[0x39; 32]).unwrap();
@@ -5211,6 +5210,38 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
         .collect();
     assert!(d_messages.contains(&a1) && d_messages.contains(&a2));
 
+    // Before the deletion, restore must verify the complete writer inventory. Keep this
+    // independent of the later deletion hold, which intentionally blocks archive import.
+    bob.db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute("DELETE FROM messages WHERE message_id = ?1", [&b1])
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    ds.archive_auth.set_inventory_fault(Some("truncate"));
+    let error = bob
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("a terminal page that omits a committed writer must fail closed");
+    assert!(error.to_string().contains("ArchiveInventoryIncomplete"));
+    assert!(bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
+        .iter()
+        .all(|message| message.message_id != b1));
+    ds.archive_auth.set_inventory_fault(None);
+    assert_eq!(
+        bob.restore_conversation_from_owner_mailbox(&cid)
+            .expect("committed writer inventory restores the complete Space"),
+        1
+    );
+    assert!(bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
+        .iter()
+        .any(|message| message.message_id == b1));
+
     // Bob resolves the authority's exact retained method. A field edit, a foreign authority or a
     // key-ID substitution stops Bob's sync at that entry with no effect and his cursor below it
     // (fail-before: an unverified deletion was skipped and later entries carried the cursor
@@ -5332,91 +5363,160 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
         g.pds_records.retain(|(repo, _, _), _| repo != ALICE_DID);
         seq
     };
-    bob.sync()
-        .expect("bob applies the deletion through ordinary C33 sync");
-    let applied: Value = serde_json::from_slice(&marker(&bob).expect("deletion marker")).unwrap();
-    assert_eq!(applied["seq"], deletion_seq);
+    let error = bob
+        .sync()
+        .expect_err("historical revocation status is not proven");
+    assert!(
+        error.to_string().contains("AccountDeletionUnverified"),
+        "{error}"
+    );
+    assert_eq!(
+        marker(&bob),
+        None,
+        "quarantine must not install a purge marker"
+    );
+    assert_eq!(last_seq(&bob, &cid), deletion_seq - 1);
+    let retained: Vec<_> = bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.sender_did == ALICE_DID)
+        .map(|message| message.message_id)
+        .collect();
+    assert_eq!(
+        retained, d_messages,
+        "quarantine must retain local plaintext"
+    );
     assert!(
         bob.list_pending_labyrinth_queue(Some(&cid), 100)
             .unwrap()
             .iter()
-            .all(|item| !d_messages.contains(&item.message_id)),
-        "queued witness duty for D must be dropped"
+            .any(|item| item.message_id == a2),
+        "queued witness duty remains while deletion is unresolved"
     );
 
-    // D's account deletion purged its mailbox: its epoch head is gone (404 `EpochNotFound`). The
-    // survivor's next message still archives, to a roster without D.
-    ds.inner.lock().unwrap().labyrinth_epochs.remove(ALICE_DID);
-    let b2 = uuid::Uuid::new_v4().to_string();
-    bob.send_message(&cid, &b2, "after D's deletion").unwrap();
-    bob.flush_labyrinth_queue()
-        .expect("a deleted account's purged epoch head never blocks the survivor's archive");
-    assert!(bob
-        .list_pending_labyrinth_queue(Some(&cid), 100)
-        .unwrap()
-        .is_empty());
-
-    // Restore consumes every snapshot-bound listWriters page, verifies its
-    // inventory commitment, and reconciles each writer's STAR/oplog head
-    // before importing any message.
+    // A state denial cannot be read as an empty deletion inventory. Both archive entry
+    // points must stop before restoring Bob's missing local row from the complete Space.
     bob.db()
         .write_tx(|tx| {
             tx.conn()
-                .execute(
-                    "DELETE FROM messages WHERE message_id IN (?1, ?2)",
-                    [&b1, &b2],
-                )
+                .execute("DELETE FROM messages WHERE message_id = ?1", [&b1])
                 .unwrap();
             Ok(())
         })
         .unwrap();
-    ds.archive_auth.set_inventory_fault(Some("truncate"));
-    let error = bob
-        .restore_conversation_from_owner_mailbox(&cid)
-        .expect_err("a terminal page that omits a committed writer must fail closed");
-    assert!(error.to_string().contains("ArchiveInventoryIncomplete"));
-    let unchanged = bob.list_messages(&cid, None, 100).unwrap();
-    assert!(unchanged
-        .iter()
-        .all(|message| message.message_id != b1 && message.message_id != b2));
-    ds.archive_auth.set_inventory_fault(None);
-    assert_eq!(
-        bob.restore_conversation_from_owner_mailbox(&cid)
-            .expect("committed writer inventory restores the complete Space"),
-        2
+    ds.inner.lock().unwrap().conversation_state_errors.insert(
+        (BOB_DID.to_owned(), cid.clone()),
+        (400, "NotEntitled".into()),
     );
-    let restored = bob.list_messages(&cid, None, 100).unwrap();
-    assert!(restored.iter().any(|message| message.message_id == b1));
-    assert!(restored.iter().any(|message| message.message_id == b2));
-    assert!(restored
+    for error in [
+        bob.restore_conversation_from_owner_mailbox(&cid)
+            .expect_err("state denial blocks restore"),
+        bob.verify_and_reindex_history(&cid)
+            .expect_err("state denial blocks reindex"),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("ArchiveDeletionInventoryUnavailable"),
+            "{error}"
+        );
+    }
+    assert!(bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
         .iter()
-        .all(|message| !d_messages.contains(&message.message_id)));
+        .all(|message| message.message_id != b1));
+    ds.inner
+        .lock()
+        .unwrap()
+        .conversation_state_errors
+        .remove(&(BOB_DID.to_owned(), cid.clone()));
 
-    // A recovered device accepts the same authenticated complete snapshot;
-    // account-deleted author copies remain suppressed.
+    // A recovered device has no local MLS leaf for Alice. Restoration must retain all
+    // archived rows out of view until the deletion's historical status can be proven.
     let code = bob.setup_recovery_code().expect("bob recovery code");
     let bob2 = open("bob2", BOB_DID);
     bob2.enroll_device(&scopes).expect("enroll bob2");
     bob2.restore_with_recovery_code(&code)
         .expect("bob2 recovers the archive");
-    assert_eq!(
-        bob2.restore_conversation_from_owner_mailbox(&cid)
-            .expect("fresh-device restore verifies the paged inventory"),
-        2
+    // The fresh device has no leaf of Alice. An outage resolving her DID while validating the
+    // sequenced deletion must abort before any archived row is imported or made visible.
+    bob2.db()
+        .write_tx(|tx| {
+            tx.delete_account_meta(&format!("did_doc:{ALICE_DID}"))?;
+            tx.delete_account_meta(&format!("did_doc_meta:{ALICE_DID}"))
+        })
+        .unwrap();
+    ds.inner.lock().unwrap().transport_error_next_resolve_for = Some(ALICE_DID.into());
+    let error = bob2
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("DID outage blocks fresh restoration before import");
+    assert!(
+        error
+            .to_string()
+            .contains("injected DID resolution transport error"),
+        "{error}"
     );
-    let recovered = bob2.list_messages(&cid, None, 100).unwrap();
-    assert!(recovered.iter().any(|message| message.message_id == b1));
-    assert!(recovered.iter().any(|message| message.message_id == b2));
-    assert!(recovered
-        .iter()
-        .all(|message| !d_messages.contains(&message.message_id)));
+    assert!(bob2.list_messages(&cid, None, 100).unwrap().is_empty());
+    let original_proof = {
+        let mut state = ds.inner.lock().unwrap();
+        let entry = &mut state.account_deletions.get_mut(&cid).unwrap()[0];
+        let original = entry["keyProof"].clone();
+        entry["keyProof"] = json!({ "$bytes": STANDARD.encode([9u8; 8]) });
+        original
+    };
+    let error = bob2
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("an actor-unverified listed deletion blocks archive import");
+    assert!(
+        error.to_string().contains("ArchiveDeletionUnverified"),
+        "{error}"
+    );
+    assert!(bob2.list_messages(&cid, None, 100).unwrap().is_empty());
+    ds.inner
+        .lock()
+        .unwrap()
+        .account_deletions
+        .get_mut(&cid)
+        .unwrap()[0]["keyProof"] = original_proof;
+    // Even after the resolver recovers, the old device-record CAR alone cannot prove that
+    // Alice's signing device was unrevoked at the signed instant. Stay closed until an
+    // authenticated revocation-status proof is available.
+    let error = bob2
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("fresh restore cannot infer non-revocation from absent cache");
+    assert!(
+        error.to_string().contains("ArchiveDeletionUnverified"),
+        "{error}"
+    );
+    let evidence = bob2
+        .db()
+        .read_tx(|tx| {
+            tx.get_labyrinth_state(
+                &catbird_mls::client::deletion_authority::unverified_deletion_key(
+                    &cid,
+                    ALICE_DID,
+                    deletion_seq,
+                ),
+            )
+        })
+        .unwrap()
+        .expect("the exact sequenced deletion is retained as evidence");
+    let evidence: catbird_mls::client::deletion_authority::UnverifiedAccountDeletion =
+        serde_json::from_slice(&evidence).unwrap();
+    assert_eq!(
+        evidence.reason,
+        catbird_mls::client::deletion_authority::UnverifiedDeletionReason::RevocationStatusUnproven,
+        "the CAR must bind Alice's device key before historical status blocks the purge"
+    );
+    assert!(bob2.list_messages(&cid, None, 100).unwrap().is_empty());
 }
 
-/// Cold start: the DS authenticates `ConversationNotFound` and this device holds no local state
-/// for the conversation. Restore falls back to the account's owner records (as flush does) instead
-/// of failing on the Conversation Space lookup.
+/// Cold start: a signed Space denial proves removal, but a forgotten conversation state cannot
+/// enumerate account deletions. Owner history stays quarantined until that inventory is available.
 #[test]
-fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records() {
+fn forgotten_conversation_state_holds_owner_history_after_space_denial() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
     let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
@@ -5447,6 +5547,14 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
         .send_message(&cid, &msg_id, "kept in owner records")
         .unwrap();
     assert_eq!(alice.rescue_conversation_on_kick(&cid).unwrap(), 1);
+    let owner_batch = ds
+        .archive_auth
+        .drain_apply_calls()
+        .into_iter()
+        .flat_map(|(_, call)| call["writes"].as_array().cloned().unwrap_or_default())
+        .find(|write| write["collection"] == "blue.catbird.labyrinth.ownerBatch")
+        .expect("rescue published an owner batch");
+    let owner_batch_json = serde_json::to_vec(&owner_batch["value"]).unwrap();
 
     // The DS forgetting the conversation is only a lead: the Space authority itself (here the
     // home DS) must deny the account, with its signed denial, before owner records stand in for
@@ -5467,6 +5575,15 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
         let group = chat_wire::json_bytes(&conversation["coordinates"]["groupId"]).unwrap();
         (space, group)
     };
+    let error = alice
+        .open_rescued_owner_batch(&owner_batch_json)
+        .expect_err("direct batch open cannot expose plaintext without deletion inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("ArchiveDeletionInventoryUnavailable"),
+        "{error}"
+    );
     alice
         .db()
         .write_tx(|tx| {
@@ -5497,21 +5614,22 @@ fn restore_of_a_conversation_the_ds_no_longer_knows_falls_back_to_owner_records(
     );
     ds.archive_auth
         .set_space_denied(ALICE_DID, &space, Some(&group));
-    assert_eq!(
-        alice
-            .restore_conversation_from_owner_mailbox(&cid)
-            .expect("owner-only restore after authenticated Space denial"),
-        1
+    let error = alice
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("owner history needs a complete deletion inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("ArchiveDeletionInventoryUnavailable"),
+        "{error}"
     );
-    let restored = alice.list_messages(&cid, None, 10).unwrap();
-    assert_eq!(restored.len(), 1);
-    assert_eq!(restored[0].message_id, msg_id);
+    assert!(alice.list_messages(&cid, None, 10).unwrap().is_empty());
 }
 
-/// A fresh removed device has no MLS group. Exact authenticated NotEntitled is therefore only a
-/// lead: a verified owner receipt must recover the Space pin and that Space must independently
-/// deny the account. A malicious NotEntitled for an active member, generic 400, and auth failure
-/// must not unlock owner-only history.
+/// A fresh removed device has no MLS group. Exact authenticated NotEntitled is only a lead:
+/// owner receipts must recover the Space pin, and its authority must independently deny the
+/// account. Even then, missing conversation state cannot certify the deletion inventory, so
+/// owner plaintext stays held. Generic 400 and auth failure also remain closed.
 #[test]
 fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5673,19 +5791,19 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     );
     assert!(removed.list_messages(&cid, None, 10).unwrap().is_empty());
     ds.archive_auth.set_directory_outage(false);
-    assert_eq!(
-        removed
-            .restore_conversation_from_owner_mailbox(&cid)
-            .expect("authenticated Space denial permits owner restore"),
-        1
+    let error = removed
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("a denied state cannot certify its deletion inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("ArchiveDeletionInventoryUnavailable"),
+        "{error}"
     );
-    assert_eq!(
-        removed.list_messages(&cid, None, 10).unwrap()[0].message_id,
-        message_id
-    );
+    assert!(removed.list_messages(&cid, None, 10).unwrap().is_empty());
 
-    // Homed on another DS, the removed member gets the same signed denial through its own home's
-    // relay, and the same restore.
+    // The other home relays the same signed Space denial, but it cannot turn an inaccessible
+    // conversation state into proof that no account deletion occurred.
     let cross_keys = Arc::new(MemKeyStore::new());
     let cross = live_client_homed(
         tmp.path(),
@@ -5699,16 +5817,16 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     cross
         .restore_with_recovery_code(&code)
         .expect("recover removed member archive keys");
-    assert_eq!(
-        cross
-            .restore_conversation_from_owner_mailbox(&cid)
-            .expect("the authority's relayed signed denial permits owner restore"),
-        1
+    let error = cross
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("relayed Space denial cannot certify deletion inventory");
+    assert!(
+        error
+            .to_string()
+            .contains("ArchiveDeletionInventoryUnavailable"),
+        "{error}"
     );
-    assert_eq!(
-        cross.list_messages(&cid, None, 10).unwrap()[0].message_id,
-        message_id
-    );
+    assert!(cross.list_messages(&cid, None, 10).unwrap().is_empty());
 
     // The same DS response is malicious while the Space still admits the account.
     ds.archive_auth.set_space_denied(BOB_DID, &space, None);

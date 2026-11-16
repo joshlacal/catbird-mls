@@ -3854,12 +3854,12 @@ impl CatbirdMlsClient {
             // Every entry below verifies before any effect. One that does not stops this
             // conversation's sync with the cursor below it: no later entry carries it past.
             if label == Some(crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND) {
-                // A deletion takes effect only under its deleting device's own signature. One
-                // this conversation's sequencer did not sign stops the sync below it; any other
-                // that does not verify is kept as evidence and shown, and the cursor moves on.
+                // A deletion takes effect only under its deleting device's own signature. Keep
+                // any unverified entry as evidence, then leave the cursor below it so later
+                // messages cannot make an unresolved deletion silently permanent.
                 let decision = self.authorize_account_deletion(cid, &convo.sequencer_did, entry)?;
                 if matches!(
-                    decision,
+                    &decision,
                     live_integrity::AccountDeletionDecision::Unverified {
                         reason: crate::client::deletion_authority::UnverifiedDeletionReason::SequencerUnverified,
                         ..
@@ -3870,6 +3870,13 @@ impl CatbirdMlsClient {
                     ));
                 }
                 self.apply_account_deletion_decision(cid, entry, &decision)?;
+                if let live_integrity::AccountDeletionDecision::Unverified { reason, .. } = decision
+                {
+                    if reason != crate::client::deletion_authority::UnverifiedDeletionReason::OtherConversation {
+                        tracing::warn!(cid, entry_seq, ?reason, "account deletion remains unverified; sync will retry at this entry");
+                        return Err(MLSError::InvalidState("AccountDeletionUnverified".into()));
+                    }
+                }
                 let now_ms = self.hooks.now_ms();
                 self.db.write_tx(|tx| {
                     if let Some(mut c) = tx.get_conversation(cid)? {

@@ -101,6 +101,7 @@ impl PlatformKeyStore for UnitMemKeyStore {
 struct SyncMockState {
     authority_keys: BTreeMap<String, P256SigningKey>,
     pds_devices: BTreeMap<String, Vec<(String, Vec<u8>)>>,
+    fail_next_did_resolve_for: Option<String>,
     entries_by_after: BTreeMap<i64, Vec<Value>>,
     conversation_state: Option<Value>,
     pending_leaf_recoveries: Vec<Value>,
@@ -214,6 +215,10 @@ impl PlatformTransport for SyncMockTransport {
         let q = query_params(&request.url);
         let mut st = self.state.lock().unwrap();
         if let Some(plc_did) = request.url.strip_prefix("https://plc.directory/") {
+            if st.fail_next_did_resolve_for.as_deref() == Some(plc_did) {
+                st.fail_next_did_resolve_for = None;
+                return Err(MLSError::Internal("injected DID resolver outage".into()));
+            }
             return json_http(200, &plc_did_doc(plc_did));
         }
         if request.url.ends_with("/.well-known/did.json") {
@@ -254,7 +259,6 @@ impl PlatformTransport for SyncMockTransport {
                 .map(|(dev_id, pk)| {
                     let value = json!({
                         "$type": "blue.catbird.chat.device",
-                        "deviceId": dev_id,
                         "algorithm": "Ed25519",
                         "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(pk) },
                         "createdAt": "2026-11-14T00:00:00.000Z",

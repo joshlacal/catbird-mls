@@ -79,6 +79,8 @@ pub enum UnverifiedDeletionReason {
     BadSignature,
     /// A verified device revocation predates the device-signed deletion instant.
     DeviceRevokedAtSignedAt,
+    /// The device key verifies, but no signed historical non-revocation proof exists yet.
+    RevocationStatusUnproven,
     /// The same signed request was already applied at another seq of this conversation.
     Replayed,
     /// The sequencer signature does not verify for this conversation.
@@ -88,9 +90,12 @@ pub enum UnverifiedDeletionReason {
 }
 
 impl UnverifiedDeletionReason {
-    /// Whether a later pass may still verify the entry (a key may become available).
+    /// Whether a later pass may verify the entry when missing authority evidence arrives.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::DeviceKeyUnavailable)
+        matches!(
+            self,
+            Self::DeviceKeyUnavailable | Self::RevocationStatusUnproven
+        )
     }
 }
 
@@ -233,8 +238,10 @@ pub fn device_key_from_key_proof(
     let ipld_core::ipld::Ipld::Map(fields) = record else {
         return None;
     };
+    // `deviceId` is the verified MST record key, not a field in the canonical
+    // blue.catbird.chat.device record. `verify_car_record_proof` already binds the
+    // signed commit to `blue.catbird.chat.device/{device_id}`.
     if !matches!(fields.get("$type"), Some(ipld_core::ipld::Ipld::String(kind)) if kind == DEVICE_RECORD_COLLECTION)
-        || !matches!(fields.get("deviceId"), Some(ipld_core::ipld::Ipld::String(id)) if id == device_id)
     {
         return None;
     }

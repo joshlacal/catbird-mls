@@ -756,7 +756,7 @@ fn message_ids(client: &CatbirdMlsClient) -> Vec<String> {
 }
 
 #[test]
-fn a_device_signed_deletion_purges_only_messages_up_to_its_signed_instant() {
+fn a_valid_local_leaf_deletion_is_quarantined_without_nonrevocation_proof() {
     let tmp = tempfile::tempdir().unwrap();
     let (client, state, alice_signer, bob_signer, group_id) = client_with_bob_leaf(&tmp);
     let before = SIGNED_AT_MS;
@@ -788,26 +788,42 @@ fn a_device_signed_deletion_purges_only_messages_up_to_its_signed_instant() {
         .unwrap()
         .entries_by_after
         .insert(5, vec![entry]);
-    apply_served_entries(&client, &alice_signer);
-    assert_eq!(message_ids(&client), vec![BOB_M2.to_string()]);
-    let marker = client
+    let convo = client
+        .db
+        .read_tx(|tx| tx.get_conversation(CONVO_ID))
+        .unwrap()
+        .unwrap();
+    let mut pass = EntryPass {
+        max_seq: convo.last_seq,
+        ..EntryPass::default()
+    };
+    assert!(client
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+        .unwrap_err()
+        .to_string()
+        .contains("AccountDeletionUnverified"));
+    assert_eq!(
+        message_ids(&client),
+        vec![BOB_M1.to_string(), BOB_M2.to_string()]
+    );
+    assert!(client
         .db
         .read_tx(|tx| tx.get_labyrinth_state(&chat_wire::account_deletion_key(CONVO_ID, BOB_DID)))
         .unwrap()
-        .and_then(|raw| authority::AppliedAccountDeletion::decode(&raw))
-        .unwrap();
+        .is_none());
     assert_eq!(
-        marker,
-        authority::StoredAccountDeletion::Signed(authority::AppliedAccountDeletion {
-            seq: 6,
-            signed_at_ms: SIGNED_AT_MS,
-            operation_id: DELETION_OP.into(),
-        })
+        client.unverified_account_deletions(CONVO_ID).unwrap()[0].reason,
+        UnverifiedDeletionReason::RevocationStatusUnproven,
     );
-    assert!(client
-        .unverified_account_deletions(CONVO_ID)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        client
+            .db
+            .read_tx(|tx| tx.get_conversation(CONVO_ID))
+            .unwrap()
+            .unwrap()
+            .last_seq,
+        5,
+    );
 }
 
 #[test]
@@ -872,6 +888,11 @@ fn deletion_uses_stored_receipt_time_for_message_and_queued_copy() {
                 created_at_ms: local_at,
             })?;
         }
+        tx.put_labyrinth_state(
+            &format!("native.message:{CONVO_ID}:{BOB_M3}"),
+            &serde_json::to_vec(&json!({ "sequencer_receipt_json": stored(bound) }))?,
+            bound,
+        )?;
         assert_eq!(
             crate::client::live_sync::live_integrity::purge_covered_messages(
                 tx, CONVO_ID, BOB_DID, &marker,
@@ -880,6 +901,15 @@ fn deletion_uses_stored_receipt_time_for_message_and_queued_copy() {
         );
         assert!(tx.get_message(BOB_M1)?.is_none());
         assert!(tx.get_message(BOB_M2)?.is_some());
+        assert!(tx
+            .get_labyrinth_state(&format!("native.message:{CONVO_ID}:{BOB_M1}"))?
+            .is_none());
+        assert!(tx
+            .get_labyrinth_state(&format!("native.message:{CONVO_ID}:{BOB_M2}"))?
+            .is_some());
+        assert!(tx
+            .get_labyrinth_state(&format!("native.message:{CONVO_ID}:{BOB_M3}"))?
+            .is_none());
         let remaining = tx.list_labyrinth_queue(Some(CONVO_ID), 10)?;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].item_id, format!("queue:{BOB_M2}"));
@@ -889,113 +919,78 @@ fn deletion_uses_stored_receipt_time_for_message_and_queued_copy() {
 }
 
 #[test]
-fn forged_unsigned_and_replayed_deletions_are_kept_as_evidence_and_purge_nothing() {
+fn forged_unsigned_and_genuine_deletions_hold_cursor_without_purging() {
     let tmp = tempfile::tempdir().unwrap();
     let (client, state, alice_signer, bob_signer, group_id) = client_with_bob_leaf(&tmp);
     insert_row(&client, &group_id, BOB_M1, BOB_DID, DEV_B1, 3);
     let forger = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
-    let forged = deletion_write(&forger, DEV_B1, DELETION_OP, SIGNED_AT);
-    let entries = vec![
-        deletion_entry(&state, CONVO_ID, BOB_DID, 6, BOB_M2, Some(forged), None),
-        deletion_entry(&state, CONVO_ID, BOB_DID, 7, BOB_M3, None, None),
-    ];
-    state.lock().unwrap().entries_by_after.insert(5, entries);
-    apply_served_entries(&client, &alice_signer);
-    assert_eq!(
-        message_ids(&client),
-        vec![BOB_M1.to_string()],
-        "nothing hidden"
-    );
-    let kept: Vec<_> = client
-        .unverified_account_deletions(CONVO_ID)
-        .unwrap()
-        .into_iter()
-        .map(|e| (e.seq, e.reason))
-        .collect();
-    assert_eq!(
-        kept,
-        vec![
-            (6, UnverifiedDeletionReason::BadSignature),
-            (7, UnverifiedDeletionReason::NoActorWrite)
-        ]
-    );
-    let convo = client
-        .db
-        .read_tx(|tx| tx.get_conversation(CONVO_ID))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        convo.last_seq, 7,
-        "unverified deletions never stall the cursor"
-    );
+    let try_sync = || {
+        let convo = client
+            .db
+            .read_tx(|tx| tx.get_conversation(CONVO_ID))
+            .unwrap()
+            .unwrap();
+        let mut pass = EntryPass {
+            max_seq: convo.last_seq,
+            ..EntryPass::default()
+        };
+        client.apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+    };
+    let cursor = || {
+        client
+            .db
+            .read_tx(|tx| tx.get_conversation(CONVO_ID))
+            .unwrap()
+            .unwrap()
+            .last_seq
+    };
+    for (write, reason) in [
+        (
+            Some(deletion_write(&forger, DEV_B1, DELETION_OP, SIGNED_AT)),
+            UnverifiedDeletionReason::BadSignature,
+        ),
+        (None, UnverifiedDeletionReason::NoActorWrite),
+    ] {
+        let entry = deletion_entry(&state, CONVO_ID, BOB_DID, 6, BOB_M2, write, None);
+        state
+            .lock()
+            .unwrap()
+            .entries_by_after
+            .insert(5, vec![entry]);
+        assert!(try_sync()
+            .unwrap_err()
+            .to_string()
+            .contains("AccountDeletionUnverified"));
+        assert_eq!(cursor(), 5, "an unresolved deletion holds the live cursor");
+        assert_eq!(message_ids(&client), vec![BOB_M1.to_string()]);
+        assert_eq!(
+            client.unverified_account_deletions(CONVO_ID).unwrap()[0].reason,
+            reason,
+        );
+    }
 
-    // The genuine request applies once; the same signed request sequenced again is a replay.
+    // Even the genuine actor signature cannot prove historical non-revocation.
     let genuine = deletion_write(&bob_signer, DEV_B1, DELETION_OP, SIGNED_AT);
-    let entries = vec![
-        deletion_entry(
-            &state,
-            CONVO_ID,
-            BOB_DID,
-            8,
-            "66666666-6666-4666-8666-666666666601",
-            Some(genuine.clone()),
-            None,
-        ),
-        deletion_entry(
-            &state,
-            CONVO_ID,
-            BOB_DID,
-            9,
-            "66666666-6666-4666-8666-666666666602",
-            Some(genuine),
-            None,
-        ),
-    ];
-    state.lock().unwrap().entries_by_after.insert(7, entries);
-    apply_served_entries(&client, &alice_signer);
-    let last = client.unverified_account_deletions(CONVO_ID).unwrap();
-    assert_eq!(last.len(), 3);
-    assert_eq!(
-        (last[2].seq, last[2].reason),
-        (9, UnverifiedDeletionReason::Replayed)
-    );
-
-    // A different operation ID for the same deleted account is also terminally replayed: it
-    // cannot replace the first marker with a narrower purge bound.
-    let different_op = deletion_write(
-        &bob_signer,
-        DEV_B1,
-        "fedcba9876543210fedcba9876543210",
-        SIGNED_AT,
-    );
-    let later_entry = deletion_entry(
-        &state,
-        CONVO_ID,
-        BOB_DID,
-        10,
-        "66666666-6666-4666-8666-666666666603",
-        Some(different_op),
-        None,
-    );
+    let first = deletion_entry(&state, CONVO_ID, BOB_DID, 6, BOB_M2, Some(genuine), None);
     state
         .lock()
         .unwrap()
         .entries_by_after
-        .insert(9, vec![later_entry]);
-    apply_served_entries(&client, &alice_signer);
+        .insert(5, vec![first]);
+    assert!(try_sync()
+        .unwrap_err()
+        .to_string()
+        .contains("AccountDeletionUnverified"));
+    assert_eq!(cursor(), 5);
+    assert_eq!(message_ids(&client), vec![BOB_M1.to_string()]);
     assert_eq!(
-        client
-            .unverified_account_deletions(CONVO_ID)
-            .unwrap()
-            .last()
-            .unwrap()
-            .reason,
-        UnverifiedDeletionReason::Replayed,
+        client.unverified_account_deletions(CONVO_ID).unwrap()[0].reason,
+        UnverifiedDeletionReason::RevocationStatusUnproven,
     );
 }
 
 #[test]
-fn a_proven_revocation_blocks_only_deletions_signed_at_or_after_it() {
+fn revocation_at_signed_instant_is_rejected_and_later_revocation_does_not_authorize_purge() {
     let tmp = tempfile::tempdir().unwrap();
     let (client, state, _, bob_signer, _) = client_with_bob_leaf(&tmp);
     let entry = deletion_entry(
@@ -1029,7 +1024,10 @@ fn a_proven_revocation_blocks_only_deletions_signed_at_or_after_it() {
         client
             .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &entry)
             .unwrap(),
-        AccountDeletionDecision::Apply { .. }
+        AccountDeletionDecision::Unverified {
+            reason: UnverifiedDeletionReason::RevocationStatusUnproven,
+            ..
+        }
     ));
 }
 
@@ -1060,20 +1058,18 @@ fn deletion_operation_dedupe_is_rechecked_in_the_apply_transaction() {
         )),
         None,
     );
-    let first_decision = client
-        .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &first)
-        .unwrap();
-    let later_decision = client
-        .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &later)
-        .unwrap();
-    assert!(matches!(
-        first_decision,
-        AccountDeletionDecision::Apply { .. }
-    ));
-    assert!(matches!(
-        later_decision,
-        AccountDeletionDecision::Apply { .. }
-    ));
+    // Exercise the lower-level idempotency transaction with synthetic Apply decisions. The
+    // public authorizer currently quarantines both until historical status proof exists.
+    let first_decision = AccountDeletionDecision::Apply {
+        deleted_did: BOB_DID.into(),
+        seq: 6,
+        write: authority::parse_actor_write(&first).unwrap(),
+    };
+    let later_decision = AccountDeletionDecision::Apply {
+        deleted_did: BOB_DID.into(),
+        seq: 7,
+        write: authority::parse_actor_write(&later).unwrap(),
+    };
     client
         .apply_account_deletion_decision(CONVO_ID, &first, &first_decision)
         .unwrap();
@@ -1178,7 +1174,6 @@ fn a_fresh_device_verifies_a_deletion_through_its_key_proof() {
     let bob_signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
     let record = json!({
         "$type": "blue.catbird.chat.device",
-        "deviceId": DEV_B1,
         "algorithm": "Ed25519",
         "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(bob_signer.public()) },
         "createdAt": "2026-11-14T00:00:00.000Z",
@@ -1192,7 +1187,7 @@ fn a_fresh_device_verifies_a_deletion_through_its_key_proof() {
     let (_, proof) = crate::labyrinth::repo_proof::build_repo_proof_car_v1(
         BOB_DID,
         "3lb2zzzzzzzzz",
-        &[(format!("blue.catbird.chat.device/{DEV_B1}"), cbor)],
+        &[(format!("blue.catbird.chat.device/{DEV_B1}"), cbor.clone())],
         &signing_key,
     )
     .unwrap();
@@ -1206,20 +1201,81 @@ fn a_fresh_device_verifies_a_deletion_through_its_key_proof() {
         Some(write.clone()),
         Some(proof.clone()),
     );
-    match client
+    state.lock().unwrap().fail_next_did_resolve_for = Some(BOB_DID.into());
+    assert!(client
         .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &entry)
-        .unwrap()
-    {
-        AccountDeletionDecision::Apply {
-            deleted_did,
-            seq,
-            write,
-        } => {
-            assert_eq!((deleted_did.as_str(), seq), (BOB_DID, 6));
-            assert_eq!(write.signed_at_ms, SIGNED_AT_MS);
+        .unwrap_err()
+        .to_string()
+        .contains("injected DID resolver outage"));
+    let did_doc = serde_json::to_vec(&plc_did_doc(BOB_DID)).unwrap();
+    assert_eq!(
+        authority::device_key_from_key_proof(&proof, BOB_DID, DEV_B1, SIGNED_AT_MS, &did_doc,),
+        Some(bob_signer.public().to_vec()),
+        "server-shaped chat.device record is bound by its CAR path",
+    );
+    assert!(matches!(
+        client
+            .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &entry)
+            .unwrap(),
+        AccountDeletionDecision::Unverified {
+            reason: UnverifiedDeletionReason::RevocationStatusUnproven,
+            ..
         }
-        other => panic!("expected the proof to verify, got {other:?}"),
-    }
+    ));
+    // The canonical record has no deviceId field. Its identity comes from the signed MST path.
+    let (_, wrong_path_proof) = crate::labyrinth::repo_proof::build_repo_proof_car_v1(
+        BOB_DID,
+        "3lb2zzzzzzzzz",
+        &[(format!("blue.catbird.chat.device/{DEV_A1}"), cbor.clone())],
+        &signing_key,
+    )
+    .unwrap();
+    let wrong_path = deletion_entry(
+        &state,
+        CONVO_ID,
+        BOB_DID,
+        6,
+        BOB_M2,
+        Some(write.clone()),
+        Some(wrong_path_proof),
+    );
+    assert!(authority::device_key_from_key_proof(
+        &authority::key_proof_bytes(&wrong_path).unwrap(),
+        BOB_DID,
+        DEV_B1,
+        SIGNED_AT_MS,
+        &did_doc,
+    )
+    .is_none());
+    assert!(matches!(
+        client
+            .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &wrong_path)
+            .unwrap(),
+        AccountDeletionDecision::Unverified {
+            reason: UnverifiedDeletionReason::DeviceKeyUnavailable,
+            ..
+        }
+    ));
+    // Even a later observed revocation does not prove that an earlier one was absent.
+    client
+        .db
+        .write_tx(|tx| {
+            tx.put_account_meta(
+                &authority::verified_device_revocation_key(BOB_DID, DEV_B1),
+                &(SIGNED_AT_MS + 1).to_string(),
+                1,
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        client
+            .authorize_account_deletion(CONVO_ID, SEQUENCER_DID, &entry)
+            .unwrap(),
+        AccountDeletionDecision::Unverified {
+            reason: UnverifiedDeletionReason::RevocationStatusUnproven,
+            ..
+        }
+    ));
     // A later enrollment cannot authorize a deletion signed before the device existed.
     let mut future_record = record.clone();
     future_record["createdAt"] = json!("2026-11-17T00:00:00.000Z");
