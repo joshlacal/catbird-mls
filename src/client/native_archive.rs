@@ -3304,12 +3304,16 @@ impl CatbirdMlsClient {
                 tx.get_account_meta(&format!("recognized_own_device:{device_id}"))
             })?;
             let status = item["status"].as_str().unwrap_or("unknown").to_owned();
-            let unrecognized = status != "revoked"
-                && (pds_key.as_deref() != Some(pubkey_bytes.as_slice())
+            let unrecognized = if status == "revoked" {
+                // A still-authorized PDS record contradicts a revoked DS row.
+                pds_key.is_some()
+            } else {
+                pds_key.as_deref() != Some(pubkey_bytes.as_slice())
                     || (is_current && pubkey_bytes.as_slice() != signer.public())
                     || (!is_current
                         && recognized_key.as_deref()
-                            != Some(hex::encode(&pubkey_bytes).as_str())));
+                            != Some(hex::encode(&pubkey_bytes).as_str()))
+            };
             out.push(RegisteredDeviceInfo {
                 device_id,
                 device_name: item["deviceName"].as_str().map(str::to_owned),
