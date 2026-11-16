@@ -1175,6 +1175,31 @@ struct NativeRotationResult {
 
 #[cfg(feature = "labyrinth")]
 impl CatbirdMlsClient {
+    fn ensure_recovery_share_home_service_pin(&self) -> Result<(), MLSError> {
+        let proven = self.resolve_peer_home_ds_did(&self.normalized_did)?;
+        let proven = proven.ok_or_else(|| {
+                MLSError::InvalidState(
+                    "account home delivery-service declaration is unproven".into(),
+                )
+            })?;
+        if proven != self.config.home_ds_did {
+            return Err(MLSError::InvalidState(
+                "account home delivery service differs from the configured service".into(),
+            ));
+        }
+        let placements = NativeArchiveVault {
+            db: self.db.clone(),
+            namespace: "native.placements",
+            hooks: self.hooks.clone(),
+        };
+        crate::labyrinth::recovery_shares::pin_proven_home_service(
+            &placements,
+            &self.normalized_did,
+            &proven,
+        )
+        .map_err(|error| native_archive_error(crate::labyrinth::map_error(error)))
+    }
+
     fn native_archive_run<F: Future + Send>(&self, future: F) -> F::Output where F::Output: Send {
         let hooks = self.hooks.clone();
         hooks.with_labyrinth_rng(|| block_on_sync(future))
@@ -1199,7 +1224,8 @@ impl CatbirdMlsClient {
             verified_inventories: Mutex::new(std::collections::BTreeMap::new()),
         });
         let transport = Arc::new(crate::labyrinth::GatewayXrpcTransport::new(gateway.clone(), signer.clone(), self.normalized_did.clone(), config.device_id)
-            .with_clock(Arc::new(NativeArchiveClock(self.hooks.clone()))));
+            .with_clock(Arc::new(NativeArchiveClock(self.hooks.clone())))
+            .with_home_ds_did(config.home_ds_did.clone()));
         let deps = crate::labyrinth::SessionDeps {
             did: self.normalized_did.clone(), transport, signer,
             vault: Arc::new(NativeArchiveVault { db: self.db.clone(), namespace: "native.session", hooks: self.hooks.clone() }),
@@ -1278,6 +1304,62 @@ impl CatbirdMlsClient {
         Ok(status)
     }
 
+    pub fn labyrinth_recovery_presence(&self) -> Result<LabyrinthRecoveryPresence, MLSError> {
+        let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
+        self.native_archive_run(async {
+            let presence = self.native_archive_deps()?.recovery_presence().await.map_err(native_archive_error)?;
+            Ok(LabyrinthRecoveryPresence {
+                local_state: presence.local_state,
+                mailbox_epoch: presence.mailbox_epoch,
+                pds_head: presence.pds_head,
+                ds_head: presence.ds_head,
+                requires_recovery: presence.requires_recovery(),
+            })
+        })
+    }
+
+    pub fn list_recovery_methods(&self) -> Result<Vec<LabyrinthRecoveryMethodInfo>, MLSError> {
+        let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
+        self.native_archive_run(async {
+            let session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?
+                .ok_or_else(|| MLSError::InvalidState("Labyrinth must be restored before listing recovery methods".into()))?;
+            let now_ms = self.hooks.now_ms();
+            session.list_recovery_methods().await.map_err(native_archive_error).map(|methods| {
+                methods.into_iter().map(|method| LabyrinthRecoveryMethodInfo {
+                    vdevice_id: method.vdevice_id.to_vec(),
+                    mechanism: method.mechanism.as_str().to_owned(),
+                    device_key: method.device_key.0.to_vec(),
+                    created_at_ms: method.created_at_ms,
+                    last_used_at_ms: method.last_used_at_ms,
+                    stale_at_ms: method.stale_at_ms,
+                    stale_now: method.stale_at(now_ms),
+                    revoked: method.revoked,
+                }).collect()
+            })
+        })
+    }
+
+    fn set_recovery_needs_attention(&self, needs_attention: bool) -> Result<(), MLSError> {
+        let now_ms = self.hooks.now_ms();
+        let status = self.db.write_tx(|tx| {
+            let raw = tx.get_labyrinth_state("status_json")?
+                .ok_or_else(|| MLSError::InvalidState("Labyrinth status not initialized".into()))?;
+            let mut status: LabyrinthBackupStatus = serde_json::from_slice(&raw)
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            status.recovery_needs_attention = needs_attention;
+            tx.put_labyrinth_state("status_json", &serde_json::to_vec(&status)
+                .map_err(|e| MLSError::Internal(e.to_string()))?, now_ms)?;
+            Ok(status)
+        })?;
+        self.notify(PlatformChangeEvent::LabyrinthStatusChanged { epoch_seq: status.epoch_seq });
+        Ok(())
+    }
+
+    pub fn acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.set_recovery_needs_attention(false)?;
+        self.labyrinth_status()
+    }
+
     fn persist_native_passkey_recovery(
         &self,
         credential_id: &[u8],
@@ -1334,8 +1416,14 @@ impl CatbirdMlsClient {
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.enable().await.map_err(native_archive_error)?;
+            // Set the durable reminder before a code can be minted. A later
+            // status-write failure must not make the only displayable code
+            // disappear into an error return.
+            self.set_recovery_needs_attention(true)?;
             let code = session.create_recovery_code().await.map_err(native_archive_error)?;
-            self.save_native_archive_status(&session, true)?;
+            if let Err(error) = self.save_native_archive_status(&session, true) {
+                tracing::warn!(%error, "recovery code created but archive status refresh failed");
+            }
             Ok(code)
         })
     }
@@ -1356,7 +1444,19 @@ impl CatbirdMlsClient {
     pub fn restore_with_recovery_code(&self, code: &str) -> Result<LabyrinthBackupStatus, MLSError> {
         #[cfg(any(test, feature = "test-utils", feature = "sim"))]
         if self.offline_archive_for_test { return self.offline_restore_with_recovery_code(code); }
-        labyrinth::recovery_code::RecoveryCode::candidates(code).map_err(|_| MLSError::invalid_input("invalid 40-character Labyrinth recovery code"))?;
+        let code_version = labyrinth::recovery_code::RecoveryCode::candidates(code)
+            .map_err(|error| match error {
+                labyrinth::Error::UnsupportedCodeVersion => MLSError::invalid_input(
+                    "recovery code version is not supported by this app",
+                ),
+                _ => MLSError::invalid_input("invalid 40-character Labyrinth recovery code"),
+            })?
+            .next()
+            .ok_or_else(|| MLSError::invalid_input("invalid 40-character Labyrinth recovery code"))?
+            .version();
+        if code_version == labyrinth::recovery_code::CodeVersion::V3 {
+            self.ensure_recovery_share_home_service_pin()?;
+        }
         // A recovery code enrolls storage keys, not an unverified chat device.
         // Register this new device normally before the library attests its binding.
         if self.db.read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?.is_none() {
@@ -2244,6 +2344,10 @@ impl CatbirdMlsClient {
                 rekeyed_passkeys: Vec::new(),
             });
         }
+        // Even a v2 method invokes the configured share store on removal.
+        // Prove the account's home DS before a rotation can reach that path;
+        // a v3 share must never be silently left live on an unproven service.
+        self.ensure_recovery_share_home_service_pin()?;
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.native_archive_run(async {
             let mut session = self
@@ -2258,6 +2362,9 @@ impl CatbirdMlsClient {
                 None => session.rotate_epoch().await,
             }
             .map_err(native_archive_error)?;
+            if let Err(error) = self.save_native_archive_status(&session, report.rekeyed_recovery_code.is_some()) {
+                tracing::warn!(%error, "archive rotation committed but status refresh failed");
+            }
             Ok(NativeRotationResult {
                 new_epoch: report.new_epoch,
                 exclusions: report
@@ -2296,6 +2403,9 @@ impl CatbirdMlsClient {
         if self.offline_archive_for_test {
             return self.offline_restore_with_passkey_prf(&credential_id, &prf_output_32);
         }
+        // A passkey may wrap either a v2 or a v3 code. Prove the home service
+        // before Labyrinth can inspect a v3 bundle and present its fetch token.
+        self.ensure_recovery_share_home_service_pin()?;
         if self
             .db
             .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?
@@ -3480,6 +3590,14 @@ impl CatbirdMlsClient {
         let target_pubkey_opt: Option<[u8; 32]> =
             <[u8; 32]>::try_from(Self::decode_device_pubkey_field(&target_entry["signaturePublicKey"]).as_slice()).ok();
         let already_revoked = target_entry["status"].as_str() == Some("revoked");
+        let prior_needs_attention = self.labyrinth_status()?.recovery_needs_attention;
+        if target_pubkey_opt.is_some() {
+            // Fail before changing server or live-group state if a v3 share
+            // cannot be deleted on the proven home service. Reserve a durable
+            // reminder for a replacement code before any rotation can start.
+            self.ensure_recovery_share_home_service_pin()?;
+            self.set_recovery_needs_attention(true)?;
+        }
 
         if !already_revoked {
             let actor_key_id =
@@ -3515,7 +3633,6 @@ impl CatbirdMlsClient {
         let mut rekeyed_recovery_code = None;
         let mut rekeyed_passkey_ids = Vec::new();
         let mut collected_exclusions = Vec::new();
-
         if let Some(chat_pubkey) = target_pubkey_opt {
             let _guard = self
                 .outbox_flush_lock
@@ -3531,10 +3648,12 @@ impl CatbirdMlsClient {
                     .revoke_chat_device(chat_pubkey)
                     .await
                     .map_err(native_archive_error)?;
-                self.save_native_archive_status(
+                if let Err(error) = self.save_native_archive_status(
                     &session,
                     out.iter().any(|r| r.rekeyed_recovery_code.is_some()),
-                )?;
+                ) {
+                    tracing::warn!(%error, "chat device revocation committed but archive status refresh failed");
+                }
                 Ok::<_, MLSError>(out)
             })?;
             for rep in reports {
@@ -3615,6 +3734,8 @@ impl CatbirdMlsClient {
             if !rekeyed_passkey_ids.is_empty() {
                 st.has_passkey_prf = false;
             }
+            st.recovery_needs_attention =
+                prior_needs_attention || rekeyed_recovery_code.is_some();
             if rekeyed_recovery_code.is_some() {
                 st.has_recovery_code = true;
             }
@@ -3633,10 +3754,18 @@ impl CatbirdMlsClient {
                 now_ms,
             )?;
             Ok(st)
-        })?;
-        self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
-            epoch_seq: status.epoch_seq,
         });
+        match status {
+            Ok(status) => self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
+                epoch_seq: status.epoch_seq,
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "chat device revocation committed but UI status update failed");
+                if let Some(epoch_seq) = new_epoch_seq {
+                    self.notify(PlatformChangeEvent::LabyrinthStatusChanged { epoch_seq });
+                }
+            }
+        }
 
         Ok(DeviceRevocationReport {
             target_device_id: target_trimmed.to_owned(),

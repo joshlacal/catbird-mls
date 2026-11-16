@@ -6,10 +6,11 @@ use std::sync::Arc;
 use crate::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, wipe_pre_cutover_local_artifacts,
     CatbirdMlsClient, CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport,
-    EnrollmentReceipt, LabyrinthBackupStatus, LeaveConversationOutcome, MailboxReadStateRecord,
-    OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer, PeerRepinProposalInfo,
-    PendingGroupCreationStatus, PlatformChangeObserver, PlatformKeyStore, PlatformTransport,
-    PreCutoverWipeReport, QueuedLabyrinthArchivePayload, RegisteredDeviceInfo,
+    EnrollmentReceipt, LabyrinthBackupStatus, LabyrinthRecoveryMethodInfo,
+    LabyrinthRecoveryPresence, LabyrinthRevocationOutcome, LeaveConversationOutcome,
+    MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer,
+    PeerRepinProposalInfo, PendingGroupCreationStatus, PlatformChangeObserver, PlatformKeyStore,
+    PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload, RegisteredDeviceInfo,
     SignedPushGatewayRegistration, SpacesEligibilityInput, SpacesEligibilityStatus,
     UploadedConversationAttachment,
 };
@@ -325,6 +326,21 @@ impl CatbirdMlsClient {
         self.labyrinth_status()
     }
 
+    #[uniffi::method(name = "labyrinth_recovery_presence")]
+    pub fn ffi_labyrinth_recovery_presence(&self) -> Result<LabyrinthRecoveryPresence, MLSError> {
+        self.labyrinth_recovery_presence()
+    }
+
+    #[uniffi::method(name = "list_recovery_methods")]
+    pub fn ffi_list_recovery_methods(&self) -> Result<Vec<LabyrinthRecoveryMethodInfo>, MLSError> {
+        self.list_recovery_methods()
+    }
+
+    #[uniffi::method(name = "acknowledge_recovery_attention")]
+    pub fn ffi_acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.acknowledge_recovery_attention()
+    }
+
     #[uniffi::method(name = "setup_recovery_code")]
     pub fn ffi_setup_recovery_code(&self) -> Result<String, MLSError> {
         self.setup_recovery_code()
@@ -364,7 +380,7 @@ impl CatbirdMlsClient {
     pub fn ffi_revoke_labyrinth_device(
         &self,
         target_device_id: String,
-    ) -> Result<LabyrinthBackupStatus, MLSError> {
+    ) -> Result<LabyrinthRevocationOutcome, MLSError> {
         self.revoke_labyrinth_device(&target_device_id)
     }
 

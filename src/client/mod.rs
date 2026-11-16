@@ -91,6 +91,10 @@ pub struct LabyrinthBackupStatus {
     pub mailbox_space_uri: String,
     pub has_recovery_code: bool,
     pub has_passkey_prf: bool,
+    /// A rotation minted a replacement code that still needs to be saved or
+    /// replaced by the account owner. Durable across app restarts.
+    #[serde(default)]
+    pub recovery_needs_attention: bool,
     pub epoch_seq: u64,
     pub active_device_ids: Vec<String>,
     /// Advisory only: this restored keychain/passkey method passed its
@@ -114,12 +118,68 @@ pub struct LabyrinthBackupStatus {
     pub directory_publication_error: Option<String>,
 }
 
-/// Enrolled-device offer for 6-digit hybrid PQ `CPace + ML-KEM-768` device pairing (`I16`).
+/// Independent account-archive presence used before offering fresh genesis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct LabyrinthRecoveryPresence {
+    pub local_state: bool,
+    pub mailbox_epoch: bool,
+    pub pds_head: bool,
+    pub ds_head: bool,
+    pub requires_recovery: bool,
+}
+
+/// One verified virtual recovery method in the account's current epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct LabyrinthRecoveryMethodInfo {
+    pub vdevice_id: Vec<u8>,
+    pub mechanism: String,
+    pub device_key: Vec<u8>,
+    pub created_at_ms: u64,
+    pub last_used_at_ms: Option<u64>,
+    pub stale_at_ms: Option<u64>,
+    pub stale_now: bool,
+    pub revoked: bool,
+}
+
+/// A Labyrinth-only revocation result that does not discard a fresh code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct LabyrinthRevocationOutcome {
+    pub status: LabyrinthBackupStatus,
+    pub rekeyed_recovery_code: Option<String>,
+    pub rekeyed_passkey_ids: Vec<Vec<u8>>,
+}
+
+impl core::fmt::Debug for LabyrinthRevocationOutcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LabyrinthRevocationOutcome")
+            .field("status", &self.status)
+            .field(
+                "rekeyed_recovery_code",
+                &self.rekeyed_recovery_code.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rekeyed_passkey_ids", &self.rekeyed_passkey_ids)
+            .finish()
+    }
+}
+
+/// Enrolled-device offer for 6-digit hybrid PQ `CPace + ML-KEM-768` device pairing (`I16`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct OtcPairingOffer {
     pub six_digit_code: String,
     pub formatted_code: String,
+}
+
+impl core::fmt::Debug for OtcPairingOffer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OtcPairingOffer")
+            .field("six_digit_code", &"<redacted>")
+            .field("formatted_code", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Completed hybrid PQ `CPace + ML-KEM-768` OTC handshake transcript (`I16`).
@@ -161,7 +221,7 @@ pub struct RegisteredDeviceInfo {
 }
 
 /// Per-step result of unified `revoke_device`, including atomic recovery-method rotation outputs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct DeviceRevocationReport {
     pub target_device_id: String,
@@ -172,6 +232,24 @@ pub struct DeviceRevocationReport {
     pub pds_record_deleted: bool,
     pub rekeyed_recovery_code: Option<String>,
     pub rekeyed_passkey_ids: Vec<Vec<u8>>,
+}
+
+impl core::fmt::Debug for DeviceRevocationReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceRevocationReport")
+            .field("target_device_id", &self.target_device_id)
+            .field("ds_revoked", &self.ds_revoked)
+            .field("groups_updated", &self.groups_updated)
+            .field("labyrinth_rotated", &self.labyrinth_rotated)
+            .field("new_epoch_seq", &self.new_epoch_seq)
+            .field("pds_record_deleted", &self.pds_record_deleted)
+            .field(
+                "rekeyed_recovery_code",
+                &self.rekeyed_recovery_code.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rekeyed_passkey_ids", &self.rekeyed_passkey_ids)
+            .finish()
+    }
 }
 
 /// Safety-number & 72-hour hold metadata for a peer mailbox full-chain reset (`repin_peer`).
@@ -631,6 +709,7 @@ pub(crate) mod native_client {
                         mailbox_space_uri: mailbox_uri.clone(),
                         has_recovery_code: false,
                         has_passkey_prf: false,
+                        recovery_needs_attention: false,
                         epoch_seq: 1,
                         active_device_ids: vec![config.device_id.clone()],
                         recovery_method_stale: false,
@@ -2313,7 +2392,7 @@ pub(crate) mod native_client {
         pub fn revoke_labyrinth_device(
             &self,
             target_device_id: &str,
-        ) -> Result<LabyrinthBackupStatus, MLSError> {
+        ) -> Result<LabyrinthRevocationOutcome, MLSError> {
             if target_device_id.trim().is_empty() {
                 return Err(MLSError::invalid_input(
                     "target_device_id must not be empty",
@@ -2323,6 +2402,24 @@ pub(crate) mod native_client {
                 return Err(MLSError::ContextClosed);
             }
             let now_ms = self.hooks.now_ms();
+            #[cfg(feature = "labyrinth")]
+            let prior_needs_attention = {
+                let valid_key = hex::decode(target_device_id.trim())
+                    .ok()
+                    .is_some_and(|key| key.len() == 32);
+                if !valid_key {
+                    return Err(MLSError::invalid_input(
+                        "target_device_id must be a 32-byte Labyrinth device key",
+                    ));
+                }
+                self.ensure_recovery_share_home_service_pin()?;
+                // A committed rotation can mint the only copy of a new code.
+                // Persist the reminder before the mutation starts.
+                let prior_needs_attention = self.labyrinth_status()?.recovery_needs_attention;
+                self.set_recovery_needs_attention(true)?;
+                prior_needs_attention
+            };
+            let mut fallback_status = self.labyrinth_status()?;
             #[cfg(feature = "labyrinth")]
             let rotated_remote = self.rotate_native_archive(Some(target_device_id))?;
             let status = self.db.write_tx(|tx| {
@@ -2336,6 +2433,14 @@ pub(crate) mod native_client {
                 {
                     st.epoch_seq = rotated_remote.new_epoch;
                     st.rotation_exclusions = rotated_remote.exclusions.clone();
+                    st.recovery_needs_attention =
+                        prior_needs_attention || rotated_remote.rekeyed_recovery_code.is_some();
+                    if st.recovery_needs_attention {
+                        st.has_recovery_code = true;
+                    }
+                    if !rotated_remote.rekeyed_passkeys.is_empty() {
+                        st.has_passkey_prf = false;
+                    }
                 }
                 #[cfg(not(feature = "labyrinth"))]
                 {
@@ -2357,11 +2462,42 @@ pub(crate) mod native_client {
                     now_ms,
                 )?;
                 Ok(st)
-            })?;
+            });
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => {
+                    // Keep the code in the return value even if this UI status
+                    // refresh fails. The reminder was already committed.
+                    tracing::warn!(%error, "archive revocation committed but status refresh failed");
+                    #[cfg(feature = "labyrinth")]
+                    {
+                        fallback_status.epoch_seq = rotated_remote.new_epoch;
+                        fallback_status.rotation_exclusions = rotated_remote.exclusions.clone();
+                        fallback_status.recovery_needs_attention =
+                            prior_needs_attention || rotated_remote.rekeyed_recovery_code.is_some();
+                        fallback_status.has_recovery_code |=
+                            rotated_remote.rekeyed_recovery_code.is_some();
+                        if !rotated_remote.rekeyed_passkeys.is_empty() {
+                            fallback_status.has_passkey_prf = false;
+                        }
+                    }
+                    fallback_status
+                }
+            };
             self.notify(PlatformChangeEvent::LabyrinthStatusChanged {
                 epoch_seq: status.epoch_seq,
             });
-            Ok(status)
+            Ok(LabyrinthRevocationOutcome {
+                status,
+                #[cfg(feature = "labyrinth")]
+                rekeyed_recovery_code: rotated_remote.rekeyed_recovery_code,
+                #[cfg(not(feature = "labyrinth"))]
+                rekeyed_recovery_code: None,
+                #[cfg(feature = "labyrinth")]
+                rekeyed_passkey_ids: rotated_remote.rekeyed_passkeys,
+                #[cfg(not(feature = "labyrinth"))]
+                rekeyed_passkey_ids: Vec::new(),
+            })
         }
 
         /// Import Space history messages into local `<did_hash>.db` (`I13`).
@@ -2400,6 +2536,16 @@ pub(crate) mod native_client {
                             continue;
                         }
                     }
+                    let mut gap_key = super::chat_wire::undecryptable_evidence_key(
+                        conversation_id,
+                        &msg.message_id,
+                    );
+                    if tx.get_labyrinth_state(&gap_key)?.is_none() {
+                        gap_key =
+                            super::chat_wire::unavailable_message_key(conversation_id, &msg.message_id);
+                    }
+                    let local = tx.get_message(&msg.message_id)?;
+                    let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
                     if let Some(retained) = tx.get_labyrinth_state(&format!(
                         "native.message:{conversation_id}:{}",
                         msg.message_id
@@ -2416,17 +2562,17 @@ pub(crate) mod native_client {
                                     .into(),
                             ));
                         }
+                        // A restored archive copy keeps only its canonical frame and receipt in
+                        // `native.message`; it has no `sender_did` or `plaintext_json` fields.
+                        // A caller-supplied import therefore cannot replace an existing gap or
+                        // invent a missing row under that evidence. Verified reindex must do it.
+                        if gap || local.is_none() {
+                            return Err(MLSError::Cryptography(
+                                "history import cannot replace retained authenticated archive evidence"
+                                    .into(),
+                            ));
+                        }
                     }
-                    let mut gap_key = super::chat_wire::undecryptable_evidence_key(
-                        conversation_id,
-                        &msg.message_id,
-                    );
-                    if tx.get_labyrinth_state(&gap_key)?.is_none() {
-                        gap_key =
-                            super::chat_wire::unavailable_message_key(conversation_id, &msg.message_id);
-                    }
-                    let local = tx.get_message(&msg.message_id)?;
-                    let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
                     if local.is_some() && !gap {
                         continue;
                     }
@@ -2471,6 +2617,27 @@ pub(crate) mod native_client {
         ) -> Result<QueuedLabyrinthArchivePayload, MLSError> {
             serde_json::from_slice::<QueuedLabyrinthArchivePayload>(&row.payload_bytes)
                 .map_err(|e| MLSError::Cryptography(format!("invalid archive queue payload: {e}")))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn labyrinth_recovery_presence(&self) -> Result<LabyrinthRecoveryPresence, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn list_recovery_methods(&self) -> Result<Vec<LabyrinthRecoveryMethodInfo>, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
         }
 
         #[cfg(not(feature = "labyrinth"))]

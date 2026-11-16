@@ -467,6 +467,65 @@ fn import_conversation_history_skips_existing_replaces_gap_and_validates_convers
 }
 
 #[test]
+fn import_cannot_replace_a_retained_archive_row_through_a_gap() {
+    let tmp = TempDir::new().unwrap();
+    let clock = Arc::new(FixedStepClock::new(1_700_000_000_000, 1));
+    let client = open_enrolled_tail_client(&tmp, clock, 7, Arc::new(TailTransport::new()));
+    let cid = "a1234567-89ab-4cde-8123-456789abcdef";
+    let verified = MessageRow {
+        message_id: "restored-message".into(),
+        conversation_id: cid.into(),
+        group_id: vec![0x22; 32],
+        epoch: 1,
+        seq: 2,
+        sender_did: "did:plc:peeruserbbbbbbbbbbbbbbbb".into(),
+        sender_device_id: BOB_DEV_1.into(),
+        plaintext_json: r#"{"text":"verified"}"#.into(),
+        created_at_ms: 1_700_000_000_002,
+        is_own: false,
+    };
+    client
+        .db
+        .write_tx(|tx| {
+            tx.insert_message(&verified)?;
+            tx.put_labyrinth_state(
+                &format!("native.message:{cid}:{}", verified.message_id),
+                &serde_json::to_vec(&json!({
+                    "message_id": verified.message_id.clone(),
+                    "conversation_id": cid,
+                    "labyrinth_frame_json": verified.plaintext_json.clone(),
+                    "frame_nonce_b64": null,
+                    "sequencer_receipt_json": null,
+                    "original_sender_attestation_json": null,
+                    "created_at_ms": verified.created_at_ms,
+                }))?,
+                verified.created_at_ms,
+            )?;
+            tx.put_labyrinth_state(
+                &chat_wire::undecryptable_evidence_key(cid, &verified.message_id),
+                br#"{"gap":true}"#,
+                verified.created_at_ms,
+            )
+        })
+        .unwrap();
+    let mut forged = verified.clone();
+    forged.plaintext_json = r#"{"text":"forged"}"#.into();
+    assert!(client.import_conversation_history(cid, vec![forged]).is_err());
+    assert_eq!(
+        client.db.read_tx(|tx| tx.get_message(&verified.message_id)).unwrap(),
+        Some(verified.clone())
+    );
+    assert!(client
+        .db
+        .read_tx(|tx| tx.get_labyrinth_state(&chat_wire::undecryptable_evidence_key(
+            cid,
+            &verified.message_id,
+        )))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn ffi_pending_group_creation_status_retry_and_cancel_wrappers_preserve_outcomes() {
     let tmp = TempDir::new().unwrap();
     let clock = Arc::new(FixedStepClock::new(1_700_000_000_000, 1));
