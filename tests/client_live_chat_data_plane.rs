@@ -11758,6 +11758,20 @@ fn own_leaf_recovery_fails_closed_when_device_inventory_is_unavailable_or_missin
         .unwrap()
         .device_keys
         .insert((ALICE_DID.to_owned(), alice_second_id.clone()), removed_key);
+    let identity_change_key = format!("did_identity_changed:{ALICE_DID}");
+    f.alice
+        .db()
+        .write_tx(|tx| tx.put_account_meta(&identity_change_key, "1", 1))
+        .unwrap();
+    assert!(
+        f.alice.sync().is_err(),
+        "an identity-changed requester cannot get a leaf"
+    );
+    assert!(!has_second_leaf());
+    f.alice
+        .db()
+        .write_tx(|tx| tx.delete_account_meta(&identity_change_key))
+        .unwrap();
     f.alice
         .sync()
         .expect("verified active requester can recover");
