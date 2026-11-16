@@ -942,7 +942,7 @@ impl SharedMockDs {
         if url.contains("/xrpc/blue.catbird.labyrinth.deleteAccountData") {
             use catbird_mls::labyrinth::write_auth::{WRITE_BODY_HEADER, WRITE_DOMAIN};
             let nsid = "blue.catbird.labyrinth.deleteAccountData";
-            let (write, _) = match device_signed_claim(
+            let (write, device_key) = match device_signed_claim(
                 &g,
                 account,
                 &req,
@@ -953,6 +953,12 @@ impl SharedMockDs {
                 Ok(verified) => verified,
                 Err(message) => return xrpc_error(401, "InvalidSignature", message),
             };
+            let key_proof = device_key_proof(
+                &self.archive_auth,
+                account,
+                write["actorDeviceId"].as_str().unwrap_or_default(),
+                &device_key,
+            );
             let payload_sha256 =
                 hex::encode(Sha256::digest(req.body.as_deref().unwrap_or_default()));
             if write["endpointNsid"] != nsid || write["payloadSha256"] != payload_sha256 {
@@ -962,6 +968,22 @@ impl SharedMockDs {
                     "write body does not bind this payload",
                 );
             }
+            let actor_write = {
+                let header = |name: &str| {
+                    req.headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case(name))
+                        .and_then(|h| URL_SAFE_NO_PAD.decode(&h.value).ok())
+                        .unwrap_or_default()
+                };
+                json!({
+                    "writeBody": { "$bytes": STANDARD.encode(header(WRITE_BODY_HEADER)) },
+                    "payloadBytes": { "$bytes": STANDARD.encode(req.body.as_deref().unwrap_or_default()) },
+                    "signature": {
+                        "$bytes": STANDARD.encode(header(&format!("{WRITE_BODY_HEADER}-signature")))
+                    },
+                })
+            };
             g.labyrinth_epochs.remove(account);
             let receipt_key_id = labyrinth_protocol::receipt::expected_receipt_key_id(DS_DID);
             let affected_cids: Vec<String> = g
@@ -978,7 +1000,7 @@ impl SharedMockDs {
                 .collect();
             for cid in affected_cids {
                 let next_seq = g.entries.get(&cid).map_or(0, Vec::len) as i64 + 1;
-                let del_entry = signed_account_deletion(
+                let mut del_entry = signed_account_deletion(
                     &g.receipt_sk,
                     &receipt_key_id,
                     DS_DID,
@@ -986,6 +1008,8 @@ impl SharedMockDs {
                     account,
                     next_seq,
                 );
+                del_entry["actorWrite"] = actor_write.clone();
+                del_entry["keyProof"] = json!({ "$bytes": STANDARD.encode(&key_proof) });
                 g.entries
                     .entry(cid.clone())
                     .or_default()
@@ -2503,7 +2527,8 @@ fn signed_account_deletion(
     seq: i64,
 ) -> Value {
     let entry_id = uuid::Uuid::new_v4().to_string();
-    let received_at = "2026-11-03T00:00:00.000Z";
+    let received_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let received_at = received_at.as_str();
     let seq_text = seq.to_string();
     let fields = [sequencer, cid, deleted, &seq_text, &entry_id, received_at];
     let mut message = b"catbird-mls-account-deletion-authority-v2\0".to_vec();
@@ -2529,6 +2554,49 @@ fn signed_account_deletion(
             "keyId": key_id,
             "signature": { "$bytes": STANDARD.encode(signature.to_bytes()) },
         },
+    })
+}
+
+/// `keyProof`: a repo proof, under `did`'s `#atproto` key, of its `chat.device` record for
+/// `device_id`.
+fn device_key_proof(
+    fixture: &NativeArchiveAuthFixture,
+    did: &str,
+    device_id: &str,
+    device_key: &[u8],
+) -> Vec<u8> {
+    let record = json!({
+        "$type": "blue.catbird.chat.device",
+        "deviceId": device_id,
+        "algorithm": "Ed25519",
+        "mlsSignaturePublicKey": { "$bytes": STANDARD.encode(device_key) },
+        "createdAt": "2026-11-03T00:00:00.000Z",
+    });
+    fixture
+        .build_signed_car_response(did, "blue.catbird.chat.device", device_id, Some(&record))
+        .unwrap()
+        .body
+}
+
+/// `actorWrite`: the deleting device's own signed `deleteAccountData` request body.
+fn deletion_actor_write(signer: &SignatureKeyPair, device_id: &str) -> Value {
+    use catbird_mls::labyrinth::write_auth::WriteBody;
+    use openmls_traits::signatures::Signer as _;
+    let mut op = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut op);
+    let body = serde_json::to_vec(&json!({
+        "operationId": hex::encode(op),
+        "actorDeviceId": device_id,
+        "endpointNsid": "blue.catbird.labyrinth.deleteAccountData",
+        "payloadSha256": hex::encode(Sha256::digest(b"{}")),
+        "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    }))
+    .unwrap();
+    let signature = signer.sign(&WriteBody::signing_input(&body)).unwrap();
+    json!({
+        "writeBody": { "$bytes": STANDARD.encode(&body) },
+        "payloadBytes": { "$bytes": STANDARD.encode(b"{}") },
+        "signature": { "$bytes": STANDARD.encode(signature) },
     })
 }
 
@@ -3020,20 +3088,8 @@ fn run_live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync(
         &alice_dev,
         peer_send_counter,
     );
-    let queued_before_duplicate = bob
-        .db()
-        .read_tx(|tx| tx.list_labyrinth_queue(None, 100))
-        .unwrap()
-        .len();
-    let error = bob
-        .sync()
-        .expect_err("an equal counter on a distinct retained message is refused");
-    assert!(
-        error
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "{error:?}"
-    );
+    bob.sync()
+        .expect("an equal counter on a distinct retained message is evidence only");
     bob.db()
         .read_tx(|tx| {
             assert_eq!(
@@ -3042,25 +3098,16 @@ fn run_live_catbird_mls_client_c33_dm_i4_i13_i14_labyrinth_and_group_sync(
             );
             assert!(tx
                 .get_pending_op("native_archive_receipt", &duplicate_id)?
-                .is_some());
-            assert_eq!(
-                tx.list_labyrinth_queue(None, 100)?.len(),
-                queued_before_duplicate
-            );
+                .is_none());
+            let evidence =
+                tx.get_account_meta(&catbird_mls::client::send_counter::send_counter_gap_key(
+                    &dm_cid,
+                    duplicate_send.seq,
+                ))?;
+            assert!(evidence.as_deref().is_some_and(|e| e.contains("regressed")));
             Ok(())
         })
         .unwrap();
-    rebind_application_send_counter(
-        &ds,
-        &dm_cid,
-        &duplicate_id,
-        &enrolled_signer(&alice),
-        ALICE_DID,
-        &alice_dev,
-        peer_send_counter + 1,
-    );
-    bob.sync()
-        .expect("the distinct message completes under its genuine greater counter");
     let before_receipt_replay = mls_snapshot();
     bob.db()
         .write_tx(|tx| {
@@ -3913,11 +3960,16 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         .iter()
         .filter(|m| m.plaintext_json.contains("message.unavailable"))
         .collect();
-    assert_eq!(placeholders.len(), 1, "a never-received pruned message leaves a placeholder");
+    assert_eq!(
+        placeholders.len(),
+        1,
+        "a never-received pruned message leaves a placeholder"
+    );
     assert_eq!(placeholders[0].sender_did, ALICE_DID);
     assert!(bob_messages
         .iter()
-        .all(|m| m.message_id != pruned_mid && !m.plaintext_json.contains("pruned before bob reads it")));
+        .all(|m| m.message_id != pruned_mid
+            && !m.plaintext_json.contains("pruned before bob reads it")));
 
     // 6. Publication can succeed after the sender loses the response. Preserve both the
     // exact retry ciphertext and its plaintext across restart without reusing sender keys.
@@ -5238,10 +5290,27 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
             .unwrap()
             .pop();
     }
+    let alice_device = ds
+        .inner
+        .lock()
+        .unwrap()
+        .device_keys
+        .keys()
+        .find(|(did, _)| did.as_str() == ALICE_DID)
+        .map(|(_, device)| device.clone())
+        .expect("alice enrolled");
+    let alice_signer = enrolled_signer(&alice);
+    let alice_write = deletion_actor_write(&alice_signer, &alice_device);
+    let alice_proof = device_key_proof(
+        &ds.archive_auth,
+        ALICE_DID,
+        &alice_device,
+        alice_signer.public(),
+    );
     let deletion_seq = {
         let mut g = ds.inner.lock().unwrap();
         let seq = next_seq(&g);
-        let entry = signed_account_deletion(
+        let mut entry = signed_account_deletion(
             &historical_receipt_sk,
             &key_id_2,
             DS_DID,
@@ -5249,16 +5318,22 @@ fn c33_peer_applies_account_deletion_and_restore_reconciles_complete_inventory()
             ALICE_DID,
             seq,
         );
+        entry["actorWrite"] = alice_write.clone();
+        entry["keyProof"] = json!({ "$bytes": STANDARD.encode(&alice_proof) });
         g.entries.get_mut(&cid).unwrap().push(entry.clone());
         g.account_deletions
             .entry(cid.clone())
             .or_default()
             .push(entry);
+        // The account's PDS repository is already gone when another device synchronizes. The
+        // deletion must reach actorWrite/keyProof verification without a live device directory.
+        g.pds_records.retain(|(repo, _, _), _| repo != ALICE_DID);
         seq
     };
     bob.sync()
         .expect("bob applies the deletion through ordinary C33 sync");
-    assert_eq!(marker(&bob), Some(deletion_seq.to_string().into_bytes()));
+    let applied: Value = serde_json::from_slice(&marker(&bob).expect("deletion marker")).unwrap();
+    assert_eq!(applied["seq"], deletion_seq);
     assert!(
         bob.list_pending_labyrinth_queue(Some(&cid), 100)
             .unwrap()
@@ -12088,14 +12163,13 @@ fn legacy_enrollment_marker_rebinds_the_same_signer_key() {
     );
 }
 
-/// Gap 1 regression. `getEntries` cannot omit an accepted tail row, while peer counters need only
-/// increase within an epoch: reservations may leave holes, but duplicates and rewinds are refused.
-/// Both failures leave the durable cursor and ACK watermark at the verified prefix; restoring a
-/// contiguous row or increasing counter lets the same sync path advance.
+/// `getEntries` cannot omit an accepted tail row. Peer counters are evidence only: a jump,
+/// duplicate or rewind is stored without blocking a valid MLS message. A missing sequenced row
+/// still leaves the durable cursor and ACK watermark at the verified prefix.
 ///
 /// Fail-before: sync rejected a valid counter jump that the sequencer accepts.
 #[test]
-fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
+fn sync_requires_contiguous_entry_seq_and_records_peer_counter_anomalies() {
     let (_tmp, ds, alice, bob, cid, alice_device, _) = synced_group_pair();
     let baseline = last_seq(&bob, &cid);
     let first = new_id();
@@ -12156,7 +12230,7 @@ fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
     alice
         .send_message(&cid, &new_id(), "counter four")
         .expect("the mock DS sequences a skipped counter");
-    // Counters are monotone reservations, not a gap-free delivery sequence.
+    // A skipped counter is evidence, but delivery continues.
     bob.sync().expect("peer sendCounter 2 -> 4 advances");
     assert_eq!(last_seq(&bob, &cid), before_counter_jump + 1);
 
@@ -12166,38 +12240,44 @@ fn sync_requires_contiguous_entry_seq_and_increasing_peer_send_counter() {
         .expect("the next increasing counter is sequenced");
     let signer = enrolled_signer(&alice);
     let before_non_increasing = last_seq(&bob, &cid);
-    let ack_before = ds.inner.lock().unwrap().acked_watermarks.clone();
     rebind_application_send_counter(&ds, &cid, &candidate, &signer, ALICE_DID, &order_key.2, 4);
-    let error = bob
-        .sync()
-        .expect_err("a distinct duplicate counter is refused");
-    assert!(
-        error
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "{error:?}"
-    );
-    assert_eq!(last_seq(&bob, &cid), before_non_increasing);
-    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_before);
-
-    rebind_application_send_counter(&ds, &cid, &candidate, &signer, ALICE_DID, &order_key.2, 3);
-    let error = bob.sync().expect_err("a peer counter rewind is refused");
-    assert!(
-        error
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "{error:?}"
-    );
-    assert_eq!(last_seq(&bob, &cid), before_non_increasing);
-    assert_eq!(ds.inner.lock().unwrap().acked_watermarks, ack_before);
-
-    rebind_application_send_counter(&ds, &cid, &candidate, &signer, ALICE_DID, &order_key.2, 5);
-    bob.sync().expect("the restored increasing counter applies");
+    bob.sync().expect("duplicate counter is evidence only");
+    assert_eq!(last_seq(&bob, &cid), before_non_increasing + 1);
     assert!(bob
         .list_messages(&cid, None, 20)
         .unwrap()
         .iter()
         .any(|row| row.message_id == candidate));
+    let evidence = bob
+        .db()
+        .read_tx(|tx| {
+            tx.get_account_meta(&catbird_mls::client::send_counter::send_counter_gap_key(
+                &cid,
+                before_non_increasing + 1,
+            ))
+        })
+        .unwrap();
+    assert!(evidence.as_deref().is_some_and(|e| e.contains("regressed")));
+
+    let rewind = new_id();
+    alice.send_message(&cid, &rewind, "counter rewind").unwrap();
+    rebind_application_send_counter(&ds, &cid, &rewind, &signer, ALICE_DID, &order_key.2, 3);
+    bob.sync().expect("rewound counter is also evidence only");
+    assert!(bob
+        .list_messages(&cid, None, 20)
+        .unwrap()
+        .iter()
+        .any(|row| row.message_id == rewind));
+    let evidence = bob
+        .db()
+        .read_tx(|tx| {
+            tx.get_account_meta(&catbird_mls::client::send_counter::send_counter_gap_key(
+                &cid,
+                before_non_increasing + 2,
+            ))
+        })
+        .unwrap();
+    assert!(evidence.as_deref().is_some_and(|e| e.contains("regressed")));
 }
 
 struct NseReceiptFixture {

@@ -100,9 +100,9 @@ pub fn peer_send_counter_key(
 /// entry a second time.
 pub const NSE_SEND_COUNTER_RECORDED: &str = "send_counter_recorded";
 
-/// Refuse a counter that cannot follow `last` within one MLS epoch: out of the safe-integer
-/// range, or not greater than `last`. A counter that skips ahead is accepted here; the strict
-/// comparison is recorded as evidence by [`crate::client::send_counter`].
+/// Refuse only a counter outside the lexicon's positive safe-integer range. A duplicate,
+/// rewind or jump is accepted for delivery and recorded as evidence by
+/// [`crate::client::send_counter`].
 pub fn verify_next_peer_send_counter(last: Option<&str>, next: u64) -> Result<(), MLSError> {
     let prior = last
         .map(|last| {
@@ -1425,7 +1425,10 @@ fn append_account_deletion_text(bytes: &mut Vec<u8>, text: &str) -> Option<()> {
 }
 
 /// Server transcript: v2 domain, key ID, then the complete v1 deletion record transcript.
-fn account_deletion_authority_signing_bytes(key_id: &str, fields: &[&str]) -> Option<Vec<u8>> {
+pub(crate) fn account_deletion_authority_signing_bytes(
+    key_id: &str,
+    fields: &[&str],
+) -> Option<Vec<u8>> {
     let fields_len = fields.iter().try_fold(0usize, |len, field| {
         len.checked_add(4)?.checked_add(field.len())
     })?;
@@ -1464,7 +1467,8 @@ fn account_deletion_signature_valid(
         })
 }
 
-/// `labyrinth_state` key: `cid` sequenced `did`'s account deletion; the value is its seq.
+/// `labyrinth_state` key: `cid` sequenced `did`'s account deletion. The value is the applied
+/// deletion (`AppliedAccountDeletion` JSON), or its seq alone for a marker written earlier.
 pub fn account_deletion_key(cid: &str, did: &str) -> String {
     format!("native.account_deleted:{cid}:{did}")
 }
@@ -3837,9 +3841,9 @@ mod tests {
     }
 
     #[test]
-    fn peer_send_counter_boundaries_reject_replay_rollback_corruption_and_safe_int_overflow() {
+    fn peer_send_counter_boundaries_record_replay_and_rollback_but_reject_invalid_inputs() {
         const MAX_SAFE: u64 = 9_007_199_254_740_991;
-        verify_next_peer_send_counter(None, 0).unwrap();
+        assert!(verify_next_peer_send_counter(None, 0).is_err());
         verify_next_peer_send_counter(None, 1).unwrap();
         verify_next_peer_send_counter(None, MAX_SAFE).unwrap();
         assert!(matches!(
@@ -3866,14 +3870,8 @@ mod tests {
                 received: MAX_SAFE
             }
         );
-        assert!(matches!(
-            verify_next_peer_send_counter(Some("5"), 5),
-            Err(MLSError::Cryptography(_))
-        ));
-        assert!(matches!(
-            verify_next_peer_send_counter(Some("5"), 4),
-            Err(MLSError::Cryptography(_))
-        ));
+        verify_next_peer_send_counter(Some("5"), 5).unwrap();
+        verify_next_peer_send_counter(Some("5"), 4).unwrap();
         assert!(matches!(
             verify_next_peer_send_counter(Some("5"), MAX_SAFE + 1),
             Err(MLSError::Cryptography(_))

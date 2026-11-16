@@ -1301,11 +1301,8 @@ mod proofs {
         let verdict = classify_peer_send_counter(has_prior.then_some(prior), next);
         match &verdict {
             Err(_) => {
-                // Refused only out of range, or not increasing within one epoch.
-                assert!(
-                    next > MAX_SAFE_SEND_COUNTER
-                        || (has_prior && prior.same_epoch && next <= prior.last)
-                );
+                // Valid counters are evidence only; only an invalid wire range is refused.
+                assert!(next == 0 || next > MAX_SAFE_SEND_COUNTER);
             }
             Ok(PeerCounterVerdict::Baseline) => assert!(!has_prior),
             Ok(PeerCounterVerdict::Contiguous) => {
@@ -1319,11 +1316,11 @@ mod proofs {
                 assert!(*expected != next);
             }
             Ok(PeerCounterVerdict::Regressed { last, received }) => {
-                assert!(has_prior && !prior.same_epoch);
+                assert!(has_prior);
                 assert!(*last == prior.last && *received == next && next <= prior.last);
             }
         }
-        if next <= MAX_SAFE_SEND_COUNTER && has_prior && next > prior.last {
+        if next > 0 && next <= MAX_SAFE_SEND_COUNTER && has_prior && next > prior.last {
             // Strictness: any increasing counter other than the expected one is a gap.
             assert!(verdict.as_ref().is_ok_and(|v| match v {
                 PeerCounterVerdict::Contiguous => {
@@ -1711,7 +1708,13 @@ mod tests {
                 same_epoch,
             })
         };
-        assert!(classify_peer_send_counter(prior(10, 0, true), 10).is_err());
+        assert_eq!(
+            classify_peer_send_counter(prior(10, 0, true), 10).unwrap(),
+            PeerCounterVerdict::Regressed {
+                last: 10,
+                received: 10
+            }
+        );
         assert_eq!(
             classify_peer_send_counter(prior(10, 0, true), 11).unwrap(),
             PeerCounterVerdict::Contiguous

@@ -2090,9 +2090,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
     for pruned_id in [pruned_own_id, pruned_sib_id] {
         assert!(alice
             .db
-            .read_tx(|tx| tx.get_labyrinth_state(&chat_wire::unavailable_message_key(
-                CONVO_ID, pruned_id
-            )))
+            .read_tx(|tx| tx
+                .get_labyrinth_state(&chat_wire::unavailable_message_key(CONVO_ID, pruned_id)))
             .unwrap()
             .is_some());
         let row = alice
@@ -2100,7 +2099,9 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
             .read_tx(|tx| tx.get_message(pruned_id))
             .unwrap()
             .expect("placeholder row");
-        assert!(row.plaintext_json.contains(chat_wire::UNAVAILABLE_MESSAGE_NOTICE));
+        assert!(row
+            .plaintext_json
+            .contains(chat_wire::UNAVAILABLE_MESSAGE_NOTICE));
     }
     let continuity: crate::client::send_counter::PeerCounterContinuity = serde_json::from_str(
         &alice
@@ -2302,10 +2303,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         None
     );
 
-    // 4. Stale `sendCounter` enforcement (`L4865`) for `(BOB_DID, DEV_A1)` AND `(ALICE_DID, DEV_A2)`:
-    // Pre-seed both counters to `"10"`; an entry with `sendCounter: 1` MUST fail with stale-counter
-    // error BEFORE reaching `deserialize app msg` (`[0u8; 8]` would fail with `"deserialize app msg"`
-    // if `L4865` skipped the counter check!).
+    // 4. Stale `sendCounter` on both a peer and an own sibling is evidence only. These two
+    // malformed MLS bodies still fail at deserialization; no message is delivered.
     let bob_same_dev_key = chat_wire::peer_send_counter_key(CONVO_ID, 0, epoch, BOB_DID, DEV_A1);
     alice
         .db
@@ -2340,10 +2339,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
         .unwrap_err();
     assert!(
-        err_stale_bob
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "peer sharing device UUID string must check sendCounter before decrypt: {err_stale_bob}"
+        err_stale_bob.to_string().contains("deserialize app msg"),
+        "peer sharing device UUID string still rejects malformed MLS bytes: {err_stale_bob}"
     );
 
     let stale_sib = make_signed_app_entry(
@@ -2371,10 +2368,8 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
         .unwrap_err();
     assert!(
-        err_stale_sib
-            .to_string()
-            .contains("non-increasing peer sendCounter"),
-        "own sibling device must check sendCounter before decrypt: {err_stale_sib}"
+        err_stale_sib.to_string().contains("deserialize app msg"),
+        "own sibling device still rejects malformed MLS bytes: {err_stale_sib}"
     );
 
     // 5. Re-delivery at `entry_seq == current.last_seq`:

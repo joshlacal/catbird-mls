@@ -32,8 +32,7 @@ use crate::client::traits::PlatformChangeEvent;
 use crate::client::QueuedLabyrinthArchivePayload;
 use crate::error::{ConversationSyncFailure, MLSError};
 use crate::messaging::receive::{
-    extract_plaintext_body_and_verify_aad, handle_account_deleted_event,
-    verify_application_aad_archive_evidence,
+    extract_plaintext_body_and_verify_aad, verify_application_aad_archive_evidence,
 };
 use crate::metadata::derive_metadata_key_from_group;
 use crate::orchestrator::canonical_transport::{
@@ -98,9 +97,12 @@ struct EntryPass {
     was_retired: bool,
 }
 
-/// Records an applied, sequenced `accountDeletedEntry`. Archive history loads and restores hide
-/// every copy of `deleted_did`'s messages that orders before it: no server redaction covers the
-/// witness and owner copies other members already published.
+#[path = "live_integrity.rs"]
+pub(crate) mod live_integrity;
+
+/// Writes the earlier marker form, the deletion's seq alone, which readers still honour: archive
+/// history loads and restores hide every copy of `deleted_did`'s messages ordered before it.
+#[cfg(test)]
 pub(super) fn record_account_deletion(
     tx: &crate::storage::SqlTx<'_>,
     cid: &str,
@@ -297,22 +299,6 @@ impl CatbirdMlsClient {
             );
         }
         Ok(verified)
-    }
-
-    /// Effects of a verified account deletion: no more archive duty for the account, its local
-    /// messages go, and archive loads and restores hide its copies ordered before `seq`.
-    pub(super) fn apply_verified_account_deletion(
-        &self,
-        cid: &str,
-        deleted_did: &str,
-        seq: i64,
-    ) -> Result<(), MLSError> {
-        let now_ms = self.hooks.now_ms();
-        self.db
-            .write_tx(|tx| record_account_deletion(tx, cid, deleted_did, seq, now_ms))?;
-        handle_account_deleted_event(&self.db, cid, deleted_did)?;
-        self.clear_cached_groups();
-        Ok(())
     }
 }
 
@@ -3720,6 +3706,14 @@ impl CatbirdMlsClient {
         // Pre-fetch PDS `blue.catbird.chat.device` keys (`I4`) for all DIDs referenced in batch
         // plus all current local `MlsGroup` members.
         let mut candidate_dids = BTreeMap::new();
+        let deleting_dids: BTreeSet<String> = sorted_entries
+            .iter()
+            .filter(|entry| {
+                entry.get("$type").and_then(Value::as_str)
+                    == Some(crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND)
+            })
+            .filter_map(|entry| entry["deletedDid"].as_str().map(str::to_owned))
+            .collect();
         for entry in &sorted_entries {
             chat_wire::collect_dids_from_json(entry, &mut candidate_dids);
         }
@@ -3746,7 +3740,17 @@ impl CatbirdMlsClient {
         }
         let mut auth_keys_by_did: BTreeMap<String, Vec<AuthorizedPeerDeviceKey>> = BTreeMap::new();
         for did in candidate_dids.keys() {
-            let keys = self.fetch_and_cache_authorized_pds_device_keys(did)?;
+            // Deletion can arrive after the actor's PDS repository is gone. Its actorWrite
+            // verifies through the self-contained keyProof below; a prior application entry
+            // still has to prove its own sender key and will fail without one.
+            let keys = match self.fetch_and_cache_authorized_pds_device_keys(did) {
+                Ok(keys) => keys,
+                Err(error) if deleting_dids.contains(did) => {
+                    tracing::warn!(%did, %error, "deleted account PDS keys unavailable; verifying deletion keyProof");
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            };
             auth_keys_by_did.insert(did.clone(), keys);
         }
         let flat_auth_keys: Vec<AuthorizedPeerDeviceKey> = auth_keys_by_did
@@ -3827,14 +3831,31 @@ impl CatbirdMlsClient {
             // Every entry below verifies before any effect. One that does not stops this
             // conversation's sync with the cursor below it: no later entry carries it past.
             if label == Some(crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND) {
-                let (deleted_did, seq) = self
-                    .verify_account_deleted_entry(cid, &convo.sequencer_did, entry)?
-                    .ok_or_else(|| {
-                        MLSError::Cryptography(
-                            "I13: account deletion authority does not verify".into(),
-                        )
-                    })?;
-                self.apply_verified_account_deletion(cid, &deleted_did, seq)?;
+                // A deletion takes effect only under its deleting device's own signature. One
+                // this conversation's sequencer did not sign stops the sync below it; any other
+                // that does not verify is kept as evidence and shown, and the cursor moves on.
+                let decision = self.authorize_account_deletion(cid, &convo.sequencer_did, entry)?;
+                if matches!(
+                    decision,
+                    live_integrity::AccountDeletionDecision::Unverified {
+                        reason: crate::client::deletion_authority::UnverifiedDeletionReason::SequencerUnverified,
+                        ..
+                    }
+                ) {
+                    return Err(MLSError::Cryptography(
+                        "I13: account deletion authority does not verify".into(),
+                    ));
+                }
+                self.apply_account_deletion_decision(cid, entry, &decision)?;
+                let now_ms = self.hooks.now_ms();
+                self.db.write_tx(|tx| {
+                    if let Some(mut c) = tx.get_conversation(cid)? {
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = now_ms;
+                        tx.upsert_conversation(&c)?;
+                    }
+                    Ok(())
+                })?;
                 pass.applied = pass.applied.saturating_add(1);
                 pass.max_seq = pass.max_seq.max(entry_seq);
                 continue;

@@ -14,8 +14,9 @@
 //! baseline.
 //!
 //! A mismatch never blocks delivery and never reaches the user as an error: it is stored as
-//! evidence ([`send_counter_gap_key`]) and exported for diagnosis. A non-increasing counter within
-//! one epoch stays a hard error, as before.
+//! evidence ([`send_counter_gap_key`]) and exported for diagnosis. Even a non-increasing counter
+//! is evidence only; the last verified high-water mark stays put so one anomaly does not cause a
+//! cascade of false gaps.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +45,7 @@ pub enum PeerCounterVerdict {
     Contiguous,
     /// Anything other than the expected successor while the counter still increased.
     Gap { expected: u64, received: u64 },
-    /// Across an epoch boundary, a counter at or below the last one seen.
+    /// A counter at or below the last one seen, in this epoch or across an epoch boundary.
     Regressed { last: u64, received: u64 },
 }
 
@@ -57,27 +58,21 @@ impl PeerCounterVerdict {
 
 /// Classify the next verified counter of a sender device against what the receiver knew.
 ///
-/// `Err` only for a counter outside the safe-integer range, or a counter that does not increase
-/// within one epoch (both refused before this change). Every other outcome is `Ok`.
+/// `Err` only for a counter outside the lexicon's 1..=safe-integer range. Every valid counter is delivered;
+/// non-increasing counters are stored as evidence.
 pub fn classify_peer_send_counter(
     prior: Option<PeerCounterPrior>,
     next: u64,
 ) -> Result<PeerCounterVerdict, MLSError> {
-    if next > MAX_SAFE_SEND_COUNTER {
+    if next == 0 || next > MAX_SAFE_SEND_COUNTER {
         return Err(MLSError::Cryptography(
-            "peer sendCounter exceeds the canonical safe-integer range".into(),
+            "peer sendCounter is outside the canonical positive safe-integer range".into(),
         ));
     }
     let Some(prior) = prior else {
         return Ok(PeerCounterVerdict::Baseline);
     };
     if next <= prior.last {
-        if prior.same_epoch {
-            return Err(MLSError::Cryptography(format!(
-                "non-increasing peer sendCounter: last {}, received {next}",
-                prior.last
-            )));
-        }
         return Ok(PeerCounterVerdict::Regressed {
             last: prior.last,
             received: next,
@@ -325,8 +320,7 @@ mod native {
         ))
     }
 
-    /// Check a verified counter without recording it: `Err` exactly where
-    /// [`record_peer_send_counter`] would refuse it.
+    /// Check a verified counter without recording it: only an invalid wire-range counter fails.
     pub(crate) fn check_peer_send_counter(
         tx: &SqlReadTx<'_>,
         conversation_id: &str,
@@ -421,29 +415,31 @@ mod native {
             sender_device_id,
         )?;
         let verdict = classify_peer_send_counter(prior, counter)?;
-        tx.put_account_meta(
-            &crate::client::chat_wire::peer_send_counter_key(
-                conversation_id,
-                generation,
-                epoch,
-                sender_did,
-                sender_device_id,
-            ),
-            &counter.to_string(),
-            now_ms,
-        )?;
-        tx.put_account_meta(
-            &continuity_key,
-            &serde_json::to_string(&PeerCounterContinuity {
-                sender_did: sender_did.to_owned(),
-                sender_device_id: sender_device_id.to_owned(),
-                counter,
-                skipped: 0,
-                epoch: epoch_u,
-                seq,
-            })?,
-            now_ms,
-        )?;
+        if !matches!(verdict, PeerCounterVerdict::Regressed { .. }) {
+            tx.put_account_meta(
+                &crate::client::chat_wire::peer_send_counter_key(
+                    conversation_id,
+                    generation,
+                    epoch,
+                    sender_did,
+                    sender_device_id,
+                ),
+                &counter.to_string(),
+                now_ms,
+            )?;
+            tx.put_account_meta(
+                &continuity_key,
+                &serde_json::to_string(&PeerCounterContinuity {
+                    sender_did: sender_did.to_owned(),
+                    sender_device_id: sender_device_id.to_owned(),
+                    counter,
+                    skipped: 0,
+                    epoch: epoch_u,
+                    seq,
+                })?,
+                now_ms,
+            )?;
+        }
         if let (true, Some(prior)) = (verdict.is_anomaly(), prior) {
             let (kind, expected) = match verdict {
                 PeerCounterVerdict::Gap { expected, .. } => ("gap", Some(expected)),
@@ -674,6 +670,7 @@ mod tests {
             classify_peer_send_counter(None, 7).unwrap(),
             PeerCounterVerdict::Baseline
         );
+        assert!(classify_peer_send_counter(None, 0).is_err());
         assert_eq!(
             classify_peer_send_counter(prior(5, 0, true), 6).unwrap(),
             PeerCounterVerdict::Contiguous
@@ -706,9 +703,21 @@ mod tests {
     }
 
     #[test]
-    fn non_increase_is_refused_within_an_epoch_and_recorded_across_epochs() {
-        assert!(classify_peer_send_counter(prior(5, 0, true), 5).is_err());
-        assert!(classify_peer_send_counter(prior(5, 0, true), 4).is_err());
+    fn non_increase_is_evidence_in_all_epochs() {
+        assert_eq!(
+            classify_peer_send_counter(prior(5, 0, true), 5).unwrap(),
+            PeerCounterVerdict::Regressed {
+                last: 5,
+                received: 5
+            }
+        );
+        assert_eq!(
+            classify_peer_send_counter(prior(5, 0, true), 4).unwrap(),
+            PeerCounterVerdict::Regressed {
+                last: 5,
+                received: 4
+            }
+        );
         assert_eq!(
             classify_peer_send_counter(prior(5, 0, false), 5).unwrap(),
             PeerCounterVerdict::Regressed {
