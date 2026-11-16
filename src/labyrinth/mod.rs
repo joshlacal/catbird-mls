@@ -13,6 +13,7 @@ pub mod hooks_status;
 pub mod journal;
 pub mod mac_gate;
 pub mod queue;
+pub mod recovery_shares;
 pub mod repo_proof;
 pub mod session;
 pub mod signer;

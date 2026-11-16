@@ -8,6 +8,7 @@ use labyrinth::client::{
     RotationReport, ThreadCursor, ThreadList,
 };
 use labyrinth::mailbox::{EpochPublic, MailboxKeys};
+use labyrinth::recovery_share::RecoveryShares;
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PublicRepoBackend};
 use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, SpaceRpc};
@@ -19,6 +20,7 @@ use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
 
 use super::map_error;
+use super::recovery_shares::GatewayRecoveryShareStore;
 use super::signer::{ChatKeySigner, LatchedTransportSigner, SignerFault};
 use super::space::{
     thread_placement_key, Placement, ResolvingSpaceThreadStore, SpaceMailbox, ThreadPlacement,
@@ -36,12 +38,39 @@ pub struct RotationExclusion {
 }
 
 /// A rotation result whose exclusions and re-keyed recovery methods remain visible to native clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionRotationReport {
     pub new_epoch: u64,
     pub exclusions: Vec<RotationExclusion>,
     pub rekeyed_recovery_code: Option<String>,
     pub rekeyed_passkeys: Vec<[u8; 16]>,
+}
+
+impl core::fmt::Debug for SessionRotationReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SessionRotationReport")
+            .field("new_epoch", &self.new_epoch)
+            .field("exclusions", &self.exclusions)
+            .field("rekeyed_recovery_code", &self.rekeyed_recovery_code.as_ref().map(|_| "<redacted>"))
+            .field("rekeyed_passkeys", &self.rekeyed_passkeys)
+            .finish()
+    }
+}
+
+/// Independent evidence that an account already has an archive. A fresh
+/// device must restore from an existing method instead of creating epoch 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPresence {
+    pub local_state: bool,
+    pub mailbox_epoch: bool,
+    pub pds_head: bool,
+    pub ds_head: bool,
+}
+
+impl RecoveryPresence {
+    pub fn requires_recovery(&self) -> bool {
+        !self.local_state && (self.mailbox_epoch || self.pds_head || self.ds_head)
+    }
 }
 
 fn rotation_report(
@@ -404,6 +433,51 @@ impl labyrinth::client::Clock for TransportClock {
 }
 
 impl SessionDeps {
+    fn recovery_shares(&self) -> RecoveryShares {
+        RecoveryShares::reader(Box::new(GatewayRecoveryShareStore::new(
+            self.did.clone(),
+            self.transport.clone(),
+            self.placements.clone(),
+        )))
+    }
+
+    /// Check the mailbox and both public head sources independently. A
+    /// partial publication still blocks a new genesis, and an unavailable
+    /// source propagates an error instead of being treated as absent.
+    pub async fn recovery_presence(&self) -> Result<RecoveryPresence> {
+        let local_state = self
+            .vault
+            .has_state(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        let mailbox_epoch = self
+            .space_store()
+            .ok_or_else(space_unreachable)?
+            .get_epoch(0)
+            .await
+            .map_err(map_error)?
+            .is_some();
+        let pds_head = match &self.pds {
+            Some(pds) => PdsDirectory::new(pds.clone())
+                .latest(&self.did)
+                .await
+                .map_err(map_error)?
+                .is_some(),
+            None => false,
+        };
+        let ds_head = self
+            .ds_directory()
+            .latest(&self.did)
+            .await
+            .map_err(map_error)?
+            .is_some();
+        Ok(RecoveryPresence {
+            local_state,
+            mailbox_epoch,
+            pds_head,
+            ds_head,
+        })
+    }
+
     pub(crate) fn ds_directory(&self) -> DsDirectoryStore {
         DsDirectoryStore::new(self.transport.clone(), self.sequencer_receipt_key.clone())
             .with_placements(self.did.clone(), self.placements.clone())
@@ -778,6 +852,7 @@ impl SessionDeps {
         fault: SignerFault,
         persisted: Option<Zeroizing<Vec<u8>>>,
     ) -> LabyrinthSession {
+        lab.set_recovery_shares(Some(self.recovery_shares()));
         let persisted = Arc::new(std::sync::Mutex::new(persisted));
         let directory = Arc::from(self.directory());
         lab.set_state_sink(Box::new(VaultStateSink {
@@ -837,6 +912,11 @@ impl SessionDeps {
         if let Some(s) = self.clone().open().await? {
             return Ok(s);
         }
+        if self.recovery_presence().await?.requires_recovery() {
+            return Err(OrchestratorError::InvalidInput(
+                "labyrinth: this account already has history; restore it with a passkey, another device, or a recovery code".into(),
+            ));
+        }
         let placement = self.probe_placement().await?;
         let fault = SignerFault::default();
         let initialized = Labyrinth::initialize_with_report(
@@ -861,11 +941,12 @@ impl SessionDeps {
     pub async fn restore_with_recovery_code(self, code: &str) -> Result<LabyrinthSession> {
         let placement = self.probe_placement().await?;
         let fault = SignerFault::default();
-        let restored = Labyrinth::restore_with_recovery_code(
+        let restored = Labyrinth::restore_with_recovery_code_shared(
             &self.did,
             code,
             self.transport_signer(&fault),
             self.backends(placement)?,
+            Some(self.recovery_shares()),
         )
         .await;
         surface(&fault)?;
@@ -894,12 +975,13 @@ impl SessionDeps {
     ) -> Result<LabyrinthSession> {
         let placement = self.probe_placement().await?;
         let fault = SignerFault::default();
-        let restored = Labyrinth::restore_with_passkey(
+        let restored = Labyrinth::restore_with_passkey_shared(
             &self.did,
             prf_output_32,
             credential_id,
             self.transport_signer(&fault),
             self.backends(placement)?,
+            Some(self.recovery_shares()),
         )
         .await;
         surface(&fault)?;
@@ -1234,6 +1316,10 @@ impl LabyrinthSession {
         self.recovery_method_stale
     }
 
+    pub async fn list_recovery_methods(&self) -> Result<Vec<RecoveryMethod>> {
+        self.lab.list_recovery_methods().await.map_err(map_error)
+    }
+
     pub fn pending_directory_epoch(&self) -> Option<u64> {
         self.lab.pending_directory_epoch()
     }
@@ -1382,7 +1468,18 @@ impl LabyrinthSession {
                 .map(|report| rotation_report(report, &recovery_methods))
                 .collect()
         });
-        self.finish(out)
+        match out {
+            Err(error @ labyrinth::Error::EpochUnanchored { .. }) => {
+                let report = self
+                    .lab
+                    .last_unanchored_rotation()
+                    .cloned()
+                    .ok_or_else(|| map_error(error.clone()))?;
+                self.note_directory_publication(&Err(error));
+                self.finish(Ok(vec![rotation_report(report, &recovery_methods)]))
+            }
+            other => self.finish(other),
+        }
     }
 
     pub fn device_key_hex(&self) -> String {
@@ -1881,9 +1978,8 @@ impl LabyrinthSession {
                 self.lab.rotate_epoch().await
             }
             other => other,
-        }
-        .map(|report| rotation_report(report, &recovery_methods));
-        self.finish(out)
+        };
+        self.finish_rotation(out, &recovery_methods)
     }
 
     pub async fn revoke_device(&mut self, device_key: [u8; 32]) -> Result<SessionRotationReport> {
@@ -1897,9 +1993,31 @@ impl LabyrinthSession {
                 }
             }
             other => other,
+        };
+        self.finish_rotation(out, &recovery_methods)
+    }
+
+    /// A rotation may have committed to the mailbox before directory
+    /// publication failed. Labyrinth retains the complete report, including
+    /// a newly minted replacement code. Save that report and the pending
+    /// publication marker rather than discarding the only visible code.
+    fn finish_rotation(
+        &mut self,
+        out: labyrinth::Result<RotationReport>,
+        recovery_methods: &[RecoveryMethod],
+    ) -> Result<SessionRotationReport> {
+        match out {
+            Err(error @ labyrinth::Error::EpochUnanchored { .. }) => {
+                let report = self
+                    .lab
+                    .last_unanchored_rotation()
+                    .cloned()
+                    .ok_or_else(|| map_error(error.clone()))?;
+                self.note_directory_publication(&Err(error));
+                self.finish(Ok(rotation_report(report, recovery_methods)))
+            }
+            other => self.finish(other.map(|report| rotation_report(report, recovery_methods))),
         }
-        .map(|report| rotation_report(report, &recovery_methods));
-        self.finish(out)
     }
 
     /// `[CB-22]` / `Gate 5`: copies every readable message and own encrypted

@@ -57,7 +57,8 @@ pub fn map_xrpc_error(e: XrpcTransportError) -> labyrinth::Error {
         // A kicked or never-joined device may not read live conversation state (exact
         // protocol errors, HTTP 400); callers fall back to saved placement / owner-mode
         // exactly as for HTTP 403.
-        Some("NotEntitled" | "AccessOutsideMembershipInterval") if e.status == 400 => {
+        Some("NotEntitled" | "AccessOutsideMembershipInterval" | "ChatDeviceNotActive")
+            if e.status == 400 => {
             labyrinth::Error::Forbidden
         }
         _ if e.status == 401 || e.status == 403 => labyrinth::Error::Forbidden,
@@ -270,6 +271,7 @@ pub struct GatewayXrpcTransport {
     did: String,
     device_id: String,
     clock: Arc<dyn labyrinth::client::Clock>,
+    home_ds_did: Option<String>,
 }
 
 impl GatewayXrpcTransport {
@@ -285,12 +287,24 @@ impl GatewayXrpcTransport {
             did,
             device_id,
             clock: Arc::new(labyrinth::client::SystemClock),
+            home_ds_did: None,
         }
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn labyrinth::client::Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// The configured home delivery-service DID. Recovery-share calls also
+    /// require an independently proven pin in the encrypted placement vault.
+    pub fn with_home_ds_did(mut self, did: String) -> Self {
+        self.home_ds_did = Some(did);
+        self
+    }
+
+    pub(crate) fn home_ds_did(&self) -> Option<&str> {
+        self.home_ds_did.as_deref()
     }
 
     pub(crate) fn now_ms(&self) -> u64 {
@@ -550,7 +564,7 @@ struct PublishEpochHeadIn<'a> {
     epoch: &'a EpochPublicDef,
 }
 
-fn deterministic_op_id(tag: &str, payload: &[u8]) -> [u8; 16] {
+pub(crate) fn deterministic_op_id(tag: &str, payload: &[u8]) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(tag.as_bytes());
     h.update([0u8]);

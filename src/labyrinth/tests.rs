@@ -159,6 +159,16 @@ impl LabyrinthGateway for MockSixEndpointGateway {
     async fn submit_labyrinth(&self, request: LabyrinthRequest) -> Result<GatewayResponse, String> {
         let mut st = self.state.lock().unwrap();
         match request.nsid.as_str() {
+            "blue.catbird.labyrinth.getRecoveryShareCapabilities" => Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: br#"{"supported":true,"version":1,"hpkeSuite":"DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM","keyId":"fixture-kek"}"#.to_vec(),
+            }),
+            "blue.catbird.labyrinth.deleteRecoveryShare" => Ok(GatewayResponse {
+                status: 404,
+                content_type: Some("application/json".into()),
+                body: br#"{"error":"RecoveryShareNotFound"}"#.to_vec(),
+            }),
             "blue.catbird.labyrinth.publishEpochHead" => {
                 if st.publish_epoch_failures > 0 {
                     st.publish_epoch_failures -= 1;
@@ -341,23 +351,102 @@ fn build_deps(
         actor_did: did.to_owned(),
         state: ds_state,
     });
+    let placements = Arc::new(MemoryVault::default());
+    super::recovery_shares::pin_proven_home_service(
+        placements.as_ref(),
+        did,
+        "did:web:fixture-home.example",
+    )
+    .expect("fixture home service pin");
     SessionDeps {
         did: did.to_owned(),
-        transport: Arc::new(GatewayXrpcTransport::new(
-            gw,
-            signer.clone(),
-            did.to_owned(),
-            device_id.to_owned(),
-        )),
+        transport: Arc::new(
+            GatewayXrpcTransport::new(gw, signer.clone(), did.to_owned(), device_id.to_owned())
+                .with_home_ds_did("did:web:fixture-home.example".into()),
+        ),
         signer,
         vault: Arc::new(MemoryVault::default()),
         pds: Some(Arc::new(pds_host.client(did))),
         space: Some(Arc::new(space_host.client(did))),
-        placements: Arc::new(MemoryVault::default()),
+        placements,
         local_authority,
         sequencer_receipt_key: None,
         default_conversation_authority_did: None,
     }
+}
+
+#[tokio::test]
+async fn fresh_device_must_restore_existing_mailbox_before_genesis_writes() {
+    let did = "did:plc:archiveowner000000000000000";
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState::default()));
+    let first = build_deps(
+        did,
+        "dev-a1",
+        11,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    first.clone().enable().await.expect("first device genesis");
+    assert_eq!(first.list_mailbox_devices().await.unwrap().len(), 1);
+
+    let fresh = build_deps(did, "dev-a2", 12, ds_state, &space_host, &pds_host, None);
+    let presence = fresh.recovery_presence().await.unwrap();
+    assert!(!presence.local_state);
+    assert!(presence.mailbox_epoch);
+    assert!(presence.pds_head);
+    assert!(presence.ds_head);
+    assert!(presence.requires_recovery());
+    let error = fresh.enable().await.err().expect("must refuse new genesis");
+    assert!(error.to_string().contains("restore"));
+    assert_eq!(first.list_mailbox_devices().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn revoked_device_surfaces_rekeyed_code_when_ds_head_publish_fails() {
+    let did = "did:plc:revokecodeowner000000000000";
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState::default()));
+    let first = build_deps(
+        did,
+        "dev-a1",
+        21,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let mut first_session = first.clone().enable().await.expect("first device genesis");
+    let code = first_session
+        .create_recovery_code()
+        .await
+        .expect("create v2 recovery method");
+    let second = build_deps(
+        did,
+        "dev-a2",
+        22,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let mut second_session = second
+        .restore_with_recovery_code(&code)
+        .await
+        .expect("restore second device");
+    ds_state.lock().unwrap().publish_epoch_failures = 1;
+
+    let report = second_session
+        .revoke_device(first_session.device_key_pub())
+        .await
+        .expect("mailbox rotation remains committed despite DS publication failure");
+    assert!(report.rekeyed_recovery_code.is_some());
+    assert!(second_session.pending_directory_epoch().is_some());
+    assert_eq!(report.new_epoch, second_session.latest_epoch());
 }
 
 #[tokio::test]
