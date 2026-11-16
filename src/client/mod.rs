@@ -2376,10 +2376,14 @@ pub(crate) mod native_client {
                             ));
                         }
                     }
-                    let gap_key = super::chat_wire::undecryptable_evidence_key(
+                    let mut gap_key = super::chat_wire::undecryptable_evidence_key(
                         conversation_id,
                         &msg.message_id,
                     );
+                    if tx.get_labyrinth_state(&gap_key)?.is_none() {
+                        gap_key =
+                            super::chat_wire::unavailable_message_key(conversation_id, &msg.message_id);
+                    }
                     let local = tx.get_message(&msg.message_id)?;
                     let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
                     if local.is_some() && !gap {

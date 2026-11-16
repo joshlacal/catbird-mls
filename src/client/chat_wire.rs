@@ -212,6 +212,59 @@ pub struct UndecryptableEntryEvidence {
     pub recorded_at_ms: i64,
 }
 
+/// System notice of a sequenced message whose payload was pruned before this device held it.
+pub const UNAVAILABLE_MESSAGE_NOTICE: &str = "message.unavailable";
+/// [`UnavailableEntryEvidence::reason`] of a `payloadPruned` entry.
+pub const PAYLOAD_PRUNED_REASON: &str = "payload-pruned";
+
+/// `labyrinth_state` key of the evidence kept for a sequenced message whose payload was pruned
+/// before this device received it.
+pub fn unavailable_message_key(cid: &str, message_id: &str) -> String {
+    format!("native.unavailable:{cid}:{message_id}")
+}
+
+/// Durable evidence of a sequenced application entry this device never received: the verified
+/// sequencer receipt exactly as served, and who sent it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnavailableEntryEvidence {
+    pub version: u32,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub entry_id: String,
+    pub seq: i64,
+    pub generation: i64,
+    pub epoch: i64,
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub reason: String,
+    pub receipt: Value,
+    pub recorded_at_ms: i64,
+}
+
+impl UnavailableEntryEvidence {
+    /// The timeline row marking the entry: a neutral system notice at its seq.
+    pub fn placeholder_row(
+        &self,
+        group_id: &[u8],
+        is_own: bool,
+    ) -> Result<crate::storage::MessageRow, MLSError> {
+        Ok(crate::storage::MessageRow {
+            message_id: self.message_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            group_id: group_id.to_vec(),
+            epoch: self.epoch,
+            seq: self.seq,
+            sender_did: self.sender_did.clone(),
+            sender_device_id: self.sender_device_id.clone(),
+            plaintext_json: serde_json::to_string(
+                &crate::orchestrator::MLSMessagePayload::system(UNAVAILABLE_MESSAGE_NOTICE),
+            )?,
+            created_at_ms: self.recorded_at_ms,
+            is_own,
+        })
+    }
+}
+
 impl UndecryptableEntryEvidence {
     /// The timeline row marking the gap: a system notice at the entry's seq.
     pub fn gap_row(

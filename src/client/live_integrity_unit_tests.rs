@@ -497,3 +497,112 @@ fn an_own_receipt_for_a_seq_another_message_holds_is_recorded() {
         (7, "slot-taken")
     );
 }
+
+#[test]
+fn a_pruned_entry_never_received_leaves_evidence_and_a_placeholder_without_inventing_a_counter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (transport, state) = SyncMockTransport::new();
+    let (client, _) = open_unit_client(
+        &tmp,
+        "pruned",
+        ALICE_DID,
+        DEV_A1,
+        transport,
+        crate::sim_hooks::SimClientHooks::system_default(),
+    );
+    let (signer, group_id, coords) = seed_active_group(&client, CONVO_ID, SEQUENCER_DID, 0, 5, &[]);
+    let epoch = coords["epoch"].as_u64().unwrap();
+    let bob = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+    {
+        let mut st = state.lock().unwrap();
+        st.pds_devices.insert(
+            ALICE_DID.to_string(),
+            vec![(DEV_A1.to_string(), signer.public().to_vec())],
+        );
+        st.pds_devices.insert(
+            BOB_DID.to_string(),
+            vec![(DEV_B1.to_string(), bob.public().to_vec())],
+        );
+    }
+    // Bob's counter 2 was verified at seq 5.
+    client
+        .db
+        .write_tx(|tx| {
+            send_counter::record_peer_send_counter(
+                tx,
+                CONVO_ID,
+                0,
+                epoch as i64,
+                BOB_DID,
+                DEV_B1,
+                Some(2),
+                5,
+                1,
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    let served = pruned_entry(&state, &group_id, epoch, BOB_M1, BOB_DID, DEV_B1, 6);
+    state
+        .lock()
+        .unwrap()
+        .entries_by_after
+        .insert(5, vec![served]);
+    apply_served_entries(&client, &signer);
+
+    let row = client
+        .db
+        .read_tx(|tx| tx.get_message(BOB_M1))
+        .unwrap()
+        .expect("placeholder row");
+    assert_eq!(row.seq, 6);
+    assert!(row
+        .plaintext_json
+        .contains(chat_wire::UNAVAILABLE_MESSAGE_NOTICE));
+    let evidence: chat_wire::UnavailableEntryEvidence = serde_json::from_slice(
+        &client
+            .db
+            .read_tx(|tx| {
+                tx.get_labyrinth_state(&chat_wire::unavailable_message_key(CONVO_ID, BOB_M1))
+            })
+            .unwrap()
+            .expect("receipt evidence"),
+    )
+    .unwrap();
+    assert_eq!((evidence.seq, evidence.sender_did.as_str()), (6, BOB_DID));
+    assert_eq!(evidence.receipt["entryId"], BOB_M1);
+    let per_epoch = chat_wire::peer_send_counter_key(CONVO_ID, 0, epoch as i64, BOB_DID, DEV_B1);
+    assert_eq!(
+        client
+            .db
+            .read_tx(|tx| tx.get_account_meta(&per_epoch))
+            .unwrap(),
+        Some("2".to_string()),
+        "the pruned entry does not bump the counter"
+    );
+
+    // Bob's next message carries 4: the pruned entry held 3, so there is no gap.
+    let receipt = stage_nse_message(
+        &client,
+        &group_id,
+        &sequencer_key(&state),
+        BOB_M2,
+        BOB_DID,
+        DEV_B1,
+        7,
+        None,
+    );
+    client
+        .finish_received_archive_evidence(
+            CONVO_ID,
+            BOB_M2,
+            7,
+            BOB_M2,
+            &receipt,
+            Some((BOB_DID, DEV_B1)),
+            Some(4),
+            DEV_A1,
+        )
+        .unwrap();
+    assert_eq!(counter_evidence(&client), vec![]);
+}

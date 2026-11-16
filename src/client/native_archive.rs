@@ -2110,10 +2110,15 @@ impl CatbirdMlsClient {
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
                 let local = tx.get_message(message_id)?;
-                let gap_key = super::chat_wire::undecryptable_evidence_key(conversation_id, message_id);
-                let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
+                // An undecryptable or unavailable placeholder yields to a verified copy.
+                let mut gap_key = None;
+                for key in [super::chat_wire::undecryptable_evidence_key(conversation_id, message_id),
+                    super::chat_wire::unavailable_message_key(conversation_id, message_id)] {
+                    if gap_key.is_none() && tx.get_labyrinth_state(&key)?.is_some() { gap_key = Some(key); }
+                }
+                let gap = local.is_some() && gap_key.is_some();
                 match select_restore_copy(group, local.as_ref(), gap) {
-                    Some(copy) => chosen.push((copy, local.is_none() || gap, gap.then_some(gap_key))),
+                    Some(copy) => chosen.push((copy, local.is_none() || gap, if gap { gap_key } else { None })),
                     None => skipped += 1,
                 }
             }

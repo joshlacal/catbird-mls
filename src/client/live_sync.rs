@@ -4929,29 +4929,46 @@ impl CatbirdMlsClient {
                                 "I13: pruned receipt generation mismatch".into(),
                             ));
                         }
-                        if pruned.sender_did != self.normalized_did
-                            || pruned.sender_device_id != canonical_dev_id
-                        {
-                            let key = chat_wire::peer_send_counter_key(
+                        let own_device = pruned.sender_did == self.normalized_did
+                            && pruned.sender_device_id == canonical_dev_id;
+                        if tx.get_message(msg_id)?.is_none() {
+                            // Pruned before this device ever held it: keep the signed receipt as
+                            // durable evidence and show a neutral placeholder at its seq.
+                            let evidence = chat_wire::UnavailableEntryEvidence {
+                                version: 1,
+                                conversation_id: cid.to_owned(),
+                                message_id: msg_id.to_owned(),
+                                entry_id: expected_rcpt_entry_id.to_owned(),
+                                seq: entry_seq,
+                                generation: pruned.generation,
+                                epoch: pruned.epoch,
+                                sender_did: pruned.sender_did.clone(),
+                                sender_device_id: pruned.sender_device_id.clone(),
+                                reason: chat_wire::PAYLOAD_PRUNED_REASON.to_owned(),
+                                receipt: rcpt_val.clone(),
+                                recorded_at_ms: now_ms,
+                            };
+                            tx.insert_message(&evidence.placeholder_row(&c.group_id, own_device)?)?;
+                            tx.put_labyrinth_state(
+                                &chat_wire::unavailable_message_key(cid, msg_id),
+                                &serde_json::to_vec(&evidence)?,
+                                now_ms,
+                            )?;
+                        }
+                        if !own_device {
+                            // Its counter is unknowable here: count the entry so the sender's
+                            // next counter is still compared exactly, without inventing one.
+                            super::send_counter::record_peer_send_counter(
+                                tx,
                                 cid,
                                 pruned.generation,
                                 pruned.epoch,
                                 &pruned.sender_did,
                                 &pruned.sender_device_id,
-                            );
-                            if let Some(last) = tx.get_account_meta(&key)? {
-                                let next = last
-                                    .parse::<u64>()
-                                    .ok()
-                                    .and_then(|counter| counter.checked_add(1))
-                                    .ok_or_else(|| {
-                                        MLSError::Cryptography(
-                                            "peer sendCounter exhausted at pruned entry".into(),
-                                        )
-                                    })?;
-                                chat_wire::verify_next_peer_send_counter(Some(&last), next)?;
-                                tx.put_account_meta(&key, &next.to_string(), now_ms)?;
-                            }
+                                None,
+                                entry_seq,
+                                now_ms,
+                            )?;
                         }
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = now_ms;

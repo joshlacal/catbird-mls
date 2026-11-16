@@ -2082,9 +2082,39 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
             .db
             .read_tx(|tx| tx.get_account_meta(&sib_counter_key))
             .unwrap(),
-        Some("4".to_string()),
-        "pruned entry from sibling device must advance peer_send_counter_key"
+        Some("3".to_string()),
+        "a pruned entry never invents a counter for the sibling device"
     );
+    // Never received here: each pruned entry leaves receipt evidence and a neutral placeholder,
+    // and counts once toward the sibling's next counter.
+    for pruned_id in [pruned_own_id, pruned_sib_id] {
+        assert!(alice
+            .db
+            .read_tx(|tx| tx.get_labyrinth_state(&chat_wire::unavailable_message_key(
+                CONVO_ID, pruned_id
+            )))
+            .unwrap()
+            .is_some());
+        let row = alice
+            .db
+            .read_tx(|tx| tx.get_message(pruned_id))
+            .unwrap()
+            .expect("placeholder row");
+        assert!(row.plaintext_json.contains(chat_wire::UNAVAILABLE_MESSAGE_NOTICE));
+    }
+    let continuity: crate::client::send_counter::PeerCounterContinuity = serde_json::from_str(
+        &alice
+            .db
+            .read_tx(|tx| {
+                tx.get_account_meta(&crate::client::send_counter::peer_send_continuity_key(
+                    CONVO_ID, 0, ALICE_DID, DEV_A2,
+                ))
+            })
+            .unwrap()
+            .expect("sibling continuity"),
+    )
+    .unwrap();
+    assert_eq!((continuity.counter, continuity.skipped), (3, 1));
 
     // Helper to build a signed `applicationMessageEntry` at `seq` (before ciphertext decryption).
     let make_signed_app_entry = |msg_id: &str,

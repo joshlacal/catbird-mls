@@ -3886,14 +3886,12 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         "SpaceAvatarPointer must survive epoch-advancing commit re-encryption"
     );
 
-    // 5. A `payloadPruned` entry (O7) in `getEntries` (`I14`) is skipped cleanly under its own
-    // I13 receipt, which mls-ds keeps serving, without aborting subsequent live entries!
+    // 5. A `payloadPruned` entry (O7) in `getEntries` (`I14`) Bob never received leaves a
+    // neutral placeholder under its own I13 receipt, which mls-ds keeps serving, without
+    // aborting subsequent live entries.
+    let pruned_mid = uuid::Uuid::new_v4().to_string();
     alice
-        .send_message(
-            &clean_cid,
-            &uuid::Uuid::new_v4().to_string(),
-            "pruned before bob reads it",
-        )
+        .send_message(&clean_cid, &pruned_mid, "pruned before bob reads it")
         .expect("alice send before pruning");
     prune_entry(&ds, &clean_cid, ds.entry_count(&clean_cid));
     let after_pruned_mid = uuid::Uuid::new_v4().to_string();
@@ -3906,13 +3904,20 @@ fn adversarial_round2_fault_regressions_i2_i6_i13_i14_and_avatar_preservation() 
         .expect("alice send after pruned");
     bob.sync()
         .expect("bob sync advances past payloadPruned entry without crashing");
-    assert!(bob
-        .list_messages(&clean_cid, None, 20)
-        .unwrap()
+    let bob_messages = bob.list_messages(&clean_cid, None, 20).unwrap();
+    assert!(bob_messages.iter().any(|m| m
+        .plaintext_json
+        .contains("Live message after payloadPruned entry")));
+    // Only the sequencer-local entry id survives pruning: the placeholder carries that.
+    let placeholders: Vec<_> = bob_messages
         .iter()
-        .any(|m| m
-            .plaintext_json
-            .contains("Live message after payloadPruned entry")));
+        .filter(|m| m.plaintext_json.contains("message.unavailable"))
+        .collect();
+    assert_eq!(placeholders.len(), 1, "a never-received pruned message leaves a placeholder");
+    assert_eq!(placeholders[0].sender_did, ALICE_DID);
+    assert!(bob_messages
+        .iter()
+        .all(|m| m.message_id != pruned_mid && !m.plaintext_json.contains("pruned before bob reads it")));
 
     // 6. Publication can succeed after the sender loses the response. Preserve both the
     // exact retry ciphertext and its plaintext across restart without reusing sender keys.
