@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "59117054d8fc309ad07ab33ea05c6ad4abdff05e",
-    "sourceSha256": "81b7cc0835421b583d2449e7f0a8dfe5f647393a353b649a08fe6c1dba9b3cf5",
-    "sourceTree": "85e59f9ab1e1ea6135a9107a92d98fc6f405fc4b"
+    "sourceRevision": "09c11655fefc53b3b3405b798842fca5254de7e7",
+    "sourceSha256": "4b941d3a0c0d57c237885fce5ac216a955b41340ab84beb36f0b4a71c164c7f3",
+    "sourceTree": "4a3d19d2cf66c5d7d02a6837b467caebb0792813"
   },
   "defs": {
     "accessEndedEvent": {
@@ -103,8 +103,14 @@
       "type": "object"
     },
     "accountDeletionActorWrite": {
-      "description": "Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The signed request with which a device of deletedDid called blue.catbird.labyrinth.deleteAccountData. writeBody is the exact labyrinthWriteBody JSON bytes the device sent, {operationId, actorDeviceId, endpointNsid, payloadSha256, signedAt}, never re-encoded. signature is the device's 64-byte Ed25519 signature over UTF8(CATBIRD-LABYRINTH-WRITE\\0) followed by writeBody. endpointNsid is blue.catbird.labyrinth.deleteAccountData, actorDeviceId names the signing device of deletedDid, and signedAt is the device-signed deletion instant. Every direct, relayed and mirrored copy of the entry carries the same bytes.",
+      "description": "Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. The signed request with which a device of deletedDid called blue.catbird.labyrinth.deleteAccountData. writeBody is the exact labyrinthWriteBody JSON bytes the device sent, {operationId, actorDeviceId, endpointNsid, payloadSha256, signedAt}, never re-encoded. payloadBytes is the exact HTTP JSON body whose SHA-256 equals writeBody.payloadSha256; readers parse it as an empty object and do not trust only the hash. signature is the device's 64-byte Ed25519 signature over UTF8(CATBIRD-LABYRINTH-WRITE\\0) followed by writeBody. endpointNsid is blue.catbird.labyrinth.deleteAccountData, actorDeviceId names the signing device of deletedDid, and signedAt is the device-signed deletion instant. Every direct, relayed and mirrored copy of the entry carries the same bytes. Historical entries without payloadBytes decode but do not meet the client deletion-proof gate.",
       "properties": {
+        "payloadBytes": {
+          "description": "Optional for historical decoding; required for client enforcement. Exact signed deleteAccountData HTTP request body bytes, copied before account data is removed. The reader verifies SHA-256 against writeBody.payloadSha256 and requires the parsed JSON object to have no members.",
+          "maxLength": 1024,
+          "minLength": 2,
+          "type": "bytes"
+        },
         "signature": {
           "maxLength": 64,
           "minLength": 64,
