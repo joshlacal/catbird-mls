@@ -94,25 +94,28 @@ pub fn peer_send_counter_key(
     )
 }
 
-/// Require a verified peer sender's counter to increase once initialized.
+/// Field of retained `native.message` evidence present once the notification extension
+/// recorded the entry for its sender's counter continuity: the verified `sendCounter`, or
+/// `"unknown"` when the extension could not learn it. Foreground completion never counts such an
+/// entry a second time.
+pub const NSE_SEND_COUNTER_RECORDED: &str = "send_counter_recorded";
+
+/// Refuse a counter that cannot follow `last` within one MLS epoch: out of the safe-integer
+/// range, or not greater than `last`. A counter that skips ahead is accepted here; the strict
+/// comparison is recorded as evidence by [`crate::client::send_counter`].
 pub fn verify_next_peer_send_counter(last: Option<&str>, next: u64) -> Result<(), MLSError> {
-    if next > 9_007_199_254_740_991 {
-        return Err(MLSError::Cryptography(
-            "peer sendCounter exceeds the canonical safe-integer range".into(),
-        ));
-    }
-    let Some(last) = last else {
-        return Ok(());
-    };
-    let last = last
-        .parse::<u64>()
-        .map_err(|_| MLSError::Internal(format!("corrupt peer send counter {last:?}")))?;
-    if next <= last {
-        return Err(MLSError::Cryptography(format!(
-            "non-increasing peer sendCounter: last {last}, received {next}"
-        )));
-    }
-    Ok(())
+    let prior = last
+        .map(|last| {
+            last.parse::<u64>()
+                .map_err(|_| MLSError::Internal(format!("corrupt peer send counter {last:?}")))
+        })
+        .transpose()?
+        .map(|last| crate::client::send_counter::PeerCounterPrior {
+            last,
+            skipped: 0,
+            same_epoch: true,
+        });
+    crate::client::send_counter::classify_peer_send_counter(prior, next).map(|_| ())
 }
 
 /// Durable fork evidence for a conversation whose peer signed a different current-epoch prior.
@@ -3792,7 +3795,24 @@ mod tests {
         ));
 
         verify_next_peer_send_counter(Some("5"), 6).unwrap();
+        // A skipped counter is not refused here; the strict comparison records it as a gap.
         verify_next_peer_send_counter(Some("5"), MAX_SAFE).unwrap();
+        let strict = crate::client::send_counter::classify_peer_send_counter(
+            Some(crate::client::send_counter::PeerCounterPrior {
+                last: 5,
+                skipped: 0,
+                same_epoch: true,
+            }),
+            MAX_SAFE,
+        )
+        .unwrap();
+        assert_eq!(
+            strict,
+            crate::client::send_counter::PeerCounterVerdict::Gap {
+                expected: 6,
+                received: MAX_SAFE
+            }
+        );
         assert!(matches!(
             verify_next_peer_send_counter(Some("5"), 5),
             Err(MLSError::Cryptography(_))

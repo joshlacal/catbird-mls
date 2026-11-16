@@ -4965,6 +4965,13 @@ impl CatbirdMlsClient {
                 send_counter,
             )?;
             tx.put_account_meta(&counter_key, &confirmed.to_string(), self.hooks.now_ms())?;
+            super::send_counter::check_own_receipt_slot(
+                tx,
+                &queued.conversation_id,
+                seq,
+                &queued.message_id,
+                self.hooks.now_ms(),
+            )?;
             tx.insert_message(&row)?;
             tx.put_labyrinth_state(
                 &format!(

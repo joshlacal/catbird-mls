@@ -908,21 +908,20 @@ impl CatbirdMlsClient {
                 && (message.sender_did != self.normalized_did
                     || message.sender_device_id != canonical_device_id)
             {
-                let key = chat_wire::peer_send_counter_key(
-                    cid,
-                    convo.generation,
-                    bound_epoch as i64,
-                    &message.sender_did,
-                    &message.sender_device_id,
-                );
-                let last = tx.get_account_meta(&key)?;
-                if let Some(send_counter) = send_counter {
-                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
-                    tx.put_account_meta(&key, &send_counter.to_string(), now_ms)?;
-                } else if entry_seq > convo.last_seq || last.is_none() {
-                    return Err(MLSError::Cryptography(
-                        "applicationSendBody missing sendCounter".into(),
-                    ));
+                // The extension records the counter in the transaction that stores the
+                // message; completing that entry here must not count it a second time.
+                if evidence[chat_wire::NSE_SEND_COUNTER_RECORDED].is_null() {
+                    super::send_counter::record_peer_send_counter(
+                        tx,
+                        cid,
+                        convo.generation,
+                        bound_epoch as i64,
+                        &message.sender_did,
+                        &message.sender_device_id,
+                        send_counter,
+                        entry_seq,
+                        now_ms,
+                    )?;
                 }
             }
             evidence["sequencer_receipt_json"] = json!(stored_receipt);
@@ -1040,18 +1039,17 @@ impl CatbirdMlsClient {
             if evidence.sender_did != self.normalized_did
                 || evidence.sender_device_id != self.config.device_id
             {
-                if let Some(send_counter) = evidence.send_counter {
-                    let key = chat_wire::peer_send_counter_key(
-                        cid,
-                        convo.generation,
-                        evidence.epoch,
-                        &evidence.sender_did,
-                        &evidence.sender_device_id,
-                    );
-                    let last = tx.get_account_meta(&key)?;
-                    chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
-                    tx.put_account_meta(&key, &send_counter.to_string(), evidence.recorded_at_ms)?;
-                }
+                super::send_counter::record_peer_send_counter(
+                    tx,
+                    cid,
+                    convo.generation,
+                    evidence.epoch,
+                    &evidence.sender_did,
+                    &evidence.sender_device_id,
+                    evidence.send_counter,
+                    evidence.seq,
+                    evidence.recorded_at_ms,
+                )?;
             }
             if tx.get_message(&evidence.message_id)?.is_none() {
                 let is_own = evidence.sender_did == self.normalized_did;
@@ -3350,6 +3348,24 @@ impl CatbirdMlsClient {
                 kv_batch.apply(&RusqliteKvBackend(tx.conn()))?;
                 self.clear_cached_groups();
                 if let Some(mut c) = current {
+                    if (next_epoch as i64) > c.epoch {
+                        let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                        let provider = self.hooks.openmls_provider(storage);
+                        if let Some(group) =
+                            MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
+                                .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                        {
+                            super::send_counter::advance_send_counter_epoch_chain(
+                                tx,
+                                cid,
+                                c.generation,
+                                c.epoch,
+                                next_epoch as i64,
+                                &super::send_counter::group_leaf_devices(&group),
+                                now_ms,
+                            )?;
+                        }
+                    }
                     c.epoch = next_epoch as i64;
                     if authoritative_seq == c.last_seq + 1 {
                         c.last_seq = authoritative_seq;
@@ -3780,6 +3796,24 @@ impl CatbirdMlsClient {
                         "non-contiguous conversation sequence: expected {expected_next_seq}, received {entry_seq}"
                     )));
                 }
+                // An own message the sequencer already receipted at this seq must be this entry.
+                let entry_message_id = is_application
+                    .then(|| {
+                        body.get("messageId")
+                            .or_else(|| entry.get("messageId"))
+                            .or_else(|| entry.get("entryId"))
+                            .and_then(Value::as_str)
+                    })
+                    .flatten();
+                self.db.write_tx(|tx| {
+                    super::send_counter::check_own_receipt_at_entry(
+                        tx,
+                        cid,
+                        entry_seq,
+                        entry_message_id,
+                        now_ms,
+                    )
+                })?;
                 expected_next_seq = expected_next_seq.checked_add(1).ok_or_else(|| {
                     MLSError::Cryptography("conversation sequence exhausted".into())
                 })?;
@@ -4384,6 +4418,7 @@ impl CatbirdMlsClient {
                         return Ok(false);
                     };
                     let mut removed_self = false;
+                    let epoch_before_commit = c.epoch;
                     // This sync merges the Commit: a peer's, or an own one from its journal.
                     let mut merged = false;
                     if is_own_echo {
@@ -4666,6 +4701,26 @@ impl CatbirdMlsClient {
                             apply_verified_roster_effects(tx, cid, kind, body, now_ms)?;
                         }
                     }
+                    if c.epoch > epoch_before_commit && !removed_self {
+                        // This device applied the Commit itself: counters of the leaves that
+                        // stay remain comparable across it.
+                        let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+                        let provider = self.hooks.openmls_provider(storage);
+                        if let Some(group) =
+                            MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
+                                .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
+                        {
+                            super::send_counter::advance_send_counter_epoch_chain(
+                                tx,
+                                cid,
+                                c.generation,
+                                epoch_before_commit,
+                                c.epoch,
+                                &super::send_counter::group_leaf_devices(&group),
+                                now_ms,
+                            )?;
+                        }
+                    }
                     // Epoch-key erasure is atomic with accepted MLS state and its cursor.
                     Self::prune_pending_commit_transitions(
                         tx,
@@ -4807,6 +4862,14 @@ impl CatbirdMlsClient {
                         .get("entryId")
                         .and_then(Value::as_str)
                         .unwrap_or(msg_id);
+                    // A verified signed body always names its counter; only a pruned entry,
+                    // whose body is gone, completes without one.
+                    let send_counter = body.get("sendCounter").and_then(Value::as_u64);
+                    if verified_application_body.is_some() && send_counter.is_none() {
+                        return Err(MLSError::Cryptography(
+                            "applicationSendBody missing sendCounter".into(),
+                        ));
+                    }
                     self.finish_received_archive_evidence(
                         cid,
                         msg_id,
@@ -4814,7 +4877,7 @@ impl CatbirdMlsClient {
                         entry_id,
                         receipt,
                         outer_sender,
-                        body.get("sendCounter").and_then(Value::as_u64),
+                        send_counter,
                         canonical_dev_id,
                     )?;
                     pass.max_seq = pass.max_seq.max(entry_seq);
@@ -4992,16 +5055,24 @@ impl CatbirdMlsClient {
                         let epoch = body["prior"]["epoch"].as_i64().ok_or_else(|| {
                             MLSError::Cryptography("applicationSendBody prior missing epoch".into())
                         })?;
-                        let key = chat_wire::peer_send_counter_key(
-                            cid,
+                        self.db.read_tx(|tx| {
+                            super::send_counter::check_peer_send_counter(
+                                tx,
+                                cid,
+                                generation,
+                                epoch,
+                                sender_did,
+                                sender_device_id,
+                                send_counter,
+                            )
+                        })?;
+                        Some((
                             generation,
                             epoch,
-                            sender_did,
-                            sender_device_id,
-                        );
-                        let last = self.db.read_tx(|tx| tx.get_account_meta(&key))?;
-                        chat_wire::verify_next_peer_send_counter(last.as_deref(), send_counter)?;
-                        Some((key, send_counter))
+                            sender_did.to_owned(),
+                            sender_device_id.to_owned(),
+                            send_counter,
+                        ))
                     }
                 } else {
                     None
@@ -5079,10 +5150,20 @@ impl CatbirdMlsClient {
                     let mut c = tx
                         .get_conversation(cid)?
                         .ok_or_else(|| MLSError::group_not_found(cid))?;
-                    if let Some((key, send_counter)) = &peer_counter {
-                        let last = tx.get_account_meta(key)?;
-                        chat_wire::verify_next_peer_send_counter(last.as_deref(), *send_counter)?;
-                        tx.put_account_meta(key, &send_counter.to_string(), now_ms)?;
+                    if let Some((generation, epoch, sender_did, sender_device_id, send_counter)) =
+                        &peer_counter
+                    {
+                        super::send_counter::record_peer_send_counter(
+                            tx,
+                            cid,
+                            *generation,
+                            *epoch,
+                            sender_did,
+                            sender_device_id,
+                            Some(*send_counter),
+                            entry_seq,
+                            now_ms,
+                        )?;
                     }
                     let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
                     let provider = self.hooks.openmls_provider(storage);
@@ -5340,7 +5421,7 @@ impl CatbirdMlsClient {
                                 .to_owned(),
                             send_counter: peer_counter
                                 .as_ref()
-                                .map(|(_, send_counter)| *send_counter),
+                                .map(|(_, _, _, _, send_counter)| *send_counter),
                             reason: reason.to_owned(),
                             recorded_at_ms: now_ms,
                         },
