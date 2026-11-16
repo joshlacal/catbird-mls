@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::client::config::CatbirdMlsClientConfig;
 use crate::client::did_resolution::{
-    did_doc_cache_key, did_doc_meta_key, resolve_did_document_observed,
+    did_doc_cache_key, did_doc_meta_key, did_identity_changed_key, resolve_did_document_observed,
     resolve_did_document_strict, DID_DOC_CACHE_TTL_MS, MAX_DID_DOCUMENT_BYTES,
 };
 use crate::client::traits::{
@@ -422,6 +422,24 @@ fn cache_serves_only_fresh_documents_this_resolver_fetched() {
 }
 
 #[test]
+fn malformed_live_did_answer_never_uses_a_cached_document() {
+    let did = "did:web:seq.example.net";
+    let url = "https://seq.example.net/.well-known/did.json";
+    let transport = IdentityMockTransport::new();
+    let (_dir, client) = open_client(transport.clone());
+    transport.queue(url, json_response(200, &doc_for(did, "zOriginal")));
+    resolve_did_document_strict(&client.db, transport.as_ref(), 1, did).unwrap();
+    transport.queue(
+        url,
+        json_response(200, &doc_for("did:web:other.example.net", "zBad")),
+    );
+    assert!(
+        resolve_did_document_strict(&client.db, transport.as_ref(), 2, did).is_err(),
+        "a mismatched live answer must not be hidden by the cache"
+    );
+}
+
+#[test]
 fn background_receipt_key_row_survives_purge_expiry_and_failed_refresh() {
     let url = "https://seq.example.net/.well-known/did.json";
     let did = "did:web:seq.example.net";
@@ -495,4 +513,12 @@ fn key_rotation_is_observed_against_the_last_fetched_document() {
     assert!(rotated.atproto_key_changed());
     assert_eq!(rotated.previous_atproto_key.as_deref(), Some("zFirst"));
     assert_eq!(rotated.current_atproto_key.as_deref(), Some("zSecond"));
+    assert_eq!(
+        client
+            .db
+            .read_tx(|tx| tx.get_account_meta(&did_identity_changed_key(did)))
+            .unwrap(),
+        Some("1".to_owned()),
+        "a signing-key change stays visible to the leaf-recovery gate"
+    );
 }

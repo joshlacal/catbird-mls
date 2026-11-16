@@ -40,6 +40,11 @@ pub(crate) fn did_doc_meta_key(did: &str) -> String {
     format!("did_doc_meta:{did}")
 }
 
+/// Sticky until the account explicitly reviews a repository signing-key change.
+pub(crate) fn did_identity_changed_key(did: &str) -> String {
+    format!("did_identity_changed:{}", bare_did(did))
+}
+
 /// Provenance stored beside a cached DID document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,17 +163,19 @@ pub(crate) fn resolve_did_document_observed(
         headers: Vec::new(),
         body: None,
     }) {
-        Ok(resp) if resp.status == 200 => match parse_fetched_document(&resp.body, did) {
-            Ok((doc_bytes, doc)) => {
-                let observation = store_fetched_document(db, did, &doc_bytes, &doc, now_ms)?;
-                return Ok((Some(doc_bytes), Some(observation)));
-            }
-            Err(error) => error,
-        },
-        Ok(resp) if (300..400).contains(&resp.status) => MLSError::Cryptography(format!(
-            "DID document fetch for `{did}` was redirected (HTTP {}); redirects are refused",
-            resp.status
-        )),
+        Ok(resp) if resp.status == 200 => {
+            // An answer from the resolver that is malformed or belongs to another DID is an
+            // identity failure. A cached document must not turn that answer into success.
+            let (doc_bytes, doc) = parse_fetched_document(&resp.body, did)?;
+            let observation = store_fetched_document(db, did, &doc_bytes, &doc, now_ms)?;
+            return Ok((Some(doc_bytes), Some(observation)));
+        }
+        Ok(resp) if (300..400).contains(&resp.status) => {
+            return Err(MLSError::Cryptography(format!(
+                "DID document fetch for `{did}` was redirected (HTTP {}); redirects are refused",
+                resp.status
+            )));
+        }
         Ok(resp) => MLSError::Internal(format!(
             "DID document fetch for `{did}` failed with HTTP {}",
             resp.status
@@ -204,6 +211,9 @@ fn store_fetched_document(
             .and_then(|raw| serde_json::from_str::<DidDocCacheMeta>(&raw).ok())
             .filter(|meta| meta.source == DID_DOC_CACHE_SOURCE)
             .and_then(|meta| meta.atproto_key);
+        if previous.is_some() && previous != current_atproto_key {
+            tx.put_account_meta(&did_identity_changed_key(did), "1", now_ms)?;
+        }
         tx.put_account_meta(&did_doc_cache_key(did), doc_text, now_ms)?;
         tx.put_account_meta(&did_doc_meta_key(did), &meta_json, now_ms)?;
         Ok(previous)

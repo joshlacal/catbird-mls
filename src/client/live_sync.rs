@@ -1868,7 +1868,7 @@ impl CatbirdMlsClient {
         } else {
             recipient_did
         };
-        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
+        let peer_ds = self.resolve_peer_home_ds_did(peer_did)?.ok_or_else(|| {
             MLSError::Cryptography("C33 peer home DS authority unavailable".into())
         })?;
         let effective_seq_did = dr_transcript::derive_deterministic_coordinator(
@@ -2162,7 +2162,7 @@ impl CatbirdMlsClient {
         }
         let recipient_did = self.normalized_did.as_str();
         let sender_home = self
-            .resolve_peer_home_ds_did(sender_did)
+            .resolve_peer_home_ds_did(sender_did)?
             .ok_or_else(|| missing("sender home DS authority"))?;
         let authority = dr_transcript::derive_deterministic_coordinator(
             &sender_home,
@@ -2806,7 +2806,7 @@ impl CatbirdMlsClient {
             .unwrap_or_default();
         requests.sort_by_key(|request| request["requestedAt"].as_str());
         let mut unentitled = None;
-        let mut cached_own_devices: Option<Option<Value>> = None;
+        let mut cached_own_devices: Option<Value> = None;
         let found = 'found: {
             for request in requests {
                 if request["requesterDeviceStatus"].as_str() == Some("pending_approval")
@@ -2822,19 +2822,57 @@ impl CatbirdMlsClient {
                 let accepted = acceptance.as_ref().filter(|authorization| {
                     authorization["recoveryRequestId"] == request["recoveryRequestId"]
                 });
+                if accepted.is_none() && request["signedRequest"].is_null() {
+                    tracing::info!(cid, "leaf recovery: skipping an unsigned request");
+                    continue;
+                }
+                let (Some(did), Some(device)) = (
+                    request["requesterDid"].as_str(),
+                    request["requesterDeviceId"].as_str(),
+                ) else {
+                    return Err(refused("the request names no requester device"));
+                };
+                // Fetch current PDS authorization even for a previously accepted request. This
+                // observes signing-key changes before any recovery Welcome can be produced.
+                let requester_key = self.pds_device_key(did, device, &BTreeMap::new())?;
+                if self
+                    .db
+                    .read_tx(|tx| {
+                        tx.get_account_meta(&super::did_resolution::did_identity_changed_key(did))
+                    })?
+                    .is_some()
+                {
+                    return Err(refused("requester DID repository identity changed"));
+                }
+                if did == self.normalized_did {
+                    if cached_own_devices.is_none() {
+                        cached_own_devices = Some(self.query_signed_chat_ds(
+                            "blue.catbird.chat.getOwnDevices",
+                            &[("actorDeviceId", canonical_dev_id), ("limit", "100")],
+                            canonical_dev_id,
+                            signer,
+                        )?);
+                    }
+                    let items = cached_own_devices
+                        .as_ref()
+                        .and_then(|response| response.get("items"))
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| refused("getOwnDevices returned no device list"))?;
+                    let own_device = items
+                        .iter()
+                        .map(|item| item.get("device").unwrap_or(item))
+                        .find(|candidate| candidate["deviceId"].as_str() == Some(device))
+                        .ok_or_else(|| refused("own requester absent from getOwnDevices"))?;
+                    if own_device["status"].as_str() != Some("active") {
+                        return Err(refused("own requester is not active"));
+                    }
+                    if chat_wire::json_bytes(&own_device["signaturePublicKey"])? != requester_key {
+                        return Err(refused("own requester key differs between PDS and home DS"));
+                    }
+                }
                 let (authorization, verified_key) = match accepted {
                     Some(authorization) => (authorization.clone(), None),
-                    None if request["signedRequest"].is_null() => {
-                        tracing::info!(cid, "leaf recovery: skipping an unsigned request");
-                        continue;
-                    }
                     None => {
-                        let (Some(did), Some(device)) = (
-                            request["requesterDid"].as_str(),
-                            request["requesterDeviceId"].as_str(),
-                        ) else {
-                            return Err(refused("the request names no requester device"));
-                        };
                         if resp["state"]["leaves"]
                             .as_array()
                             .into_iter()
@@ -2851,40 +2889,11 @@ impl CatbirdMlsClient {
                             );
                             continue;
                         }
-                        if did == self.normalized_did {
-                            let own_devs = cached_own_devices.get_or_insert_with(|| {
-                                self.query_signed_chat_ds(
-                                    "blue.catbird.chat.getOwnDevices",
-                                    &[("actorDeviceId", canonical_dev_id), ("limit", "100")],
-                                    canonical_dev_id,
-                                    signer,
-                                )
-                                .ok()
-                            });
-                            if let Some(own_devs_val) = own_devs {
-                                if let Some(items) =
-                                    own_devs_val.get("items").and_then(Value::as_array)
-                                {
-                                    if items.iter().any(|item| {
-                                        let dev = item.get("device").unwrap_or(item);
-                                        dev["deviceId"].as_str() == Some(device)
-                                            && dev["status"].as_str() == Some("pending_approval")
-                                    }) {
-                                        tracing::info!(
-                                            cid,
-                                            "leaf recovery: refusing own sibling device in pending_approval status"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
                         // `I4` (`ADR-009`): the PDS-authorized key of exactly that device.
-                        let key = self.pds_device_key(did, device, &BTreeMap::new())?;
                         let body = verify_signed_mutation_body(
                             &request["signedRequest"],
                             SignedMutationKind::LeafRecoveryRequest,
-                            &key,
+                            &requester_key,
                         )?;
                         let authorization =
                             chat_wire::leaf_recovery_request_authorization(&body, cid)?;
@@ -2920,7 +2929,7 @@ impl CatbirdMlsClient {
                             tracing::info!(cid, "leaf recovery: request is not eligible");
                             continue;
                         }
-                        (authorization, Some(key))
+                        (authorization, Some(requester_key))
                     }
                 };
                 let (kp_bytes, kp_ref) = chat_wire::authorized_recovery_reservation(

@@ -670,15 +670,21 @@ impl NativeLocalAuthority {
         use crate::labyrinth::LabyrinthGateway as _;
 
         if did == self.account_did {
-            let doc_opt = self.gateway.resolve_did_document(did).await.ok().flatten();
-            let parsed_doc = doc_opt
-                .as_deref()
-                .and_then(|b| atproto_spaces::did_resolver::DidDocument::parse_json(did, b).ok());
+            let doc_bytes = self
+                .gateway
+                .resolve_did_document(did)
+                .await
+                .map_err(crate::orchestrator::error::OrchestratorError::Credential)?
+                .ok_or_else(|| crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("DID document not found for own account `{did}`"),
+                ))?;
+            let parsed_doc =
+                atproto_spaces::did_resolver::DidDocument::parse_json(did, &doc_bytes).ok();
             let atproto_key = parsed_doc.as_ref().and_then(|d| d.atproto_key.clone());
-            let pds_endpoint = doc_opt
-                .as_deref()
-                .and_then(|b| super::chat_wire::extract_pds_endpoint_from_did_doc(b, did))
-                .unwrap_or_else(|| self.gateway.config.pds_endpoint.clone());
+            let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
+                .ok_or_else(|| crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("no #atproto_pds service in the DID document of own account `{did}`"),
+                ))?;
 
             let raw_devices = match self.paginate_pds_collection(
                 &pds_endpoint,
@@ -3233,6 +3239,23 @@ impl CatbirdMlsClient {
             &own_device_id,
             &signer,
         )?;
+        // Compare the home DS inventory with the account's independently resolved PDS records.
+        // A PDS-only chat.device is surfaced as a row so the UI can alert on a ghost device even
+        // when the home DS omits it. When the DID publishes #atproto, verify each CAR proof.
+        let own_doc = self.resolve_did_document(&self.normalized_did)?
+            .ok_or_else(|| MLSError::Cryptography("own DID document unavailable".into()))?;
+        let has_repo_key = atproto_spaces::did_resolver::DidDocument::parse_json(
+            &self.normalized_did,
+            &own_doc,
+        )
+        .ok()
+        .and_then(|doc| doc.atproto_key)
+        .is_some();
+        let mut pds_by_device: std::collections::BTreeMap<String, Vec<u8>> = self
+            .fetch_and_cache_authorized_pds_device_keys_checked(&self.normalized_did, has_repo_key)?
+            .into_iter()
+            .map(|record| (record.device_id, record.signature_public_key))
+            .collect();
         let mailbox_by_transport: std::collections::BTreeMap<[u8; 32], String> =
             if self.is_device_pending_approval()? {
                 std::collections::BTreeMap::new()
@@ -3274,24 +3297,50 @@ impl CatbirdMlsClient {
                 .unwrap_or_else(|| {
                     crate::orchestrator::canonical_transport::derive_key_id(&pubkey_bytes)
                 });
-            let is_current = item["isCurrentDevice"]
-                .as_bool()
-                .unwrap_or_else(|| device_id == own_device_id);
+            // The home DS cannot label an arbitrary row as this device to suppress the alert.
+            let is_current = device_id == own_device_id;
+            let pds_key = pds_by_device.remove(&device_id);
+            let recognized_key = self.db.read_tx(|tx| {
+                tx.get_account_meta(&format!("recognized_own_device:{device_id}"))
+            })?;
+            let status = item["status"].as_str().unwrap_or("unknown").to_owned();
+            let unrecognized = status != "revoked"
+                && (pds_key.as_deref() != Some(pubkey_bytes.as_slice())
+                    || (is_current && pubkey_bytes.as_slice() != signer.public())
+                    || (!is_current
+                        && recognized_key.as_deref()
+                            != Some(hex::encode(&pubkey_bytes).as_str())));
             out.push(RegisteredDeviceInfo {
                 device_id,
                 device_name: item["deviceName"].as_str().map(str::to_owned),
                 signature_public_key: pubkey_bytes,
                 key_id,
                 auth_generation: item["authGeneration"].as_i64().unwrap_or(1),
-                status: item["status"]
-                    .as_str()
-                    .unwrap_or("active")
-                    .to_owned(),
+                status,
                 created_at: item["createdAt"].as_str().unwrap_or("").to_owned(),
                 last_active_at: item["lastActiveAt"].as_str().map(str::to_owned),
                 dormant_at: item["dormantAt"].as_str().map(str::to_owned),
                 labyrinth_device_key_hex,
                 is_current_device: is_current,
+                unrecognized,
+            });
+        }
+        for (device_id, signature_public_key) in pds_by_device {
+            let key_id =
+                crate::orchestrator::canonical_transport::derive_key_id(&signature_public_key);
+            out.push(RegisteredDeviceInfo {
+                is_current_device: device_id == own_device_id,
+                device_id,
+                device_name: None,
+                signature_public_key,
+                key_id,
+                auth_generation: 0,
+                status: "pds_only".to_owned(),
+                created_at: String::new(),
+                last_active_at: None,
+                dormant_at: None,
+                labyrinth_device_key_hex: None,
+                unrecognized: true,
             });
         }
         Ok(out)

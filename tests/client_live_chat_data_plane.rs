@@ -5448,13 +5448,16 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         &uuid::Uuid::new_v4().to_string(),
         &alice_keys,
     );
-    let source = live_client(
+    // Bob's account declares the other home from its first enrollment. A declaration is
+    // create-only, so later test devices for this DID must use that same home.
+    let source = live_client_homed(
         tmp.path(),
         &ds,
         "removed-source",
         BOB_DID,
         &uuid::Uuid::new_v4().to_string(),
         &bob_keys,
+        CROSS_HOME_DS_DID,
     );
     alice.enroll_device(&scopes).expect("enroll admin");
     source
@@ -5510,13 +5513,14 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         ds.archive_auth
             .set_unsigned_space_not_found(Some("com.atproto.space.listWriters"), status);
         let keys = Arc::new(MemKeyStore::new());
-        let client = live_client(
+        let client = live_client_homed(
             tmp.path(),
             &ds,
             &format!("unsigned-space-not-found-{status}"),
             BOB_DID,
             &uuid::Uuid::new_v4().to_string(),
             &keys,
+            CROSS_HOME_DS_DID,
         );
         client
             .restore_with_recovery_code(&code)
@@ -5536,10 +5540,10 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     ds.archive_auth.set_unsigned_space_not_found(None, 0);
 
     // A signed denial binding another MLS group than the owner receipts pinned (the Space a wrong,
-    // unsigned generation names) proves no removal, through any home.
+    // unsigned generation names) proves no removal across the home relay.
     ds.archive_auth
         .set_space_denied(BOB_DID, &space, Some(&[0x5a; 32]));
-    for (index, home) in [DS_DID, CROSS_HOME_DS_DID].into_iter().enumerate() {
+    for (index, home) in [CROSS_HOME_DS_DID].into_iter().enumerate() {
         let keys = Arc::new(MemKeyStore::new());
         let client = live_client_homed(
             tmp.path(),
@@ -5566,13 +5570,14 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
         .set_space_denied(BOB_DID, &space, Some(&group));
 
     let removed_keys = Arc::new(MemKeyStore::new());
-    let removed = live_client(
+    let removed = live_client_homed(
         tmp.path(),
         &ds,
         "removed-fresh",
         BOB_DID,
         &uuid::Uuid::new_v4().to_string(),
         &removed_keys,
+        CROSS_HOME_DS_DID,
     );
     removed
         .restore_with_recovery_code(&code)
@@ -5626,13 +5631,14 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
     // The same DS response is malicious while the Space still admits the account.
     ds.archive_auth.set_space_denied(BOB_DID, &space, None);
     let active_keys = Arc::new(MemKeyStore::new());
-    let active = live_client(
+    let active = live_client_homed(
         tmp.path(),
         &ds,
         "active-fresh",
         BOB_DID,
         &uuid::Uuid::new_v4().to_string(),
         &active_keys,
+        CROSS_HOME_DS_DID,
     );
     active
         .restore_with_recovery_code(&code)
@@ -5652,13 +5658,14 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
             (status, error_code.to_owned()),
         );
         let keys = Arc::new(MemKeyStore::new());
-        let client = live_client(
+        let client = live_client_homed(
             tmp.path(),
             &ds,
             &format!("malicious-{index}"),
             BOB_DID,
             &uuid::Uuid::new_v4().to_string(),
             &keys,
+            CROSS_HOME_DS_DID,
         );
         client
             .restore_with_recovery_code(&code)
@@ -9479,6 +9486,52 @@ fn enrolled(
     client
 }
 
+#[test]
+fn own_pds_ghost_device_is_exposed_as_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "ghost-alert-alice", ALICE_DID, &new_id());
+    let ghost_id = new_id();
+    let ghost_key = [0x71u8; 32];
+    let put: Value = serde_json::from_slice(
+        &chat_wire::build_pds_device_put_record_body_at(
+            ALICE_DID,
+            &ghost_id,
+            &ghost_key,
+            "2026-11-16T00:00:00.000Z",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ds.inner.lock().unwrap().pds_records.insert(
+        (
+            ALICE_DID.to_owned(),
+            "blue.catbird.chat.device".to_owned(),
+            ghost_id.clone(),
+        ),
+        put["record"].clone(),
+    );
+
+    let devices = alice.list_devices().expect("read own device directories");
+    let ghost = devices
+        .iter()
+        .find(|device| device.device_id == ghost_id)
+        .unwrap();
+    assert!(
+        ghost.unrecognized,
+        "PDS-only chat.device must trigger the alert"
+    );
+    assert_eq!(ghost.status, "pds_only");
+    assert_eq!(ghost.signature_public_key, ghost_key.to_vec());
+    assert!(
+        !devices
+            .iter()
+            .find(|device| device.is_current_device)
+            .unwrap()
+            .unrecognized
+    );
+}
+
 /// A direct request's Welcome joins only through the checked `C33` import. mls-ds offers Bob the
 /// Welcome for Alice's request before it serves him the opening entry, first relabeled as a plain
 /// `welcomeView`, then as its `directRequestWelcomeView`: Bob joins nothing and acknowledges
@@ -11655,6 +11708,62 @@ fn own_leaf_recovery_fulfillment_moves_nothing_on_a_forged_answer() {
         .any(|row| row.conversation_id == cid));
 }
 
+#[test]
+fn own_leaf_recovery_fails_closed_when_device_inventory_is_unavailable_or_missing() {
+    let f = send_order_fixture(false);
+    let alice_second_id = new_id();
+    let alice_second = enrolled(
+        &f.tmp,
+        &f.ds,
+        "alice-second-gated",
+        ALICE_DID,
+        &alice_second_id,
+    );
+    alice_second.sync().expect("second device requests a leaf");
+    let has_second_leaf = || {
+        f.ds.inner.lock().unwrap().conversations[&f.cid]["leaves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|leaf| leaf["userDid"] == ALICE_DID && leaf["deviceId"] == alice_second_id)
+    };
+
+    f.ds.inner.lock().unwrap().xrpc_failures.push((
+        "/xrpc/blue.catbird.chat.getOwnDevices",
+        503,
+        "CapacityUnavailable",
+        None,
+    ));
+    assert!(
+        f.alice.sync().is_err(),
+        "an inventory outage cannot authorize recovery"
+    );
+    assert!(!has_second_leaf());
+
+    let removed_key =
+        f.ds.inner
+            .lock()
+            .unwrap()
+            .device_keys
+            .remove(&(ALICE_DID.to_owned(), alice_second_id.clone()))
+            .expect("second device was enrolled");
+    assert!(
+        f.alice.sync().is_err(),
+        "a PDS-only requester cannot get a leaf"
+    );
+    assert!(!has_second_leaf());
+
+    f.ds.inner
+        .lock()
+        .unwrap()
+        .device_keys
+        .insert((ALICE_DID.to_owned(), alice_second_id.clone()), removed_key);
+    f.alice
+        .sync()
+        .expect("verified active requester can recover");
+    assert!(has_second_leaf());
+}
+
 /// Leaf-recovery fulfillment adds only the requester of a pending invitation this device
 /// verified: the add request of a participant acceptance whose invitation verified, for exactly
 /// that device, key, auth generation and KeyPackage, at exactly the coordinate the acceptance
@@ -13799,7 +13908,18 @@ fn late_joiners_advance_and_can_fulfill_a_later_invitees_acceptance() {
         .any(|message| message.message_id == next_message));
 
     let eve_second_device = new_id();
-    let eve_second = enrolled(&f.tmp, ds, "eve-second", EVE_DID, &eve_second_device);
+    let eve_second = live_client_homed(
+        f.tmp.path(),
+        ds,
+        "eve-second",
+        EVE_DID,
+        &eve_second_device,
+        &Arc::new(MemKeyStore::new()),
+        CROSS_HOME_DS_DID,
+    );
+    eve_second
+        .enroll_device(&oauth_scopes())
+        .expect("enroll Eve's second device");
     eve_second
         .sync()
         .expect("Eve's second device requests recovery");

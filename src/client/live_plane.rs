@@ -772,8 +772,8 @@ impl CatbirdMlsClient {
     }
 
     /// The PDS that hosts `target_did`'s repository: the `#atproto_pds` service of its
-    /// independently resolved DID document. Only this account's own repository may use the
-    /// configured PDS; another account's records are never read from it.
+    /// independently resolved DID document. No account PDS fallback is allowed, including for
+    /// this account's own repository.
     pub(crate) fn repo_pds_endpoint(
         &self,
         target_did: &str,
@@ -783,9 +783,6 @@ impl CatbirdMlsClient {
             .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(doc, target_did))
         {
             return Ok(endpoint);
-        }
-        if target_did == self.normalized_did {
-            return Ok(self.pds_base());
         }
         Err(MLSError::Cryptography(format!(
             "no #atproto_pds service in the DID document of `{target_did}`"
@@ -1008,11 +1005,11 @@ impl CatbirdMlsClient {
         let _ = require_repo_proof;
         let pds_endpoint = match self.repo_pds_endpoint(target_did, resolved.as_deref()) {
             Ok(endpoint) => endpoint,
-            Err(_) => {
-                // A DID whose document names no repository host (a service DID) has no chat
-                // devices. Its directory is empty; no other host is asked in its place.
+            Err(error) => {
+                // A missing repository host cannot authorize a chat device. Service DIDs are
+                // excluded before device-directory prefetch; they do not justify an empty set.
                 invalidate()?;
-                return Ok(Vec::new());
+                return Err(error);
             }
         };
 
@@ -1160,39 +1157,6 @@ impl CatbirdMlsClient {
         self.db
             .write_tx(|tx| tx.put_account_meta(&cache_key, &encoded, now_ms))?;
         Ok(authorized)
-    }
-
-    pub(crate) fn resolve_peer_home_ds_did(&self, target_did: &str) -> Option<String> {
-        let pds_endpoint = self
-            .resolve_did_document(target_did)
-            .ok()
-            .flatten()
-            .and_then(|doc| chat_wire::extract_pds_endpoint_from_did_doc(&doc, target_did))
-            .unwrap_or_else(|| self.pds_base());
-        let url = format!(
-            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.declaration&rkey=self",
-            pds_endpoint.trim_end_matches('/'),
-            chat_wire::urlencode_form_component(target_did),
-        );
-        let resp = self
-            .transport
-            .execute_http(PlatformHttpRequest {
-                method: "GET".to_string(),
-                url,
-                headers: Vec::new(),
-                body: None,
-            })
-            .ok()?;
-        if resp.status != 200 {
-            return None;
-        }
-        let val: Value = serde_json::from_slice(&resp.body).ok()?;
-        val.pointer("/value/deliveryService")
-            .or_else(|| val.pointer("/value/homeDsDid"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
     }
 
     /// `mls-ds` bootstrap: `enrollDevice`, PDS device + declaration records, request keys and
@@ -1430,8 +1394,16 @@ impl CatbirdMlsClient {
             &self.config.home_ds_did,
             &self.hooks.now_rfc3339_millis(),
         )?;
-        let put_url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_base());
-        let _ = self.execute_json_post(put_url, decl_body)?;
+        // Create-only, like the device record: the session's OAuth scope grants no update.
+        // An existing declaration naming this home DS is success; one naming another DS is a
+        // conflict this device cannot resolve on its own.
+        let home_ds_did = self.config.home_ds_did.clone();
+        self.publish_pds_record_create_only(
+            super::declaration_proof::DECLARATION_COLLECTION,
+            "self",
+            decl_body,
+            |existing_val| chat_wire::pds_chat_declaration_matches(existing_val, &home_ds_did),
+        )?;
 
         // 4. Generate + publish the C33 DirectRequestKeyPublication once the device is active and
         //    the DS does not yet hold it (real `mls-ds` rejects `pending_approval` callers with
@@ -1683,6 +1655,15 @@ impl CatbirdMlsClient {
             &body,
             &signer,
         )?;
+        // The explicit approval is the only automatic recognition of another device. A
+        // getOwnDevices read by itself never silently accepts a new or changed key.
+        self.db.write_tx(|tx| {
+            tx.put_account_meta(
+                &format!("recognized_own_device:{canonical_target}"),
+                &hex::encode(target_signature_public_key),
+                self.hooks.now_ms(),
+            )
+        })?;
         Ok(())
     }
 
@@ -2068,7 +2049,7 @@ impl CatbirdMlsClient {
         let prep_outer: Value = serde_json::from_slice(&prepare_http.body)
             .map_err(|e| MLSError::Internal(format!("parse prepareDirectRequest: {e}")))?;
         // The coordinator signs both a preparation and a terminal receipt.
-        let peer_ds = self.resolve_peer_home_ds_did(peer_did).ok_or_else(|| {
+        let peer_ds = self.resolve_peer_home_ds_did(peer_did)?.ok_or_else(|| {
             MLSError::Cryptography("C33 peer home DS authority unavailable".into())
         })?;
         let effective_sequencer = dr_transcript::derive_deterministic_coordinator(
