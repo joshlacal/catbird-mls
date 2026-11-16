@@ -50,11 +50,11 @@ ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
 GENERATOR_VERSION = 9
 PROVENANCE_KEY = "_catbird_mls_provenance"
-CANONICAL_SOURCE_REVISION = "59117054d8fc309ad07ab33ea05c6ad4abdff05e"
-CANONICAL_SOURCE_TREE = "85e59f9ab1e1ea6135a9107a92d98fc6f405fc4b"
-CANONICAL_SOURCE_SHA256 = "81b7cc0835421b583d2449e7f0a8dfe5f647393a353b649a08fe6c1dba9b3cf5"
-SERVER_SOURCE_REVISION = "80d575384c2bae3a8a8e12d543f51c1e82ccf5a4"
-SERVER_SOURCE_TREE = "d29722834ec0d6800ef0bc8ba5b877fd54f7a787"
+CANONICAL_SOURCE_REVISION = "09c11655fefc53b3b3405b798842fca5254de7e7"
+CANONICAL_SOURCE_TREE = "4a3d19d2cf66c5d7d02a6837b467caebb0792813"
+CANONICAL_SOURCE_SHA256 = "4b941d3a0c0d57c237885fce5ac216a955b41340ab84beb36f0b4a71c164c7f3"
+SERVER_SOURCE_REVISION = "3a0a5a2e6d902b76cf47de261661b4b4ecbe7526"
+SERVER_SOURCE_TREE = "b0834e5a057f8e734ad03e587aedfb01ce6c82a3"
 SERVER_VECTOR_SET = "signed-mutation"
 SERVER_VECTOR_SET_COUNT = 25
 
@@ -186,7 +186,7 @@ def canonical_revision() -> tuple[str, str]:
 def server_revision() -> tuple[str, str]:
     return read_vcs_revision(
         repository_root() / "mls-ds",
-        "Sol-approved mls-ds",
+        "Dec 1 mls-ds",
         SERVER_SOURCE_REVISION,
         SERVER_SOURCE_TREE,
     )
