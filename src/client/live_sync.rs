@@ -466,15 +466,15 @@ impl CatbirdMlsClient {
                     MlsGroup::load(provider.storage(), &GroupId::from_slice(&successor_group))
                         .map_err(|e| MLSError::Internal(format!("load successor group: {e:?}")))?
                         .ok_or_else(|| MLSError::group_not_found(cid))?;
-                if let Some((epoch, version, mut meta)) =
+                if let Some((epoch, version, meta)) =
                     chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snapshot)
                 {
                     super::archive_policy::accept_snapshot(
                         tx,
                         cid,
                         cursor.unwrap_or(0),
-                        &mut meta,
-                        false,
+                        &meta,
+                        super::archive_policy::SnapshotPolicyAuthority::ExactCarry,
                         now_ms,
                     )?;
                     let row =
@@ -2566,11 +2566,11 @@ impl CatbirdMlsClient {
         // Welcome bytes to this device, a retired row rejoins only at its generation or a later
         // one, and the joined group must be the state its signed `next` names.
         //
-        // The roster attestation in the Welcome's GroupInfo, whose signature staging verifies
-        // under the Welcome sender's leaf, grants this device its verified roster only when that
-        // sender is exactly the verified fulfiller's leaf ([`chat_wire::attested_roster`]).
-        // Without a valid one it joins with no roster; a retired row drops the one it held, as
-        // it read none of the transitions since.
+        // The recovery attestation in the Welcome's GroupInfo is covered by the staged GroupInfo
+        // signature. Its roster and history-backup policy are accepted only when that sender is
+        // exactly the verified fulfillment actor and the attestation names the joined coordinate.
+        // An older, missing, or malformed policy is conservatively OFF: carried metadata may
+        // predate an opt-out and is not evidence of the effective policy at this recovery.
         let verified = self.db.read_tx(|tx| {
             let overlay = KvWriteOverlay::new(RusqliteKvBackend(tx.conn()));
             let storage = OpenMlsKvStorage::new(overlay);
@@ -2639,8 +2639,14 @@ impl CatbirdMlsClient {
                     == format!("{fulfiller_did}#{fulfiller_device}").as_bytes()
                     && sender.signature_key().as_slice() == key.as_slice()
             });
+            let attestation = attestation.filter(|_| from_fulfiller);
+            let history_backup = attestation.as_deref().and_then(|attestation| {
+                chat_wire::attested_history_backup(attestation, cid, generation)
+                    .ok()
+                    .flatten()
+            });
             let roster = attestation
-                .filter(|_| from_fulfiller)
+                .as_deref()
                 .ok_or_else(|| {
                     MLSError::Cryptography(
                         "roster attestation: none from the verified fulfiller".into(),
@@ -2648,7 +2654,7 @@ impl CatbirdMlsClient {
                 })
                 .and_then(|attestation| {
                     chat_wire::attested_roster(
-                        &attestation,
+                        attestation,
                         cid,
                         generation,
                         &self.normalized_did,
@@ -2661,9 +2667,24 @@ impl CatbirdMlsClient {
             if chat_wire::require_coordinate_names_group(&next, &group, &provider).is_err() {
                 return Ok(None);
             }
-            Ok(Some((member_dids, body, request_digest, next, roster)))
+            Ok(Some((
+                member_dids,
+                body,
+                request_digest,
+                next,
+                roster,
+                history_backup,
+            )))
         })?;
-        let Some((member_dids, fulfillment_body, request_digest, next, roster)) = verified else {
+        let Some((
+            member_dids,
+            fulfillment_body,
+            request_digest,
+            next,
+            roster,
+            attested_history_backup,
+        )) = verified
+        else {
             tracing::warn!(
                 cid,
                 transition_seq,
@@ -2671,6 +2692,7 @@ impl CatbirdMlsClient {
             );
             return Ok(false);
         };
+        let recovery_history_backup = attested_history_backup.unwrap_or(false);
         let roster = roster
             .inspect_err(|error| tracing::warn!(cid, %error, "joining without a verified roster"))
             .ok();
@@ -2739,12 +2761,9 @@ impl CatbirdMlsClient {
 
             let mut decrypted_title: Option<String> = None;
             if let Some(snap) = meta_snap_opt {
-                if let Some((m_epoch, m_ver, mut meta)) =
+                if let Some((m_epoch, m_ver, meta)) =
                     chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snap)
                 {
-                    super::archive_policy::accept_snapshot(
-                        tx, cid, transition_seq, &mut meta, false, now_ms,
-                    )?;
                     let meta_row =
                         chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, now_ms)?;
                     decrypted_title = meta_row.title.clone();
@@ -2754,6 +2773,13 @@ impl CatbirdMlsClient {
                     tx.put_account_meta(&format!("metadata_snapshot_json:{cid}"), &snap_s, now_ms)?;
                 }
             }
+            super::archive_policy::accept_recovery_attestation(
+                tx,
+                cid,
+                transition_seq,
+                recovery_history_backup,
+                now_ms,
+            )?;
 
             let generation = next["generation"].as_i64().unwrap_or(0);
             // A retired row keeps its history, title, unread count and pinned sequencer.
@@ -2836,9 +2862,9 @@ impl CatbirdMlsClient {
     /// [`chat_wire::require_recovery_key_package`]), is an error before any effect.
     ///
     /// An `add` commits an Add of the KeyPackage; a `replace` removes the requester device's
-    /// exact leaf and adds the KeyPackage in one Commit. When this device holds a verified
-    /// roster, the Welcome's GroupInfo attests it to the joiner
-    /// ([`chat_wire::roster_attestation_extension`]).
+    /// exact leaf and adds the KeyPackage in one Commit. The Welcome's GroupInfo attests the
+    /// effective history-backup policy and, when available, this device's verified roster
+    /// ([`chat_wire::recovery_attestation_extension`]).
     ///
     /// Consume-once: a request is bound to exactly the coordinate it was signed (or accepted)
     /// at, and every transition, this fulfillment included, moves the conversation past that
@@ -3119,10 +3145,6 @@ impl CatbirdMlsClient {
         let prior_gch = chat_wire::json_bytes(&prior_coords["groupContextHash"])?;
         let prior_ctag = chat_wire::json_bytes(&prior_coords["confirmationTag"])?;
         let replace = authorization["recoveryKind"] == "replace";
-        let attestation = roster
-            .as_ref()
-            .map(|roster| chat_wire::roster_attestation_extension(cid, prior_gen, roster))
-            .transpose()?;
 
         // Only the sim-only P15 calibration retries; production submits each Commit once.
         #[cfg_attr(not(feature = "sim"), allow(unused_mut, unused_variables))]
@@ -3206,6 +3228,15 @@ impl CatbirdMlsClient {
                     }));
                 }
 
+                let metadata_carry = self
+                    .metadata_snapshot_plaintext_for_carry_forward(
+                        tx,
+                        cid,
+                        &convo.group_id,
+                        &mut group,
+                        &provider,
+                    )?;
+
                 let aad_prior = chat_wire::build_aad_prior_coordinate(
                     &convo_uuid,
                     &convo.group_id,
@@ -3227,6 +3258,15 @@ impl CatbirdMlsClient {
                         MLSError::Cryptography(format!("canonical_commit_aad_bytes: {e}"))
                     })?;
 
+                // Policy controls do not move MLS coordinates. Read the effective value only
+                // after all discovery I/O, in the same transaction that constructs GroupInfo,
+                // so a completed concurrent control cannot be attested from a stale preflight.
+                let attestation = chat_wire::recovery_attestation_extension(
+                    cid,
+                    prior_gen,
+                    roster.as_ref(),
+                    super::archive_policy::current_enabled(tx, cid)?,
+                )?;
                 group.set_aad(commit_aad_bytes);
                 let mut builder = group
                     .commit_builder()
@@ -3235,13 +3275,11 @@ impl CatbirdMlsClient {
                     .force_self_update(true)
                     .load_psks(provider.storage())
                     .map_err(|e| MLSError::Cryptography(format!("recovery commit: {e:?}")))?;
-                if let Some(attestation) = &attestation {
-                    builder = builder
-                        .create_group_info_with_extensions([attestation.clone()])
-                        .map_err(|e| {
-                            MLSError::Cryptography(format!("roster attestation: {e:?}"))
-                        })?;
-                }
+                builder = builder
+                    .create_group_info_with_extensions([attestation])
+                    .map_err(|e| {
+                        MLSError::Cryptography(format!("recovery attestation: {e:?}"))
+                    })?;
                 let bundle = builder
                     .build(provider.rand(), provider.crypto(), signer, |_| true)
                     .map_err(|e| MLSError::Cryptography(format!("recovery commit: {e:?}")))?
@@ -3266,22 +3304,6 @@ impl CatbirdMlsClient {
                 let next_epoch = group.epoch().as_u64();
                 let (next_gch, next_ctag) =
                     chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_row = tx.get_group_metadata(cid)?;
-                let meta_ver = meta_row
-                    .as_ref()
-                    .map(|m| m.metadata_version.max(1) as u64)
-                    .unwrap_or(1);
-                let title_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.title.clone())
-                    .unwrap_or_default();
-                let desc_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.description.clone())
-                    .unwrap_or_default();
-                let avatar_opt = meta_row
-                    .as_ref()
-                    .and_then(chat_wire::space_avatar_from_metadata_row);
                 let meta_key = derive_metadata_key_from_group(
                     &mut group,
                     provider.crypto(),
@@ -3291,8 +3313,7 @@ impl CatbirdMlsClient {
                 )
                 .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                 let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
-                    tx,
-                    cid,
+                    metadata_carry,
                     &meta_key,
                     &convo.group_id,
                     &convo_uuid,
@@ -3300,14 +3321,6 @@ impl CatbirdMlsClient {
                     next_epoch,
                     &next_gch,
                     &next_ctag,
-                    &transition_id,
-                    meta_ver,
-                    canonical_dev_id,
-                    auth_generation,
-                    signer.public(),
-                    &title_s,
-                    &desc_s,
-                    avatar_opt,
                 )?;
                 drop(provider);
                 let kv_batch = overlay.into_batch();
@@ -4235,13 +4248,18 @@ impl CatbirdMlsClient {
                             MlsGroup::load(provider.storage(), &GroupId::from_slice(&c.group_id))
                                 .map_err(|e| MLSError::Internal(format!("load group: {e:?}")))?
                         {
-                            if let Some((m_epoch, m_ver, mut meta)) =
+                            if let Some((m_epoch, m_ver, meta)) =
                                 chat_wire::try_decrypt_group_metadata_snapshot(
                                     &mut group, &provider, snap,
                                 )
                             {
                                 super::archive_policy::accept_snapshot(
-                                    tx, cid, entry_seq, &mut meta, true, now_ms,
+                                    tx,
+                                    cid,
+                                    entry_seq,
+                                    &meta,
+                                    super::archive_policy::SnapshotPolicyAuthority::AuthoredMetadataTransition,
+                                    now_ms,
                                 )?;
                                 let meta_row = chat_wire::group_metadata_row_from_v1(
                                     cid, m_ver, m_epoch, &meta, now_ms,
@@ -4817,6 +4835,7 @@ impl CatbirdMlsClient {
                         let retain_loser = crate::planted::is_planted_bug_active(
                             crate::planted::PlantedBug::P1KeepLoserStagedCommit,
                         ) && group.pending_commit().is_some();
+                        let mut metadata_carry = None;
                         if !retain_loser {
                             let processed =
                                 group.process_message(&provider, proto).map_err(|e| {
@@ -4840,6 +4859,19 @@ impl CatbirdMlsClient {
                                 &flat_auth_keys,
                             )?;
                             removed_self = staged.self_removed();
+                            if !removed_self {
+                                metadata_carry = snap_opt
+                                    .map(|_| {
+                                        self.metadata_snapshot_plaintext_for_carry_forward(
+                                            tx,
+                                            cid,
+                                            &c.group_id,
+                                            &mut group,
+                                            &provider,
+                                        )
+                                    })
+                                    .transpose()?;
+                            }
                             group.merge_staged_commit(&provider, *staged).map_err(|e| {
                                 MLSError::Cryptography(format!("merge_staged_commit: {e:?}"))
                             })?;
@@ -4869,14 +4901,22 @@ impl CatbirdMlsClient {
                             c.epoch = group.epoch().as_u64() as i64;
                             merged = true;
                         }
-                        if let Some(snap) = snap_opt {
-                            if let Some((m_epoch, m_ver, mut meta)) =
-                                chat_wire::try_decrypt_group_metadata_snapshot(
-                                    &mut group, &provider, snap,
-                                )
-                            {
+                        if merged && !removed_self {
+                            if let (Some(snap), Some(carry)) = (snap_opt, metadata_carry) {
+                                let (m_epoch, m_ver, meta) = self
+                                    .decrypt_verified_metadata_carry_for_epoch(
+                                        carry,
+                                        snap,
+                                        &mut group,
+                                        &provider,
+                                    )?;
                                 super::archive_policy::accept_snapshot(
-                                    tx, cid, entry_seq, &mut meta, false, now_ms,
+                                    tx,
+                                    cid,
+                                    entry_seq,
+                                    &meta,
+                                    super::archive_policy::SnapshotPolicyAuthority::ExactCarry,
+                                    now_ms,
                                 )?;
                                 let meta_row = chat_wire::group_metadata_row_from_v1(
                                     cid, m_ver, m_epoch, &meta, now_ms,
@@ -5728,6 +5768,15 @@ impl CatbirdMlsClient {
             else {
                 return Ok(None);
             };
+            let metadata_carry = self
+                .metadata_snapshot_plaintext_for_carry_forward(
+                    tx,
+                    cid,
+                    &convo.group_id,
+                    &mut old_group,
+                    &provider,
+                )?;
+
             let group_info_bytes = old_group
                 .export_group_info(provider.crypto(), signer, true)
                 .map_err(|e| MLSError::Cryptography(format!("P9 export_group_info: {e:?}")))?
@@ -5801,22 +5850,6 @@ impl CatbirdMlsClient {
             let next_epoch = group.epoch().as_u64();
             let (next_gch, next_ctag) =
                 chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-            let meta_row = tx.get_group_metadata(cid)?;
-            let meta_ver = meta_row
-                .as_ref()
-                .map(|m| m.metadata_version.max(1) as u64)
-                .unwrap_or(1);
-            let title_s = meta_row
-                .as_ref()
-                .and_then(|m| m.title.clone())
-                .unwrap_or_default();
-            let desc_s = meta_row
-                .as_ref()
-                .and_then(|m| m.description.clone())
-                .unwrap_or_default();
-            let avatar_opt = meta_row
-                .as_ref()
-                .and_then(chat_wire::space_avatar_from_metadata_row);
             let meta_key = derive_metadata_key_from_group(
                 &mut group,
                 provider.crypto(),
@@ -5826,8 +5859,7 @@ impl CatbirdMlsClient {
             )
             .map_err(|e| MLSError::Cryptography(format!("P9 metadata key: {e}")))?;
             let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
-                tx,
-                cid,
+                metadata_carry,
                 &meta_key,
                 &convo.group_id,
                 &convo_uuid,
@@ -5835,14 +5867,6 @@ impl CatbirdMlsClient {
                 next_epoch,
                 &next_gch,
                 &next_ctag,
-                &transition_id,
-                meta_ver,
-                canonical_dev_id,
-                auth_gen,
-                signer.public(),
-                &title_s,
-                &desc_s,
-                avatar_opt,
             )?;
             convo.epoch = next_epoch as i64;
             convo.updated_at_ms = now_ms;

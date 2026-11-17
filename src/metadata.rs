@@ -370,8 +370,33 @@ pub fn decrypt_metadata_blob(
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
-/// Encrypt a `GroupMetadataV1` with an explicit 12-byte nonce for clean-chat `metadataSnapshot`,
-/// returning ONLY `ciphertext || tag` (without the 12-byte nonce prepended).
+/// Encrypt exact serialized `GroupMetadataV1` bytes with an explicit 12-byte nonce for a
+/// clean-chat `metadataSnapshot`, returning only `ciphertext || tag`. Commit carry-forward uses
+/// this form so it never normalizes, reorders, or adds fields to authenticated prior plaintext.
+pub fn encrypt_metadata_snapshot_plaintext_with_nonce(
+    key: &[u8; 32],
+    group_id: &[u8],
+    epoch: u64,
+    metadata_version: u64,
+    nonce: &[u8; 12],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, MetadataError> {
+    let aad = build_metadata_aad(group_id, epoch, metadata_version);
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| MetadataError::Encryption(format!("{e}")))?;
+    let nonce_arr = chacha20poly1305::Nonce::from(*nonce);
+    cipher
+        .encrypt(
+            &nonce_arr,
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| MetadataError::Encryption(format!("{e}")))
+}
+
+/// Encrypt a typed `GroupMetadataV1` with an explicit 12-byte nonce.
 pub fn encrypt_metadata_snapshot_with_nonce(
     key: &[u8; 32],
     group_id: &[u8],
@@ -381,23 +406,41 @@ pub fn encrypt_metadata_snapshot_with_nonce(
     metadata: &GroupMetadataV1,
 ) -> Result<Vec<u8>, MetadataError> {
     let plaintext = serde_json::to_vec(metadata)?;
+    encrypt_metadata_snapshot_plaintext_with_nonce(
+        key,
+        group_id,
+        epoch,
+        metadata_version,
+        nonce,
+        &plaintext,
+    )
+}
+
+/// Decrypt exact serialized `GroupMetadataV1` bytes from a clean-chat `metadataSnapshot`.
+pub fn decrypt_metadata_snapshot_plaintext(
+    key: &[u8; 32],
+    group_id: &[u8],
+    epoch: u64,
+    metadata_version: u64,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, MetadataError> {
     let aad = build_metadata_aad(group_id, epoch, metadata_version);
     let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| MetadataError::Encryption(format!("{e}")))?;
+        .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
     let nonce_arr = chacha20poly1305::Nonce::from(*nonce);
     cipher
-        .encrypt(
+        .decrypt(
             &nonce_arr,
             chacha20poly1305::aead::Payload {
-                msg: &plaintext,
+                msg: ciphertext,
                 aad: &aad,
             },
         )
-        .map_err(|e| MetadataError::Encryption(format!("{e}")))
+        .map_err(|e| MetadataError::Decryption(format!("{e}")))
 }
 
-/// Decrypt a clean-chat `metadataSnapshot`'s `ciphertext` (which does not include the nonce)
-/// given the explicit 12-byte nonce.
+/// Decrypt a clean-chat `metadataSnapshot` into a typed `GroupMetadataV1`.
 pub fn decrypt_metadata_snapshot(
     key: &[u8; 32],
     group_id: &[u8],
@@ -406,19 +449,14 @@ pub fn decrypt_metadata_snapshot(
     nonce: &[u8; 12],
     ciphertext: &[u8],
 ) -> Result<GroupMetadataV1, MetadataError> {
-    let aad = build_metadata_aad(group_id, epoch, metadata_version);
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
-    let nonce_arr = chacha20poly1305::Nonce::from(*nonce);
-    let plaintext = cipher
-        .decrypt(
-            &nonce_arr,
-            chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
+    let plaintext = decrypt_metadata_snapshot_plaintext(
+        key,
+        group_id,
+        epoch,
+        metadata_version,
+        nonce,
+        ciphertext,
+    )?;
     Ok(serde_json::from_slice(&plaintext)?)
 }
 

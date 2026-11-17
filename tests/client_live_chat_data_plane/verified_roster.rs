@@ -167,6 +167,39 @@ fn serve_fulfillment(
         .unwrap();
     group.merge_pending_commit(&provider).unwrap();
     let next = coordinate(&group, 2);
+    let group_id = group.group_id().as_slice().to_vec();
+    let next_epoch = group.epoch().as_u64();
+    let (next_gch, next_ctag) =
+        chat_wire::compute_group_context_hash_and_tag(&group, &provider).unwrap();
+    let metadata_key = catbird_mls::metadata::derive_metadata_key_from_group(
+        &mut group,
+        provider.crypto(),
+        provider.storage(),
+        &group_id,
+        next_epoch,
+    )
+    .unwrap();
+    let metadata_origin = new_id();
+    let metadata_snapshot = chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+        &metadata_key,
+        &group_id,
+        &uuid::Uuid::parse_str(&cid).unwrap(),
+        0,
+        next_epoch,
+        &next_gch,
+        &next_ctag,
+        &metadata_origin,
+        1,
+        1,
+        committer.1,
+        committer.2,
+        1,
+        committer.0.public(),
+        &catbird_mls::metadata::GroupMetadataV1::new("", ""),
+        rand::random(),
+    )
+    .unwrap();
+
 
     let (request, transition, welcome_id) = (new_id(), new_id(), new_id());
     let reference = &reserved["keyPackageRef"];
@@ -176,6 +209,7 @@ fn serve_fulfillment(
     body["recoveryRequestId"] = json!(request);
     body["prior"] = prior;
     body["next"] = next.clone();
+    body["metadataSnapshot"] = metadata_snapshot.clone();
     body["manifest"] = json!({
         "participantChanges": [],
         "leafChanges": [{
@@ -215,6 +249,7 @@ fn serve_fulfillment(
                 { "userDid": BOB_DID, "deviceId": bob_device, "leafOrigin": "recovery" },
             ],
             "snapshotSeq": 1,
+            "metadataSnapshot": metadata_snapshot.clone(),
         }),
     );
     g.entries.insert(
@@ -232,6 +267,7 @@ fn serve_fulfillment(
             "welcomeId": welcome_id, "conversationId": cid, "sequencerDid": DS_DID,
             "transitionSeq": 1, "coordinates": next,
             "opaqueWelcome": { "$bytes": STANDARD.encode(&welcome) },
+            "metadataSnapshot": metadata_snapshot,
         }));
     cid
 }
@@ -478,15 +514,17 @@ fn recovery_welcome_attests_the_fulfillers_roster_and_nothing_else_does() {
     let attest = |generation: i64, roster: &Value| {
         let roster = roster.clone();
         move |cid: &str| {
-            Some(chat_wire::roster_attestation_extension(cid, generation, &roster).unwrap())
+            Some(
+                chat_wire::recovery_attestation_extension(cid, generation, Some(&roster), true)
+                    .unwrap(),
+            )
         }
     };
     let valid = serve_fulfillment(ds, &template, carol, carol, &f.bob_dev, attest(0, &carols));
+    let no_attestation =
+        serve_fulfillment(ds, &template, carol, carol, &f.bob_dev, |_| None);
     let refused = [
-        (
-            "no attestation",
-            serve_fulfillment(ds, &template, carol, carol, &f.bob_dev, |_| None),
-        ),
+        ("no attestation", no_attestation.clone()),
         (
             "a roster without the fulfiller's leaf",
             serve_fulfillment(
@@ -542,6 +580,21 @@ fn recovery_welcome_attests_the_fulfillers_roster_and_nothing_else_does() {
             "{case}: an invalid attestation grants no admission authority"
         );
     }
+    assert!(
+        !bob.history_backup_enabled(&no_attestation).unwrap(),
+        "a missing attestation is conservatively OFF even though carried metadata defaults ON"
+    );
+    let stale_metadata: Value = serde_json::from_str(
+        &bob.get_group_metadata(&no_attestation)
+            .unwrap()
+            .expect("carried metadata")
+            .metadata_json,
+    )
+    .unwrap();
+    assert!(
+        stale_metadata.get("historyBackup").is_none(),
+        "the stale carried metadata remains byte-policy-equivalent and is not used as freshness proof"
+    );
 
     bob.sync().expect("bob syncs his conversations");
     assert_eq!(roster(bob, &valid), Some(carols));

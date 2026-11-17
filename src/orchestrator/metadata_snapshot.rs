@@ -51,11 +51,15 @@ pub(crate) struct OpenedMetadata {
     pub(crate) metadata: GroupMetadataV1,
     pub(crate) version: u64,
     sealed: Sealed,
+    nonce: [u8; 12],
+    ciphertext_len: usize,
 }
 
 #[derive(Debug, Clone)]
 enum Sealed {
-    Legacy,
+    Legacy {
+        plaintext: Vec<u8>,
+    },
     Canonical {
         origin_transition_id: String,
         plaintext: Vec<u8>,
@@ -129,7 +133,7 @@ where
                     self.mls_context()
                         .export_metadata_key(group_id.to_vec(), epoch)?,
                 )?;
-                let metadata = crate::metadata::decrypt_metadata_snapshot(
+                let plaintext = crate::metadata::decrypt_metadata_snapshot_plaintext(
                     &key,
                     group_id,
                     epoch,
@@ -138,10 +142,17 @@ where
                     &ciphertext,
                 )
                 .map_err(|error| mls("decrypt prior metadata snapshot", error))?;
+                let metadata = serde_json::from_slice(&plaintext).map_err(|error| {
+                    OrchestratorError::Serialization(format!(
+                        "decode prior metadata snapshot: {error}"
+                    ))
+                })?;
                 Ok(OpenedMetadata {
                     metadata,
                     version,
-                    sealed: Sealed::Legacy,
+                    nonce,
+                    ciphertext_len: ciphertext.len(),
+                    sealed: Sealed::Legacy { plaintext },
                 })
             }
             MetadataScheme::Canonical {
@@ -175,6 +186,8 @@ where
                 Ok(OpenedMetadata {
                     metadata: canonical::decode_request_metadata(&plaintext)?,
                     version,
+                    nonce,
+                    ciphertext_len: ciphertext.len(),
                     sealed: Sealed::Canonical {
                         origin_transition_id: origin_transition_id.clone(),
                         plaintext,
@@ -193,19 +206,24 @@ where
         successor: &SuccessorCoordinate<'_>,
         nonce: &[u8; 12],
     ) -> Result<Vec<u8>> {
-        match &opened.sealed {
-            Sealed::Legacy => {
+        if nonce == &opened.nonce {
+            return Err(invalid(
+                "successor metadata nonce repeats the prior snapshot".into(),
+            ));
+        }
+        let ciphertext = match &opened.sealed {
+            Sealed::Legacy { plaintext } => {
                 let key = key32(
                     self.mls_context()
                         .export_metadata_key_from_pending(group_id.to_vec(), successor.epoch)?,
                 )?;
-                crate::metadata::encrypt_metadata_snapshot_with_nonce(
+                crate::metadata::encrypt_metadata_snapshot_plaintext_with_nonce(
                     &key,
                     group_id,
                     successor.epoch,
                     opened.version,
                     nonce,
-                    &opened.metadata,
+                    plaintext,
                 )
                 .map_err(|error| mls("encrypt successor metadata snapshot", error))
             }
@@ -237,7 +255,13 @@ where
                 )
                 .map_err(|error| mls("encrypt successor metadata snapshot", error))
             }
+        }?;
+        if ciphertext.len() != opened.ciphertext_len {
+            return Err(invalid(
+                "successor metadata changed authenticated plaintext length".into(),
+            ));
         }
+        Ok(ciphertext)
     }
 }
 
@@ -461,23 +485,16 @@ mod tests {
         let epoch = ctx.get_epoch(gid.clone()).unwrap();
         let gch = ctx.get_group_context_hash(gid.clone()).unwrap();
         let tag = ctx.get_confirmation_tag(gid.clone()).unwrap();
-        let metadata = GroupMetadataV1 {
-            version: 1,
-            title: "Ordinary".into(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-            extra: Default::default(),
-            space_avatar: None,
-        };
+        let plaintext = br#"{ "futureSetting":{"nested":[1,2]},"description":"","title":"Ordinary","version":1 }"#;
+        let metadata: GroupMetadataV1 = serde_json::from_slice(plaintext).unwrap();
         let key: [u8; 32] = ctx
             .export_metadata_key(gid.clone(), epoch)
             .unwrap()
             .try_into()
             .unwrap();
         let nonce = [3; 12];
-        let ct = crate::metadata::encrypt_metadata_snapshot_with_nonce(
-            &key, &gid, epoch, 1, &nonce, &metadata,
+        let ct = crate::metadata::encrypt_metadata_snapshot_plaintext_with_nonce(
+            &key, &gid, epoch, 1, &nonce, plaintext,
         )
         .unwrap();
         let prior = snapshot(
@@ -496,6 +513,13 @@ mod tests {
             .open_metadata_snapshot(&prior, &scheme, &cid, &gid)
             .unwrap();
         assert_eq!(opened.metadata, metadata);
+        let Sealed::Legacy {
+            plaintext: opened_plaintext,
+        } = &opened.sealed
+        else {
+            panic!("expected legacy metadata")
+        };
+        assert_eq!(opened_plaintext.as_slice(), plaintext);
 
         let added = ctx
             .add_members_with_aad(gid.clone(), vec![package], None)
@@ -535,5 +559,16 @@ mod tests {
             .open_metadata_snapshot(&successor, &MetadataScheme::Legacy, &cid, &gid)
             .unwrap();
         assert_eq!(reopened.metadata, metadata);
+        let Sealed::Legacy {
+            plaintext: reopened_plaintext,
+        } = &reopened.sealed
+        else {
+            panic!("expected legacy metadata")
+        };
+        assert_eq!(
+            reopened_plaintext.as_slice(),
+            plaintext,
+            "legacy carry-forward preserves exact authenticated bytes"
+        );
     }
 }

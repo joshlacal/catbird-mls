@@ -1,8 +1,10 @@
 //! Conversation history-backup policy. Every archive enqueue passes through this module.
 //!
-//! `historyBackup` lives in the encrypted group metadata. The per-sequence flip log keeps an
-//! already accepted message's decision stable even when a later signed transition turns backup
-//! back on. A sender's authenticated `noBackup` frame is an independent, permanent veto.
+//! `historyBackup` starts in encrypted group metadata, then authenticated application controls
+//! append per-sequence flips. Recovery Welcomes attest the effective value to late joiners without
+//! rewriting carried metadata. The flip log also keeps an already accepted message's decision
+//! stable when a later signed transition turns backup back on. A sender's authenticated
+//! `noBackup` frame is an independent, permanent veto.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,7 +47,7 @@ pub(crate) fn metadata_enabled(metadata: &GroupMetadataV1) -> bool {
     }
 }
 
-pub(crate) fn set_metadata_enabled(metadata: &mut GroupMetadataV1, enabled: bool) {
+fn set_metadata_enabled(metadata: &mut GroupMetadataV1, enabled: bool) {
     metadata.extra.insert(HISTORY_BACKUP.into(), json!(enabled));
 }
 
@@ -63,6 +65,17 @@ pub(crate) fn current_enabled(tx: &SqlReadTx<'_>, conversation_id: &str) -> Resu
         .get_group_metadata(conversation_id)?
         .as_ref()
         .is_none_or(row_enabled))
+}
+
+/// Stamp an explicitly authored metadata transition with the effective policy at build time.
+/// Exact epoch carry-forward never calls this: its plaintext must remain byte-identical.
+pub(crate) fn stamp_current_metadata_policy(
+    tx: &SqlReadTx<'_>,
+    conversation_id: &str,
+    metadata: &mut GroupMetadataV1,
+) -> Result<(), MLSError> {
+    set_metadata_enabled(metadata, current_enabled(tx, conversation_id)?);
+    Ok(())
 }
 
 fn enabled_at_seq(tx: &SqlReadTx<'_>, conversation_id: &str, seq: i64) -> Result<bool, MLSError> {
@@ -111,26 +124,54 @@ fn record_flip(
     Ok(was_latest)
 }
 
-/// Apply a decrypted snapshot without letting a Commit, reset, or recovery silently re-enable
-/// backup. Only a separately signed metadata transition may do that.
+/// Establish the effective policy carried by a recovery Welcome's MLS-authenticated GroupInfo
+/// extension. Recording it even when it equals the local default makes it authoritative over an
+/// older carried metadata snapshot whose explicit field differs.
+pub(crate) fn accept_recovery_attestation(
+    tx: &SqlTx<'_>,
+    conversation_id: &str,
+    seq: i64,
+    enabled: bool,
+    now_ms: i64,
+) -> Result<(), MLSError> {
+    record_flip(tx, conversation_id, seq, enabled, now_ms)?;
+    Ok(())
+}
+
+/// Whether a decrypted snapshot is allowed to make a new policy observation.
+///
+/// Exact carry preserves old authenticated plaintext but has no authority to replay that old
+/// setting at a newer sequence. Only a separately signed metadata transition may update policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotPolicyAuthority {
+    AuthoredMetadataTransition,
+    ExactCarry,
+}
+
 pub(crate) fn accept_snapshot(
     tx: &SqlTx<'_>,
     conversation_id: &str,
     seq: i64,
     metadata: &GroupMetadataV1,
-    signed_metadata_transition: bool,
+    authority: SnapshotPolicyAuthority,
     now_ms: i64,
 ) -> Result<(), MLSError> {
-    let before = current_enabled(tx, conversation_id)?;
-    let requested = metadata_enabled(metadata);
-    let explicit_on = metadata.extra.get(HISTORY_BACKUP) == Some(&json!(true));
-    if !before && requested && !(signed_metadata_transition && explicit_on) {
-        // The caller still stores the authenticated snapshot verbatim. Preserve
-        // the stricter effective policy in the sequenced log even if this is
-        // the first flip this device has ever observed.
-        record_flip(tx, conversation_id, seq, false, now_ms)?;
+    if authority == SnapshotPolicyAuthority::ExactCarry {
+        let effective = current_enabled(tx, conversation_id)?;
+        // With no flip log, the stored row is the baseline. Pin that baseline before a caller
+        // replaces the row with an unauthoritative carried/cache snapshot whose field differs.
+        if flips(tx, conversation_id)?.is_empty() && metadata_enabled(metadata) != effective {
+            record_flip(tx, conversation_id, 0, effective, now_ms)?;
+        }
         return Ok(());
     }
+    let Some(value) = metadata.extra.get(HISTORY_BACKUP) else {
+        // Legacy authored snapshots did not carry policy and cannot replay the default ON over
+        // a newer explicit control. New writers always stamp an explicit current value.
+        return Ok(());
+    };
+    let before = current_enabled(tx, conversation_id)?;
+    let requested = value.as_bool().unwrap_or(false);
     if before != requested {
         record_flip(tx, conversation_id, seq, requested, now_ms)?;
     }
@@ -394,42 +435,87 @@ mod tests {
     }
 
     #[test]
-    fn commit_snapshot_cannot_reenable_and_unknown_settings_survive() {
+    fn stale_off_exact_carry_does_not_override_a_newer_explicit_on() {
         let (_dir, db) = db();
         db.write_tx(|tx| {
             let mut off = GroupMetadataV1::new("Chat", "");
             off.extra
                 .insert("futureSetting".into(), json!({"nested": [1, 2]}));
             set_metadata_enabled(&mut off, false);
-            accept_snapshot(tx, CID, 2, &mut off, false, 2)?;
-            tx.upsert_group_metadata(&super::super::chat_wire::group_metadata_row_from_v1(
-                CID, 2, 0, &off, 2,
-            )?)?;
+            accept_snapshot(
+                tx,
+                CID,
+                2,
+                &off,
+                SnapshotPolicyAuthority::AuthoredMetadataTransition,
+                2,
+            )?;
 
-            let mut carried = off.clone();
-            carried.title = "Retitled".into();
-            set_metadata_enabled(&mut carried, true);
-            accept_snapshot(tx, CID, 3, &mut carried, false, 3)?;
-            assert!(
-                metadata_enabled(&carried),
-                "the decrypted JSON stays verbatim"
-            );
-            assert!(!current_enabled(tx, CID)?, "the effective policy stays off");
-            assert_eq!(carried.extra["futureSetting"], json!({"nested": [1, 2]}));
-
-            // A separately signed metadata transition can opt back in.
-            set_metadata_enabled(&mut carried, true);
-            accept_snapshot(tx, CID, 4, &mut carried, true, 4)?;
+            let mut on = off.clone();
+            set_metadata_enabled(&mut on, true);
+            accept_snapshot(
+                tx,
+                CID,
+                3,
+                &on,
+                SnapshotPolicyAuthority::AuthoredMetadataTransition,
+                3,
+            )?;
             assert!(current_enabled(tx, CID)?);
-            assert!(!enabled_at_seq(tx, CID, 3)?);
+
+            // A later peer Commit carries the older OFF plaintext exactly. It remains valid
+            // metadata, but cannot manufacture a fresh OFF observation at the Commit sequence.
+            accept_snapshot(
+                tx,
+                CID,
+                4,
+                &off,
+                SnapshotPolicyAuthority::ExactCarry,
+                4,
+            )?;
+            tx.upsert_group_metadata(&super::super::chat_wire::group_metadata_row_from_v1(
+                CID, 2, 1, &off, 4,
+            )?)?;
+            assert!(!metadata_enabled(&off), "the carried JSON stays verbatim");
+            assert!(current_enabled(tx, CID)?, "the explicit ON remains effective");
             assert!(enabled_at_seq(tx, CID, 4)?);
+            assert_eq!(off.extra["futureSetting"], json!({"nested": [1, 2]}));
             Ok(())
         })
         .unwrap();
     }
 
     #[test]
-    fn restored_off_metadata_without_flip_log_cannot_be_loosened_by_snapshot() {
+    fn authored_metadata_stamp_replaces_stale_on_after_completed_off() {
+        let (_dir, db) = db();
+        db.write_tx(|tx| {
+            let mut stale = GroupMetadataV1::new("Old", "");
+            set_metadata_enabled(&mut stale, true);
+            tx.upsert_group_metadata(&super::super::chat_wire::group_metadata_row_from_v1(
+                CID, 1, 0, &stale, 1,
+            )?)?;
+            record_flip(tx, CID, 2, false, 2)?;
+
+            let mut renamed = stale;
+            renamed.title = "Renamed".into();
+            stamp_current_metadata_policy(tx, CID, &mut renamed)?;
+            assert!(!metadata_enabled(&renamed));
+            accept_snapshot(
+                tx,
+                CID,
+                3,
+                &renamed,
+                SnapshotPolicyAuthority::AuthoredMetadataTransition,
+                3,
+            )?;
+            assert!(!current_enabled(tx, CID)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unauthoritative_snapshot_cannot_replace_an_off_row_baseline() {
         let (_dir, db) = db();
         db.write_tx(|tx| {
             let mut off = GroupMetadataV1::new("Chat", "");
@@ -441,9 +527,16 @@ mod tests {
 
             let mut carried = off.clone();
             set_metadata_enabled(&mut carried, true);
-            accept_snapshot(tx, CID, 0, &carried, false, 2)?;
+            accept_snapshot(
+                tx,
+                CID,
+                0,
+                &carried,
+                SnapshotPolicyAuthority::ExactCarry,
+                2,
+            )?;
             tx.upsert_group_metadata(&super::super::chat_wire::group_metadata_row_from_v1(
-                CID, 2, 0, &carried, 2,
+                CID, 2, 1, &carried, 2,
             )?)?;
             assert_eq!(
                 flips(tx, CID)?,
@@ -453,7 +546,6 @@ mod tests {
                 }]
             );
             assert!(!current_enabled(tx, CID)?);
-            assert!(!enabled_at_seq(tx, CID, 1)?);
             assert!(frame_no_backup(&stamp_outgoing(
                 tx,
                 CID,

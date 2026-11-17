@@ -142,14 +142,183 @@ fn either_direct_peer_can_turn_backup_off_and_explicitly_back_on() {
 }
 
 #[test]
-fn joining_member_inherits_effective_backup_off_in_commit_snapshot() {
+fn joining_member_inherits_effective_backup_off_from_verified_welcome() {
     let f = send_order_fixture(true);
     let cid = f.cid.as_str();
+    assert!(
+        stored_metadata(&f.alice, cid)
+            .get("historyBackup")
+            .is_none(),
+        "genesis uses the missing-field default"
+    );
     f.bob.set_history_backup_enabled(cid, false).unwrap();
     f.alice.sync().unwrap();
     assert!(!f.alice.history_backup_enabled(cid).unwrap());
 
     admit_eve(&f);
     assert!(!f.eve.history_backup_enabled(cid).unwrap());
-    assert_eq!(stored_metadata(&f.eve, cid)["historyBackup"], json!(false));
+    assert!(
+        stored_metadata(&f.eve, cid)
+            .get("historyBackup")
+            .is_none(),
+        "the Commit carries exact prior metadata; OFF arrives in the verified Welcome"
+    );
+}
+
+#[test]
+fn missing_backup_field_survives_first_membership_commit_without_normalization() {
+    let f = send_order_fixture(true);
+    let cid = f.cid.as_str();
+    assert!(stored_metadata(&f.alice, cid)
+        .get("historyBackup")
+        .is_none());
+
+    admit_eve(&f);
+
+    assert!(f.eve.history_backup_enabled(cid).unwrap());
+    assert!(stored_metadata(&f.eve, cid)
+        .get("historyBackup")
+        .is_none());
+}
+
+#[test]
+fn explicit_backup_policy_survives_generic_commit_and_leave_carry_forward() {
+    let f = send_order_fixture(true);
+    let cid = f.cid.as_str();
+
+    // Model an authenticated snapshot written by a policy-aware older client: place its explicit
+    // field in Alice's complete local metadata, then publish it through the normal signed admin
+    // metadata transition. Subsequent Commit forms must carry that plaintext exactly.
+    let mut row = f.alice.get_group_metadata(cid).unwrap().expect("metadata");
+    let mut metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+    metadata["historyBackup"] = json!(false);
+    row.metadata_json = metadata.to_string();
+    f.alice
+        .db()
+        .write_tx(|tx| tx.upsert_group_metadata(&row))
+        .unwrap();
+    f.alice
+        .update_group_metadata(cid, "Explicit policy".into(), String::new(), None)
+        .expect("publish explicit policy metadata");
+    f.bob.sync().expect("bob applies metadata transition");
+    assert_eq!(
+        stored_metadata(&f.bob, cid)["historyBackup"],
+        json!(false)
+    );
+
+    admit_eve(&f);
+    f.alice
+        .remove_group_member(MemberRole::Admin, cid, EVE_DID)
+        .expect("generic Commit removes Eve");
+    f.bob.sync().expect("bob applies Eve removal");
+    assert_eq!(
+        stored_metadata(&f.bob, cid)["historyBackup"],
+        json!(false)
+    );
+
+    let leave = f
+        .bob
+        .leave_conversation(cid)
+        .expect("bob requests durable leave");
+    assert!(!leave.left_immediately);
+    assert_eq!(
+        f.alice
+            .fulfill_pending_group_leaves()
+            .expect("alice fulfills Bob's leave"),
+        1
+    );
+    assert_eq!(
+        stored_metadata(&f.alice, cid)["historyBackup"],
+        json!(false)
+    );
+}
+
+/// A completed OFF control is newer than the stored metadata row. A later title edit must author
+/// the current OFF value rather than republish the row's missing-field ON default.
+#[test]
+fn authored_retitle_stamps_completed_off_over_stale_metadata() {
+    let f = send_order_fixture(false);
+    let cid = f.cid.as_str();
+    assert!(stored_metadata(&f.alice, cid)
+        .get("historyBackup")
+        .is_none());
+
+    f.alice
+        .set_history_backup_enabled(cid, false)
+        .expect("turn backup off");
+    f.bob.sync().expect("bob observes OFF");
+    f.alice
+        .update_group_metadata(cid, "Renamed while off".into(), String::new(), None)
+        .expect("author metadata after OFF");
+    f.bob.sync().expect("bob applies authored metadata");
+
+    assert_eq!(
+        stored_metadata(&f.bob, cid)["historyBackup"],
+        json!(false)
+    );
+    assert!(!f.alice.history_backup_enabled(cid).unwrap());
+    assert!(!f.bob.history_backup_enabled(cid).unwrap());
+}
+
+/// An epoch Commit carries the last metadata plaintext exactly, but that old field is not a new
+/// policy action. OFF metadata followed by an explicit ON remains ON after a peer applies the
+/// carried snapshot.
+#[test]
+fn stale_off_epoch_carry_does_not_override_later_explicit_on() {
+    let f = send_order_fixture(true);
+    let cid = f.cid.as_str();
+
+    f.alice
+        .set_history_backup_enabled(cid, false)
+        .expect("turn backup off");
+    f.bob.sync().expect("bob observes OFF");
+    f.alice
+        .update_group_metadata(cid, "Metadata authored off".into(), String::new(), None)
+        .expect("author OFF metadata");
+    f.bob.sync().expect("bob applies OFF metadata");
+    assert_eq!(
+        stored_metadata(&f.bob, cid)["historyBackup"],
+        json!(false)
+    );
+
+    f.alice
+        .set_history_backup_enabled(cid, true)
+        .expect("explicitly turn backup on");
+    f.bob.sync().expect("bob observes ON");
+    assert!(f.bob.history_backup_enabled(cid).unwrap());
+
+    // A legacy install persisted this one schema byte field with the old `$bytes` wrapper.
+    // Semantic byte equality must accept it without relaxing any opaque envelope field.
+    f.bob
+        .db()
+        .write_tx(|tx| {
+            let key = format!("metadata_snapshot_json:{cid}");
+            let raw = tx
+                .get_account_meta(&key)?
+                .expect("bob cached authenticated metadata");
+            let mut snapshot: Value = serde_json::from_str(&raw)?;
+            let public_key = snapshot
+                .pointer("/authorProof/signaturePublicKey")
+                .and_then(Value::as_str)
+                .expect("canonical author key")
+                .to_string();
+            snapshot["authorProof"]["signaturePublicKey"] =
+                json!({ "$bytes": public_key });
+            tx.put_account_meta(&key, &snapshot.to_string(), 0)
+        })
+        .unwrap();
+
+    f.eve.sync().expect("eve accepts the invite");
+    f.alice.sync().expect("alice adds eve with an epoch Commit");
+    f.bob.sync().expect("bob applies the epoch Commit");
+
+    assert_eq!(
+        stored_metadata(&f.bob, cid)["historyBackup"],
+        json!(false),
+        "the old metadata plaintext is still carried exactly"
+    );
+    assert!(
+        f.bob.history_backup_enabled(cid).unwrap(),
+        "the carried OFF field has no authority to override the later explicit ON"
+    );
 }

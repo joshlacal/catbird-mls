@@ -107,6 +107,7 @@ struct SyncMockState {
     pending_leaf_recoveries: Vec<Value>,
     submitted_transitions: Vec<Value>,
     acked_welcomes: Vec<Value>,
+    before_conversation_state_response: Option<Box<dyn FnOnce() + Send>>,
 }
 
 struct SyncMockTransport {
@@ -245,6 +246,31 @@ impl PlatformTransport for SyncMockTransport {
             }
             return json_http(200, &json!({ "didDoc": plc_did_doc(&did) }));
         }
+        if request
+            .url
+            .contains("/xrpc/blue.catbird.chat.getOwnDevices")
+        {
+            let actor_device = q.get("actorDeviceId").map(String::as_str);
+            let items: Vec<Value> = st
+                .pds_devices
+                .values()
+                .flatten()
+                .filter(|(device_id, _)| Some(device_id.as_str()) == actor_device)
+                .map(|(device_id, public_key)| {
+                    json!({
+                        "device": {
+                            "deviceId": device_id,
+                            "status": "active",
+                            "authGeneration": 1,
+                            "signaturePublicKey": {
+                                "$bytes": STANDARD.encode(public_key)
+                            },
+                        }
+                    })
+                })
+                .collect();
+            return json_http(200, &json!({ "items": items }));
+        }
         if request.url.contains("/xrpc/com.atproto.repo.listRecords") {
             if request
                 .url
@@ -308,11 +334,17 @@ impl PlatformTransport for SyncMockTransport {
             .contains("/xrpc/blue.catbird.chat.getConversationState")
         {
             let state = st.conversation_state.clone().unwrap_or_else(|| json!({}));
+            let pending_leaf_recoveries = st.pending_leaf_recoveries.clone();
+            let before_response = st.before_conversation_state_response.take();
+            drop(st);
+            if let Some(before_response) = before_response {
+                before_response();
+            }
             return json_http(
                 200,
                 &json!({
                     "state": state,
-                    "pendingLeafRecoveryRequests": st.pending_leaf_recoveries,
+                    "pendingLeafRecoveryRequests": pending_leaf_recoveries,
                     "pendingResetRequests": [],
                     "pendingLeaveRequests": [],
                     "accountDeletions": [],
@@ -638,14 +670,43 @@ fn seed_active_group(
             }
             let epoch = group.epoch().as_u64() as i64;
             let (gch, ctag) = chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
+            let metadata_key = derive_metadata_key_from_group(
+                &mut group,
+                provider.crypto(),
+                provider.storage(),
+                &group_id,
+                epoch as u64,
+            )
+            .map_err(|e| MLSError::Cryptography(format!("derive fixture metadata key: {e}")))?;
+            let metadata = crate::metadata::GroupMetadataV1::new("Unit Group", "");
+            let metadata_snapshot =
+                chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+                    &metadata_key,
+                    &group_id,
+                    &uuid::Uuid::parse_str(cid)
+                        .map_err(|e| MLSError::Internal(format!("fixture cid: {e}")))?,
+                    generation,
+                    epoch as u64,
+                    &gch,
+                    &ctag,
+                    "77777777-7777-4777-8777-777777777777",
+                    1,
+                    last_seq.max(0) as u64,
+                    &client.normalized_did,
+                    &client.config.device_id,
+                    1,
+                    signer.public(),
+                    &metadata,
+                    [0x5a; 12],
+                )?;
             let coords = json!({
                 "conversationId": cid,
                 "generation": generation,
                 "stateVersion": 1,
                 "groupId": { "$bytes": STANDARD.encode(&group_id) },
                 "epoch": epoch,
-                "groupContextHash": { "$bytes": STANDARD.encode(gch) },
-                "confirmationTag": { "$bytes": STANDARD.encode(ctag) },
+                "groupContextHash": { "$bytes": STANDARD.encode(&gch) },
+                "confirmationTag": { "$bytes": STANDARD.encode(&ctag) },
                 "lifecycle": "active",
             });
             let canon = chat_wire::canonicalize_wire_coordinate(&coords, Some(cid))?;
@@ -665,6 +726,14 @@ fn seed_active_group(
             tx.put_account_meta(
                 &format!("conversation_coords:{cid}"),
                 &canon.to_string(),
+                now_ms,
+            )?;
+            tx.upsert_group_metadata(&chat_wire::group_metadata_row_from_v1(
+                cid, 1, epoch, &metadata, now_ms,
+            )?)?;
+            tx.put_account_meta(
+                &format!("metadata_snapshot_json:{cid}"),
+                &metadata_snapshot.to_string(),
                 now_ms,
             )?;
             Ok(canon)
@@ -1550,11 +1619,57 @@ fn fulfill_leaf_recovery_and_join_pending_welcome_boundary_guards() {
         &bob_signer,
         &bob_kp_val,
     )];
+    // The call began while backup was ON. Complete an authenticated OFF control while recovery
+    // discovery I/O is outstanding; GroupInfo must read policy after that I/O, not from preflight.
+    let alice_db = alice.db.clone();
+    state.lock().unwrap().before_conversation_state_response = Some(Box::new(move || {
+        alice_db
+            .write_tx(|tx| {
+                crate::client::archive_policy::observe_frame(
+                    tx,
+                    &QueuedLabyrinthArchivePayload {
+                        version: 1,
+                        message_id: "55555555-5555-4555-8555-555555555559".into(),
+                        conversation_id: CONVO_ID.into(),
+                        group_id_hex: String::new(),
+                        epoch: 0,
+                        expected_member_dids: vec![],
+                        seq: 2,
+                        sender_did: ALICE_DID.into(),
+                        sender_device_id: DEV_A1.into(),
+                        sequencer_did: SEQUENCER_DID.into(),
+                        space_uri: None,
+                        plaintext_json: String::new(),
+                        labyrinth_frame_json: json!({
+                            "version": 1,
+                            "messageType": "system",
+                            "historyBackupChange": false,
+                            "backupPolicy": 1,
+                            "noBackup": true,
+                        })
+                        .to_string(),
+                        mls_ciphertext_b64: String::new(),
+                        frame_nonce_b64: None,
+                        sequencer_receipt_json: None,
+                        original_sender_attestation_json: None,
+                        created_at_ms: 2,
+                    },
+                )
+            })
+            .unwrap();
+    }));
     assert_eq!(
         alice
             .fulfill_leaf_recovery(CONVO_ID, DEV_A1, &alice_signer, 1)
             .unwrap(),
         1
+    );
+    assert!(
+        !alice
+            .db
+            .read_tx(|tx| crate::client::archive_policy::current_enabled(tx, CONVO_ID))
+            .unwrap(),
+        "the OFF control completed during discovery"
     );
 
     let mut fulfillment = state
@@ -1634,6 +1749,12 @@ fn fulfill_leaf_recovery_and_join_pending_welcome_boundary_guards() {
         .unwrap();
     assert_eq!(bob_row.sequencer_did, PINNED_SEQUENCER_DID);
     assert_eq!(bob_row.unread_count, 2);
+    assert!(
+        !bob.db
+            .read_tx(|tx| crate::client::archive_policy::current_enabled(tx, CONVO_ID))
+            .unwrap(),
+        "the recovery GroupInfo must attest the post-I/O OFF policy"
+    );
 }
 
 #[test]

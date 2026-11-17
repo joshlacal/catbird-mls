@@ -5002,19 +5002,15 @@ where
         let pm = prior_metadata_snapshot.ok_or_else(|| {
             OrchestratorError::InvalidInput("prior metadataSnapshot missing".into())
         })?;
-        let metadata_version = pm
-            .get("metadataVersion")
+        pm.get("metadataVersion")
             .and_then(|value| value.as_u64())
             .filter(|value| *value > 0)
             .ok_or_else(|| OrchestratorError::Api("metadata snapshot version missing".into()))?;
-        let origin_transition_id = pm
-            .get("originTransitionId")
-            .cloned()
+        pm.get("originTransitionId")
             .ok_or_else(|| OrchestratorError::Api("metadata snapshot origin missing".into()))?;
-        let author_proof = pm.get("authorProof").cloned().ok_or_else(|| {
+        pm.get("authorProof").ok_or_else(|| {
             OrchestratorError::Api("metadata snapshot author proof missing".into())
         })?;
-        let avatar_binding = pm.get("avatarBinding").cloned();
 
         let opened_metadata = self.open_metadata_snapshot(
             &pm,
@@ -5115,29 +5111,22 @@ where
 
         let leaf_changes = crate::client::chat_wire::recovery_leaf_changes(&authorization, &kp_ref);
 
-        let mut metadata_snapshot_json = serde_json::json!({
-            "coordinate": {
-                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                "generation": generation,
-                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
-                "epoch": target_epoch,
-                "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
-                "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) }
-            },
-            "originTransitionId": origin_transition_id,
-            "metadataVersion": metadata_version,
-            "nonce": { "$bytes": STANDARD.encode(nonce) },
-            "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
-            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
-            "ciphertextSize": ciphertext.len(),
-            "authorProof": author_proof
+        let mut metadata_snapshot_json = pm;
+        metadata_snapshot_json["coordinate"] = serde_json::json!({
+            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+            "generation": generation,
+            "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
+            "epoch": target_epoch,
+            "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
+            "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) }
         });
-        if let Some(ab) = avatar_binding {
-            metadata_snapshot_json
-                .as_object_mut()
-                .unwrap()
-                .insert("avatarBinding".to_string(), ab);
-        }
+        metadata_snapshot_json["nonce"] =
+            serde_json::json!({ "$bytes": STANDARD.encode(nonce) });
+        metadata_snapshot_json["ciphertext"] =
+            serde_json::json!({ "$bytes": STANDARD.encode(&ciphertext) });
+        metadata_snapshot_json["ciphertextSha256"] =
+            serde_json::json!(STANDARD.encode(Sha256::digest(&ciphertext)));
+        metadata_snapshot_json["ciphertextSize"] = serde_json::json!(ciphertext.len());
 
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
@@ -5997,22 +5986,6 @@ where
             conversation_id,
             &group_id_bytes,
         )?;
-        let decode_bytes = |value: Option<&serde_json::Value>| -> Result<Vec<u8>> {
-            let encoded = value
-                .and_then(|v| {
-                    v.get("$bytes")
-                        .and_then(|b| b.as_str())
-                        .or_else(|| v.as_str())
-                })
-                .ok_or_else(|| {
-                    OrchestratorError::InvalidInput("metadataSnapshot bytes missing".into())
-                })?;
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|e| OrchestratorError::Serialization(e.to_string()))
-        };
-        let prior_nonce = decode_bytes(prior_snapshot.get("nonce"))?;
-        let prior_ciphertext = decode_bytes(prior_snapshot.get("ciphertext"))?;
         let generation = prior_snapshot["coordinate"]["generation"]
             .as_u64()
             .unwrap_or(0);
@@ -6041,10 +6014,7 @@ where
         use rand::RngCore;
         let mut next_nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut next_nonce);
-        if next_nonce.as_slice() == prior_nonce.as_slice() {
-            next_nonce[0] ^= 1;
-        }
-        let next_ciphertext = self.reseal_metadata_from_pending(
+        let next_ciphertext = match self.reseal_metadata_from_pending(
             &opened_metadata,
             &group_id_bytes,
             &super::metadata_snapshot::SuccessorCoordinate {
@@ -6055,15 +6025,15 @@ where
                 confirmation_tag: &next_tag,
             },
             &next_nonce,
-        )?;
-        if next_ciphertext.len() != prior_ciphertext.len() {
-            let _ = self
-                .mls_context()
-                .clear_pending_commit(group_id_bytes.clone());
-            return Err(OrchestratorError::Mls(MLSError::Internal(
-                "removal metadata ciphertext length changed".into(),
-            )));
-        }
+        ) {
+            Ok(ciphertext) => ciphertext,
+            Err(error) => {
+                let _ = self
+                    .mls_context()
+                    .clear_pending_commit(group_id_bytes.clone());
+                return Err(error);
+            }
+        };
         let mut metadata_snapshot = prior_snapshot;
         metadata_snapshot["nonce"] =
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(next_nonce));

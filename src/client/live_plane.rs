@@ -35,7 +35,9 @@ use crate::messaging::receive::{
     OriginalSenderArchiveAttestationEnvelope, PrivateMessagePlaintextEnvelope,
 };
 use crate::metadata::{
-    derive_metadata_key_from_group, encrypt_metadata_snapshot_with_nonce, GroupMetadataV1,
+    decrypt_metadata_snapshot_plaintext, derive_metadata_key_from_group,
+    encrypt_metadata_snapshot_plaintext_with_nonce, encrypt_metadata_snapshot_with_nonce,
+    GroupMetadataV1,
 };
 use crate::orchestrator::canonical_transport::{
     canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id,
@@ -63,6 +65,14 @@ const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA
 pub(crate) struct PendingApplicationSend {
     pub(crate) body: Value,
     pub(crate) archive: QueuedLabyrinthArchivePayload,
+}
+
+/// Authenticated prior metadata held only across one Commit build.
+pub(crate) struct MetadataCarryForward {
+    snapshot: Value,
+    plaintext: Vec<u8>,
+    nonce: [u8; 12],
+    ciphertext_len: usize,
 }
 
 pub(crate) use super::chat_wire::PendingCommitTransition;
@@ -5024,6 +5034,15 @@ impl CatbirdMlsClient {
                         GenericCommitOp::SelfUpdate => {}
                     }
 
+                    let metadata_carry = self
+                        .metadata_snapshot_plaintext_for_carry_forward(
+                            tx,
+                            conversation_id,
+                            &convo.group_id,
+                            &mut group,
+                            &provider,
+                        )?;
+
                     let aad_prior = chat_wire::build_aad_prior_coordinate(
                         convo_uuid,
                         &convo.group_id,
@@ -5068,22 +5087,6 @@ impl CatbirdMlsClient {
                     let next_epoch = group.epoch().as_u64();
                     let (next_gch, next_ctag) =
                         chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                    let meta_row = tx.get_group_metadata(conversation_id)?;
-                    let meta_ver = meta_row
-                        .as_ref()
-                        .map(|m| m.metadata_version.max(1) as u64)
-                        .unwrap_or(1);
-                    let title_s = meta_row
-                        .as_ref()
-                        .and_then(|m| m.title.clone())
-                        .unwrap_or_default();
-                    let desc_s = meta_row
-                        .as_ref()
-                        .and_then(|m| m.description.clone())
-                        .unwrap_or_default();
-                    let avatar_opt = meta_row
-                        .as_ref()
-                        .and_then(chat_wire::space_avatar_from_metadata_row);
                     let meta_key = derive_metadata_key_from_group(
                         &mut group,
                         provider.crypto(),
@@ -5093,8 +5096,7 @@ impl CatbirdMlsClient {
                     )
                     .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                     let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
-                        tx,
-                        conversation_id,
+                        metadata_carry,
                         &meta_key,
                         &convo.group_id,
                         convo_uuid,
@@ -5102,14 +5104,6 @@ impl CatbirdMlsClient {
                         next_epoch,
                         &next_gch,
                         &next_ctag,
-                        &transition_id,
-                        meta_ver,
-                        canonical_dev_id,
-                        auth_gen,
-                        signer.public(),
-                        &title_s,
-                        &desc_s,
-                        avatar_opt,
                     )?;
                     (
                         signer,
@@ -5561,11 +5555,124 @@ impl CatbirdMlsClient {
         Ok(gap)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reencrypt_metadata_snapshot_for_epoch(
+    /// Decrypt the current, authenticated metadata snapshot before mutating the MLS group. The
+    /// returned plaintext lives only for the surrounding Commit build and is never persisted.
+    pub(crate) fn metadata_snapshot_plaintext_for_carry_forward<P: OpenMlsProvider>(
         &self,
         tx: &crate::storage::SqlReadTx<'_>,
         conversation_id: &str,
+        group_id: &[u8],
+        group: &mut MlsGroup,
+        provider: &P,
+    ) -> Result<MetadataCarryForward, MLSError> {
+        let refused =
+            |what: &str| MLSError::Cryptography(format!("metadata carry-forward: {what}"));
+        let encoded = tx
+            .get_account_meta(&format!("metadata_snapshot_json:{conversation_id}"))?
+            .ok_or_else(|| MLSError::InvalidState("MetadataSnapshotUnavailable".into()))?;
+        let snapshot: Value =
+            serde_json::from_str(&encoded).map_err(|_| refused("invalid cached snapshot"))?;
+        let coordinate = snapshot
+            .get("coordinate")
+            .and_then(Value::as_object)
+            .ok_or_else(|| refused("missing coordinate"))?;
+        let epoch = coordinate
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| refused("missing epoch"))?;
+        let snapshot_group_id = chat_wire::json_bytes(
+            coordinate
+                .get("groupId")
+                .ok_or_else(|| refused("missing group id"))?,
+        )?;
+        if epoch != group.epoch().as_u64()
+            || group.group_id().as_slice() != group_id
+            || snapshot_group_id.as_slice() != group_id
+        {
+            return Err(MLSError::InvalidState("StaleMetadataSnapshot".into()));
+        }
+        let convo_uuid = uuid::Uuid::parse_str(conversation_id)
+            .map_err(|_| refused("invalid conversation id"))?;
+        let snapshot_conversation_id = chat_wire::json_bytes(
+            coordinate
+                .get("conversationId")
+                .ok_or_else(|| refused("missing conversation id"))?,
+        )?;
+        if snapshot_conversation_id.as_slice() != convo_uuid.as_bytes() {
+            return Err(refused("snapshot names another conversation"));
+        }
+        let metadata_version = snapshot
+            .get("metadataVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| refused("missing metadata version"))?;
+        if snapshot.get("originTransitionId").and_then(Value::as_str).is_none()
+            || !snapshot
+                .get("authorProof")
+                .is_some_and(Value::is_object)
+        {
+            return Err(refused("missing authenticated origin"));
+        }
+        let nonce_vec = chat_wire::json_bytes(
+            snapshot
+                .get("nonce")
+                .ok_or_else(|| refused("missing nonce"))?,
+        )?;
+        let nonce: [u8; 12] = nonce_vec
+            .try_into()
+            .map_err(|_| refused("invalid nonce"))?;
+        let ciphertext = chat_wire::json_bytes(
+            snapshot
+                .get("ciphertext")
+                .ok_or_else(|| refused("missing ciphertext"))?,
+        )?;
+        let declared_size = snapshot
+            .get("ciphertextSize")
+            .and_then(Value::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or_else(|| refused("missing ciphertext size"))?;
+        let declared_hash = chat_wire::json_bytes(
+            snapshot
+                .get("ciphertextSha256")
+                .ok_or_else(|| refused("missing ciphertext digest"))?,
+        )?;
+        if declared_size != ciphertext.len()
+            || declared_hash.as_slice() != &Sha256::digest(&ciphertext)[..]
+        {
+            return Err(refused("ciphertext binding mismatch"));
+        }
+        let metadata_key = derive_metadata_key_from_group(
+            group,
+            provider.crypto(),
+            provider.storage(),
+            group_id,
+            epoch,
+        )
+        .map_err(|e| refused(&format!("derive prior key: {e}")))?;
+        let plaintext = decrypt_metadata_snapshot_plaintext(
+            &metadata_key,
+            group_id,
+            epoch,
+            metadata_version,
+            &nonce,
+            &ciphertext,
+        )
+        .map_err(|e| refused(&format!("decrypt prior snapshot: {e}")))?;
+        validate_metadata_snapshot_size(&plaintext)?;
+        Ok(MetadataCarryForward {
+            snapshot,
+            plaintext,
+            nonce,
+            ciphertext_len: ciphertext.len(),
+        })
+    }
+
+    /// Re-encrypt exact prior metadata plaintext for a Commit's next epoch. Only the AEAD and
+    /// coordinate bindings change; metadata version, origin, author proof, avatar binding, unknown
+    /// envelope fields, and every plaintext byte remain untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reencrypt_metadata_snapshot_for_epoch(
+        &self,
+        carry: MetadataCarryForward,
         metadata_key: &[u8; 32],
         group_id: &[u8],
         convo_uuid: &uuid::Uuid,
@@ -5573,90 +5680,228 @@ impl CatbirdMlsClient {
         target_epoch: u64,
         next_gch: &[u8],
         next_ctag: &[u8],
-        fallback_transition_id: &str,
-        fallback_version: u64,
-        actor_device_id: &str,
-        auth_generation: i64,
-        public_key: &[u8],
-        title: &str,
-        description: &str,
-        space_avatar: Option<SpaceAvatarPointer>,
     ) -> Result<Value, MLSError> {
-        if let Some(prev_str) =
-            tx.get_account_meta(&format!("metadata_snapshot_json:{conversation_id}"))?
-        {
-            if let Ok(prev_snap) = serde_json::from_str::<Value>(&prev_str) {
-                let prev_ver = prev_snap
-                    .get("metadataVersion")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(fallback_version);
-                let origin_tid = prev_snap
-                    .get("originTransitionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(fallback_transition_id)
-                    .to_string();
-                let author_proof = prev_snap.get("authorProof").cloned();
-                let nonce = self.hooks.random_array::<12>();
-                let payload = Self::rebuilt_group_metadata(
-                    tx,
-                    conversation_id,
-                    title,
-                    description,
-                    space_avatar.clone(),
-                )?;
-                let ct = encrypt_metadata_snapshot_with_nonce(
-                    metadata_key,
-                    group_id,
-                    target_epoch,
-                    prev_ver,
-                    &nonce,
-                    &payload,
-                )?;
-                if let Some(proof) = author_proof {
-                    return Ok(json!({
-                        "authorProof": proof,
-                        "ciphertext": { "$bytes": STANDARD.encode(&ct) },
-                        "ciphertextSha256": STANDARD.encode(Sha256::digest(&ct)),
-                        "ciphertextSize": ct.len(),
-                        "coordinate": {
-                            "confirmationTag": { "$bytes": STANDARD.encode(next_ctag) },
-                            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                            "epoch": target_epoch,
-                            "generation": generation,
-                            "groupContextHash": { "$bytes": STANDARD.encode(next_gch) },
-                            "groupId": { "$bytes": STANDARD.encode(group_id) },
-                        },
-                        "metadataVersion": prev_ver,
-                        "nonce": { "$bytes": STANDARD.encode(nonce) },
-                        "originTransitionId": origin_tid,
-                    }));
-                }
-            }
+        let refused =
+            |what: &str| MLSError::Cryptography(format!("metadata carry-forward: {what}"));
+        let MetadataCarryForward {
+            mut snapshot,
+            plaintext,
+            nonce: previous_nonce,
+            ciphertext_len: previous_len,
+        } = carry;
+        let metadata_version = snapshot
+            .get("metadataVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| refused("missing metadata version"))?;
+        let nonce = self.hooks.random_array::<12>();
+        if previous_nonce == nonce {
+            return Err(refused("nonce repeated across epochs"));
         }
-        let payload =
-            Self::rebuilt_group_metadata(tx, conversation_id, title, description, space_avatar)?;
-        chat_wire::build_encrypted_metadata_snapshot_json_for_metadata(
+        let ciphertext = encrypt_metadata_snapshot_plaintext_with_nonce(
             metadata_key,
             group_id,
-            convo_uuid,
-            generation,
             target_epoch,
-            next_gch,
-            next_ctag,
-            fallback_transition_id,
-            fallback_version,
-            1,
-            &self.normalized_did,
-            actor_device_id,
-            auth_generation,
-            public_key,
-            &payload,
-            self.hooks.random_array::<12>(),
+            metadata_version,
+            &nonce,
+            &plaintext,
         )
+        .map_err(|e| refused(&format!("encrypt next snapshot: {e}")))?;
+        if ciphertext.len() != previous_len {
+            return Err(refused("plaintext length changed"));
+        }
+        snapshot["ciphertext"] = json!({ "$bytes": STANDARD.encode(&ciphertext) });
+        snapshot["ciphertextSha256"] = json!(STANDARD.encode(Sha256::digest(&ciphertext)));
+        snapshot["ciphertextSize"] = json!(ciphertext.len());
+        snapshot["nonce"] = json!({ "$bytes": STANDARD.encode(nonce) });
+        let coordinate = snapshot
+            .get_mut("coordinate")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| refused("missing coordinate"))?;
+        coordinate.insert(
+            "confirmationTag".into(),
+            json!({ "$bytes": STANDARD.encode(next_ctag) }),
+        );
+        coordinate.insert(
+            "conversationId".into(),
+            json!(STANDARD.encode(convo_uuid.as_bytes())),
+        );
+        coordinate.insert("epoch".into(), json!(target_epoch));
+        coordinate.insert("generation".into(), json!(generation));
+        coordinate.insert(
+            "groupContextHash".into(),
+            json!({ "$bytes": STANDARD.encode(next_gch) }),
+        );
+        coordinate.insert(
+            "groupId".into(),
+            json!({ "$bytes": STANDARD.encode(group_id) }),
+        );
+        Ok(snapshot)
+    }
+
+    /// Authenticate a peer Commit's metadata as an exact epoch carry before storing it. A member
+    /// knows the metadata key, so the server's ciphertext-shape checks alone cannot prove that a
+    /// malicious committer preserved plaintext or the original authorship envelope.
+    pub(crate) fn decrypt_verified_metadata_carry_for_epoch<P: OpenMlsProvider>(
+        &self,
+        carry: MetadataCarryForward,
+        snapshot: &Value,
+        group: &mut MlsGroup,
+        provider: &P,
+    ) -> Result<(i64, i64, GroupMetadataV1), MLSError> {
+        let refused =
+            |what: &str| MLSError::Cryptography(format!("metadata carry-forward: {what}"));
+        let immutable_envelope = |value: &Value| -> Result<Value, MLSError> {
+            let mut immutable = value.clone();
+            let object = immutable
+                .as_object_mut()
+                .ok_or_else(|| refused("snapshot is not an object"))?;
+            for field in [
+                "coordinate",
+                "ciphertext",
+                "ciphertextSha256",
+                "ciphertextSize",
+                "nonce",
+            ] {
+                object
+                    .remove(field)
+                    .ok_or_else(|| refused(&format!("missing {field}")))?;
+            }
+
+            // Generated wire uses plain base64, while legacy persisted snapshots wrapped these
+            // two schema byte fields in `{"$bytes": ...}`. Normalize only those known paths;
+            // every other immutable and opaque field remains raw-Value-equal.
+            let author_proof = object
+                .get_mut("authorProof")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| refused("missing author proof"))?;
+            let public_key = chat_wire::json_bytes(
+                author_proof
+                    .get("signaturePublicKey")
+                    .ok_or_else(|| refused("missing author signature key"))?,
+            )?;
+            if public_key.len() != 32 {
+                return Err(refused("invalid author signature key"));
+            }
+            author_proof.insert(
+                "signaturePublicKey".into(),
+                json!(STANDARD.encode(public_key)),
+            );
+
+            if let Some(avatar_binding) = object.get_mut("avatarBinding") {
+                let avatar_binding = avatar_binding
+                    .as_object_mut()
+                    .ok_or_else(|| refused("invalid avatar binding"))?;
+                if let Some(hash_value) = avatar_binding.get("ciphertextSha256") {
+                    let hash = chat_wire::json_bytes(hash_value)?;
+                    if hash.len() != 32 {
+                        return Err(refused("invalid avatar ciphertext digest"));
+                    }
+                    avatar_binding
+                        .insert("ciphertextSha256".into(), json!(STANDARD.encode(hash)));
+                }
+            }
+            Ok(immutable)
+        };
+        let MetadataCarryForward {
+            snapshot: prior_snapshot,
+            plaintext: prior_plaintext,
+            nonce: prior_nonce,
+            ciphertext_len: prior_ciphertext_len,
+        } = carry;
+        let prior_coordinate = prior_snapshot
+            .get("coordinate")
+            .ok_or_else(|| refused("prior snapshot missing coordinate"))?;
+        let coordinate = snapshot
+            .get("coordinate")
+            .ok_or_else(|| refused("missing coordinate"))?;
+        if prior_coordinate["generation"] != coordinate["generation"]
+            || chat_wire::json_bytes(&prior_coordinate["conversationId"])?
+                != chat_wire::json_bytes(&coordinate["conversationId"])?
+            || chat_wire::json_bytes(&prior_coordinate["groupId"])?
+                != chat_wire::json_bytes(&coordinate["groupId"])?
+        {
+            return Err(refused("static coordinate binding changed"));
+        }
+        if immutable_envelope(&prior_snapshot)? != immutable_envelope(snapshot)? {
+            return Err(refused("authenticated envelope changed"));
+        }
+
+        chat_wire::require_coordinate_names_group(coordinate, group, provider)?;
+        let target_epoch = coordinate
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| refused("missing epoch"))?;
+        let metadata_version = snapshot
+            .get("metadataVersion")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| refused("missing metadata version"))?;
+        let nonce_vec = chat_wire::json_bytes(
+            snapshot
+                .get("nonce")
+                .ok_or_else(|| refused("missing nonce"))?,
+        )?;
+        let nonce: [u8; 12] = nonce_vec
+            .try_into()
+            .map_err(|_| refused("invalid nonce"))?;
+        if nonce == prior_nonce {
+            return Err(refused("nonce repeated across epochs"));
+        }
+        let ciphertext = chat_wire::json_bytes(
+            snapshot
+                .get("ciphertext")
+                .ok_or_else(|| refused("missing ciphertext"))?,
+        )?;
+        let declared_size = snapshot
+            .get("ciphertextSize")
+            .and_then(Value::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or_else(|| refused("missing ciphertext size"))?;
+        let declared_hash = chat_wire::json_bytes(
+            snapshot
+                .get("ciphertextSha256")
+                .ok_or_else(|| refused("missing ciphertext digest"))?,
+        )?;
+        if declared_size != ciphertext.len()
+            || ciphertext.len() != prior_ciphertext_len
+            || declared_hash.as_slice() != &Sha256::digest(&ciphertext)[..]
+        {
+            return Err(refused("ciphertext binding changed"));
+        }
+        let group_id = group.group_id().as_slice().to_vec();
+        let metadata_key = derive_metadata_key_from_group(
+            group,
+            provider.crypto(),
+            provider.storage(),
+            &group_id,
+            target_epoch,
+        )
+        .map_err(|e| refused(&format!("derive next key: {e}")))?;
+        let plaintext = decrypt_metadata_snapshot_plaintext(
+            &metadata_key,
+            &group_id,
+            target_epoch,
+            metadata_version,
+            &nonce,
+            &ciphertext,
+        )
+        .map_err(|e| refused(&format!("decrypt next snapshot: {e}")))?;
+        validate_metadata_snapshot_size(&plaintext)?;
+        if plaintext != prior_plaintext {
+            return Err(refused("plaintext changed"));
+        }
+        let metadata: GroupMetadataV1 = serde_json::from_slice(&plaintext)
+            .map_err(|e| refused(&format!("invalid metadata plaintext: {e}")))?;
+        Ok((
+            i64::try_from(target_epoch).map_err(|_| refused("epoch overflows storage"))?,
+            i64::try_from(metadata_version)
+                .map_err(|_| refused("metadata version overflows storage"))?,
+            metadata,
+        ))
     }
 
     /// The conversation's stored metadata with `title`, `description` and the avatar replaced:
-    /// every other field the last applied snapshot carried, known or not, is kept.
+    /// every other field the last applied snapshot carried, known or not, is kept. This is used
+    /// only for an explicitly authorized metadata transition, never for Commit carry-forward.
     pub(crate) fn rebuilt_group_metadata(
         tx: &crate::storage::SqlReadTx<'_>,
         conversation_id: &str,
@@ -5675,10 +5920,7 @@ impl CatbirdMlsClient {
         meta.avatar_blob_locator = None;
         meta.avatar_content_type = space_avatar.as_ref().and_then(|a| a.mime_type.clone());
         meta.space_avatar = space_avatar;
-        super::archive_policy::set_metadata_enabled(
-            &mut meta,
-            super::archive_policy::current_enabled(tx, conversation_id)?,
-        );
+        super::archive_policy::stamp_current_metadata_policy(tx, conversation_id, &mut meta)?;
         Ok(meta)
     }
 
@@ -5781,7 +6023,7 @@ impl CatbirdMlsClient {
                                 "originSeq": convo.last_seq.saturating_add(1),
                                 "originTransitionId": tid,
                                 "roleAtOrigin": "admin",
-                                "signaturePublicKey": { "$bytes": STANDARD.encode(signer.public()) },
+                                "signaturePublicKey": STANDARD.encode(signer.public()),
                             },
                             "ciphertext": { "$bytes": STANDARD.encode(&ct) },
                             "ciphertextSha256": STANDARD.encode(Sha256::digest(&ct)),
@@ -5854,8 +6096,13 @@ impl CatbirdMlsClient {
                 verify_own_answer(&resp_val, &sent, conversation_id, METADATA_ENTRY_KIND)?;
             let coords_str = serde_json::to_string(&next_coords)
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
-            let snap_str =
-                serde_json::to_string(&snap).map_err(|e| MLSError::Internal(e.to_string()))?;
+            // Cache the authenticated signed-body representation that peers replay, not the
+            // pre-signing builder value: canonical request encoding may normalize byte fields.
+            let authenticated_snap = sent
+                .pointer("/body/metadataSnapshot")
+                .ok_or_else(|| MLSError::Cryptography("signed metadata snapshot missing".into()))?;
+            let snap_str = serde_json::to_string(authenticated_snap)
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
             if crate::buggify!("after_http_2xx_before_db_commit") {
                 return Err(MLSError::Internal(
                     "sim buggify: after_http_2xx_before_db_commit".to_string(),
@@ -7408,6 +7655,15 @@ impl CatbirdMlsClient {
                 if target_leaves.is_empty() {
                     return Ok(None);
                 }
+                let metadata_carry = self
+                    .metadata_snapshot_plaintext_for_carry_forward(
+                        tx,
+                        conversation_id,
+                        &convo.group_id,
+                        &mut group,
+                        &provider,
+                    )?;
+
                 let aad_prior = chat_wire::build_aad_prior_coordinate(
                     convo_uuid,
                     &convo.group_id,
@@ -7443,22 +7699,6 @@ impl CatbirdMlsClient {
                 let next_epoch = group.epoch().as_u64();
                 let (next_gch, next_ctag) =
                     chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_row = tx.get_group_metadata(conversation_id)?;
-                let meta_ver = meta_row
-                    .as_ref()
-                    .map(|m| m.metadata_version.max(1) as u64)
-                    .unwrap_or(1);
-                let title_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.title.clone())
-                    .unwrap_or_default();
-                let desc_s = meta_row
-                    .as_ref()
-                    .and_then(|m| m.description.clone())
-                    .unwrap_or_default();
-                let avatar_opt = meta_row
-                    .as_ref()
-                    .and_then(chat_wire::space_avatar_from_metadata_row);
                 let meta_key = derive_metadata_key_from_group(
                     &mut group,
                     provider.crypto(),
@@ -7468,8 +7708,7 @@ impl CatbirdMlsClient {
                 )
                 .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                 let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
-                    tx,
-                    conversation_id,
+                    metadata_carry,
                     &meta_key,
                     &convo.group_id,
                     convo_uuid,
@@ -7477,14 +7716,6 @@ impl CatbirdMlsClient {
                     next_epoch,
                     &next_gch,
                     &next_ctag,
-                    &transition_id,
-                    meta_ver,
-                    canonical_dev_id,
-                    auth_gen,
-                    signer.public(),
-                    &title_s,
-                    &desc_s,
-                    avatar_opt,
                 )?;
                 (
                     commit_aad_val,

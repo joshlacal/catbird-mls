@@ -1198,35 +1198,72 @@ pub fn require_active_admin(roster: Option<&Value>, did: &str, cid: &str) -> Res
     )))
 }
 
-/// Private-use (`RFC 9420` §17.3) GroupInfo extension type of a recovery Welcome's roster
-/// attestation ([`roster_attestation_extension`]).
+/// Private-use (`RFC 9420` §17.3) GroupInfo extension type of a recovery Welcome's
+/// MLS-authenticated state attestation ([`recovery_attestation_extension`]).
 pub const ROSTER_ATTESTATION_EXTENSION_TYPE: u16 = 0xff01;
 
-/// The roster attestation a fulfiller puts in the GroupInfo of its recovery Welcome: `cid`, the
-/// joined `generation`, and the fulfiller's verified roster as of the coordinate it fulfills
-/// from. The GroupInfo is signed by the fulfiller's leaf and encrypted to the joiner, so the
-/// joiner learns its roster MLS-authenticated by the fulfiller it verifies ([`attested_roster`]).
-pub fn roster_attestation_extension(
+/// The state a fulfiller puts in the GroupInfo of its recovery Welcome: `cid`, joined
+/// `generation`, its effective history-backup policy, and its verified roster when one is
+/// available. The GroupInfo is signed by the fulfiller's leaf and encrypted to the joiner.
+///
+/// Policy is present even when the fulfiller has no verified roster. This lets a replacement
+/// device inherit an authenticated opt-out without rewriting the prior metadata snapshot during
+/// the Commit.
+pub fn recovery_attestation_extension(
     cid: &str,
     generation: i64,
-    roster: &Value,
+    roster: Option<&Value>,
+    history_backup: bool,
 ) -> Result<Extension, MLSError> {
-    let attestation = json!({
+    let mut attestation = json!({
         "conversationId": cid,
         "generation": generation,
-        "roster": roster,
+        "historyBackup": history_backup,
     });
+    if let Some(roster) = roster {
+        attestation["roster"] = roster.clone();
+    }
     Ok(Extension::Unknown(
         ROSTER_ATTESTATION_EXTENSION_TYPE,
         UnknownExtension(serde_json::to_vec(&attestation)?),
     ))
 }
 
-/// The roster a recovery Welcome's `attestation` ([`roster_attestation_extension`]) grants this
-/// device (`own_did`) joining `cid` at `generation`. The caller has staged the Welcome (so
-/// OpenMLS verified the GroupInfo signature) and verified that its sender is the fulfiller whose
-/// signed fulfillment it verified. The roster must be well-formed and consistent with the joined
-/// group: this account and every DID holding a leaf (`leaf_dids`) are active in it.
+fn recovery_attestation_value(
+    attestation: &[u8],
+    cid: &str,
+    generation: i64,
+) -> Result<Value, MLSError> {
+    let refused = |what: &str| MLSError::Cryptography(format!("recovery attestation: {what}"));
+    let attestation: Value =
+        serde_json::from_slice(attestation).map_err(|_| refused("invalid JSON"))?;
+    if attestation["conversationId"] != cid
+        || attestation["generation"].as_i64() != Some(generation)
+    {
+        return Err(refused("not this conversation's generation"));
+    }
+    Ok(attestation)
+}
+
+/// Effective history-backup policy in a verified recovery attestation. `None` is accepted only
+/// for an older pending Welcome produced before the field existed. A malformed present value is
+/// the fail-closed opt-out, matching metadata and application-frame policy parsing.
+pub fn attested_history_backup(
+    attestation: &[u8],
+    cid: &str,
+    generation: i64,
+) -> Result<Option<bool>, MLSError> {
+    let attestation = recovery_attestation_value(attestation, cid, generation)?;
+    Ok(attestation
+        .get("historyBackup")
+        .map(|value| value.as_bool().unwrap_or(false)))
+}
+
+/// The roster a recovery Welcome's attestation grants this device (`own_did`). The caller has
+/// staged the Welcome (so OpenMLS verified the GroupInfo signature) and verified that its sender
+/// is the fulfiller whose signed fulfillment it verified. The roster must be well-formed and
+/// consistent with the joined group: this account and every DID holding a leaf (`leaf_dids`) are
+/// active in it.
 pub fn attested_roster(
     attestation: &[u8],
     cid: &str,
@@ -1235,13 +1272,7 @@ pub fn attested_roster(
     leaf_dids: &[String],
 ) -> Result<Value, MLSError> {
     let refused = |what: &str| MLSError::Cryptography(format!("roster attestation: {what}"));
-    let attestation: Value =
-        serde_json::from_slice(attestation).map_err(|_| refused("not a roster attestation"))?;
-    if attestation["conversationId"] != cid
-        || attestation["generation"].as_i64() != Some(generation)
-    {
-        return Err(refused("not this conversation's generation"));
-    }
+    let attestation = recovery_attestation_value(attestation, cid, generation)?;
     let rows = attestation["roster"]
         .as_object()
         .ok_or_else(|| refused("roster"))?
@@ -2846,7 +2877,7 @@ pub fn build_encrypted_metadata_snapshot_json_for_metadata(
             "originSeq": origin_seq,
             "originTransitionId": transition_id,
             "roleAtOrigin": "admin",
-            "signaturePublicKey": { "$bytes": STANDARD.encode(public_key) }
+            "signaturePublicKey": STANDARD.encode(public_key)
         },
         "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
         "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
@@ -3815,11 +3846,26 @@ mod tests {
         assert!(!roster_active(Some(&roster), carol));
 
         let Extension::Unknown(kind, UnknownExtension(bytes)) =
-            roster_attestation_extension(CONVERSATION, 2, &roster).unwrap()
+            recovery_attestation_extension(CONVERSATION, 2, Some(&roster), false).unwrap()
         else {
-            panic!("roster attestation is a private-use extension");
+            panic!("recovery attestation is a private-use extension");
         };
         assert_eq!(kind, ROSTER_ATTESTATION_EXTENSION_TYPE);
+        assert_eq!(
+            attested_history_backup(&bytes, CONVERSATION, 2).unwrap(),
+            Some(false)
+        );
+        let mut malformed: Value = serde_json::from_slice(&bytes).unwrap();
+        malformed["historyBackup"] = json!("not-a-bool");
+        assert_eq!(
+            attested_history_backup(
+                &serde_json::to_vec(&malformed).unwrap(),
+                CONVERSATION,
+                2
+            )
+            .unwrap(),
+            Some(false)
+        );
         let leaf_dids = [alice.to_owned()];
         assert_eq!(
             attested_roster(&bytes, CONVERSATION, 2, bob, &leaf_dids).unwrap(),
@@ -3888,7 +3934,7 @@ mod tests {
             &provenance
         ));
         let Extension::Unknown(_, UnknownExtension(bytes)) =
-            roster_attestation_extension(CONVERSATION, 7, &roster).unwrap()
+            recovery_attestation_extension(CONVERSATION, 7, Some(&roster), true).unwrap()
         else {
             unreachable!()
         };

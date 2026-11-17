@@ -277,7 +277,6 @@ where
             conversation_id,
             &group,
         )?;
-        let prior_nonce = bytes(&snapshot["nonce"])?;
         let cid = uuid::Uuid::parse_str(conversation_id)
             .map_err(|_| invalid("Conversation ID is invalid."))?;
         let transition = uuid::Uuid::new_v4();
@@ -322,9 +321,6 @@ where
         next["groupContextHash"] = json!(STANDARD.encode(&context_hash));
         let mut nonce = [0; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        if prior_nonce == nonce {
-            nonce[0] ^= 1;
-        }
         let ciphertext = self.reseal_metadata_from_pending(
             &opened,
             &group,
@@ -339,9 +335,6 @@ where
             },
             &nonce,
         )?;
-        if ciphertext.len() != bytes(&snapshot["ciphertext"])?.len() {
-            return Err(invalid("Removal unexpectedly changed group metadata."));
-        }
         snapshot["coordinate"] = json!({"conversationId":STANDARD.encode(cid.as_bytes()), "generation":next["generation"], "groupId":next["groupId"], "epoch":next_epoch, "groupContextHash":next["groupContextHash"], "confirmationTag":next["confirmationTag"]});
         snapshot["nonce"] = json!(STANDARD.encode(nonce));
         snapshot["ciphertext"] = json!(STANDARD.encode(&ciphertext));

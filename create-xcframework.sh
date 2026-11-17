@@ -21,6 +21,9 @@ echo ""
 # compiling C dependencies for the XCFramework.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+# Always build bundled Opus so a host pkg-config archive cannot bypass these
+# deployment targets.
+export OPUS_NO_PKG_CONFIG=1
 
 # Cargo features of the shipped library. Labyrinth history backup is on: it
 # does nothing until the account enables it on a device. Set

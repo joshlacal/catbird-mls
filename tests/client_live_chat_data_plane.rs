@@ -1997,6 +1997,53 @@ impl SharedMockDs {
                 g.conversations[&cid]["coordinates"], b["prior"],
                 "fixture rejects transitions built against a superseded coordinate"
             );
+            if is_commit {
+                let prior = &g.conversations[&cid]["metadataSnapshot"];
+                let next = &b["metadataSnapshot"];
+                let prior_ciphertext =
+                    chat_wire::json_bytes(&prior["ciphertext"]).unwrap_or_default();
+                let next_ciphertext =
+                    chat_wire::json_bytes(&next["ciphertext"]).unwrap_or_default();
+                let prior_nonce = chat_wire::json_bytes(&prior["nonce"]).unwrap_or_default();
+                let next_nonce = chat_wire::json_bytes(&next["nonce"]).unwrap_or_default();
+                let metadata_coordinate = &next["coordinate"];
+                let transition_coordinate = &b["next"];
+                let conversation_bytes = uuid::Uuid::parse_str(&cid)
+                    .map(|uuid| uuid.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let coordinate_matches = metadata_coordinate["epoch"]
+                    == transition_coordinate["epoch"]
+                    && metadata_coordinate["generation"] == transition_coordinate["generation"]
+                    && chat_wire::json_bytes(&metadata_coordinate["conversationId"])
+                        .unwrap_or_default()
+                        == conversation_bytes
+                    && chat_wire::json_bytes(&metadata_coordinate["groupId"]).unwrap_or_default()
+                        == chat_wire::json_bytes(&transition_coordinate["groupId"])
+                            .unwrap_or_default()
+                    && chat_wire::json_bytes(&metadata_coordinate["groupContextHash"])
+                        .unwrap_or_default()
+                        == chat_wire::json_bytes(&transition_coordinate["groupContextHash"])
+                            .unwrap_or_default()
+                    && chat_wire::json_bytes(&metadata_coordinate["confirmationTag"])
+                        .unwrap_or_default()
+                        == chat_wire::json_bytes(&transition_coordinate["confirmationTag"])
+                            .unwrap_or_default();
+                let carried_exactly = coordinate_matches
+                    && next["metadataVersion"] == prior["metadataVersion"]
+                    && next["originTransitionId"] == prior["originTransitionId"]
+                    && next_ciphertext.len() == prior_ciphertext.len()
+                    && next["authorProof"] == prior["authorProof"]
+                    && next.get("avatarBinding") == prior.get("avatarBinding")
+                    && next_nonce != prior_nonce;
+                if !carried_exactly {
+                    return xrpc_error(
+                        400,
+                        "InvalidCommit",
+                        "commit metadata must carry prior authenticated plaintext",
+                    );
+                }
+            }
+
             let entry_kind = match btype.trim_start_matches("blue.catbird.chat.defs#") {
                 "commitTransitionBody" => "commitEntry",
                 "leafRecoveryFulfillmentBody" => "leafRecoveryFulfillmentEntry",

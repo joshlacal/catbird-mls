@@ -1797,7 +1797,7 @@ pub fn process_push_notification_with_hooks(
                 )
                 .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
 
-                let mut decrypted_meta = decrypt_metadata_snapshot(
+                let decrypted_meta = decrypt_metadata_snapshot(
                     &meta_key,
                     &current_convo.group_id,
                     snapshot.epoch as u64,
@@ -1807,12 +1807,15 @@ pub fn process_push_notification_with_hooks(
                 )
                 .map_err(|e| MLSError::Cryptography(format!("decrypt metadata snapshot: {e}")))?;
 
+                // A wake does not prove this snapshot was authored by a metadata transition.
+                // Store it verbatim, but foreground signed-entry replay is the only authority
+                // allowed to make a policy observation.
                 crate::client::archive_policy::accept_snapshot(
                     tx,
                     &wake.conversation_id,
                     wake.entry_seq,
-                    &mut decrypted_meta,
-                    false,
+                    &decrypted_meta,
+                    crate::client::archive_policy::SnapshotPolicyAuthority::ExactCarry,
                     now_ms,
                 )?;
 
