@@ -668,11 +668,18 @@ impl NativeLocalAuthority {
         Ok(Some((keys, Vec::new())))
     }
 
-    async fn fetch_verified_pds_chat_devices(
+    async fn fetch_verified_pds_chat_devices_with_times(
         &self,
         did: &str,
-    ) -> crate::orchestrator::error::Result<Option<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
+    ) -> crate::orchestrator::error::Result<Option<(Vec<[u8; 32]>, Vec<([u8; 32], u64)>)>> {
         use crate::labyrinth::LabyrinthGateway as _;
+
+        let revocation_created_at_ms = |val: &serde_json::Value| -> u64 {
+            val.get("createdAt")
+                .and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map_or(1, |dt| u64::try_from(dt.timestamp_millis().max(1)).unwrap_or(1))
+        };
 
         if did == self.account_did {
             let doc_bytes = self
@@ -731,7 +738,7 @@ impl NativeLocalAuthority {
                 )?
                 .unwrap_or_default();
             let rev_prefix = format!("at://{did}/blue.catbird.chat.deviceRevocation/");
-            let mut revoked_ids = std::collections::BTreeSet::new();
+            let mut revoked_times = std::collections::BTreeMap::<String, u64>::new();
             for rev_entry in &raw_revocations {
                 let Some(uri) = rev_entry.get("uri").and_then(serde_json::Value::as_str) else {
                     continue;
@@ -765,14 +772,18 @@ impl NativeLocalAuthority {
                     &enrolled_map,
                 )
                 .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
-                revoked_ids.insert(target_id);
+                let at_ms = revocation_created_at_ms(record_val);
+                revoked_times
+                    .entry(target_id)
+                    .and_modify(|prev| *prev = (*prev).min(at_ms))
+                    .or_insert(at_ms);
             }
             let mut active = Vec::new();
             let mut revoked = Vec::new();
             for (device_id, pk, _) in entries {
                 if let Ok(key) = <[u8; 32]>::try_from(pk.as_slice()) {
-                    if revoked_ids.contains(&device_id) {
-                        revoked.push(key);
+                    if let Some(&at_ms) = revoked_times.get(&device_id) {
+                        revoked.push((key, at_ms));
                     } else {
                         active.push(key);
                     }
@@ -789,7 +800,9 @@ impl NativeLocalAuthority {
         let Some(doc_bytes) = doc_opt else {
             #[cfg(test)]
             {
-                return self.load_cached_peer_device_keys(did);
+                return Ok(self
+                    .load_cached_peer_device_keys(did)?
+                    .map(|(active, revoked)| (active, revoked.into_iter().map(|k| (k, 1)).collect())));
             }
             #[cfg(not(test))]
             {
@@ -826,7 +839,9 @@ impl NativeLocalAuthority {
             None => {
                 #[cfg(test)]
                 {
-                    return self.load_cached_peer_device_keys(did);
+                    return Ok(self
+                        .load_cached_peer_device_keys(did)?
+                        .map(|(active, revoked)| (active, revoked.into_iter().map(|k| (k, 1)).collect())));
                 }
                 #[cfg(not(test))]
                 {
@@ -867,7 +882,7 @@ impl NativeLocalAuthority {
             )?
             .unwrap_or_default();
         let rev_prefix = format!("at://{did}/blue.catbird.chat.deviceRevocation/");
-        let mut revoked_ids = std::collections::BTreeSet::new();
+        let mut revoked_times = std::collections::BTreeMap::<String, u64>::new();
         for rev_entry in &raw_revocations {
             let Some(uri) = rev_entry.get("uri").and_then(serde_json::Value::as_str) else {
                 continue;
@@ -901,20 +916,34 @@ impl NativeLocalAuthority {
                 &enrolled_map,
             )
             .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
-            revoked_ids.insert(target_id);
+            let at_ms = revocation_created_at_ms(record_val);
+            revoked_times
+                .entry(target_id)
+                .and_modify(|prev| *prev = (*prev).min(at_ms))
+                .or_insert(at_ms);
         }
         let mut active = Vec::new();
         let mut revoked = Vec::new();
         for (device_id, pk, _) in entries {
             if let Ok(key) = <[u8; 32]>::try_from(pk.as_slice()) {
-                if revoked_ids.contains(&device_id) {
-                    revoked.push(key);
+                if let Some(&at_ms) = revoked_times.get(&device_id) {
+                    revoked.push((key, at_ms));
                 } else {
                     active.push(key);
                 }
             }
         }
         Ok(Some((active, revoked)))
+    }
+
+    async fn fetch_verified_pds_chat_devices(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Option<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
+        Ok(self
+            .fetch_verified_pds_chat_devices_with_times(did)
+            .await?
+            .map(|(active, revoked)| (active, revoked.into_iter().map(|(k, _)| k).collect())))
     }
 }
 
@@ -965,12 +994,12 @@ impl crate::labyrinth::session::LocalConversationAuthority for NativeLocalAuthor
         if did == self.account_did {
             return Ok(None);
         }
-        let Some((active, _)) = self.fetch_verified_pds_chat_devices(did).await? else {
+        let Some((active, revoked)) = self.fetch_verified_pds_chat_devices(did).await? else {
             return Ok(None);
         };
-        if active.is_empty() {
+        if active.is_empty() && revoked.is_empty() {
             return Err(crate::orchestrator::error::OrchestratorError::Credential(
-                format!("peer PDS holds zero unrevoked chat.device records for `{did}`"),
+                format!("peer PDS holds zero valid chat.device records for `{did}`"),
             ));
         }
         Ok(Some(active))
@@ -982,6 +1011,17 @@ impl crate::labyrinth::session::LocalConversationAuthority for NativeLocalAuthor
     ) -> crate::orchestrator::error::Result<Vec<[u8; 32]>> {
         Ok(self
             .fetch_verified_pds_chat_devices(did)
+            .await?
+            .map(|(_, revoked)| revoked)
+            .unwrap_or_default())
+    }
+
+    async fn revoked_chat_device_keys_with_times(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Vec<([u8; 32], u64)>> {
+        Ok(self
+            .fetch_verified_pds_chat_devices_with_times(did)
             .await?
             .map(|(_, revoked)| revoked)
             .unwrap_or_default())
@@ -2339,6 +2379,9 @@ impl CatbirdMlsClient {
                     // An unreadable marker still hides: it can only widen what the deletion covers.
                     let marker = AppliedAccountDeletion::decode(&raw).unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
                     deleted.insert(did.clone(), marker);
+                } else if let Some(raw) = tx.get_labyrinth_state(&super::deletion_authority::pds_deletion_marker_key(conversation_id, did))? {
+                    let marker = AppliedAccountDeletion::decode(&raw).unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
+                    deleted.insert(did.clone(), marker);
                 }
             }
             Ok(deleted)
@@ -2405,6 +2448,239 @@ impl CatbirdMlsClient {
                 tracing::warn!(conversation_id, ?reason, "archive restore blocked on unverified account deletion");
                 return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
             }
+        }
+        // PDS completeness check for foreign message senders whose deletion may have been
+        // omitted from `getConversationState["accountDeletions"]`.
+        let foreign_senders: Vec<String> = {
+            let all_senders: std::collections::BTreeSet<String> = history
+                .iter()
+                .filter_map(|m| m.sender.as_deref())
+                .filter(|s| *s != self.normalized_did)
+                .map(str::to_owned)
+                .collect();
+            self.db.read_tx(|tx| {
+                let mut unchecked = Vec::new();
+                for did in all_senders {
+                    let has_seq_marker = tx
+                        .get_labyrinth_state(&super::chat_wire::account_deletion_key(conversation_id, &did))?
+                        .is_some();
+                    let has_pds_marker = tx
+                        .get_labyrinth_state(&super::deletion_authority::pds_deletion_marker_key(conversation_id, &did))?
+                        .is_some();
+                    if !has_seq_marker && !has_pds_marker {
+                        unchecked.push(did);
+                    }
+                }
+                Ok(unchecked)
+            })?
+        };
+        for sender_did in foreign_senders {
+            self.verify_foreign_sender_pds_deletion(conversation_id, &sender_did)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_pds_record_car(
+        &self,
+        pds_endpoint: &str,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Vec<u8>, MLSError> {
+        let base = pds_endpoint.trim_end_matches('/');
+        let url = format!(
+            "{base}/xrpc/com.atproto.sync.getRecord?did={}&collection={}&rkey={}",
+            super::chat_wire::urlencode_form_component(did),
+            super::chat_wire::urlencode_form_component(collection),
+            super::chat_wire::urlencode_form_component(rkey),
+        );
+        let resp = self.transport.execute_http(PlatformHttpRequest {
+            method: "GET".to_owned(),
+            url,
+            headers: Vec::new(),
+            body: None,
+        })?;
+        if resp.status >= 400 {
+            return Err(MLSError::Cryptography(format!(
+                "CARv1 sync.getRecord(at://{did}/{collection}/{rkey}) failed with HTTP {}",
+                resp.status
+            )));
+        }
+        Ok(resp.body)
+    }
+
+    fn list_pds_revocations_or_tombstone(
+        &self,
+        pds_endpoint: &str,
+        did: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, MLSError> {
+        let base = pds_endpoint.trim_end_matches('/');
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let mut all_records = Vec::new();
+        for page_idx in 0..super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+            let mut url = format!(
+                "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit={}",
+                super::chat_wire::urlencode_form_component(did),
+                super::chat_wire::urlencode_form_component(
+                    super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                ),
+                super::chat_wire::PDS_LIST_RECORDS_PAGE_LIMIT,
+            );
+            if let Some(ref c) = cursor {
+                url.push_str(&format!(
+                    "&cursor={}",
+                    super::chat_wire::urlencode_form_component(c)
+                ));
+            }
+            let resp = self
+                .transport
+                .execute_http(PlatformHttpRequest {
+                    method: "GET".to_owned(),
+                    url,
+                    headers: Vec::new(),
+                    body: None,
+                })
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
+            if resp.status >= 400 {
+                let err_code = serde_json::from_slice::<serde_json::Value>(&resp.body)
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned));
+                if matches!(resp.status, 400 | 404)
+                    && matches!(
+                        err_code.as_deref(),
+                        Some("RepoNotFound" | "RepoDeactivated" | "RepoTakendown")
+                    )
+                {
+                    return Ok(None);
+                }
+                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
+            }
+            let (page_records, next_cursor) = super::chat_wire::parse_pds_list_records_page(
+                did,
+                super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                &resp.body,
+            )?;
+            all_records.extend(page_records);
+            if all_records.len() > super::chat_wire::MAX_PDS_LIST_RECORDS_ITEMS {
+                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
+            }
+            match next_cursor {
+                None => return Ok(Some(all_records)),
+                Some(next) => {
+                    if !seen_cursors.insert(next.clone())
+                        || page_idx + 1 == super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES
+                    {
+                        return Err(MLSError::InvalidState(
+                            "ArchiveDeletionInventoryUnavailable".into(),
+                        ));
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+        Ok(Some(all_records))
+    }
+
+    fn verify_foreign_sender_pds_deletion(
+        &self,
+        conversation_id: &str,
+        sender_did: &str,
+    ) -> Result<(), MLSError> {
+        let Some(doc_bytes) = self.resolve_did_document(sender_did).ok().flatten() else {
+            return Err(MLSError::InvalidState(
+                "ArchiveDeletionInventoryUnavailable".into(),
+            ));
+        };
+        let Some(pds_endpoint) =
+            super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, sender_did)
+        else {
+            return Err(MLSError::InvalidState(
+                "ArchiveDeletionInventoryUnavailable".into(),
+            ));
+        };
+        let Some(records) = self.list_pds_revocations_or_tombstone(&pds_endpoint, sender_did)?
+        else {
+            // Permanent repo tombstone: hide every message from this sender without blocking
+            // the remaining restored archive.
+            let key = super::deletion_authority::pds_deletion_marker_key(conversation_id, sender_did);
+            let now_ms = self.hooks.now_ms();
+            self.db.write_tx(|tx| {
+                tx.put_labyrinth_state(&key, i64::MAX.to_string().as_bytes(), now_ms)
+            })?;
+            return Ok(());
+        };
+        let rev_prefix = format!(
+            "at://{sender_did}/{}/",
+            super::deletion_authority::DEVICE_REVOCATION_COLLECTION
+        );
+        let mut verified_deletion: Option<super::deletion_authority::AppliedAccountDeletion> = None;
+        for rec_entry in &records {
+            let Some(uri) = rec_entry.get("uri").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(rkey) = uri
+                .strip_prefix(&rev_prefix)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.contains('/'))
+            else {
+                continue;
+            };
+            let Some(val) = rec_entry.get("value") else {
+                continue;
+            };
+            let is_self_deletion = val.get("actorDeviceId").and_then(serde_json::Value::as_str)
+                == Some(rkey)
+                && val.get("targetDeviceId").and_then(serde_json::Value::as_str) == Some(rkey)
+                && val
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|r| {
+                        r.starts_with(
+                            super::deletion_authority::DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX,
+                        )
+                    });
+            if !is_self_deletion {
+                continue;
+            }
+            let device_car = self
+                .fetch_pds_record_car(
+                    &pds_endpoint,
+                    sender_did,
+                    super::deletion_authority::DEVICE_RECORD_COLLECTION,
+                    rkey,
+                )
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
+            let revocation_car = self
+                .fetch_pds_record_car(
+                    &pds_endpoint,
+                    sender_did,
+                    super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                    rkey,
+                )
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
+            let Some(applied) = super::deletion_authority::verify_foreign_self_deletion_from_cars(
+                &device_car,
+                &revocation_car,
+                sender_did,
+                rkey,
+                &doc_bytes,
+            ) else {
+                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+            };
+            if verified_deletion
+                .as_ref()
+                .is_none_or(|prev| applied.signed_at_ms > prev.signed_at_ms)
+            {
+                verified_deletion = Some(applied);
+            }
+        }
+        if let Some(applied) = verified_deletion {
+            let key = super::deletion_authority::pds_deletion_marker_key(conversation_id, sender_did);
+            let now_ms = self.hooks.now_ms();
+            let raw = serde_json::to_vec(&applied)?;
+            self.db
+                .write_tx(|tx| tx.put_labyrinth_state(&key, &raw, now_ms))?;
         }
         Ok(())
     }
@@ -3661,21 +3937,167 @@ impl CatbirdMlsClient {
         })
     }
 
-    /// Fail-closed full account deletion (`D-3`): deletes the personal `OwnerMailbox` Space,
-    /// `mailboxKeys` PDS records, signed `mls-ds` `blue.catbird.labyrinth.deleteAccountData`,
-    /// and owned conversation Space records BEFORE wiping local SQLCipher + Keychain state.
+    /// Fail-closed full account deletion (`D-3`): persists retry state, publishes a self-signed
+    /// `blue.catbird.chat.deviceRevocation/{own_device_id}` record on PDS (aborting before DS call
+    /// if a sibling device already revoked this device), fetches and locally verifies CARv1 proofs
+    /// for `device` + `deviceRevocation`, purges remote OwnerMailbox/PDS/DS state with both
+    /// proofs attached, and finally wipes local SQLCipher + Keychain state.
     pub fn delete_account_data(&self) -> Result<(), MLSError> {
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
         }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct DeleteAccountRetryState {
+            operation_id: String,
+            signed_at_ms: i64,
+        }
+        const RETRY_META_KEY: &str = "delete_account_retry_state";
         {
             let _guard = self
                 .outbox_flush_lock
                 .lock()
                 .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
+            let deps = self.native_archive_deps()?;
+            let own_device_id = self
+                .canonical_uuid_v4_device_id()
+                .ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
+            let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+            let signer_pk: [u8; 32] = signer
+                .public()
+                .try_into()
+                .map_err(|_| MLSError::Cryptography("archive chat key is not Ed25519".into()))?;
+
+            let existing_retry = self
+                .db
+                .read_tx(|tx| tx.get_account_meta(RETRY_META_KEY))?
+                .and_then(|raw| serde_json::from_str::<DeleteAccountRetryState>(&raw).ok())
+                .and_then(|state| {
+                    let op_vec = hex::decode(&state.operation_id).ok()?;
+                    let op_id: [u8; 16] = op_vec.try_into().ok()?;
+                    let signed_at = chrono::DateTime::from_timestamp_millis(state.signed_at_ms)?;
+                    Some((op_id, state.operation_id, state.signed_at_ms, signed_at))
+                });
+            let (operation_id, op_hex, signed_at_ms, signed_at) = match existing_retry {
+                Some(loaded) => loaded,
+                None => {
+                    let mut op_id = [0u8; 16];
+                    self.hooks
+                        .with_labyrinth_rng(|| labyrinth::encoding::random(&mut op_id))
+                        .map_err(|e| native_archive_error(crate::labyrinth::map_error(e)))?;
+                    let signed_at_ms = self.hooks.now_ms().max(0);
+                    let signed_at = chrono::DateTime::from_timestamp_millis(signed_at_ms)
+                        .ok_or_else(|| {
+                            MLSError::Cryptography("invalid archive deletion clock".into())
+                        })?;
+                    let op_hex = hex::encode(op_id);
+                    let serialized = serde_json::to_string(&DeleteAccountRetryState {
+                        operation_id: op_hex.clone(),
+                        signed_at_ms,
+                    })
+                    .map_err(|e| {
+                        MLSError::Internal(format!("serialize delete_account_retry_state: {e}"))
+                    })?;
+                    let now_ms = self.hooks.now_ms();
+                    self.db
+                        .write_tx(|tx| tx.put_account_meta(RETRY_META_KEY, &serialized, now_ms))?;
+                    (op_id, op_hex, signed_at_ms, signed_at)
+                }
+            };
+
+            let signed_at_str = signed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let reason = format!(
+                "{}{op_hex}",
+                super::deletion_authority::DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX
+            );
+            let create_body =
+                super::chat_wire::build_pds_device_revocation_create_record_body_at(
+                    &self.normalized_did,
+                    &own_device_id,
+                    &own_device_id,
+                    &signed_at_str,
+                    &signer,
+                    Some(&reason),
+                )?;
+            self.publish_pds_record_create_only(
+                super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                &own_device_id,
+                create_body,
+                |existing| {
+                    super::deletion_authority::verify_self_deletion_revocation_json(
+                        &self.normalized_did,
+                        &own_device_id,
+                        &op_hex,
+                        signed_at,
+                        &signer_pk,
+                        existing,
+                    )
+                },
+            )?;
+
+            let doc_bytes = self
+                .resolve_did_document(&self.normalized_did)?
+                .ok_or_else(|| {
+                    MLSError::Cryptography(format!(
+                        "DID document not found for own account `{}`",
+                        self.normalized_did
+                    ))
+                })?;
+            let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(
+                &doc_bytes,
+                &self.normalized_did,
+            )
+            .ok_or_else(|| {
+                MLSError::Cryptography(format!(
+                    "no #atproto_pds service in DID document for `{}`",
+                    self.normalized_did
+                ))
+            })?;
+            let key_proof = self.fetch_pds_record_car(
+                &pds_endpoint,
+                &self.normalized_did,
+                super::deletion_authority::DEVICE_RECORD_COLLECTION,
+                &own_device_id,
+            )?;
+            let proved_key = super::deletion_authority::device_key_from_key_proof(
+                &key_proof,
+                &self.normalized_did,
+                &own_device_id,
+                signed_at_ms,
+                &doc_bytes,
+            );
+            if proved_key.as_deref() != Some(signer_pk.as_slice()) {
+                return Err(MLSError::insufficient_permissions(format!(
+                    "own blue.catbird.chat.device/{own_device_id} CARv1 proof failed local verification"
+                )));
+            }
+            let revocation_proof = self.fetch_pds_record_car(
+                &pds_endpoint,
+                &self.normalized_did,
+                super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                &own_device_id,
+            )?;
+            if let Err(reason) = super::deletion_authority::verify_self_deletion_revocation_car_at(
+                &revocation_proof,
+                &self.normalized_did,
+                &own_device_id,
+                &op_hex,
+                signed_at,
+                &signer_pk,
+                &doc_bytes,
+            ) {
+                return Err(MLSError::insufficient_permissions(format!(
+                    "own blue.catbird.chat.deviceRevocation/{own_device_id} CARv1 proof failed local verification: {reason:?}"
+                )));
+            }
+            let prepared = crate::labyrinth::PreparedAccountDeletion {
+                operation_id,
+                signed_at,
+                key_proof,
+                revocation_proof,
+            };
             self.native_archive_run(async {
-                let deps = self.native_archive_deps()?;
-                deps.delete_account_remote()
+                deps.delete_account_remote_prepared(&prepared)
                     .await
                     .map_err(|e| native_archive_error(crate::labyrinth::map_error(e)))
             })?;

@@ -304,10 +304,14 @@ impl CatbirdMlsClient {
             return unverified(UnverifiedDeletionReason::SignedAfterSequenced, Some(&write));
         }
         let mut keys = self.local_device_keys(cid, &deleted_did, &write.actor_device_id);
-        let mut verified = keys
-            .iter()
-            .any(|key| authority::actor_write_signature_valid(&write, key));
-        if !verified {
+        let mut verified_key = keys.iter().find_map(|key| {
+            if authority::actor_write_signature_valid(&write, key) {
+                <[u8; 32]>::try_from(key.as_slice()).ok()
+            } else {
+                None
+            }
+        });
+        if verified_key.is_none() {
             match self.key_proof_device_key(
                 entry,
                 &deleted_did,
@@ -315,7 +319,9 @@ impl CatbirdMlsClient {
                 write.signed_at_ms,
             ) {
                 Ok(Some(key)) => {
-                    verified = authority::actor_write_signature_valid(&write, &key);
+                    if authority::actor_write_signature_valid(&write, &key) {
+                        verified_key = <[u8; 32]>::try_from(key.as_slice()).ok();
+                    }
                     keys.push(key);
                 }
                 Ok(None) => {}
@@ -325,14 +331,14 @@ impl CatbirdMlsClient {
                 Err(error) => return Err(error),
             }
         }
-        if !verified {
+        let Some(verified_key) = verified_key else {
             let reason = if keys.is_empty() {
                 UnverifiedDeletionReason::DeviceKeyUnavailable
             } else {
                 UnverifiedDeletionReason::BadSignature
             };
             return unverified(reason, Some(&write));
-        }
+        };
         let revoked_at = self
             .db
             .read_tx(|tx| {
@@ -375,14 +381,39 @@ impl CatbirdMlsClient {
                         Ok(AccountDeletionDecision::AlreadyApplied)
                     }
                     Some(_) => unverified(UnverifiedDeletionReason::Replayed, Some(&write)),
-                    // Neither a local MLS leaf nor a chat.device inclusion CAR proves that
-                    // the signer was unrevoked at the historical signed instant. Until the
-                    // protocol carries signed non-revocation evidence, quarantine every new
-                    // deletion rather than purge or expose its archived content.
-                    None => unverified(
-                        UnverifiedDeletionReason::RevocationStatusUnproven,
-                        Some(&write),
-                    ),
+                    // When an entry omits `revocationProof`, neither a local MLS leaf nor a
+                    // `chat.device` CAR proves the signer was unrevoked at the signed instant,
+                    // so quarantine it. When `revocationProof` IS attached, verify the PDS
+                    // self-deletion CARv1 against `deletedDid`'s `#atproto` key.
+                    None => match authority::revocation_proof_bytes(entry) {
+                        Ok(None) => unverified(
+                            UnverifiedDeletionReason::RevocationStatusUnproven,
+                            Some(&write),
+                        ),
+                        Err(reason) => unverified(reason, Some(&write)),
+                        Ok(Some(rev_proof)) => {
+                            let Some(document) = self.resolve_did_document(&deleted_did)? else {
+                                return unverified(
+                                    UnverifiedDeletionReason::RevocationStatusUnproven,
+                                    Some(&write),
+                                );
+                            };
+                            match authority::verify_self_deletion_revocation_proof(
+                                &rev_proof,
+                                &deleted_did,
+                                &write,
+                                &verified_key,
+                                &document,
+                            ) {
+                                Ok(()) => Ok(AccountDeletionDecision::Apply {
+                                    deleted_did,
+                                    seq,
+                                    write,
+                                }),
+                                Err(reason) => unverified(reason, Some(&write)),
+                            }
+                        }
+                    },
                 }
             }
         }

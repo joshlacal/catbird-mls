@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use labyrinth::mailbox::EpochPublic;
 use labyrinth::records::{ms_from_datetime, EpochPublicDef, MailboxKeysRecord};
@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::signer::ChatKeySigner;
-use super::write_auth::{read_headers, write_headers, ReadClaim, WriteBody};
+use super::write_auth::{
+    read_headers, write_headers, ReadClaim, WriteBody, KEY_PROOF_HEADER, REVOCATION_PROOF_HEADER,
+};
 use super::LabyrinthRequest;
 use crate::orchestrator::api_client::MLSAPIClient;
 use crate::orchestrator::canonical_transport::{
@@ -418,25 +420,35 @@ impl GatewayXrpcTransport {
         payload: &[u8],
         operation_id: [u8; 16],
     ) -> Result<Vec<u8>, XrpcTransportError> {
+        let signed_at =
+            chrono::DateTime::from_timestamp_millis(self.now_ms().min(i64::MAX as u64) as i64)
+                .ok_or_else(|| transport_error("invalid archive clock"))?;
+        self.procedure_at_with_headers(nsid, payload, operation_id, signed_at, &[])
+            .await
+    }
+
+    pub async fn procedure_at_with_headers(
+        &self,
+        nsid: &str,
+        payload: &[u8],
+        operation_id: [u8; 16],
+        signed_at: chrono::DateTime<chrono::Utc>,
+        extra_headers: &[(String, String)],
+    ) -> Result<Vec<u8>, XrpcTransportError> {
         validate_nsid(nsid)?;
         if !nsid.starts_with(NSID_PREFIX) {
             return Err(transport_error(format!(
                 "refusing a non-Labyrinth procedure: {nsid}"
             )));
         }
-        let body = WriteBody::new(
-            nsid,
-            payload,
-            operation_id,
-            &self.device_id,
-            chrono::DateTime::from_timestamp_millis(self.now_ms().min(i64::MAX as u64) as i64)
-                .ok_or_else(|| transport_error("invalid archive clock"))?,
-        );
+        let body = WriteBody::new(nsid, payload, operation_id, &self.device_id, signed_at);
         let json = body.to_json();
         let signature = self
             .signer
             .sign(&WriteBody::signing_input(&json))
             .map_err(signing_error)?;
+        let mut headers = write_headers(&json, &signature);
+        headers.extend(extra_headers.iter().cloned());
         decode_response(
             self.gateway
                 .submit_labyrinth(LabyrinthRequest {
@@ -444,7 +456,7 @@ impl GatewayXrpcTransport {
                     method: "POST".into(),
                     path: format!("/xrpc/{nsid}"),
                     body: Some(payload.to_vec()),
-                    headers: write_headers(&json, &signature),
+                    headers,
                 })
                 .await,
         )
@@ -693,11 +705,22 @@ pub fn did_document_url(did: &str) -> Result<String, String> {
     crate::client::did_url::did_document_url(did)
 }
 
+/// Pre-built PDS evidence attached to `blue.catbird.labyrinth.deleteAccountData`
+/// so peers can verify self-deletion after the deleted account's PDS is gone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedAccountDeletion {
+    pub operation_id: [u8; 16],
+    pub signed_at: chrono::DateTime<chrono::Utc>,
+    pub key_proof: Vec<u8>,
+    pub revocation_proof: Vec<u8>,
+}
+
 /// Verifying `mls-ds` directory & epoch-head publisher over the 6 clean-slate endpoints.
 pub struct DsDirectoryStore {
     transport: Arc<GatewayXrpcTransport>,
     sequencer_receipt_key: Option<SequencerReceiptKey>,
     placements: Option<(String, Arc<dyn super::state::StateVault>)>,
+    prepared_deletion: Option<PreparedAccountDeletion>,
     thread_keys: std::sync::Mutex<std::collections::HashMap<String, SequencerReceiptKey>>,
     did_doc_keys: std::sync::Mutex<std::collections::HashMap<String, ParsedSequencerKeys>>,
 }
@@ -711,6 +734,7 @@ impl DsDirectoryStore {
             transport,
             sequencer_receipt_key,
             placements: None,
+            prepared_deletion: None,
             thread_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
             did_doc_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -722,6 +746,11 @@ impl DsDirectoryStore {
         placements: Arc<dyn super::state::StateVault>,
     ) -> Self {
         self.placements = Some((did.into(), placements));
+        self
+    }
+
+    pub fn with_prepared_deletion(mut self, prepared: PreparedAccountDeletion) -> Self {
+        self.prepared_deletion = Some(prepared);
         self
     }
 
@@ -924,10 +953,40 @@ impl DsDirectoryStore {
     }
 
     pub async fn delete_account_data(&self) -> labyrinth::Result<()> {
+        if let Some(ref prepared) = self.prepared_deletion {
+            return self.delete_account_data_with_evidence(prepared).await;
+        }
         let mut op_id = [0u8; 16];
         labyrinth::encoding::random(&mut op_id)?;
         self.transport
             .procedure("blue.catbird.labyrinth.deleteAccountData", b"{}", op_id)
+            .await
+            .map(|_| ())
+            .map_err(map_xrpc_error)
+    }
+
+    pub async fn delete_account_data_with_evidence(
+        &self,
+        prepared: &PreparedAccountDeletion,
+    ) -> labyrinth::Result<()> {
+        let extra = [
+            (
+                KEY_PROOF_HEADER.to_owned(),
+                URL_SAFE_NO_PAD.encode(&prepared.key_proof),
+            ),
+            (
+                REVOCATION_PROOF_HEADER.to_owned(),
+                URL_SAFE_NO_PAD.encode(&prepared.revocation_proof),
+            ),
+        ];
+        self.transport
+            .procedure_at_with_headers(
+                "blue.catbird.labyrinth.deleteAccountData",
+                b"{}",
+                prepared.operation_id,
+                prepared.signed_at,
+                &extra,
+            )
             .await
             .map(|_| ())
             .map_err(map_xrpc_error)

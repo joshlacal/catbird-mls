@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "09c11655fefc53b3b3405b798842fca5254de7e7",
-    "sourceSha256": "4b941d3a0c0d57c237885fce5ac216a955b41340ab84beb36f0b4a71c164c7f3",
-    "sourceTree": "4a3d19d2cf66c5d7d02a6837b467caebb0792813"
+    "sourceRevision": "31c161d22c6b0be185f7b0fe6a4fa98b889f0f0a",
+    "sourceSha256": "28b7711295ebbd2ae67fc664e0088d5c7db088eca7b54a9d894675c7f35f2b61",
+    "sourceTree": "87ed7888eecdca122a80309b6731ffc7cefbc676"
   },
   "defs": {
     "accessEndedEvent": {
@@ -71,6 +71,12 @@
         "receivedAt": {
           "ref": "#canonicalDatetime",
           "type": "ref"
+        },
+        "revocationProof": {
+          "description": "Optional; present only together with actorWrite. Private Catbird surface (blue.catbird.*), not an ATProto or community-ratified lexicon. A CARv1 repository proof in the com.atproto.sync.getRecord shape: the signed repository commit of deletedDid, the MST path, and the record block for the create-only blue.catbird.chat.deviceRevocation/{actorDeviceId} record where targetDeviceId == actorDeviceId, createdAt == actorWrite.signedAt, and reason == 'deleteAccountData:' || operationId. Because deviceRevocation is create-only, a valid CARv1 under deletedDid's #atproto key proves actorDeviceId had not been revoked prior to signing deletion even after deletedDid's repository is gone.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "bytes"
         },
         "seq": {
           "maximum": 9007199254740991,

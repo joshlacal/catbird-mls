@@ -838,30 +838,42 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
         .delete_account_data()
         .expect("carol delete_account_data succeeds on retry");
     assert!(carol.is_handle_closed());
+    {
+        let g = ds.inner.lock().unwrap();
+        assert!(
+            g.pds_records.contains_key(&(
+                CAROL_DID.to_string(),
+                "blue.catbird.chat.deviceRevocation".to_string(),
+                carol_dev.clone(),
+            )),
+            "deleteAccountData must publish self-deletion deviceRevocation record on PDS"
+        );
+        let has_rev_proof = g
+            .entries
+            .get(&grp_cid)
+            .and_then(|entries| entries.last())
+            .and_then(|e| e.get("revocationProof"))
+            .is_some();
+        assert!(
+            has_rev_proof,
+            "deleteAccountData entry must carry revocationProof CARv1 bytes"
+        );
+    }
 
-    let error = alice_d1
+    alice_d1
         .sync()
-        .expect_err("unproven historical authority must quarantine account deletion");
+        .expect("verified keyProof + revocationProof must apply Carol's account deletion");
     assert!(
-        matches!(&error, MLSError::SyncIncomplete { applied: 0, failures }
-            if failures.len() == 1
-                && failures[0].conversation_id == grp_cid
-                && matches!(failures[0].error.as_ref(),
-                    MLSError::InvalidState(code) if code == "AccountDeletionUnverified")),
-        "{error:?}"
-    );
-    assert_eq!(
-        last_seq(&alice_d1, &grp_cid),
-        deletion_cursor,
-        "quarantined deletion must hold the live cursor"
+        last_seq(&alice_d1, &grp_cid) > deletion_cursor,
+        "verified deletion must advance the live cursor"
     );
     assert!(
-        alice_d1
+        !alice_d1
             .list_messages(&grp_cid, None, 50)
-            .expect("alice_d1 retained messages")
+            .expect("alice_d1 messages after deletion")
             .iter()
             .any(|message| message.message_id == carol_msg_id),
-        "quarantined deletion must retain Carol's plaintext"
+        "verified deletion must purge Carol's pre-deletion live plaintext"
     );
     assert!(
         alice_d1
@@ -870,24 +882,190 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
                 "native.account_deleted:{grp_cid}:{CAROL_DID}"
             )))
             .unwrap()
-            .is_none(),
-        "quarantined deletion must not install a purge marker"
+            .is_some(),
+        "verified deletion must install the applied deletion marker"
     );
     let evidence: Value = serde_json::from_str(
         &alice_d1
             .export_conversation_integrity_evidence_json(&grp_cid)
-            .expect("export quarantined deletion evidence"),
+            .expect("export post-deletion evidence"),
     )
     .unwrap();
     assert!(
         evidence["unverifiedAccountDeletions"]
             .as_array()
-            .is_some_and(|items| items.iter().any(|item| {
-                item["deletedDid"] == CAROL_DID
-                    && item["reason"] == "revocation-status-unproven"
-            })),
-        "the exact unverified deletion evidence must remain available"
+            .is_some_and(Vec::is_empty),
+        "verified deletion must leave zero unverified account deletion entries: {evidence}"
     );
+}
+
+#[test]
+fn pds_revocation_proof_blocks_sibling_revoked_quarantines_unproven_and_hides_on_restore() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let scopes = oauth_scopes();
+
+    let alice_d1_dev = new_id();
+    let alice_d2_dev = new_id();
+    let bob_dev = new_id();
+    let carol_d1_dev = new_id();
+    let carol_d2_dev = new_id();
+
+    let alice_d1 = enrolled(&tmp, &ds, "w2-revp-a1", ALICE_DID, &alice_d1_dev);
+    let bob = enrolled(&tmp, &ds, "w2-revp-b1", BOB_DID, &bob_dev);
+    let carol_d1 = enrolled(&tmp, &ds, "w2-revp-c1", CAROL_DID, &carol_d1_dev);
+
+    let alice_code = alice_d1.setup_recovery_code().expect("alice recovery");
+    bob.setup_recovery_code().expect("bob recovery");
+    let carol_code = carol_d1.setup_recovery_code().expect("carol recovery");
+
+    let carol_d2 = live_client(
+        tmp.path(),
+        &ds,
+        "w2-revp-c2",
+        CAROL_DID,
+        &carol_d2_dev,
+        &Arc::new(MemKeyStore::new()),
+    );
+    carol_d2.enroll_device(&scopes).expect("enroll carol_d2");
+    carol_d2
+        .restore_with_recovery_code(&carol_code)
+        .expect("carol_d2 join mailbox");
+
+    let grp_cid = new_id();
+    alice_d1
+        .create_group(
+            &grp_cid,
+            DS_DID,
+            vec![BOB_DID.into(), CAROL_DID.into()],
+            Some("Revocation Proof Group".into()),
+            Some("group".into()),
+        )
+        .expect("create group");
+    join_invited_group(&alice_d1, &[&bob, &carol_d1, &carol_d2]);
+    bob.sync().expect("bob sync");
+    carol_d1.sync().expect("carol_d1 sync");
+    carol_d2.sync().expect("carol_d2 sync");
+
+    let carol_msg_id = new_id();
+    carol_d1
+        .send_message(&grp_cid, &carol_msg_id, "Carol secret pre-deletion")
+        .expect("carol send");
+    carol_d1.flush_labyrinth_queue().expect("carol flush");
+    let bob_msg_id = new_id();
+    bob.send_message(&grp_cid, &bob_msg_id, "Bob message stays visible")
+        .expect("bob send");
+    bob.flush_labyrinth_queue().expect("bob flush");
+    alice_d1.sync().expect("alice receives messages");
+    bob.sync().expect("bob catches up");
+    // Ensure Alice's OwnerMailbox has rescued owner history for fresh restore check below.
+    alice_d1.flush_labyrinth_queue().expect("alice flush");
+    alice_d1
+        .rescue_conversation_on_kick(&grp_cid)
+        .expect("alice rescues conversation history");
+
+    // 1. Sibling device revokes carol_d2; carol_d2.delete_account_data() must fail closed
+    //    BEFORE calling deleteAccountData on DS or wiping its local SQLCipher DB.
+    carol_d1
+        .revoke_device(&carol_d2_dev)
+        .expect("carol_d1 revokes carol_d2");
+    alice_d1.sync().expect("alice_d1 syncs carol_d2 revocation");
+    bob.sync().expect("bob syncs carol_d2 revocation");
+    let pre_ds_call_count = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| url.contains("/xrpc/blue.catbird.labyrinth.deleteAccountData"))
+        .count();
+    assert!(
+        carol_d2.delete_account_data().is_err(),
+        "sibling-revoked device must refuse delete_account_data"
+    );
+    assert!(
+        !carol_d2.is_handle_closed(),
+        "sibling-revoked device must keep local DB intact on refusal"
+    );
+    let post_ds_call_count = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| url.contains("/xrpc/blue.catbird.labyrinth.deleteAccountData"))
+        .count();
+    assert_eq!(
+        pre_ds_call_count, post_ds_call_count,
+        "sibling-revoked device must abort BEFORE calling deleteAccountData on DS"
+    );
+
+    // 2. Unrevoked carol_d1 deletes her account. Strip revocationProof before Bob syncs:
+    //    live sync must quarantine as AccountDeletionUnverified (`revocation-status-unproven`).
+    let bob_cursor = last_seq(&bob, &grp_cid);
+    carol_d1
+        .delete_account_data()
+        .expect("unrevoked carol_d1 delete_account_data succeeds");
+    assert!(carol_d1.is_handle_closed());
+    {
+        let mut g = ds.inner.lock().unwrap();
+        if let Some(entries) = g.entries.get_mut(&grp_cid) {
+            for e in entries.iter_mut() {
+                if e.get("deletedDid").and_then(Value::as_str) == Some(CAROL_DID) {
+                    if let Some(obj) = e.as_object_mut() {
+                        obj.remove("revocationProof");
+                    }
+                }
+            }
+        }
+    }
+    let sync_err = bob
+        .sync()
+        .expect_err("entry omitting revocationProof must quarantine");
+    assert!(
+        matches!(&sync_err, MLSError::SyncIncomplete { applied: 0, failures }
+            if failures.len() == 1
+                && failures[0].conversation_id == grp_cid
+                && matches!(failures[0].error.as_ref(),
+                    MLSError::InvalidState(code) if code == "AccountDeletionUnverified")),
+        "{sync_err:?}"
+    );
+    assert_eq!(last_seq(&bob, &grp_cid), bob_cursor);
+    assert!(bob
+        .list_messages(&grp_cid, None, 50)
+        .unwrap()
+        .iter()
+        .any(|m| m.message_id == carol_msg_id));
+
+    // 3. Fresh restore PDS completeness: even if mls-ds omits Carol from getConversationState
+    //    ["accountDeletions"], Alice's fresh device queries Carol's PDS deviceRevocation CARv1
+    //    and hides Carol's archived message while keeping Bob's visible.
+    ds.inner
+        .lock()
+        .unwrap()
+        .account_deletions
+        .remove(&grp_cid);
+    let alice_d2 = live_client(
+        tmp.path(),
+        &ds,
+        "w2-revp-a2",
+        ALICE_DID,
+        &alice_d2_dev,
+        &Arc::new(MemKeyStore::new()),
+    );
+    alice_d2.enroll_device(&scopes).expect("enroll alice_d2");
+    alice_d2
+        .restore_with_recovery_code(&alice_code)
+        .expect("alice_d2 recover archive keys");
+    let restored = alice_d2
+        .restore_conversation_from_owner_mailbox(&grp_cid)
+        .expect("fresh restore succeeds with PDS completeness check");
+    let restored_msgs = alice_d2
+        .list_messages(&grp_cid, None, 50)
+        .expect("list restored messages");
+    assert_eq!(restored, 1);
+    assert!(!restored_msgs.iter().any(|m| m.message_id == carol_msg_id));
+    assert!(restored_msgs.iter().any(|m| m.message_id == bob_msg_id));
 }
 
 #[test]

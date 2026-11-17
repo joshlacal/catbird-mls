@@ -399,8 +399,32 @@ impl NativeArchiveAuthFixture {
             let did = required(&params, "did")?;
             let collection = required(&params, "collection")?;
             let rkey = required(&params, "rkey")?;
-            if collection == "blue.catbird.chat.declaration" {
-                // The declaration lives in the underlying mock PDS store: prove what it holds.
+            if matches!(
+                collection,
+                "blue.catbird.chat.declaration"
+                    | "blue.catbird.chat.device"
+                    | "blue.catbird.chat.deviceRevocation"
+            ) {
+                let stored = {
+                    let world = self.world.lock().unwrap();
+                    if collection == "blue.catbird.chat.device" {
+                        world
+                            .chat_devices
+                            .get(&(did.to_owned(), rkey.to_owned()))
+                            .map(|r| r.value.clone())
+                    } else if collection == "blue.catbird.chat.deviceRevocation" {
+                        world
+                            .chat_device_revocations
+                            .get(&(did.to_owned(), rkey.to_owned()))
+                            .map(|r| r.value.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(value) = stored {
+                    return self.build_signed_car_response(did, collection, rkey, Some(&value));
+                }
+                // Fall back to the underlying mock PDS store when a test pre-seeded `pds_records` directly.
                 let base = request.url.split("/xrpc/").next().unwrap_or_default();
                 let read = raw(&PlatformHttpRequest {
                     method: "GET".into(),
@@ -410,17 +434,20 @@ impl NativeArchiveAuthFixture {
                     headers: Vec::new(),
                     body: None,
                 })?;
-                let stored = if read.status == 200 {
+                let fallback = if read.status == 200 {
                     parse(&read.body)?.get("value").cloned()
                 } else {
                     None
                 };
-                return match stored {
+                return match fallback {
                     Some(value) => {
                         self.build_signed_car_response(did, collection, rkey, Some(&value))
                     }
-                    // A missing declaration is proven absent.
-                    None => self.build_signed_exclusion_response(did),
+                    // A missing declaration is proven absent; device/revocation returns 404.
+                    None if collection == "blue.catbird.chat.declaration" => {
+                        self.build_signed_exclusion_response(did)
+                    }
+                    None => Ok(reply(404, json!({"error": "RecordNotFound"}))),
                 };
             }
             let stored = {
@@ -428,16 +455,6 @@ impl NativeArchiveAuthFixture {
                 if collection == labyrinth::records::nsid::MAILBOX_KEYS {
                     world
                         .mailbox_keys
-                        .get(&(did.to_owned(), rkey.to_owned()))
-                        .map(|r| r.value.clone())
-                } else if collection == "blue.catbird.chat.device" {
-                    world
-                        .chat_devices
-                        .get(&(did.to_owned(), rkey.to_owned()))
-                        .map(|r| r.value.clone())
-                } else if collection == "blue.catbird.chat.deviceRevocation" {
-                    world
-                        .chat_device_revocations
                         .get(&(did.to_owned(), rkey.to_owned()))
                         .map(|r| r.value.clone())
                 } else {

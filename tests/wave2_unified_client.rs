@@ -1009,6 +1009,10 @@ async fn resolving_space_thread_store_find_meks_probes_batch_author_first_o1_wit
 
     #[async_trait::async_trait]
     impl SpaceRpc for MockMekSpaceRpc {
+        fn authenticates_responses(&self) -> bool {
+            true
+        }
+
         async fn query(
             &self,
             nsid: &str,

@@ -10,6 +10,10 @@ use sha2::{Digest as _, Sha256};
 pub const WRITE_BODY_HEADER: &str = "catbird-labyrinth-write";
 /// Header carrying `base64url(signature over WRITE_DOMAIN || body bytes)`.
 pub const WRITE_SIGNATURE_HEADER: &str = "catbird-labyrinth-write-signature";
+/// Header carrying `base64url` encoded `blue.catbird.chat.device` key proof.
+pub const KEY_PROOF_HEADER: &str = "catbird-labyrinth-key-proof";
+/// Header carrying `base64url` encoded `blue.catbird.chat.deviceRevocation` CARv1 proof.
+pub const REVOCATION_PROOF_HEADER: &str = "catbird-labyrinth-revocation-proof";
 /// Signature domain of `labyrinthWriteBody`.
 pub const WRITE_DOMAIN: &[u8] = b"CATBIRD-LABYRINTH-WRITE\0";
 

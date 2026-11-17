@@ -26,7 +26,7 @@ use super::space::{
     thread_placement_key, Placement, ResolvingSpaceThreadStore, SpaceMailbox, ThreadPlacement,
 };
 use super::state::StateVault;
-use super::transport::{DsDirectoryStore, GatewayXrpcTransport};
+use super::transport::{DsDirectoryStore, GatewayXrpcTransport, PreparedAccountDeletion};
 pub use crate::orchestrator::error::{OrchestratorError, Result as AuthorityResult};
 use AuthorityResult as Result;
 /// One member dropped during a mailbox epoch rotation.
@@ -186,6 +186,19 @@ pub trait LocalConversationAuthority: MaybeSend + MaybeSync {
         Ok(Vec::new())
     }
 
+    /// `did`'s Ed25519 chat device signing keys paired with each key's earliest
+    /// verified revocation instant (`createdAt` ms) from PDS `deviceRevocation`.
+    /// Preserving the real revocation timestamp lets restored clients verify
+    /// pre-deletion witness copies while rejecting any post-revocation use.
+    async fn revoked_chat_device_keys_with_times(&self, did: &str) -> Result<Vec<([u8; 32], u64)>> {
+        Ok(self
+            .revoked_chat_device_keys(did)
+            .await?
+            .into_iter()
+            .map(|k| (k, 1))
+            .collect())
+    }
+
     /// `did`'s live leaf signing keys across active local MLS groups shared with
     /// this device. Every such leaf must be present and non-revoked in any
     /// device-key directory response for `did`.
@@ -242,16 +255,21 @@ impl MailboxDirectory for LocallyCheckedDirectory {
 
     async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         let mut reported = self.inner.device_transport_keys(did).await?;
-        let revoked_set: std::collections::BTreeSet<[u8; 32]> = self
+        let mut revoked_times = std::collections::BTreeMap::<[u8; 32], u64>::new();
+        for (key, at_ms) in self
             .authority
-            .revoked_chat_device_keys(did)
+            .revoked_chat_device_keys_with_times(did)
             .await
             .map_err(|error| labyrinth::Error::Backend(format!("revoked PDS devices: {error}")))?
-            .into_iter()
-            .collect();
+        {
+            revoked_times
+                .entry(key)
+                .and_modify(|prev| *prev = (*prev).min(at_ms))
+                .or_insert(at_ms);
+        }
         for entry in &mut reported {
-            if revoked_set.contains(&entry.key) {
-                entry.removed_at.get_or_insert(1);
+            if let Some(&rev_ms) = revoked_times.get(&entry.key) {
+                entry.removed_at = Some(entry.removed_at.map_or(rev_ms, |ds| ds.min(rev_ms)));
             }
         }
         if let Some(allowed) = self
@@ -264,11 +282,12 @@ impl MailboxDirectory for LocallyCheckedDirectory {
         {
             let allowed_set: std::collections::BTreeSet<[u8; 32]> = allowed.into_iter().collect();
             reported.retain(|entry| {
-                allowed_set.contains(&entry.key) || revoked_set.contains(&entry.key)
+                allowed_set.contains(&entry.key) || revoked_times.contains_key(&entry.key)
             });
             for entry in &mut reported {
                 if !allowed_set.contains(&entry.key) {
-                    entry.removed_at.get_or_insert(1);
+                    let rev_ms = revoked_times.get(&entry.key).copied().unwrap_or(1);
+                    entry.removed_at.get_or_insert(rev_ms);
                 }
             }
         }
@@ -737,6 +756,19 @@ impl SessionDeps {
             .await
     }
 
+    /// Remote half of account deletion carrying pre-published PDS device &
+    /// self-revocation CARv1 proofs so peers can verify deletion post-takedown.
+    pub async fn delete_account_remote_prepared(
+        &self,
+        prepared: &PreparedAccountDeletion,
+    ) -> labyrinth::Result<()> {
+        let spaces = self.conversation_spaces()?;
+        self.delete_account_remote_at_with_prepared(Some(Placement::Space), Some(prepared.clone()))
+            .await?;
+        self.delete_conversation_records(&spaces, self.space.is_some())
+            .await
+    }
+
     pub(crate) fn conversation_spaces(&self) -> labyrinth::Result<Vec<String>> {
         let key = thread_placement_key(&self.did);
         let Some(raw) = self
@@ -786,13 +818,26 @@ impl SessionDeps {
         &self,
         placement: Option<Placement>,
     ) -> labyrinth::Result<()> {
+        self.delete_account_remote_at_with_prepared(placement, None)
+            .await
+    }
+
+    async fn delete_account_remote_at_with_prepared(
+        &self,
+        placement: Option<Placement>,
+        prepared: Option<PreparedAccountDeletion>,
+    ) -> labyrinth::Result<()> {
         let _ = placement;
         let space_mb = self.space_store().ok_or_else(|| {
             labyrinth::Error::Backend(
                 "personal Space deletion requires the account's Space connection".into(),
             )
         })?;
-        let mailbox = SpaceMailbox::new(space_mb, Some(Arc::new(self.ds_directory())));
+        let ds = match prepared {
+            Some(prepared) => self.ds_directory().with_prepared_deletion(prepared),
+            None => self.ds_directory(),
+        };
+        let mailbox = SpaceMailbox::new(space_mb, Some(Arc::new(ds)));
         let pds = self
             .pds
             .as_ref()

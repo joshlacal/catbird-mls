@@ -1188,6 +1188,22 @@ impl CatbirdMlsClient {
                                     "I4 verified revocation has invalid createdAt".into(),
                                 )
                             })?;
+                        // Self-deletion revocations authorize the deletion at `revoked_at_ms`
+                        // and revoke the device strictly afterward (`revoked_at_ms + 1`), whereas
+                        // sibling revocations block `deleteAccountData` at or after `revoked_at_ms`.
+                        let is_self_deletion = record_val["actorDeviceId"]
+                            .as_str()
+                            .is_some_and(|actor| actor == target_id)
+                            && record_val["reason"].as_str().is_some_and(|r| {
+                                r.starts_with(
+                                    super::deletion_authority::DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX,
+                                )
+                            });
+                        let effective_revoked_at_ms = if is_self_deletion {
+                            revoked_at_ms.saturating_add(1)
+                        } else {
+                            revoked_at_ms
+                        };
                         let key = super::deletion_authority::verified_device_revocation_key(
                             target_did, &target_id,
                         );
@@ -1195,7 +1211,9 @@ impl CatbirdMlsClient {
                             let earliest = tx
                                 .get_account_meta(&key)?
                                 .and_then(|raw| raw.parse::<i64>().ok())
-                                .map_or(revoked_at_ms, |old| old.min(revoked_at_ms));
+                                .map_or(effective_revoked_at_ms, |old| {
+                                    old.min(effective_revoked_at_ms)
+                                });
                             tx.put_account_meta(&key, &earliest.to_string(), self.hooks.now_ms())
                         })?;
                     }

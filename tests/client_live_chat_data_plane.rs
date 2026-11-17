@@ -1020,7 +1020,9 @@ impl SharedMockDs {
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.deleteAccountData") {
-            use catbird_mls::labyrinth::write_auth::{WRITE_BODY_HEADER, WRITE_DOMAIN};
+            use catbird_mls::labyrinth::write_auth::{
+                REVOCATION_PROOF_HEADER, WRITE_BODY_HEADER, WRITE_DOMAIN,
+            };
             let nsid = "blue.catbird.labyrinth.deleteAccountData";
             let (write, device_key) = match device_signed_claim(
                 &g,
@@ -1039,6 +1041,12 @@ impl SharedMockDs {
                 write["actorDeviceId"].as_str().unwrap_or_default(),
                 &device_key,
             );
+            let revocation_proof = req
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(REVOCATION_PROOF_HEADER))
+                .and_then(|h| URL_SAFE_NO_PAD.decode(&h.value).ok())
+                .filter(|b| !b.is_empty());
             let payload_sha256 =
                 hex::encode(Sha256::digest(req.body.as_deref().unwrap_or_default()));
             if write["endpointNsid"] != nsid || write["payloadSha256"] != payload_sha256 {
@@ -1090,6 +1098,9 @@ impl SharedMockDs {
                 );
                 del_entry["actorWrite"] = actor_write.clone();
                 del_entry["keyProof"] = json!({ "$bytes": STANDARD.encode(&key_proof) });
+                if let Some(ref rev_proof) = revocation_proof {
+                    del_entry["revocationProof"] = json!({ "$bytes": STANDARD.encode(rev_proof) });
+                }
                 g.entries
                     .entry(cid.clone())
                     .or_default()

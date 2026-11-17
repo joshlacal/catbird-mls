@@ -51,7 +51,8 @@ pub use space::{
 pub use state::{MlsStateVault, StateVault, STATE_NAMESPACE};
 pub use status::ArchiveStatus;
 pub use transport::{
-    ApiGateway, DsDirectoryStore, GatewayXrpcTransport, LabyrinthGateway, XrpcTransportError,
+    ApiGateway, DsDirectoryStore, GatewayXrpcTransport, LabyrinthGateway, PreparedAccountDeletion,
+    XrpcTransportError,
 };
 
 /// One `blue.catbird.labyrinth.*` XRPC request ready for the platform gateway.
