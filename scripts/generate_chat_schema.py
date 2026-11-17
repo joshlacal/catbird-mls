@@ -50,9 +50,9 @@ ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
 GENERATOR_VERSION = 9
 PROVENANCE_KEY = "_catbird_mls_provenance"
-CANONICAL_SOURCE_REVISION = "31c161d22c6b0be185f7b0fe6a4fa98b889f0f0a"
-CANONICAL_SOURCE_TREE = "87ed7888eecdca122a80309b6731ffc7cefbc676"
-CANONICAL_SOURCE_SHA256 = "28b7711295ebbd2ae67fc664e0088d5c7db088eca7b54a9d894675c7f35f2b61"
+CANONICAL_SOURCE_REVISION = "322a3302ec5835e45109391c691c114c69bc858b"
+CANONICAL_SOURCE_TREE = "abb53025be9a1e7b3ae52e6c310fa1f03d355fe2"
+CANONICAL_SOURCE_SHA256 = "331dfccd668b27487571cb9453564f237fccc312d3c365852b5594daad1bcc2b"
 SERVER_SOURCE_REVISION = "fbe1e23f482486cb89d47feafc9e973d5f85b87d"
 SERVER_SOURCE_TREE = "ff65049e163afa04b3cc990e1cd2c675c939f2ca"
 SERVER_VECTOR_SET = "signed-mutation"
@@ -96,6 +96,7 @@ def load_source(path: Path, *, require_defs: bool = False) -> tuple[dict, str]:
 
 
 def resolve_tree(repository: Path, commit_id: str) -> str:
+    repository = repository.resolve()
     res = subprocess.run(
         ["git", "-C", str(repository), "rev-parse", f"{commit_id}^{{tree}}"],
         capture_output=True,
