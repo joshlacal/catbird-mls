@@ -689,8 +689,10 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
         .expect("bob_d1 group members")
         .contains(&BOB_DID.to_string()));
 
-    // 4. `delete_account_data` fails closed on remote 500 (keeping local DB open), then purges on retry
-    //    and sequences signed `accountDeletedEntry` so survivors purge Carol's messages.
+    // 4. `delete_account_data` fails closed on remote 500. Its later sequenced
+    // deletion remains quarantined until historical non-revocation can be proved:
+    // survivors retain the cursor, plaintext and exact unverified evidence.
+    let deletion_cursor = last_seq(&alice_d1, &grp_cid);
     ds.inner.lock().unwrap().xrpc_failures.push((
         "/blue.catbird.labyrinth.deleteAccountData",
         500,
@@ -711,16 +713,54 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
         .expect("carol delete_account_data succeeds on retry");
     assert!(carol.is_handle_closed());
 
-    alice_d1
+    let error = alice_d1
         .sync()
-        .expect("alice_d1 syncs carol accountDeletedEntry");
+        .expect_err("unproven historical authority must quarantine account deletion");
     assert!(
-        !alice_d1
+        matches!(&error, MLSError::SyncIncomplete { applied: 0, failures }
+            if failures.len() == 1
+                && failures[0].conversation_id == grp_cid
+                && matches!(failures[0].error.as_ref(),
+                    MLSError::InvalidState(code) if code == "AccountDeletionUnverified")),
+        "{error:?}"
+    );
+    assert_eq!(
+        last_seq(&alice_d1, &grp_cid),
+        deletion_cursor,
+        "quarantined deletion must hold the live cursor"
+    );
+    assert!(
+        alice_d1
             .list_messages(&grp_cid, None, 50)
-            .expect("alice_d1 messages after carol account deletion")
+            .expect("alice_d1 retained messages")
             .iter()
-            .any(|m| m.sender_did == CAROL_DID),
-        "verified accountDeletedEntry must purge Carol's messages on surviving peers"
+            .any(|message| message.message_id == carol_msg_id),
+        "quarantined deletion must retain Carol's plaintext"
+    );
+    assert!(
+        alice_d1
+            .db()
+            .read_tx(|tx| tx.get_labyrinth_state(&format!(
+                "native.account_deleted:{grp_cid}:{CAROL_DID}"
+            )))
+            .unwrap()
+            .is_none(),
+        "quarantined deletion must not install a purge marker"
+    );
+    let evidence: Value = serde_json::from_str(
+        &alice_d1
+            .export_conversation_integrity_evidence_json(&grp_cid)
+            .expect("export quarantined deletion evidence"),
+    )
+    .unwrap();
+    assert!(
+        evidence["unverifiedAccountDeletions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["deletedDid"] == CAROL_DID
+                    && item["reason"] == "revocation-status-unproven"
+            })),
+        "the exact unverified deletion evidence must remain available"
     );
 }
 

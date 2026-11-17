@@ -89,6 +89,12 @@ impl PaginationGuard {
         let Some(cursor) = next_cursor else {
             return Ok(());
         };
+        if item_count == 0 {
+            return Err(OrchestratorError::Api(format!(
+                "{} pagination returned a continuation cursor without items",
+                self.context
+            )));
+        }
         if cursor.is_empty() {
             return Err(OrchestratorError::Api(format!(
                 "{} pagination returned an empty continuation cursor",
@@ -166,5 +172,11 @@ mod tests {
     fn rejects_an_empty_continuation_cursor() {
         let mut guard = PaginationGuard::with_limits("test", 3, 3);
         assert_api_error(guard.observe_page(1, Some("")), "empty continuation");
+    }
+
+    #[test]
+    fn rejects_a_continuation_page_without_progress() {
+        let mut guard = PaginationGuard::with_limits("test", 3, 3);
+        assert_api_error(guard.observe_page(0, Some("next")), "without items");
     }
 }

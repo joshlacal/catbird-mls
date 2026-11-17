@@ -481,6 +481,41 @@ impl SessionDeps {
         })
     }
 
+    /// Resolve the typo-corrected code against the live bundle inventory
+    /// before deciding whether a recovery-share service proof is needed.
+    pub async fn recovery_code_requires_share(&self, code: &str) -> Result<bool> {
+        let bundles = self
+            .space_store()
+            .ok_or_else(space_unreachable)?
+            .list_virtual_devices()
+            .await
+            .map_err(map_error)?;
+        labyrinth::client::enroll::recovery_code_requires_share(&self.did, code, &bundles)
+            .map_err(map_error)
+    }
+
+    /// Unwrap and match the passkey's live bundles without exposing the
+    /// recovery code, returning only whether version-3 share access is possible.
+    pub async fn passkey_recovery_requires_share(
+        &self,
+        credential_id: &[u8],
+        prf_output_32: &[u8],
+    ) -> Result<bool> {
+        let bundles = self
+            .space_store()
+            .ok_or_else(space_unreachable)?
+            .list_virtual_devices()
+            .await
+            .map_err(map_error)?;
+        labyrinth::client::enroll::passkey_recovery_requires_share(
+            &self.did,
+            prf_output_32,
+            credential_id,
+            &bundles,
+        )
+        .map_err(map_error)
+    }
+
     pub(crate) fn ds_directory(&self) -> DsDirectoryStore {
         DsDirectoryStore::new(self.transport.clone(), self.sequencer_receipt_key.clone())
             .with_placements(self.did.clone(), self.placements.clone())

@@ -1107,13 +1107,28 @@ impl CatbirdMlsClient {
         // Phase 1: `getConversations` -> C33 incoming direct requests + group invitation
         // acceptance, and the conversations whose leaf recovery this device owes.
         let mut owed = Vec::new();
-        let (conv_applied, inventory_session_id) = self.sync_conversations_list(
+        let (conv_applied, inventory_session_id) = match self.sync_conversations_list(
             &canonical_dev_id,
             &signer,
             auth_generation,
             &mut owed,
             &mut failures,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                failures.push(ConversationSyncFailure {
+                    conversation_id: "<conversation-inventory>".into(),
+                    error: Box::new(error),
+                });
+                if total_applied > 0 || !failures.is_empty() {
+                    self.notify_change(PlatformChangeEvent::ConversationsUpdated);
+                }
+                return Err(MLSError::SyncIncomplete {
+                    applied: total_applied,
+                    failures,
+                });
+            }
+        };
         total_applied = total_applied.saturating_add(conv_applied);
 
         // Phase 2: `getPendingWelcomes` -> StagedWelcome join + acknowledgeWelcome.
@@ -1157,22 +1172,56 @@ impl CatbirdMlsClient {
             }
         }));
         // Phase 3: every known conversation's entries, then its owed and authorized work.
-        let convos = self.db.read_tx(|tx| tx.list_conversations(None, 200))?;
-        for convo in convos {
-            let welcome_pending = welcomed.contains(&convo.conversation_id);
-            match self.sync_one_conversation(
-                &canonical_dev_id,
-                &signer,
-                auth_generation,
-                &convo,
-                welcome_pending,
-            ) {
-                Ok(applied) => total_applied = total_applied.saturating_add(applied),
-                Err(error) => failures.push(ConversationSyncFailure {
-                    conversation_id: convo.conversation_id,
-                    error: Box::new(error),
-                }),
+        // Keyset pagination includes the conversation-id tiebreaker, so more than 200 rows
+        // sharing one timestamp cannot disappear between pages.
+        let mut local_cursor: Option<(i64, String)> = None;
+        loop {
+            let cursor = local_cursor
+                .as_ref()
+                .map(|(updated_at_ms, conversation_id)| (*updated_at_ms, conversation_id.as_str()));
+            let convos = self
+                .db
+                .read_tx(|tx| tx.list_conversations_page(cursor, 200))?;
+            if convos.is_empty() {
+                break;
             }
+            let Some(last) = convos.last() else {
+                break;
+            };
+            let next_cursor = (last.updated_at_ms, last.conversation_id.clone());
+            if local_cursor.as_ref().is_some_and(|previous| {
+                next_cursor.0 > previous.0
+                    || (next_cursor.0 == previous.0 && next_cursor.1 <= previous.1)
+            }) {
+                failures.push(ConversationSyncFailure {
+                    conversation_id: "<local-conversation-inventory>".into(),
+                    error: Box::new(MLSError::Cryptography(
+                        "local conversation pagination made no progress".into(),
+                    )),
+                });
+                break;
+            }
+            let has_more = convos.len() == 200;
+            for convo in convos {
+                let welcome_pending = welcomed.contains(&convo.conversation_id);
+                match self.sync_one_conversation(
+                    &canonical_dev_id,
+                    &signer,
+                    auth_generation,
+                    &convo,
+                    welcome_pending,
+                ) {
+                    Ok(applied) => total_applied = total_applied.saturating_add(applied),
+                    Err(error) => failures.push(ConversationSyncFailure {
+                        conversation_id: convo.conversation_id,
+                        error: Box::new(error),
+                    }),
+                }
+            }
+            if !has_more {
+                break;
+            }
+            local_cursor = Some(next_cursor);
         }
 
         // A failed conversation may still have applied the entries before its failing one.
@@ -1267,52 +1316,133 @@ impl CatbirdMlsClient {
         owed: &mut Vec<(String, Value)>,
         failures: &mut Vec<ConversationSyncFailure>,
     ) -> Result<(u32, Option<String>), MLSError> {
-        let resp = self.query_signed_chat_ds(
-            "blue.catbird.chat.getConversations",
-            &[
+        let mut page_cursor: Option<String> = None;
+        let mut inventory_session_id: Option<String> = None;
+        let mut first_page = true;
+        let mut pagination =
+            crate::orchestrator::pagination::PaginationGuard::for_conversations(
+                "live conversation inventory",
+            );
+        let mut inventory_items = Vec::new();
+        loop {
+            let mut params = vec![
                 ("actorDeviceId", canonical_dev_id),
                 ("limit", "100"),
                 ("supportedProtocolVersions", "1"),
                 ("supportedProtocolVersions", "2"),
-            ],
-            canonical_dev_id,
-            signer,
-        )?;
-        let inventory_session_id = resp
-            .get("inventorySessionId")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        let Some(items) = resp
-            .get("items")
-            .or_else(|| resp.get("conversations"))
-            .or_else(|| resp.get("states"))
-            .and_then(|v| v.as_array())
-        else {
-            return Ok((0, inventory_session_id));
-        };
+            ];
+            if let Some(cursor) = page_cursor.as_deref() {
+                params.push(("pageCursor", cursor));
+            }
+            let mut resp = self.query_signed_chat_ds(
+                "blue.catbird.chat.getConversations",
+                &params,
+                canonical_dev_id,
+                signer,
+            )?;
+            let page_session_id = match resp.get("inventorySessionId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+                _ => {
+                    return Err(MLSError::Cryptography(
+                        "conversation inventory has an invalid inventorySessionId".into(),
+                    ));
+                }
+            };
+            if first_page {
+                inventory_session_id = page_session_id;
+                first_page = false;
+            } else if page_session_id != inventory_session_id {
+                return Err(MLSError::Cryptography(
+                    "conversation inventory changed its snapshot session between pages".into(),
+                ));
+            }
+            let next_cursor = match resp.get("nextPageCursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+                _ => {
+                    return Err(MLSError::Cryptography(
+                        "conversation inventory has an invalid continuation cursor".into(),
+                    ));
+                }
+            };
+            if let Some(has_more) = resp.get("hasMore") {
+                if has_more.as_bool() != Some(next_cursor.is_some()) {
+                    return Err(MLSError::Cryptography(
+                        "conversation inventory has inconsistent pagination".into(),
+                    ));
+                }
+            }
+            let object = resp.as_object_mut().ok_or_else(|| {
+                MLSError::Cryptography("conversation inventory is not an object".into())
+            })?;
+            let page_items = if let Some(items) = object.remove("items") {
+                items
+            } else if let Some(items) = object.remove("conversations") {
+                items
+            } else if let Some(items) = object.remove("states") {
+                items
+            } else {
+                return Err(MLSError::Cryptography(
+                    "conversation inventory is missing items".into(),
+                ));
+            };
+            let Value::Array(page_items) = page_items else {
+                return Err(MLSError::Cryptography(
+                    "conversation inventory items are malformed".into(),
+                ));
+            };
+            pagination
+                .observe_page(page_items.len(), next_cursor.as_deref())
+                .map_err(|error| MLSError::Cryptography(error.to_string()))?;
+            inventory_items.extend(page_items);
+            match next_cursor {
+                Some(next) => page_cursor = Some(next),
+                None => break,
+            }
+        }
 
-        let mut count = 0u32;
-        for item in items {
-            let state = item.get("state").unwrap_or(item);
-            let Some(cid) = state
+        let mut states = Vec::with_capacity(inventory_items.len());
+        let mut seen = BTreeSet::new();
+        for item in inventory_items {
+            let state = match item {
+                Value::Object(mut object) => object
+                    .remove("state")
+                    .unwrap_or_else(|| Value::Object(object)),
+                value => value,
+            };
+            let cid = state
                 .pointer("/coordinates/conversationId")
                 .or_else(|| state.get("conversationId"))
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "conversation inventory item has no conversation id".into(),
+                    )
+                })?
+                .to_owned();
+            if !seen.insert(cid.clone()) {
+                return Err(MLSError::Cryptography(format!(
+                    "conversation inventory repeated conversation {cid}"
+                )));
+            }
+            states.push((cid, state));
+        }
+
+        let mut count = 0u32;
+        for (cid, state) in states {
             match self.sync_inventory_item(
                 canonical_dev_id,
                 signer,
                 auth_generation,
-                cid,
-                state,
+                &cid,
+                &state,
                 owed,
             ) {
                 Ok(applied) => count = count.saturating_add(applied),
                 Err(error) => failures.push(ConversationSyncFailure {
-                    conversation_id: cid.to_owned(),
+                    conversation_id: cid,
                     error: Box::new(error),
                 }),
             }
@@ -2613,7 +2743,7 @@ impl CatbirdMlsClient {
                     chat_wire::try_decrypt_group_metadata_snapshot(&mut group, &provider, snap)
                 {
                     super::archive_policy::accept_snapshot(
-                        tx, cid, entry_seq, &mut meta, false, now_ms,
+                        tx, cid, transition_seq, &mut meta, false, now_ms,
                     )?;
                     let meta_row =
                         chat_wire::group_metadata_row_from_v1(cid, m_ver, m_epoch, &meta, now_ms)?;
@@ -3679,9 +3809,11 @@ impl CatbirdMlsClient {
         if let Some((seq, _)) = pending_receipts.first_key_value() {
             cursor_seq = cursor_seq.min(seq.saturating_sub(1));
         }
-        for _ in 0..50 {
+        let mut pagination =
+            crate::orchestrator::pagination::PaginationGuard::for_messages("live entry sync");
+        loop {
             let after_seq_str = cursor_seq.to_string();
-            let resp = match self.query_signed_chat_ds(
+            let mut resp = match self.query_signed_chat_ds(
                 "blue.catbird.chat.getEntries",
                 &[
                     ("actorDeviceId", canonical_dev_id),
@@ -3693,23 +3825,57 @@ impl CatbirdMlsClient {
                 signer,
             ) {
                 Ok(resp) => resp,
-                Err(MLSError::InvalidState(code)) if code == "ConversationNotFound" => break,
+                Err(MLSError::InvalidState(code)) if code == "ConversationNotFound" => {
+                    if sorted_entries.is_empty() {
+                        break;
+                    }
+                    return Err(MLSError::Cryptography(
+                        "conversation disappeared during entry pagination".into(),
+                    ));
+                }
                 Err(err) => return Err(err),
             };
-            let Some(page_entries) = resp.get("entries").and_then(|v| v.as_array()) else {
-                break;
+            let page_entries = resp
+                .as_object_mut()
+                .and_then(|object| object.remove("entries"))
+                .ok_or_else(|| {
+                    MLSError::Cryptography("entry page is missing entries".into())
+                })?;
+            let Value::Array(page_entries) = page_entries else {
+                return Err(MLSError::Cryptography(
+                    "entry page has malformed entries".into(),
+                ));
             };
+            if page_entries.len() > 100 {
+                return Err(MLSError::Cryptography(
+                    "entry page exceeds the requested limit".into(),
+                ));
+            }
             if page_entries.is_empty() {
+                pagination
+                    .observe_page(0, None)
+                    .map_err(|error| MLSError::Cryptography(error.to_string()))?;
                 break;
             }
-            let page_len = page_entries.len();
-            let page_max_seq = page_entries
-                .iter()
-                .filter_map(|e| e.get("seq").and_then(|s| s.as_i64()))
-                .max()
-                .unwrap_or(cursor_seq);
-            sorted_entries.extend(page_entries.iter().cloned());
-            if page_len < 100 || page_max_seq <= cursor_seq {
+            let mut page_max_seq = cursor_seq;
+            for entry in &page_entries {
+                let seq = entry.get("seq").and_then(Value::as_i64).ok_or_else(|| {
+                    MLSError::Cryptography("entry page contains an invalid sequence".into())
+                })?;
+                if seq <= cursor_seq {
+                    return Err(MLSError::Cryptography(
+                        "entry pagination made no sequence progress".into(),
+                    ));
+                }
+                page_max_seq = page_max_seq.max(seq);
+            }
+            let has_more = page_entries.len() == 100;
+            let next_cursor = has_more.then(|| page_max_seq.to_string());
+            pagination
+                .observe_page(page_entries.len(), next_cursor.as_deref())
+                .map_err(|error| MLSError::Cryptography(error.to_string()))?;
+            sorted_entries.extend(page_entries);
+            if !has_more {
                 break;
             }
             cursor_seq = page_max_seq;

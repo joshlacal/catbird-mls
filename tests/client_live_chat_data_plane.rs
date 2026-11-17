@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use catbird_mls::canonical_transport::{derive_key_id, CanonicalOperation};
 use catbird_mls::chat_v2::transcript::direct_request::{self as dr_transcript, DirectRequestKind};
@@ -172,6 +172,8 @@ struct MockDsState {
     convo_kps: BTreeMap<(String, String), Vec<Value>>,
     // Conversations: cid -> state JSON
     conversations: BTreeMap<String, Value>,
+    // Return the same continuation cursor after the first inventory page.
+    repeat_conversation_cursor: bool,
     // Conversation entries: cid -> Vec<Value>
     entries: BTreeMap<String, Vec<Value>>,
     // Pending welcomes: (did, device_id) -> Vec<Value>
@@ -309,6 +311,7 @@ impl SharedMockDs {
                 dr_keys: BTreeMap::new(),
                 convo_kps: BTreeMap::new(),
                 conversations: BTreeMap::new(),
+                repeat_conversation_cursor: false,
                 entries: BTreeMap::new(),
                 pending_welcomes: BTreeMap::new(),
                 leaf_recoveries: BTreeMap::new(),
@@ -810,6 +813,65 @@ impl SharedMockDs {
                 }));
             }
             return ok_json(json!({ "records": page }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.getRecoveryShareCapabilities") {
+            if let Err(message) = verify_read(
+                &g,
+                account,
+                &req,
+                "blue.catbird.labyrinth.getRecoveryShareCapabilities",
+                true,
+            ) {
+                return xrpc_error(401, "InvalidSignature", message);
+            }
+            return ok_json(json!({
+                "supported": true,
+                "version": 1,
+                "hpkeSuite": "DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_256_GCM",
+                "keyId": "mock-recovery-share-kek-1"
+            }));
+        }
+
+        if url.contains("/xrpc/blue.catbird.labyrinth.deleteRecoveryShare") {
+            use catbird_mls::labyrinth::write_auth::{WRITE_BODY_HEADER, WRITE_DOMAIN};
+            let nsid = "blue.catbird.labyrinth.deleteRecoveryShare";
+            let write = match device_signed_claim(
+                &g,
+                account,
+                &req,
+                WRITE_BODY_HEADER,
+                "actorDeviceId",
+                WRITE_DOMAIN,
+            ) {
+                Ok((write, _)) => write,
+                Err(message) => return xrpc_error(401, "InvalidSignature", message),
+            };
+            let payload_sha256 =
+                hex::encode(Sha256::digest(req.body.as_deref().unwrap_or_default()));
+            let valid_vid = body_json
+                .pointer("/vdeviceId/$bytes")
+                .and_then(Value::as_str)
+                .and_then(|value| {
+                    STANDARD_NO_PAD
+                        .decode(value)
+                        .or_else(|_| STANDARD.decode(value))
+                        .ok()
+                })
+                .is_some_and(|value| value.len() == 16);
+            if write["endpointNsid"] != nsid
+                || write["payloadSha256"] != payload_sha256
+                || !valid_vid
+            {
+                return xrpc_error(
+                    400,
+                    "InvalidRequest",
+                    "deleteRecoveryShare is not bound to one virtual device",
+                );
+            }
+            // Candidate writes only version-2 recovery methods, so no remote
+            // share exists. The protocol's exact absent-share result is 404.
+            return xrpc_error(404, "RecoveryShareNotFound", "share does not exist");
         }
 
         if url.contains("/xrpc/blue.catbird.labyrinth.getMailboxKeysRecord") {
@@ -2245,7 +2307,30 @@ impl SharedMockDs {
                 })
                 .cloned()
                 .collect();
-            return ok_json(json!({ "conversations": list }));
+            let limit = q
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, 100);
+            let offset = q
+                .get("pageCursor")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let page: Vec<Value> = list.iter().skip(offset).take(limit).cloned().collect();
+            let next_offset = offset.saturating_add(page.len());
+            let next_cursor = if g.repeat_conversation_cursor && offset > 0 {
+                Some(offset.to_string())
+            } else if next_offset < list.len() && !page.is_empty() {
+                Some(next_offset.to_string())
+            } else {
+                None
+            };
+            return ok_json(json!({
+                "conversations": page,
+                "inventorySessionId": "mock-inventory-session",
+                "hasMore": next_cursor.is_some(),
+                "nextPageCursor": next_cursor,
+            }));
         }
 
         if url.contains("/xrpc/blue.catbird.chat.getPendingWelcomes") {
@@ -2414,6 +2499,13 @@ impl SharedMockDs {
                     "sequencerReceipt": {},
                 }));
             }
+            list.sort_by_key(|entry| entry["seq"].as_i64().unwrap_or_default());
+            let limit = q
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, 100);
+            list.truncate(limit);
             return ok_json(json!({ "entries": list }));
         }
 
@@ -5096,6 +5188,8 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
     bob.accept_direct_request(&request.request_id)
         .expect("bob accepts");
     alice.sync().expect("alice syncs acceptance");
+    // The recovery method must predate every archived copy that a fresh device must open.
+    let code = bob.setup_recovery_code().expect("bob recovery code");
 
     let a1 = uuid::Uuid::new_v4().to_string();
     alice
@@ -5241,6 +5335,43 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
         .unwrap()
         .iter()
         .any(|message| message.message_id == b1));
+    // A state denial cannot be read as an empty deletion inventory. Both archive entry
+    // points must stop before restoring Bob's missing local row from the complete Space.
+    bob.db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute("DELETE FROM messages WHERE message_id = ?1", [&b1])
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    ds.inner.lock().unwrap().conversation_state_errors.insert(
+        (BOB_DID.to_owned(), cid.clone()),
+        (400, "NotEntitled".into()),
+    );
+    for error in [
+        bob.restore_conversation_from_owner_mailbox(&cid)
+            .expect_err("state denial blocks restore"),
+        bob.verify_and_reindex_history(&cid)
+            .expect_err("state denial blocks reindex"),
+    ] {
+        assert!(
+            error
+                .to_string()
+                .contains("ArchiveDeletionInventoryUnavailable"),
+            "{error}"
+        );
+    }
+    assert!(bob
+        .list_messages(&cid, None, 100)
+        .unwrap()
+        .iter()
+        .all(|message| message.message_id != b1));
+    ds.inner
+        .lock()
+        .unwrap()
+        .conversation_state_errors
+        .remove(&(BOB_DID.to_owned(), cid.clone()));
 
     // Bob resolves the authority's exact retained method. A field edit, a foreign authority or a
     // key-ID substitution stops Bob's sync at that entry with no effect and his cursor below it
@@ -5302,8 +5433,14 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
             .get_mut(&cid)
             .unwrap()
             .push(entry);
-        let error = bob.sync().expect_err(name).to_string();
-        assert!(error.contains("account deletion"), "{name}: {error}");
+        let error = bob.sync().expect_err(name);
+        assert!(
+            matches!(&error, MLSError::SyncIncomplete { applied: 0, failures }
+                if failures.len() == 1
+                    && failures[0].conversation_id == cid
+                    && matches!(failures[0].error.as_ref(), MLSError::Cryptography(_))),
+            "{name}: {error:?}"
+        );
         assert_eq!(marker(&bob), None, "{name}");
         assert_eq!(last_seq(&bob, &cid), rogue_seq - 1, "{name}");
         assert_eq!(
@@ -5323,22 +5460,17 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
             .unwrap()
             .pop();
     }
-    let alice_device = ds
-        .inner
-        .lock()
-        .unwrap()
-        .device_keys
-        .keys()
-        .find(|(did, _)| did.as_str() == ALICE_DID)
-        .map(|(_, device)| device.clone())
-        .expect("alice enrolled");
-    let alice_signer = enrolled_signer(&alice);
-    let alice_write = deletion_actor_write(&alice_signer, &alice_device);
+    // Use a historical Alice device for the deletion. Its CAR is the only key source,
+    // while Alice's active device stays in the live directory to authenticate archive copies.
+    let deletion_device = uuid::Uuid::new_v4().to_string();
+    let deletion_signer =
+        SignatureKeyPair::new(SignatureScheme::ED25519).expect("historical deletion signer");
+    let alice_write = deletion_actor_write(&deletion_signer, &deletion_device);
     let alice_proof = device_key_proof(
         &ds.archive_auth,
         ALICE_DID,
-        &alice_device,
-        alice_signer.public(),
+        &deletion_device,
+        deletion_signer.public(),
     );
     let deletion_seq = {
         let mut g = ds.inner.lock().unwrap();
@@ -5358,9 +5490,8 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
             .entry(cid.clone())
             .or_default()
             .push(entry);
-        // The account's PDS repository is already gone when another device synchronizes. The
-        // deletion must reach actorWrite/keyProof verification without a live device directory.
-        g.pds_records.retain(|(repo, _, _), _| repo != ALICE_DID);
+        // The historical signing device is absent from the current PDS directory; the active
+        // device remains available only to authenticate Alice's archived sender copies.
         seq
     };
     let error = bob
@@ -5395,51 +5526,29 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
         "queued witness duty remains while deletion is unresolved"
     );
 
-    // A state denial cannot be read as an empty deletion inventory. Both archive entry
-    // points must stop before restoring Bob's missing local row from the complete Space.
-    bob.db()
-        .write_tx(|tx| {
-            tx.conn()
-                .execute("DELETE FROM messages WHERE message_id = ?1", [&b1])
-                .unwrap();
-            Ok(())
-        })
-        .unwrap();
-    ds.inner.lock().unwrap().conversation_state_errors.insert(
-        (BOB_DID.to_owned(), cid.clone()),
-        (400, "NotEntitled".into()),
-    );
-    for error in [
-        bob.restore_conversation_from_owner_mailbox(&cid)
-            .expect_err("state denial blocks restore"),
-        bob.verify_and_reindex_history(&cid)
-            .expect_err("state denial blocks reindex"),
-    ] {
-        assert!(
-            error
-                .to_string()
-                .contains("ArchiveDeletionInventoryUnavailable"),
-            "{error}"
-        );
-    }
-    assert!(bob
-        .list_messages(&cid, None, 100)
-        .unwrap()
-        .iter()
-        .all(|message| message.message_id != b1));
-    ds.inner
-        .lock()
-        .unwrap()
-        .conversation_state_errors
-        .remove(&(BOB_DID.to_owned(), cid.clone()));
 
     // A recovered device has no local MLS leaf for Alice. Restoration must retain all
     // archived rows out of view until the deletion's historical status can be proven.
-    let code = bob.setup_recovery_code().expect("bob recovery code");
-    let bob2 = open("bob2", BOB_DID);
-    bob2.enroll_device(&scopes).expect("enroll bob2");
-    bob2.restore_with_recovery_code(&code)
-        .expect("bob2 recovers the archive");
+    let recover = |name: &str| {
+        let client = open(name, BOB_DID);
+        client.enroll_device(&scopes).expect("enroll recovered Bob");
+        client
+            .restore_with_recovery_code(&code)
+            .expect("recover Bob's archive");
+        client
+    };
+    let baseline = recover("bob-baseline");
+    let baseline_error = baseline
+        .restore_conversation_from_owner_mailbox(&cid)
+        .expect_err("historically unproven genuine deletion blocks archive import");
+    assert!(
+        baseline_error
+            .to_string()
+            .contains("ArchiveDeletionUnverified"),
+        "{baseline_error}"
+    );
+    assert!(baseline.list_messages(&cid, None, 100).unwrap().is_empty());
+    let bob2 = recover("bob2");
     // The fresh device has no leaf of Alice. An outage resolving her DID while validating the
     // sequenced deletion must abort before any archived row is imported or made visible.
     bob2.db()
@@ -9699,6 +9808,157 @@ fn enrolled(
     client
 }
 
+fn seed_inert_conversation_inventory(ds: &SharedMockDs, count: usize) -> Vec<String> {
+    let mut state = ds.inner.lock().unwrap();
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let cid = new_id();
+        state.conversations.insert(
+            cid.clone(),
+            json!({
+                "conversationKind": "group",
+                "coordinates": {
+                    "conversationId": cid.clone(),
+                    "generation": 0,
+                    "epoch": 0,
+                    "groupId": { "$bytes": STANDARD.encode([0_u8; 32]) },
+                },
+                "participants": [],
+            }),
+        );
+        ids.push(cid);
+    }
+    ids
+}
+
+#[test]
+fn sync_paginates_conversation_inventory_past_the_server_page_limit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "inventory-pages-alice", ALICE_DID, &new_id());
+    let _ = seed_inert_conversation_inventory(&ds, 101);
+    ds.inner.lock().unwrap().http_log.clear();
+
+    alice.sync().expect("complete two-page inventory sync");
+
+    let pages: Vec<String> = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| url.contains("/xrpc/blue.catbird.chat.getConversations"))
+        .map(|(_, url, _)| url.clone())
+        .collect();
+    assert_eq!(pages.len(), 2);
+    assert!(!pages[0].contains("pageCursor="));
+    assert!(pages[1].contains("pageCursor=100"));
+}
+
+#[test]
+fn sync_reports_repeated_conversation_inventory_cursor_as_incomplete() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice = enrolled(
+        &tmp,
+        &ds,
+        "inventory-repeat-alice",
+        ALICE_DID,
+        &new_id(),
+    );
+    let ids = seed_inert_conversation_inventory(&ds, 101);
+    let mut state = ds.inner.lock().unwrap();
+    state.repeat_conversation_cursor = true;
+    state.http_log.clear();
+    drop(state);
+
+    let error = alice.sync().expect_err("repeated cursor must not complete");
+    assert!(
+        matches!(&error, MLSError::SyncIncomplete { applied: 0, failures }
+            if failures.len() == 1
+                && failures[0].conversation_id == "<conversation-inventory>"
+                && matches!(failures[0].error.as_ref(), MLSError::Cryptography(_))),
+        "{error:?}"
+    );
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .http_log
+            .iter()
+            .filter(|(_, url, _)| {
+                url.contains("/xrpc/blue.catbird.chat.getConversations")
+            })
+            .count(),
+        2,
+        "a repeated cursor must stop after the repeated page"
+    );
+    let no_completion_sentinels = alice
+        .db()
+        .read_tx(|tx| {
+            for cid in &ids {
+                if tx
+                    .get_account_meta(&format!("conversation_kind:{cid}"))?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .unwrap();
+    assert!(
+        no_completion_sentinels,
+        "an incomplete inventory must not process any page as complete"
+    );
+}
+
+#[test]
+fn sync_scans_every_local_conversation_past_the_two_hundred_row_page() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "local-pages-alice", ALICE_DID, &new_id());
+    let mut ids = Vec::new();
+    alice
+        .db()
+        .write_tx(|tx| {
+            for _ in 0..201 {
+                let cid = new_id();
+                let group_id = uuid::Uuid::parse_str(&cid).unwrap().as_bytes().to_vec();
+                tx.upsert_conversation(&catbird_mls::storage::ConversationRow {
+                    conversation_id: cid.clone(),
+                    group_id,
+                    generation: 0,
+                    epoch: 0,
+                    last_seq: 0,
+                    sequencer_did: DS_DID.into(),
+                    space_uri: None,
+                    title: None,
+                    unread_count: 0,
+                    updated_at_ms: 42,
+                })?;
+                ids.push(cid);
+            }
+            Ok(())
+        })
+        .unwrap();
+    ds.inner.lock().unwrap().http_log.clear();
+
+    assert_eq!(alice.sync().expect("scan every local page"), 0);
+    let state = ds.inner.lock().unwrap();
+    let reads = state
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| {
+            url.contains("/xrpc/blue.catbird.chat.getConversationState")
+                && query_map(url)
+                    .get("conversationId")
+                    .is_some_and(|cid| ids.contains(cid))
+        })
+        .count();
+    assert_eq!(reads, 201);
+}
+
 #[test]
 fn own_pds_ghost_device_is_exposed_as_unrecognized() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -12195,7 +12455,7 @@ fn leaf_recovery_fulfills_only_a_verified_pending_acceptance() {
                 request["requesterDeviceId"] = json!(carol_dev);
                 request["reservation"]["requesterDeviceId"] = json!(carol_dev);
             }),
-            "not the authorized request",
+            "not a PDS-authorized device",
         ),
     ];
     let mut acceptance_seq = None;
@@ -12267,6 +12527,44 @@ fn synced_group_pair() -> (
     alice.sync().expect("alice reaches the DS head");
     bob.sync().expect("bob reaches the DS head");
     (tmp, ds, alice, bob, cid, alice_device, bob_device)
+}
+
+#[test]
+fn sync_paginates_more_than_one_hundred_cryptographic_entries() {
+    let (_tmp, ds, alice, bob, cid, _, _) = synced_group_pair();
+    let mut sent = Vec::with_capacity(101);
+    for index in 0..101 {
+        let message_id = new_id();
+        let text = format!("entry pagination message {index}");
+        alice
+            .send_message(&cid, &message_id, &text)
+            .expect("sequence application message");
+        sent.push((message_id, text));
+    }
+    ds.inner.lock().unwrap().http_log.clear();
+
+    bob.sync().expect("sync both entry pages");
+    let stored = bob.list_messages(&cid, None, 200).unwrap();
+    for (message_id, text) in &sent {
+        let message = stored
+            .iter()
+            .find(|message| &message.message_id == message_id)
+            .unwrap_or_else(|| panic!("missing paginated message {message_id}"));
+        let plaintext: Value = serde_json::from_str(&message.plaintext_json).unwrap();
+        assert_eq!(plaintext["text"].as_str(), Some(text.as_str()));
+    }
+    let entry_reads = ds
+        .inner
+        .lock()
+        .unwrap()
+        .http_log
+        .iter()
+        .filter(|(_, url, _)| {
+            url.contains("/xrpc/blue.catbird.chat.getEntries")
+                && query_map(url).get("conversationId") == Some(&cid)
+        })
+        .count();
+    assert_eq!(entry_reads, 2, "101 user messages require exactly two pages");
 }
 
 #[test]

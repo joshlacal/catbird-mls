@@ -145,6 +145,9 @@ impl crate::labyrinth::LabyrinthGateway for NativeArchiveGateway {
 #[cfg(feature = "labyrinth")]
 #[async_trait::async_trait]
 impl crate::labyrinth::LabyrinthSpaceGateway for NativeArchiveGateway {
+    fn authenticates_responses(&self) -> bool {
+        true
+    }
     async fn submit_space(&self, request: crate::labyrinth::LabyrinthSpaceRequest) -> Result<crate::orchestrator::canonical_transport::GatewayResponse, String> {
         let response = self.submit_space_with_headers(request).await?;
         Ok(crate::orchestrator::canonical_transport::GatewayResponse { status: response.status, content_type: response.content_type, body: response.body })
@@ -1323,7 +1326,7 @@ impl CatbirdMlsClient {
         self.native_archive_run(async {
             let session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?
                 .ok_or_else(|| MLSError::InvalidState("Labyrinth must be restored before listing recovery methods".into()))?;
-            let now_ms = self.hooks.now_ms();
+            let now_ms = self.hooks.now_ms().max(0) as u64;
             session.list_recovery_methods().await.map_err(native_archive_error).map(|methods| {
                 methods.into_iter().map(|method| LabyrinthRecoveryMethodInfo {
                     vdevice_id: method.vdevice_id.to_vec(),
@@ -1444,23 +1447,19 @@ impl CatbirdMlsClient {
     pub fn restore_with_recovery_code(&self, code: &str) -> Result<LabyrinthBackupStatus, MLSError> {
         #[cfg(any(test, feature = "test-utils", feature = "sim"))]
         if self.offline_archive_for_test { return self.offline_restore_with_recovery_code(code); }
-        let code_version = labyrinth::recovery_code::RecoveryCode::candidates(code)
-            .map_err(|error| match error {
-                labyrinth::Error::UnsupportedCodeVersion => MLSError::invalid_input(
-                    "recovery code version is not supported by this app",
-                ),
-                _ => MLSError::invalid_input("invalid 40-character Labyrinth recovery code"),
-            })?
-            .next()
-            .ok_or_else(|| MLSError::invalid_input("invalid 40-character Labyrinth recovery code"))?
-            .version();
-        if code_version == labyrinth::recovery_code::CodeVersion::V3 {
-            self.ensure_recovery_share_home_service_pin()?;
-        }
         // A recovery code enrolls storage keys, not an unverified chat device.
         // Register this new device normally before the library attests its binding.
         if self.db.read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?.is_none() {
             self.enroll_device(&super::REQUIRED_LABYRINTH_OAUTH_SCOPES.iter().map(|scope| (*scope).to_owned()).collect::<Vec<_>>())?;
+        }
+        let requires_share = self.native_archive_run(async {
+            self.native_archive_deps()?
+                .recovery_code_requires_share(code)
+                .await
+                .map_err(native_archive_error)
+        })?;
+        if requires_share {
+            self.ensure_recovery_share_home_service_pin()?;
         }
         let status = {
             let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
@@ -2428,9 +2427,6 @@ impl CatbirdMlsClient {
         if self.offline_archive_for_test {
             return self.offline_restore_with_passkey_prf(&credential_id, &prf_output_32);
         }
-        // A passkey may wrap either a v2 or a v3 code. Prove the home service
-        // before Labyrinth can inspect a v3 bundle and present its fetch token.
-        self.ensure_recovery_share_home_service_pin()?;
         if self
             .db
             .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?
@@ -2442,6 +2438,15 @@ impl CatbirdMlsClient {
                     .map(|scope| (*scope).to_owned())
                     .collect::<Vec<_>>(),
             )?;
+        }
+        let requires_share = self.native_archive_run(async {
+            self.native_archive_deps()?
+                .passkey_recovery_requires_share(&credential_id, &prf_output_32)
+                .await
+                .map_err(native_archive_error)
+        })?;
+        if requires_share {
+            self.ensure_recovery_share_home_service_pin()?;
         }
         let status = {
             let _guard = self

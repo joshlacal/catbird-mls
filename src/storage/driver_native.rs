@@ -1126,6 +1126,58 @@ impl<'a> SqlReadTx<'a> {
             .map_err(|e| map_rusqlite_err("list_conversations.collect", &e))
     }
 
+    /// Stable keyset pagination for conversation scans. The cursor is the
+    /// final `(updated_at_ms, conversation_id)` from the previous page,
+    /// matching this query's descending-time, ascending-id order.
+    pub fn list_conversations_page(
+        &self,
+        before: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<ConversationRow>, MLSError> {
+        let cap = limit.min(500) as i64;
+        let sql = if before.is_some() {
+            "SELECT conversation_id, group_id, generation, epoch, last_seq, sequencer_did, \
+                    space_uri, title, unread_count, updated_at_ms \
+             FROM conversations \
+             WHERE updated_at_ms < ?1 OR (updated_at_ms = ?1 AND conversation_id > ?2) \
+             ORDER BY updated_at_ms DESC, conversation_id ASC LIMIT ?3"
+        } else {
+            "SELECT conversation_id, group_id, generation, epoch, last_seq, sequencer_did, \
+                    space_uri, title, unread_count, updated_at_ms \
+             FROM conversations \
+             ORDER BY updated_at_ms DESC, conversation_id ASC LIMIT ?1"
+        };
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| map_rusqlite_err("list_conversations_page.prepare", &e))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(ConversationRow {
+                conversation_id: row.get(0)?,
+                group_id: row.get(1)?,
+                generation: row.get(2)?,
+                epoch: row.get(3)?,
+                last_seq: row.get(4)?,
+                sequencer_did: row.get(5)?,
+                space_uri: row.get(6)?,
+                title: row.get(7)?,
+                unread_count: row.get(8)?,
+                updated_at_ms: row.get(9)?,
+            })
+        };
+        let rows = if let Some((updated_at_ms, conversation_id)) = before {
+            stmt.query_map(
+                rusqlite::params![updated_at_ms, conversation_id, cap],
+                map_row,
+            )
+        } else {
+            stmt.query_map(rusqlite::params![cap], map_row)
+        }
+        .map_err(|e| map_rusqlite_err("list_conversations_page.query", &e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| map_rusqlite_err("list_conversations_page.collect", &e))
+    }
+
     pub fn list_messages(
         &self,
         conversation_id: &str,

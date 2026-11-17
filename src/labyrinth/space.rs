@@ -104,6 +104,13 @@ pub trait LabyrinthSpaceGateway: MaybeSend + MaybeSync {
     async fn submit_space(&self, request: LabyrinthSpaceRequest)
         -> Result<GatewayResponse, String>;
 
+    /// True only when the gateway verifies every successful Space read before
+    /// returning it (response MAC, STAR, inventory commitment and rollback
+    /// floors as applicable).
+    fn authenticates_responses(&self) -> bool {
+        false
+    }
+
     async fn submit_space_with_headers(
         &self,
         request: LabyrinthSpaceRequest,
@@ -241,6 +248,9 @@ fn check_space_nsid(nsid: &str) -> Result<(), SpaceError> {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl SpaceRpc for SpaceXrpcTransport {
+    fn authenticates_responses(&self) -> bool {
+        self.gateway.authenticates_responses()
+    }
     async fn query(
         &self,
         nsid: &str,

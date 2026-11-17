@@ -60,19 +60,25 @@ def external_build_options():
 
 def exact_source_identity(diagnostics):
     revision_pattern = r"(?:[a-f0-9]{40}|[a-f0-9]{64})"
-    if shutil.which("jj"):
+    if (ROOT / ".jj").exists():
+        if shutil.which("jj") is None:
+            raise ValueError("Jujutsu workspace requires jj to resolve its exact source identity")
         try:
             revision = run(
                 "jj", "log", "--no-graph", "-r", "latest(::@ & ~empty())", "-T", "commit_id"
             )
-            commit = run("git", "rev-parse", f"{revision}^{{commit}}")
-            tree = run("git", "rev-parse", f"{revision}^{{tree}}")
-            if re.fullmatch(revision_pattern, revision) and commit == revision \
-                    and re.fullmatch(revision_pattern, tree):
-                diagnostics["vcs"] = "jj"
-                return revision, tree
-        except (OSError, subprocess.CalledProcessError):
-            pass
+            git_dir = Path(run("jj", "git", "root"))
+            if not git_dir.is_absolute():
+                git_dir = ROOT / git_dir
+            commit = run("git", "--git-dir", str(git_dir), "rev-parse", f"{revision}^{{commit}}")
+            tree = run("git", "--git-dir", str(git_dir), "rev-parse", f"{revision}^{{tree}}")
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError("unable to resolve exact Jujutsu commit and Git tree") from error
+        if re.fullmatch(revision_pattern, revision) is None or commit != revision \
+                or re.fullmatch(revision_pattern, tree) is None:
+            raise ValueError("Jujutsu source must resolve to an exact Git commit and tree")
+        diagnostics["vcs"] = "jj"
+        return revision, tree
     if run("git", "status", "--porcelain=v1", "--untracked-files=all",
            "--ignore-submodules=none"):
         raise ValueError("ordinary Git checkout must be clean")

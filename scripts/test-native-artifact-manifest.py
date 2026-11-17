@@ -155,6 +155,7 @@ class ReceiptIntegrityTests(unittest.TestCase):
     def test_content_identity_survives_checkout_relocation(self):
         def checkout(name):
             root = self.root / name
+            (root / ".jj").mkdir(parents=True)
             crate = root / "crate"
             (crate / "src").mkdir(parents=True)
             (root / "scripts").mkdir()
@@ -192,7 +193,9 @@ class ReceiptIntegrityTests(unittest.TestCase):
                     return json.dumps(metadata)
                 if args[:2] == ("jj", "log"):
                     return "a" * 40
-                if args[:2] == ("git", "rev-parse"):
+                if args[:3] == ("jj", "git", "root"):
+                    return str(root / ".git")
+                if args[:2] == ("git", "--git-dir"):
                     return "a" * 40 if args[-1].endswith("^{commit}") else "b" * 40
                 if args[0].endswith("rustc"):
                     return "rustc fixture"
@@ -230,6 +233,50 @@ class ReceiptIntegrityTests(unittest.TestCase):
             right_diagnostics["path_package_manifests"]["path#fixture@0.1.0"],
         )
 
+    def test_jj_only_checkout_uses_backend_git_commit_and_tree(self):
+        root = self.root / "jj-only"
+        (root / ".jj").mkdir(parents=True)
+        backend = self.root / "backend.git"
+        calls = []
+
+        def fake_run(*args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("jj", "log"):
+                return "a" * 40
+            if args[:3] == ("jj", "git", "root"):
+                return str(backend)
+            if args[:3] == ("git", "--git-dir", str(backend)):
+                return "a" * 40 if args[-1].endswith("^{commit}") else "b" * 40
+            raise AssertionError(args)
+
+        diagnostics = {}
+        with patch.object(manifest, "ROOT", root), \
+                patch.object(manifest, "run", side_effect=fake_run), \
+                patch.object(manifest.shutil, "which", return_value="/fixture/jj"):
+            revision, tree = manifest.exact_source_identity(diagnostics)
+        self.assertEqual((revision, tree), ("a" * 40, "b" * 40))
+        self.assertEqual(diagnostics["vcs"], "jj")
+        self.assertIn(
+            ("git", "--git-dir", str(backend), "rev-parse", f'{"a" * 40}^{{tree}}'),
+            calls,
+        )
+
+    def test_jj_identity_failure_does_not_fall_back_to_git(self):
+        root = self.root / "broken-jj"
+        (root / ".jj").mkdir(parents=True)
+        calls = []
+
+        def fake_run(*args, **_kwargs):
+            calls.append(args)
+            raise OSError("unavailable Jujutsu store")
+
+        with patch.object(manifest, "ROOT", root), \
+                patch.object(manifest, "run", side_effect=fake_run), \
+                patch.object(manifest.shutil, "which", return_value="/fixture/jj"):
+            with self.assertRaisesRegex(ValueError, "exact Jujutsu commit and Git tree"):
+                manifest.exact_source_identity({})
+        self.assertFalse(any(args[0] == "git" for args in calls))
+
     def test_clean_git_only_checkout_has_exact_commit_and_tree(self):
         def fake_run(*args, **_kwargs):
             if args[:2] == ("git", "status"):
@@ -239,7 +286,8 @@ class ReceiptIntegrityTests(unittest.TestCase):
             raise AssertionError(args)
 
         diagnostics = {}
-        with patch.object(manifest.shutil, "which", return_value=None), \
+        with patch.object(manifest, "ROOT", self.root), \
+                patch.object(manifest.shutil, "which", return_value=None), \
                 patch.object(manifest, "run", side_effect=fake_run):
             revision, tree = manifest.exact_source_identity(diagnostics)
         self.assertEqual(revision, "c" * 40)
