@@ -445,6 +445,7 @@ impl CatbirdMlsClient {
                     seq: *seq,
                     signed_at_ms: write.signed_at_ms,
                     operation_id: write.operation_id.clone(),
+                    actor_device_id: Some(write.actor_device_id.clone()),
                 };
                 self.db.write_tx(|tx| {
                     // Authorization reads happen outside this transaction. Re-check the terminal

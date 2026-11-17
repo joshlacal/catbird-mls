@@ -3321,6 +3321,48 @@ pub fn canonical_labyrinth_frame_json(plaintext_json: &str) -> String {
     plaintext_json.to_string()
 }
 
+/// Compare a local SQLite `messages.plaintext_json` display/payload string against an
+/// authenticated Labyrinth `message.frame` JSON string, accounting for JSON key ordering and
+/// the `"backupPolicy": 1` envelope stamp added by `archive_policy::stamp_outgoing`.
+pub fn archive_frame_matches_local_plaintext(
+    local_plaintext_json: &str,
+    archived_frame_json: &str,
+) -> bool {
+    if local_plaintext_json == archived_frame_json {
+        return true;
+    }
+    let canonical_local = canonical_labyrinth_frame_json(local_plaintext_json);
+    if canonical_local == archived_frame_json {
+        return true;
+    }
+    let (Ok(mut local_val), Ok(mut arch_val)) = (
+        serde_json::from_str::<Value>(&canonical_local),
+        serde_json::from_str::<Value>(archived_frame_json),
+    ) else {
+        return false;
+    };
+    // Carry explicit `noBackup` from raw `local_plaintext_json` if `canonical_labyrinth_frame_json`
+    // normalized `{text, noBackup}` through `MLSMessagePayload::text`.
+    if let (Ok(raw_local), Some(local_obj)) = (
+        serde_json::from_str::<Value>(local_plaintext_json),
+        local_val.as_object_mut(),
+    ) {
+        if let Some(nb) = raw_local.get("noBackup") {
+            local_obj
+                .entry("noBackup".to_string())
+                .or_insert_with(|| nb.clone());
+        }
+    }
+    for val in [&mut local_val, &mut arch_val] {
+        if let Some(obj) = val.as_object_mut() {
+            if obj.get("backupPolicy") == Some(&json!(1)) {
+                obj.remove("backupPolicy");
+            }
+        }
+    }
+    local_val == arch_val
+}
+
 fn deterministic_tid_wire(timestamp_ms: i64, sub_seq: u64, discriminator: &str) -> String {
     const S32: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
     let micros = (timestamp_ms.max(0) as u64)

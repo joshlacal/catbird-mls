@@ -47,6 +47,33 @@ pub const DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX: &str = "deleteAccountDat
 /// Clock tolerance between the device-signed instant and the sequencer's instant, and the margin
 /// a purge keeps after the device-signed instant.
 pub const DELETION_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// Archive key-validity bound (ms) for a self-deletion `deviceRevocation` created at `created_at_ms`.
+/// Pre-deletion frames/witnesses/MEKs whose DS `issuedAtMs` falls in
+/// `[created_at_ms, created_at_ms + DELETION_CLOCK_SKEW_MS]` (hidden afterward by
+/// [`AppliedAccountDeletion::covers`]) must still pass `ChatDeviceKey::valid_at` (`at_ms < bound`)
+/// during `load_history` so archive restore does not abort with `undecryptable` before hiding them.
+pub fn self_deletion_archive_revocation_bound_ms(created_at_ms: u64) -> u64 {
+    created_at_ms
+        .saturating_add(DELETION_CLOCK_SKEW_MS as u64)
+        .saturating_add(1)
+}
+
+/// Whether `record_val` is a well-formed self-deletion `deviceRevocation/{target_device_id}`
+/// record (`actorDeviceId == target_device_id` and `reason` = `deleteAccountData:{32-hex}`).
+pub fn is_valid_self_deletion_revocation_record(record_val: &Value, target_device_id: &str) -> bool {
+    record_val.get("actorDeviceId").and_then(Value::as_str) == Some(target_device_id)
+        && record_val
+            .get("reason")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix(DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX))
+            .is_some_and(|op| {
+                op.len() == 32
+                    && op
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+}
 /// Largest accepted `actorWrite.writeBody`.
 pub const MAX_WRITE_BODY_BYTES: usize = 1024;
 /// Largest accepted `actorWrite.payloadBytes` (the exact HTTP body).
@@ -585,6 +612,7 @@ pub fn verify_foreign_self_deletion_from_cars(
         seq: i64::MAX,
         signed_at_ms,
         operation_id,
+        actor_device_id: Some(device_id.to_owned()),
     })
 }
 
@@ -654,6 +682,8 @@ pub struct AppliedAccountDeletion {
     pub seq: i64,
     pub signed_at_ms: i64,
     pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_device_id: Option<String>,
 }
 
 impl AppliedAccountDeletion {
@@ -700,6 +730,16 @@ impl StoredAccountDeletion {
                     && issued_at_ms.is_none_or(|issued| issued <= applied.purge_bound_ms())
             }
         }
+    }
+
+    /// Whether `seq` is at or after the deletion entry and names the self-deleted `actor_device_id`.
+    pub fn self_deleted_device_post_entry(&self, seq: i64, sender_device_id: &str) -> bool {
+        matches!(
+            self,
+            Self::Signed(applied)
+                if seq >= applied.seq
+                    && applied.actor_device_id.as_deref() == Some(sender_device_id)
+        )
     }
 }
 

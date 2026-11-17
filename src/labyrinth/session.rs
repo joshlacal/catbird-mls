@@ -292,6 +292,7 @@ impl MailboxDirectory for LocallyCheckedDirectory {
                 entry.removed_at = Some(entry.removed_at.map_or(rev_ms, |ds| ds.min(rev_ms)));
             }
         }
+        let mut had_pds_device_list = false;
         if let Some(allowed) = self
             .authority
             .authorized_chat_device_keys(did)
@@ -300,6 +301,7 @@ impl MailboxDirectory for LocallyCheckedDirectory {
                 labyrinth::Error::Backend(format!("authorized PDS devices: {error}"))
             })?
         {
+            had_pds_device_list = true;
             let allowed_set: std::collections::BTreeSet<[u8; 32]> = allowed.into_iter().collect();
             reported.retain(|entry| {
                 allowed_set.contains(&entry.key) || revoked_times.contains_key(&entry.key)
@@ -319,34 +321,51 @@ impl MailboxDirectory for LocallyCheckedDirectory {
                 labyrinth::Error::Backend(format!("PDS repo tombstone check: {error}"))
             })?;
         if let Some(del_ms) = verified_deleted_ms {
-            for entry in &mut reported {
-                entry.removed_at = Some(entry.removed_at.map_or(del_ms, |ds| ds.min(del_ms)));
+            if !had_pds_device_list {
+                let bound =
+                    crate::client::deletion_authority::self_deletion_archive_revocation_bound_ms(
+                        del_ms,
+                    );
+                for entry in &mut reported {
+                    entry.removed_at = Some(entry.removed_at.map_or(bound, |ds| ds.min(bound)));
+                }
             }
         } else if is_tombstoned {
             for entry in &mut reported {
                 entry.removed_at.get_or_insert(u64::MAX);
             }
         }
-        if verified_deleted_ms.is_none() && !is_tombstoned {
+        if verified_deleted_ms.is_none() {
             if let Some(shared_leaves) = self
                 .authority
                 .shared_group_leaf_keys(did)
                 .await
                 .map_err(|error| labyrinth::Error::Backend(format!("shared MLS leaves: {error}")))?
             {
-                let active_reported: std::collections::BTreeSet<[u8; 32]> = reported
-                    .iter()
-                    .filter(|entry| entry.removed_at.is_none())
-                    .map(|entry| entry.key)
-                    .collect();
-                for leaf_key in shared_leaves {
-                    let accounted_as_revoked = reported.iter().any(|entry| entry.key == leaf_key)
-                        && revoked_times.contains_key(&leaf_key);
-                    if !active_reported.contains(&leaf_key) && !accounted_as_revoked {
-                        return Err(labyrinth::Error::Backend(
-                            "chat device directory omits or revokes a live shared MLS group leaf"
-                                .into(),
-                        ));
+                if is_tombstoned {
+                    for leaf_key in shared_leaves {
+                        if !reported.iter().any(|entry| entry.key == leaf_key) {
+                            return Err(labyrinth::Error::DirectoryIncomplete {
+                                pds_present: false,
+                                ds_present: true,
+                            });
+                        }
+                    }
+                } else {
+                    let active_reported: std::collections::BTreeSet<[u8; 32]> = reported
+                        .iter()
+                        .filter(|entry| entry.removed_at.is_none())
+                        .map(|entry| entry.key)
+                        .collect();
+                    for leaf_key in shared_leaves {
+                        let accounted_as_revoked = reported.iter().any(|entry| entry.key == leaf_key)
+                            && revoked_times.contains_key(&leaf_key);
+                        if !active_reported.contains(&leaf_key) && !accounted_as_revoked {
+                            return Err(labyrinth::Error::Backend(
+                                "chat device directory omits or revokes a live shared MLS group leaf"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
             }

@@ -1261,6 +1261,135 @@ fn pds_revocation_proof_delete_retry_past_300s_refreshes_signed_at_and_keeps_pds
 }
 
 #[test]
+fn self_deletion_clock_skew_ahead_ds_receipt_restores_and_hides_deleted_messages() {
+    use catbird_mls::sim_hooks::{FixedStepClock, OsSimEntropy, SimClientHooks};
+
+    // Start clients at current wall clock (so OpenMLS KeyPackages are unexpired) while
+    // advancing the mock DS clock +120s ahead for receipts. Carol's self-deletion
+    // (`del_ms = start + 10s`) then precedes her frame's `issuedAtMs` by 110s (< 300s skew).
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let clock = Arc::new(FixedStepClock::new(start_ms, 1));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new_with_now_fn(Arc::new({
+        let clock = clock.clone();
+        move || catbird_mls::sim_hooks::SimClock::now_ms(clock.as_ref())
+    }));
+    let ds_ahead_ms = start_ms + 120_000;
+    ds.inner.lock().unwrap().mock_clock_ms = Some(ds_ahead_ms);
+    let scopes = oauth_scopes();
+
+    let open_clocked = |dir: &str, did: &str, dev_id: &str| {
+        CatbirdMlsClient::open_with_hooks(
+            CatbirdMlsClientConfig {
+                storage_root: tmp.path().join(dir).to_string_lossy().into(),
+                account_did: did.into(),
+                device_id: dev_id.into(),
+                home_ds_did: DS_DID.into(),
+                home_ds_endpoint: DS_URL.into(),
+                pds_endpoint: PDS_URL.into(),
+            },
+            Arc::new(MemKeyStore::new()),
+            ds.for_account(did),
+            None,
+            SimClientHooks::new(clock.clone(), Arc::new(OsSimEntropy)),
+        )
+        .expect("open clocked client")
+    };
+
+    let alice = open_clocked("w2-skew-alice", ALICE_DID, &new_id());
+    let carol = open_clocked("w2-skew-carol", CAROL_DID, &new_id());
+    alice.enroll_device(&scopes).expect("enroll alice");
+    carol.enroll_device(&scopes).expect("enroll carol");
+    let alice_code = alice.setup_recovery_code().expect("alice recovery");
+    carol.setup_recovery_code().expect("carol recovery");
+
+    let grp_cid = new_id();
+    alice
+        .create_group(
+            &grp_cid,
+            DS_DID,
+            vec![CAROL_DID.into()],
+            Some("Clock skew group".into()),
+            Some("group".into()),
+        )
+        .expect("create group");
+    join_invited_group(&alice, &[&carol]);
+    carol.sync().expect("carol sync group");
+
+    let alice_msg_id = new_id();
+    let carol_msg_id = new_id();
+    alice
+        .send_message(&grp_cid, &alice_msg_id, "alice-survivor")
+        .expect("alice send");
+    carol.sync().expect("carol sync survivor");
+    carol
+        .send_message(&grp_cid, &carol_msg_id, "carol-skewed-pre-delete")
+        .expect("carol send");
+    alice.sync().expect("alice sync carol message");
+    assert!(alice.flush_labyrinth_queue().expect("alice flush") >= 2);
+    assert!(carol.flush_labyrinth_queue().expect("carol flush") >= 2);
+    alice
+        .rescue_conversation_on_kick(&grp_cid)
+        .expect("alice rescue conversation history");
+
+    // Client clock moves +10s ahead of `start_ms` (still ~110s behind `ds_ahead_ms`, well inside 300s).
+    clock.advance_ms(10_000);
+    carol
+        .delete_account_data()
+        .expect("carol delete_account_data succeeds within 300s skew");
+    alice.sync().expect("alice sync accepts carol deletion");
+
+    // Reindexing existing history and restoring onto a fresh device must both succeed
+    // (0 undecryptable errors), hide Carol's skewed message, and preserve Alice's message.
+    let reindexed = alice
+        .verify_and_reindex_history(&grp_cid)
+        .expect("verify_and_reindex_history must not choke on [del_ms, del_ms + 300s] frame");
+    assert_eq!(reindexed, 1);
+    let alice_msgs = alice
+        .list_messages(&grp_cid, None, 50)
+        .expect("list alice messages");
+    assert!(!alice_msgs.iter().any(|m| m.message_id == carol_msg_id));
+    assert!(alice_msgs.iter().any(|m| m.message_id == alice_msg_id));
+
+    let alice_d2 = open_clocked("w2-skew-alice-d2", ALICE_DID, &new_id());
+    alice_d2.enroll_device(&scopes).expect("enroll alice_d2");
+    alice_d2
+        .restore_with_recovery_code(&alice_code)
+        .expect("alice_d2 recover archive keys");
+    let restored = alice_d2
+        .restore_conversation_from_owner_mailbox(&grp_cid)
+        .expect("fresh restore with live PDS revocation must handle [del_ms, del_ms + 300s]");
+    assert_eq!(restored, 1);
+    let restored_msgs = alice_d2
+        .list_messages(&grp_cid, None, 50)
+        .expect("list alice_d2 messages");
+    assert!(!restored_msgs.iter().any(|m| m.message_id == carol_msg_id));
+    assert!(restored_msgs.iter().any(|m| m.message_id == alice_msg_id));
+
+    // Once Carol's PDS repo is tombstoned (`RepoNotFound`), `!had_pds_device_list` also
+    // applies `self_deletion_archive_revocation_bound_ms(del_ms)` and restores cleanly.
+    ds.inner
+        .lock()
+        .unwrap()
+        .pds_repo_status_for
+        .insert(CAROL_DID.into(), (400, "RepoNotFound".into()));
+    let alice_d3 = open_clocked("w2-skew-alice-d3", ALICE_DID, &new_id());
+    alice_d3.enroll_device(&scopes).expect("enroll alice_d3");
+    alice_d3
+        .restore_with_recovery_code(&alice_code)
+        .expect("alice_d3 recover archive keys");
+    let restored_tombstoned = alice_d3
+        .restore_conversation_from_owner_mailbox(&grp_cid)
+        .expect("fresh restore with tombstoned PDS must handle [del_ms, del_ms + 300s]");
+    assert_eq!(restored_tombstoned, 1);
+    let d3_msgs = alice_d3
+        .list_messages(&grp_cid, None, 50)
+        .expect("list alice_d3 messages");
+    assert!(!d3_msgs.iter().any(|m| m.message_id == carol_msg_id));
+    assert!(d3_msgs.iter().any(|m| m.message_id == alice_msg_id));
+}
+
+#[test]
 fn d5_flush_requires_signed_space_denial_jwt_fc07_group_leaves_and_attachment_persistence() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();

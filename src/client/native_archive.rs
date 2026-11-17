@@ -852,7 +852,15 @@ impl NativeLocalAuthority {
                     &enrolled_map,
                 )
                 .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
-                let at_ms = revocation_created_at_ms(record_val);
+                let raw_ms = revocation_created_at_ms(record_val);
+                let at_ms = if super::deletion_authority::is_valid_self_deletion_revocation_record(
+                    record_val,
+                    &target_id,
+                ) {
+                    super::deletion_authority::self_deletion_archive_revocation_bound_ms(raw_ms)
+                } else {
+                    raw_ms
+                };
                 revoked_times
                     .entry(target_id)
                     .and_modify(|prev| *prev = (*prev).min(at_ms))
@@ -1004,7 +1012,15 @@ impl NativeLocalAuthority {
                 &enrolled_map,
             )
             .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
-            let at_ms = revocation_created_at_ms(record_val);
+            let raw_ms = revocation_created_at_ms(record_val);
+            let at_ms = if super::deletion_authority::is_valid_self_deletion_revocation_record(
+                record_val,
+                &target_id,
+            ) {
+                super::deletion_authority::self_deletion_archive_revocation_bound_ms(raw_ms)
+            } else {
+                raw_ms
+            };
             revoked_times
                 .entry(target_id)
                 .and_modify(|prev| *prev = (*prev).min(at_ms))
@@ -1304,7 +1320,7 @@ fn select_restore_copy<'a>(copies: &'a [RestoreCopy], local: Option<&MessageRow>
     let mut matching = copies.iter().filter(|(row, _, _)| {
         local.conversation_id == row.conversation_id && local.seq == row.seq && local.epoch == row.epoch
             && local.sender_did == row.sender_did && local.sender_device_id == row.sender_device_id
-            && (local_gap || canonical_labyrinth_frame_json(&local.plaintext_json) == row.plaintext_json)
+            && (local_gap || super::chat_wire::archive_frame_matches_local_plaintext(&local.plaintext_json, &row.plaintext_json))
     });
     let first = matching.next()?;
     (!local_gap || matching.next().is_none()).then_some(first)
@@ -2513,6 +2529,21 @@ impl CatbirdMlsClient {
                 }
                 Ok(deleted)
             })?;
+        for m in messages.iter() {
+            if let (Some(sender), Some(r)) = (m.sender.as_deref(), m.archived_receipt.as_ref()) {
+                if let Some(marker) = deleted.get(sender) {
+                    let seq = i64::try_from(r.signed.payload.seq).unwrap_or(i64::MAX);
+                    if let Ok((_, sender_device_id)) = r.signed.payload.split_sender_device() {
+                        if marker.self_deleted_device_post_entry(seq, sender_device_id) {
+                            return Err(MLSError::Cryptography(
+                                "archive contains frame from self-deleted device at or after accountDeletedEntry"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let before = messages.len();
         // A copy stays unless the deletion covers it: ordered before the deletion and, for a
         // device-signed deletion, issued no later than its signed instant. A copy without a
@@ -2584,7 +2615,9 @@ impl CatbirdMlsClient {
             let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
                 MLSError::Cryptography("getConversationState is missing accountDeletions".into())
             })?;
-            for entry in deletions {
+            let mut ordered_deletions: Vec<&serde_json::Value> = deletions.iter().collect();
+            ordered_deletions.sort_by_key(|entry| entry["seq"].as_i64().unwrap_or(i64::MAX));
+            for entry in ordered_deletions {
                 let decision =
                     self.authorize_account_deletion(conversation_id, &sequencer, entry)?;
                 if pinned.is_some() {
@@ -2594,9 +2627,11 @@ impl CatbirdMlsClient {
                         ..
                     } = &decision
                     {
-                        if *reason
-                            != super::deletion_authority::UnverifiedDeletionReason::OtherConversation
-                        {
+                        if !matches!(
+                            reason,
+                            super::deletion_authority::UnverifiedDeletionReason::OtherConversation
+                                | super::deletion_authority::UnverifiedDeletionReason::Replayed
+                        ) {
                             tracing::warn!(
                                 conversation_id,
                                 ?reason,
@@ -2694,7 +2729,9 @@ impl CatbirdMlsClient {
         })?;
         // Each listed deletion needs the deleting device's signature and historical status.
         // A key proof can verify the device key when this device holds no leaf of it.
-        for entry in deletions {
+        let mut ordered_deletions: Vec<&serde_json::Value> = deletions.iter().collect();
+        ordered_deletions.sort_by_key(|entry| entry["seq"].as_i64().unwrap_or(i64::MAX));
+        for entry in ordered_deletions {
             let decision = self.authorize_account_deletion(conversation_id, &sequencer, entry)?;
             self.apply_account_deletion_decision(conversation_id, entry, &decision)?;
             if let super::live_sync::live_integrity::AccountDeletionDecision::Unverified {
@@ -2702,8 +2739,11 @@ impl CatbirdMlsClient {
                 ..
             } = decision
             {
-                if reason == super::deletion_authority::UnverifiedDeletionReason::OtherConversation
-                {
+                if matches!(
+                    reason,
+                    super::deletion_authority::UnverifiedDeletionReason::OtherConversation
+                        | super::deletion_authority::UnverifiedDeletionReason::Replayed
+                ) {
                     continue;
                 }
                 // No archived row is made visible while a sequencer-listed deletion remains
@@ -3801,7 +3841,7 @@ impl CatbirdMlsClient {
                     .is_some_and(|((row, _, _), _, _)| {
                         row.seq == existing.seq
                             && row.sender_did == existing.sender_did
-                            && row.plaintext_json == existing.plaintext_json
+                            && super::chat_wire::archive_frame_matches_local_plaintext(&existing.plaintext_json, &row.plaintext_json)
                     });
                 if !matches_verified {
                     tx.conn()

@@ -4052,7 +4052,11 @@ impl CatbirdMlsClient {
                 self.apply_account_deletion_decision(cid, entry, &decision)?;
                 if let live_integrity::AccountDeletionDecision::Unverified { reason, .. } = decision
                 {
-                    if reason != crate::client::deletion_authority::UnverifiedDeletionReason::OtherConversation {
+                    if !matches!(
+                        reason,
+                        crate::client::deletion_authority::UnverifiedDeletionReason::OtherConversation
+                            | crate::client::deletion_authority::UnverifiedDeletionReason::Replayed
+                    ) {
                         tracing::warn!(cid, entry_seq, ?reason, "account deletion remains unverified; sync will retry at this entry");
                         return Err(MLSError::InvalidState("AccountDeletionUnverified".into()));
                     }

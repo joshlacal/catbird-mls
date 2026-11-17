@@ -852,6 +852,7 @@ fn deletion_uses_stored_receipt_time_for_message_and_queued_copy() {
         seq: 6,
         signed_at_ms: SIGNED_AT_MS,
         operation_id: DELETION_OP.into(),
+        actor_device_id: None,
     });
     db.write_tx(|tx| {
         for (id, local_at, receipt_at) in
@@ -1034,7 +1035,7 @@ fn revocation_at_signed_instant_is_rejected_and_later_revocation_does_not_author
 #[test]
 fn deletion_operation_dedupe_is_rechecked_in_the_apply_transaction() {
     let tmp = tempfile::tempdir().unwrap();
-    let (client, state, _, bob_signer, _) = client_with_bob_leaf(&tmp);
+    let (client, state, alice_signer, bob_signer, _) = client_with_bob_leaf(&tmp);
     let first = deletion_entry(
         &state,
         CONVO_ID,
@@ -1092,6 +1093,71 @@ fn deletion_operation_dedupe_is_rechecked_in_the_apply_transaction() {
             .reason,
         UnverifiedDeletionReason::Replayed,
     );
+
+    // Sequenced duplicate `accountDeletedEntry` classified as `Replayed` during live sync
+    // preserves the original `seq = 6` marker and evidence while advancing `last_seq` so
+    // conversation catch-up does not wedge.
+    client
+        .db
+        .write_tx(|tx| {
+            tx.conn()
+                .execute(
+                    "UPDATE conversations SET last_seq = 7 WHERE conversation_id = ?1",
+                    rusqlite::params![CONVO_ID],
+                )
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    let replayed_live = deletion_entry(
+        &state,
+        CONVO_ID,
+        BOB_DID,
+        8,
+        BOB_M3,
+        Some(deletion_write(
+            &bob_signer,
+            DEV_B1,
+            "0123456789abcdef0123456789abcdef",
+            SIGNED_AT,
+        )),
+        None,
+    );
+    let convo = client
+        .db
+        .read_tx(|tx| tx.get_conversation(CONVO_ID))
+        .unwrap()
+        .unwrap();
+    state
+        .lock()
+        .unwrap()
+        .entries_by_after
+        .insert(convo.last_seq, vec![replayed_live]);
+    let mut pass = EntryPass {
+        max_seq: convo.last_seq,
+        ..EntryPass::default()
+    };
+    client
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+        .expect("replayed accountDeletedEntry must advance sync cursor after quarantining evidence");
+    let convo_after = client
+        .db
+        .read_tx(|tx| tx.get_conversation(CONVO_ID))
+        .unwrap()
+        .unwrap();
+    assert_eq!(convo_after.last_seq, 8);
+    let marker_after = client
+        .db
+        .read_tx(|tx| tx.get_labyrinth_state(&chat_wire::account_deletion_key(CONVO_ID, BOB_DID)))
+        .unwrap()
+        .and_then(|raw| authority::AppliedAccountDeletion::decode(&raw))
+        .unwrap();
+    assert_eq!(marker_after.seq(), 6);
+    assert!(client
+        .unverified_account_deletions(CONVO_ID)
+        .unwrap()
+        .iter()
+        .any(|ev| ev.seq == 8 && ev.reason == UnverifiedDeletionReason::Replayed));
 }
 
 #[test]

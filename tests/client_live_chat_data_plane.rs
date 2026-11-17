@@ -8861,7 +8861,7 @@ fn sequence_send(g: &mut MockDsState, body_json: &Value) -> Result<PlatformHttpR
         entry_id: entry_id.clone(),
         archive_commitment: commit_arr,
         seq,
-        issued_at_ms: 1_762_000_000_000,
+        issued_at_ms: g.mock_clock_ms.unwrap_or(1_762_000_000_000),
     };
     if g.tamper_next_receipt {
         g.tamper_next_receipt = false;
