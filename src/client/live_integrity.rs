@@ -215,18 +215,47 @@ impl CatbirdMlsClient {
         if let Ok(leaves) = self.current_leaves(cid) {
             push(leaves);
         }
-        let others = self
-            .db
-            .read_tx(|tx| tx.list_conversations(None, 500))
-            .unwrap_or_default();
+        let others = crate::client::all_local_conversation_ids(&self.db).unwrap_or_default();
         for other in others {
-            if other.conversation_id != cid {
-                if let Ok(leaves) = self.current_leaves(&other.conversation_id) {
+            if other != cid {
+                if let Ok(leaves) = self.current_leaves(&other) {
                     push(leaves);
                 }
             }
         }
         keys
+    }
+
+    /// A retired signing key cannot authenticate a newly encountered historical
+    /// record by itself. Ask today's repository to attest to the same bytes.
+    #[cfg(feature = "labyrinth")]
+    fn reanchor_deletion_record(
+        &self,
+        historical: &[u8],
+        document: &[u8],
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Option<Vec<u8>> {
+        let pds = chat_wire::extract_pds_endpoint_from_did_doc(document, did)?;
+        let key = atproto_spaces::did_resolver::DidDocument::parse_json(did, document)
+            .ok()?
+            .atproto_key?;
+        let current = self
+            .fetch_pds_record_car(&pds, did, collection, rkey)
+            .ok()?;
+        let rev = crate::labyrinth::repo_proof::verify_reanchored_record(
+            historical, &current, did, collection, rkey, &key,
+        )
+        .ok()?;
+        crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+            &self.db,
+            did,
+            &rev,
+            self.hooks.now_ms(),
+        )
+        .ok()?;
+        Some(current)
     }
 
     /// The device key `keyProof` proves, verified under `did`'s DID document. `Err` only when
@@ -244,13 +273,22 @@ impl CatbirdMlsClient {
         let Some(document) = self.resolve_did_document(did)? else {
             return Ok(None);
         };
-        Ok(authority::device_key_from_key_proof(
-            &proof,
-            did,
-            device_id,
-            signed_at_ms,
-            &document,
-        ))
+        let verify = |car: &[u8]| {
+            authority::device_key_from_key_proof(car, did, device_id, signed_at_ms, &document)
+        };
+        let key = verify(&proof);
+        #[cfg(feature = "labyrinth")]
+        let key = key.or_else(|| {
+            self.reanchor_deletion_record(
+                &proof,
+                &document,
+                did,
+                authority::DEVICE_RECORD_COLLECTION,
+                device_id,
+            )
+            .and_then(|current| verify(&current))
+        });
+        Ok(key)
     }
 
     /// Decide what a sequenced `accountDeletedEntry` does here: verify the sequencer's
@@ -361,68 +399,73 @@ impl CatbirdMlsClient {
                 Some(&write),
             );
         }
-        let applied_at = self.db.read_tx(|tx| {
-            tx.get_labyrinth_state(&authority::deletion_operation_key(
-                cid,
-                &deleted_did,
-                &write.operation_id,
-            ))
-        })?;
-        match applied_at
-            .as_deref()
-            .and_then(|raw| std::str::from_utf8(raw).ok()?.parse::<i64>().ok())
+        let existing = self
+            .db
+            .read_tx(|tx| {
+                tx.get_labyrinth_state(&chat_wire::account_deletion_key(cid, &deleted_did))
+            })?
+            .map(|raw| {
+                AppliedAccountDeletion::decode(&raw)
+                    .ok_or_else(|| MLSError::InvalidState("UnreadableAccountDeletionMarker".into()))
+            })
+            .transpose()?;
+        if let Some(previous) = existing
+            .as_ref()
+            .and_then(|marker| marker.operation(&write.operation_id))
         {
-            Some(applied) if applied == seq => Ok(AccountDeletionDecision::AlreadyApplied),
-            Some(_) => unverified(UnverifiedDeletionReason::Replayed, Some(&write)),
-            None => {
-                // The account's deletion is terminal. A new operation ID cannot replace an
-                // earlier marker with a narrower signed time and resurrect archived messages.
-                let existing = self
-                    .db
-                    .read_tx(|tx| {
-                        tx.get_labyrinth_state(&chat_wire::account_deletion_key(cid, &deleted_did))
-                    })?
-                    .and_then(|raw| AppliedAccountDeletion::decode(&raw));
-                match existing {
-                    Some(marker) if marker.seq() == seq => {
-                        Ok(AccountDeletionDecision::AlreadyApplied)
-                    }
-                    Some(_) => unverified(UnverifiedDeletionReason::Replayed, Some(&write)),
-                    // When an entry omits `revocationProof`, neither a local MLS leaf nor a
-                    // `chat.device` CAR proves the signer was unrevoked at the signed instant,
-                    // so quarantine it. When `revocationProof` IS attached, verify the PDS
-                    // self-deletion CARv1 against `deletedDid`'s `#atproto` key.
-                    None => match authority::revocation_proof_bytes(entry) {
-                        Ok(None) => unverified(
-                            UnverifiedDeletionReason::RevocationStatusUnproven,
-                            Some(&write),
-                        ),
-                        Err(reason) => unverified(reason, Some(&write)),
-                        Ok(Some(rev_proof)) => {
-                            let Some(document) = self.resolve_did_document(&deleted_did)? else {
-                                return unverified(
-                                    UnverifiedDeletionReason::RevocationStatusUnproven,
-                                    Some(&write),
-                                );
-                            };
-                            match authority::verify_self_deletion_revocation_proof(
-                                &rev_proof,
-                                &deleted_did,
-                                &write,
-                                &verified_key,
-                                &document,
-                            ) {
-                                Ok(()) => Ok(AccountDeletionDecision::Apply {
-                                    deleted_did,
-                                    seq,
-                                    write,
-                                }),
-                                Err(reason) => unverified(reason, Some(&write)),
-                            }
-                        }
-                    },
-                }
+            if previous.seq != seq {
+                return unverified(UnverifiedDeletionReason::Replayed, Some(&write));
             }
+            if previous.signed_at_ms == write.signed_at_ms
+                && previous.actor_device_id.as_deref() == Some(write.actor_device_id.as_str())
+            {
+                return Ok(AccountDeletionDecision::AlreadyApplied);
+            }
+        }
+        let rev_proof = match authority::revocation_proof_bytes(entry) {
+            Ok(Some(proof)) => proof,
+            Ok(None) => {
+                return unverified(
+                    UnverifiedDeletionReason::RevocationStatusUnproven,
+                    Some(&write),
+                )
+            }
+            Err(reason) => return unverified(reason, Some(&write)),
+        };
+        let Some(document) = self.resolve_did_document(&deleted_did)? else {
+            return unverified(
+                UnverifiedDeletionReason::RevocationStatusUnproven,
+                Some(&write),
+            );
+        };
+        let verify = |car: &[u8]| {
+            authority::verify_self_deletion_revocation_proof(
+                car,
+                &deleted_did,
+                &write,
+                &verified_key,
+                &document,
+            )
+        };
+        let verified = verify(&rev_proof);
+        #[cfg(feature = "labyrinth")]
+        let verified = verified.or_else(|reason| {
+            self.reanchor_deletion_record(
+                &rev_proof,
+                &document,
+                &deleted_did,
+                authority::DEVICE_REVOCATION_COLLECTION,
+                &write.actor_device_id,
+            )
+            .map_or(Err(reason), |current| verify(&current))
+        });
+        match verified {
+            Ok(()) => Ok(AccountDeletionDecision::Apply {
+                deleted_did,
+                seq,
+                write,
+            }),
+            Err(reason) => unverified(reason, Some(&write)),
         }
     }
 
@@ -448,40 +491,49 @@ impl CatbirdMlsClient {
                     actor_device_id: Some(write.actor_device_id.clone()),
                 };
                 self.db.write_tx(|tx| {
-                    // Authorization reads happen outside this transaction. Re-check the terminal
-                    // marker and operation here so two concurrent sync calls cannot each replace
-                    // it with a different signed instant.
+                    // Recheck the operation inside the transaction. Independent
+                    // erasures retain independent sequence and signed-time bounds.
                     let marker_key = chat_wire::account_deletion_key(cid, deleted_did);
                     let op_key =
                         authority::deletion_operation_key(cid, deleted_did, &write.operation_id);
-                    let existing = tx.get_labyrinth_state(&marker_key)?;
-                    let prior_op = tx.get_labyrinth_state(&op_key)?;
-                    if existing.is_some() || prior_op.is_some() {
-                        if existing
-                            .as_deref()
-                            .and_then(AppliedAccountDeletion::decode)
-                            .is_none_or(|marker| marker.seq() != *seq)
-                        {
-                            let evidence = UnverifiedAccountDeletion {
-                                conversation_id: cid.to_owned(),
-                                deleted_did: deleted_did.clone(),
-                                seq: *seq,
-                                entry_id: entry["entryId"].as_str().unwrap_or_default().to_owned(),
-                                reason: UnverifiedDeletionReason::Replayed,
-                                operation_id: Some(write.operation_id.clone()),
-                                actor_device_id: Some(write.actor_device_id.clone()),
-                                entry: entry.clone(),
-                                recorded_at_ms: now_ms,
-                            };
-                            tx.put_labyrinth_state(
-                                &authority::unverified_deletion_key(cid, deleted_did, *seq),
-                                &serde_json::to_vec(&evidence)?,
-                                now_ms,
-                            )?;
-                        }
-                        return Ok(());
+                    let existing = tx
+                        .get_labyrinth_state(&marker_key)?
+                        .map(|raw| {
+                            AppliedAccountDeletion::decode(&raw).ok_or_else(|| {
+                                MLSError::InvalidState("UnreadableAccountDeletionMarker".into())
+                            })
+                        })
+                        .transpose()?;
+                    let previous_seq = tx.get_labyrinth_state(&op_key)?;
+                    if previous_seq
+                        .as_ref()
+                        .is_some_and(|old| old != seq.to_string().as_bytes())
+                    {
+                        let evidence = UnverifiedAccountDeletion {
+                            conversation_id: cid.to_owned(),
+                            deleted_did: deleted_did.clone(),
+                            seq: *seq,
+                            entry_id: entry["entryId"].as_str().unwrap_or_default().to_owned(),
+                            reason: UnverifiedDeletionReason::Replayed,
+                            operation_id: Some(write.operation_id.clone()),
+                            actor_device_id: Some(write.actor_device_id.clone()),
+                            entry: entry.clone(),
+                            recorded_at_ms: now_ms,
+                        };
+                        return tx.put_labyrinth_state(
+                            &authority::unverified_deletion_key(cid, deleted_did, *seq),
+                            &serde_json::to_vec(&evidence)?,
+                            now_ms,
+                        );
                     }
-                    tx.put_labyrinth_state(&marker_key, &serde_json::to_vec(&applied)?, now_ms)?;
+                    let merged =
+                        StoredAccountDeletion::merge_verified(existing.as_ref(), applied.clone())
+                            .map_err(MLSError::Cryptography)?;
+                    tx.put_labyrinth_state(
+                        &marker_key,
+                        &merged.encode().map_err(MLSError::Internal)?,
+                        now_ms,
+                    )?;
                     tx.put_labyrinth_state(&op_key, seq.to_string().as_bytes(), now_ms)?;
                     let del_meta_key = authority::verified_deleted_account_key(deleted_did);
                     let del_ms = applied.signed_at_ms.max(0);

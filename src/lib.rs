@@ -59,7 +59,7 @@ pub mod atproto_bytes;
 
 pub use catbird_atproto as atproto;
 #[cfg(not(target_arch = "wasm32"))]
-pub use client::CatbirdMlsClient;
+pub use client::{CatbirdMlsClient, GeneratedRecoveryCode};
 pub use client::{
     CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport, LeaveConversationOutcome,
     MailboxReadStateRecord, OtcInitiatedSession, PeerRepinProposalInfo, PlatformChangeEvent,

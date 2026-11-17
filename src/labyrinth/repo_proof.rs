@@ -362,7 +362,10 @@ pub fn is_valid_tid(tid: &str) -> bool {
         .all(|&b| matches!(b, b'2'..=b'7' | b'a'..=b'z'))
 }
 
-pub fn parse_verified_car_v1(car_bytes: &[u8]) -> Result<(Cid, HashMap<Cid, Vec<u8>>), String> {
+fn verified_car_blocks(
+    car_bytes: &[u8],
+    rooted: bool,
+) -> Result<(Option<Cid>, HashMap<Cid, Vec<u8>>), String> {
     if car_bytes.is_empty() || car_bytes.len() > MAX_CAR_ARCHIVE_BYTES {
         return Err("CARv1 archive empty or exceeds 4 MiB ceiling".to_owned());
     }
@@ -381,10 +384,10 @@ pub fn parse_verified_car_v1(car_bytes: &[u8]) -> Result<(Cid, HashMap<Cid, Vec<
     verify_canonical_dagcbor(header_bytes)?;
     let header: CarHeader = serde_ipld_dagcbor::from_slice(header_bytes)
         .map_err(|_| "malformed CARv1 header".to_owned())?;
-    if header.version != 1 || header.roots.len() != 1 {
-        return Err("CARv1 header must have version 1 and exactly 1 root CID".to_owned());
+    if header.version != 1 || header.roots.len() != usize::from(rooted) {
+        return Err("CARv1 header version or root count mismatch".to_owned());
     }
-    let root_cid = header.roots[0];
+    let root_cid = header.roots.first().copied();
 
     let mut blocks = HashMap::new();
     while pos < car_bytes.len() {
@@ -427,10 +430,15 @@ pub fn parse_verified_car_v1(car_bytes: &[u8]) -> Result<(Cid, HashMap<Cid, Vec<
         }
     }
 
-    if !blocks.contains_key(&root_cid) {
+    if root_cid.is_some_and(|root| !blocks.contains_key(&root)) {
         return Err("CARv1 proof missing root commit block".to_owned());
     }
     Ok((root_cid, blocks))
+}
+
+pub fn parse_verified_car_v1(car_bytes: &[u8]) -> Result<(Cid, HashMap<Cid, Vec<u8>>), String> {
+    let (root, blocks) = verified_car_blocks(car_bytes, true)?;
+    Ok((root.ok_or("missing CAR root")?, blocks))
 }
 
 pub fn verify_atproto_v3_commit_with_rev(
@@ -476,32 +484,16 @@ pub fn verify_atproto_v3_commit(
         .map(|(mst_root_cid, _)| mst_root_cid)
 }
 
-fn walk_mst_proof(
-    blocks: &HashMap<Cid, Vec<u8>>,
-    node_cid: Cid,
-    target_key: &[u8],
+fn bounded_mst_keys(
+    node: &MstNodeData,
     lower_bound: Option<&[u8]>,
     upper_bound: Option<&[u8]>,
-    visited: &mut HashSet<Cid>,
-    depth: usize,
-) -> Result<Option<Cid>, String> {
-    if depth > MST_MAX_DEPTH {
-        return Err("MST proof exceeded maximum depth".to_owned());
-    }
-    if !visited.insert(node_cid) {
-        return Err("cycle detected in MST proof".to_owned());
-    }
-    let node_bytes = blocks
-        .get(&node_cid)
-        .ok_or_else(|| "missing MST node block in CAR proof".to_owned())?;
-    let node: MstNodeData = serde_ipld_dagcbor::from_slice(node_bytes)
-        .map_err(|_| "malformed MST node block".to_owned())?;
-    if depth > 0 && node.e.is_empty() {
-        return Err("non-root MST node cannot be empty".to_owned());
-    }
-
+) -> Result<Vec<Vec<u8>>, String> {
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(node.e.len());
     for (idx, entry) in node.e.iter().enumerate() {
+        if entry.p.saturating_add(entry.k.len()) > 1024 {
+            return Err("MST record path exceeds the repository key limit".into());
+        }
         if entry.k.is_empty() {
             return Err("MST entry key suffix cannot be empty".to_owned());
         }
@@ -546,6 +538,205 @@ fn walk_mst_proof(
         keys.push(full_key);
     }
 
+    Ok(keys)
+}
+
+/// Enumerate every revocation key under the signed commit identified by the
+/// authoritative PDS head. Each intersecting subtree must be present, even
+/// when no records are found. Numeric rev equality without CID equality
+/// cannot authenticate the same repository revision.
+pub fn verify_revocation_inventory(
+    car: &[u8],
+    did: &str,
+    head_cid: &str,
+    head_rev: &str,
+    key: &SpaceVerifyingKey,
+) -> Result<Vec<(String, String)>, String> {
+    let (root, blocks) = parse_verified_car_v1(car)?;
+    let mut inventory = RevocationInventory::new(did, head_cid, head_rev, key)?;
+    if root != inventory.head {
+        return Err("snapshot does not match current head".into());
+    }
+    while let Some(cid) = inventory.expected() {
+        inventory.consume(
+            cid,
+            blocks
+                .get(&cid)
+                .ok_or("missing revocation inventory subtree")?,
+        )?;
+    }
+    inventory.finish()
+}
+
+type InventorySubtree = (Cid, Option<Vec<u8>>, Option<Vec<u8>>, usize);
+
+/// Verify a collection range by fetching its signed head and only the MST blocks that overlap it.
+/// Other collections and record payloads do not count against the proof budget.
+pub struct RevocationInventory {
+    did: String,
+    head: Cid,
+    rev: String,
+    key: SpaceVerifyingKey,
+    awaiting_commit: bool,
+    failed: bool,
+    pending: Vec<InventorySubtree>,
+    visited: HashSet<Cid>,
+    entries: Vec<(String, String)>,
+    bytes: usize,
+}
+
+impl RevocationInventory {
+    pub fn new(
+        did: &str,
+        head_cid: &str,
+        head_rev: &str,
+        key: &SpaceVerifyingKey,
+    ) -> Result<Self, String> {
+        let head: Cid = head_cid
+            .parse()
+            .map_err(|_| "invalid repository head CID")?;
+        if head.to_string() != head_cid || !is_valid_tid(head_rev) {
+            return Err("invalid repository head".into());
+        }
+        Ok(Self {
+            did: did.to_owned(),
+            head,
+            rev: head_rev.to_owned(),
+            key: key.clone(),
+            awaiting_commit: true,
+            failed: false,
+            pending: vec![],
+            visited: HashSet::new(),
+            entries: vec![],
+            bytes: 0,
+        })
+    }
+
+    fn expected(&self) -> Option<Cid> {
+        if self.awaiting_commit {
+            Some(self.head)
+        } else {
+            self.pending.last().map(|item| item.0)
+        }
+    }
+
+    pub fn next_block(&self) -> Option<String> {
+        self.expected().map(|cid| cid.to_string())
+    }
+
+    /// Accept the rootless CAR returned by getBlocks for exactly the requested identifier.
+    pub fn ingest(&mut self, car: &[u8]) -> Result<(), String> {
+        if self.failed {
+            return Err("inventory verification has failed".into());
+        }
+        self.failed = true;
+        let expected = self
+            .expected()
+            .ok_or("unexpected block after complete inventory")?;
+        let (_, blocks) = verified_car_blocks(car, false)?;
+        if blocks.len() != 1 {
+            return Err("expected one requested repository block".into());
+        }
+        self.consume(
+            expected,
+            blocks
+                .get(&expected)
+                .ok_or("missing requested repository block")?,
+        )?;
+        self.failed = false;
+        Ok(())
+    }
+
+    fn consume(&mut self, cid: Cid, raw: &[u8]) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .checked_add(raw.len())
+            .ok_or("overflow in repository inventory")?;
+        if self.bytes > MAX_CAR_ARCHIVE_BYTES
+            || self.visited.len() >= MAX_CAR_SECTIONS
+            || !self.visited.insert(cid)
+        {
+            return Err("repository inventory too large or contains a repeated subtree".into());
+        }
+        if self.awaiting_commit {
+            let (tree_root, rev) = verify_atproto_v3_commit_with_rev(raw, &self.did, &self.key)?;
+            if rev != self.rev {
+                return Err("repository snapshot does not match current revision".into());
+            }
+            self.awaiting_commit = false;
+            self.pending.push((tree_root, None, None, 0));
+            return Ok(());
+        }
+        let (_, lo, hi, depth) = self.pending.pop().ok_or("unexpected inventory node")?;
+        if depth > MST_MAX_DEPTH {
+            return Err("inventory tree exceeds depth bound".into());
+        }
+        const PREFIX: &[u8] = b"blue.catbird.chat.deviceRevocation/";
+        // '/' + 1 encloses exactly the keys with this collection prefix.
+        const END: &[u8] = b"blue.catbird.chat.deviceRevocation0";
+        let node: MstNodeData = serde_ipld_dagcbor::from_slice(raw)
+            .map_err(|_| "invalid revocation inventory tree node")?;
+        let keys = bounded_mst_keys(&node, lo.as_deref(), hi.as_deref())?;
+        let children = std::iter::once(node.l).chain(node.e.iter().map(|entry| entry.t));
+        for (idx, child) in children.enumerate() {
+            let left = idx.checked_sub(1).and_then(|i| keys.get(i)).or(lo.as_ref());
+            let right = keys.get(idx).or(hi.as_ref());
+            if let Some(child) = child {
+                if left.is_none_or(|k| k.as_slice() < END)
+                    && right.is_none_or(|k| k.as_slice() > PREFIX)
+                {
+                    self.pending
+                        .push((child, left.cloned(), right.cloned(), depth + 1));
+                }
+            }
+        }
+        for (path, entry) in keys.iter().zip(&node.e) {
+            if let Some(raw_key) = path.strip_prefix(PREFIX) {
+                let rkey = std::str::from_utf8(raw_key).map_err(|_| "invalid revocation key")?;
+                if rkey.is_empty() || rkey.contains('/') {
+                    return Err("invalid revocation key".into());
+                }
+                self.entries.push((rkey.to_owned(), entry.v.to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<(String, String)>, String> {
+        if self.failed || self.expected().is_some() {
+            return Err("incomplete repository inventory".into());
+        }
+        self.entries.sort_unstable();
+        Ok(self.entries)
+    }
+}
+
+fn walk_mst_proof(
+    blocks: &HashMap<Cid, Vec<u8>>,
+    node_cid: Cid,
+    target_key: &[u8],
+    lower_bound: Option<&[u8]>,
+    upper_bound: Option<&[u8]>,
+    visited: &mut HashSet<Cid>,
+    depth: usize,
+) -> Result<Option<Cid>, String> {
+    if depth > MST_MAX_DEPTH {
+        return Err("MST proof exceeded maximum depth".to_owned());
+    }
+    if !visited.insert(node_cid) {
+        return Err("cycle detected in MST proof".to_owned());
+    }
+    let node_bytes = blocks
+        .get(&node_cid)
+        .ok_or_else(|| "missing MST node block in CAR proof".to_owned())?;
+    let node: MstNodeData = serde_ipld_dagcbor::from_slice(node_bytes)
+        .map_err(|_| "malformed MST node block".to_owned())?;
+    if depth > 0 && node.e.is_empty() && node.l.is_none() {
+        return Err("non-root MST node cannot be empty".to_owned());
+    }
+
+    let keys = bounded_mst_keys(&node, lower_bound, upper_bound)?;
     if keys.is_empty() {
         return match node.l {
             Some(left_cid) => walk_mst_proof(
@@ -592,6 +783,42 @@ fn walk_mst_proof(
             }
         }
     }
+}
+
+/// Verify the same record under today's repository key after a signing-key rotation.
+/// The historical CAR supplies only a content identifier. Authority comes from
+/// a fresh, independently fetched and signature-verified proof of identical bytes.
+pub fn verify_reanchored_record(
+    historical_car: &[u8],
+    current_car: &[u8],
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    current_key: &SpaceVerifyingKey,
+) -> Result<String, String> {
+    let (current, rev) =
+        verify_car_record_proof_with_rev(current_car, did, collection, rkey, current_key)?;
+    let (cid, _) = current.ok_or("current repository excludes the historical record")?;
+    let (root, blocks) = parse_verified_car_v1(historical_car)?;
+    let old: SignedAtprotoCommitV3 = serde_ipld_dagcbor::from_slice(&blocks[&root])
+        .map_err(|_| "malformed historical repository commit")?;
+    if old.did != did || old.version != 3 {
+        return Err("historical repository DID or format mismatch".into());
+    }
+    let path = format!("{collection}/{rkey}");
+    let old_cid = walk_mst_proof(
+        &blocks,
+        old.data,
+        path.as_bytes(),
+        None,
+        None,
+        &mut HashSet::new(),
+        0,
+    )?;
+    if old_cid != Some(cid) || !blocks.contains_key(&cid) {
+        return Err("current repository record differs from historical proof".into());
+    }
+    Ok(rev)
 }
 
 /// Verify a CARv1 repository proof (`com.atproto.sync.getRecord`) against `atproto_key`,
@@ -828,7 +1055,11 @@ pub fn build_repo_proof_car_v1(
     write_uvarint(&mut out, header_bytes.len() as u64);
     out.extend_from_slice(&header_bytes);
 
+    let mut written = HashSet::new();
     let mut write_block = |cid: &Cid, data: &[u8]| {
+        if !written.insert(*cid) {
+            return;
+        }
         let cid_bytes = cid.to_bytes();
         write_uvarint(&mut out, (cid_bytes.len() + data.len()) as u64);
         out.extend_from_slice(&cid_bytes);
@@ -846,6 +1077,107 @@ pub fn build_repo_proof_car_v1(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn inventory_requires_current_signed_head_and_covers_empty_collections() {
+        let did = "did:plc:inventory";
+        let rev = "3lb2zzzzzzzzz";
+        let key = SpaceSigningKey::random_p256();
+        let (record, bytes) = encode_atproto_json_record_dagcbor(&json!({"value": "one"})).unwrap();
+        let (root, car) = build_repo_proof_car_v1(did, rev, &[], &key).unwrap();
+        let verify = |car: &[u8], head: &Cid| {
+            verify_revocation_inventory(car, did, &head.to_string(), rev, &key.verifying_key())
+        };
+        assert!(verify(&car, &root).unwrap().is_empty());
+        let (filled, snapshot) = build_repo_proof_car_v1(
+            did,
+            rev,
+            &[(
+                "blue.catbird.chat.deviceRevocation/device".into(),
+                bytes.clone(),
+            )],
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            verify(&snapshot, &filled).unwrap(),
+            vec![("device".into(), record.to_string())]
+        );
+        assert!(verify(&car, &filled).is_err());
+        let (root_block, mut blocks) = parse_verified_car_v1(&snapshot).unwrap();
+        let mut partial =
+            RevocationInventory::new(did, &filled.to_string(), rev, &key.verifying_key()).unwrap();
+        let mut count = 0;
+        while let Some(requested) = partial.next_block() {
+            let cid: Cid = requested.parse().unwrap();
+            let block = &blocks[&cid];
+            let header = serde_ipld_dagcbor::to_vec(&CarHeader {
+                version: 1,
+                roots: vec![],
+            })
+            .unwrap();
+            let mut response = vec![];
+            write_uvarint(&mut response, header.len() as u64);
+            response.extend(header);
+            let cid_bytes = cid.to_bytes();
+            write_uvarint(&mut response, (cid_bytes.len() + block.len()) as u64);
+            response.extend(cid_bytes);
+            response.extend(block);
+            partial.ingest(&response).unwrap();
+            count += 1;
+        }
+        assert_eq!(
+            count, 2,
+            "only head and MST node fetched, never record payloads"
+        );
+        assert_eq!(
+            partial.finish().unwrap(),
+            verify(&snapshot, &filled).unwrap()
+        );
+        let commit = blocks.remove(&root_block).unwrap();
+        let mut header_only = Vec::new();
+        let header = serde_ipld_dagcbor::to_vec(&CarHeader {
+            version: 1,
+            roots: vec![root_block],
+        })
+        .unwrap();
+        write_uvarint(&mut header_only, header.len() as u64);
+        header_only.extend(header);
+        let cid_bytes = root_block.to_bytes();
+        write_uvarint(&mut header_only, (cid_bytes.len() + commit.len()) as u64);
+        header_only.extend(cid_bytes);
+        header_only.extend(commit);
+        assert!(verify(&header_only, &root_block).is_err());
+        let next = SpaceSigningKey::random_p256();
+        let (_, reanchored) = build_repo_proof_car_v1(
+            did,
+            rev,
+            &[("blue.catbird.chat.deviceRevocation/device".into(), bytes)],
+            &next,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_reanchored_record(
+                &snapshot,
+                &reanchored,
+                did,
+                "blue.catbird.chat.deviceRevocation",
+                "device",
+                &next.verifying_key()
+            )
+            .unwrap(),
+            rev
+        );
+        assert!(verify_reanchored_record(
+            &snapshot,
+            &car,
+            did,
+            "blue.catbird.chat.deviceRevocation",
+            "device",
+            &key.verifying_key()
+        )
+        .is_err());
+    }
 
     #[test]
     fn car_v1_inclusion_and_exclusion_proofs_verify_and_reject_tampering() {

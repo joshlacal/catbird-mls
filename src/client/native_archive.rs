@@ -1138,14 +1138,13 @@ impl crate::labyrinth::session::LocalConversationAuthority for NativeLocalAuthor
         if did == self.account_did {
             return Ok(None);
         }
-        let convos = self
-            .db
-            .read_tx(|tx| tx.list_conversations(None, 500))
+        // Snapshot IDs in one read transaction; display pagination is intentionally capped.
+        let conversation_ids = super::all_local_conversation_ids(&self.db)
             .map_err(crate::orchestrator::error::OrchestratorError::Mls)?;
         let mut shared = std::collections::BTreeSet::new();
         let mut saw_live_shared_group = false;
-        for convo in convos {
-            let Some((_, _, applied, leaves)) = self.group(&convo.conversation_id)? else {
+        for conversation_id in conversation_ids {
+            let Some((_, _, applied, leaves)) = self.group(&conversation_id)? else {
                 continue;
             };
             if applied <= 0 || !leaves.iter().any(|(m, _)| *m == self.account_did) {
@@ -1731,25 +1730,92 @@ impl CatbirdMlsClient {
         })
     }
 
-    fn set_recovery_needs_attention(&self, needs_attention: bool) -> Result<(), MLSError> {
-        let now_ms = self.hooks.now_ms();
+    /// Serialize recovery credential changes across handles and processes for this account.
+    /// An OS-held advisory lock is released on crash, even if a remote rotation is in flight.
+    fn lock_recovery_receipts(&self) -> Result<std::fs::File, MLSError> {
+        if self.is_handle_closed() {
+            return Err(MLSError::ContextClosed);
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.db_path.with_extension("recovery.lock"))
+            .map_err(|e| MLSError::Internal(format!("open recovery receipt lock: {e}")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(MLSError::InvalidState("RecoveryOperationInProgress".into()))
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(MLSError::Internal(format!("lock recovery receipts: {e}")))
+            }
+        }
+    }
+
+    /// Commit the receipt transition before the first irreversible mutation. Seed each fresh
+    /// database independently so a receipt surviving a local reset cannot match a new code.
+    fn begin_recovery_generation(&self) -> Result<(bool, u64), MLSError> {
+        self.db.write_tx(|tx| {
+            let raw = tx
+                .get_labyrinth_state("status_json")?
+                .ok_or_else(|| MLSError::InvalidState("Labyrinth status not initialized".into()))?;
+            let mut status: LabyrinthBackupStatus = serde_json::from_slice(&raw)?;
+            let previous_attention = status.recovery_needs_attention;
+            status.recovery_generation = match status.recovery_generation {
+                0 => (self.hooks.uuid_v4().as_u128() as u64) >> 1,
+                old => old
+                    .checked_add(1)
+                    .ok_or_else(|| MLSError::InvalidState("RecoveryGenerationExhausted".into()))?,
+            };
+            status.recovery_needs_attention = true;
+            tx.put_labyrinth_state(
+                "status_json",
+                &serde_json::to_vec(&status)?,
+                self.hooks.now_ms(),
+            )?;
+            Ok((previous_attention, status.recovery_generation))
+        })
+    }
+
+    /// Retained for callers using pre-generation receipts. A versioned receipt must be
+    /// acknowledged using its expected generation.
+    pub fn acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.acknowledge_recovery_receipt(0)
+    }
+
+    pub fn acknowledge_recovery_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        if expected_generation == 0 {
+            return Err(MLSError::invalid_input(
+                "recovery receipt generation must be nonzero",
+            ));
+        }
+        self.acknowledge_recovery_receipt(expected_generation)
+    }
+
+    fn acknowledge_recovery_receipt(
+        &self,
+        expected: u64,
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        let _guard = self.lock_recovery_receipts()?;
         let status = self.db.write_tx(|tx| {
             let raw = tx.get_labyrinth_state("status_json")?
                 .ok_or_else(|| MLSError::InvalidState("Labyrinth status not initialized".into()))?;
-            let mut status: LabyrinthBackupStatus = serde_json::from_slice(&raw)
-                .map_err(|e| MLSError::Internal(e.to_string()))?;
-            status.recovery_needs_attention = needs_attention;
-            tx.put_labyrinth_state("status_json", &serde_json::to_vec(&status)
-                .map_err(|e| MLSError::Internal(e.to_string()))?, now_ms)?;
+            let mut status: LabyrinthBackupStatus = serde_json::from_slice(&raw)?;
+            if status.recovery_generation != expected {
+                return Err(MLSError::InvalidState("StaleRecoveryReceipt".into()));
+            }
+            status.recovery_needs_attention = false;
+            tx.put_labyrinth_state("status_json", &serde_json::to_vec(&status)?, self.hooks.now_ms())?;
             Ok(status)
         })?;
+        drop(_guard);
         self.notify(PlatformChangeEvent::LabyrinthStatusChanged { epoch_seq: status.epoch_seq });
-        Ok(())
-    }
-
-    pub fn acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
-        self.set_recovery_needs_attention(false)?;
-        self.labyrinth_status()
+        Ok(status)
     }
 
     fn persist_native_passkey_recovery(
@@ -1803,20 +1869,32 @@ impl CatbirdMlsClient {
     }
 
     pub fn setup_recovery_code(&self) -> Result<String, MLSError> {
+        Ok(self.setup_recovery_code_with_receipt()?.code)
+    }
+
+    pub fn setup_recovery_code_with_receipt(&self) -> Result<GeneratedRecoveryCode, MLSError> {
+        let _receipt_guard = self.lock_recovery_receipts()?;
         #[cfg(any(test, feature = "test-utils", feature = "sim"))]
-        if self.offline_archive_for_test { return self.offline_setup_recovery_code(); }
+        if self.offline_archive_for_test {
+            let (_, recovery_generation) = self.begin_recovery_generation()?;
+            let code = self.offline_setup_recovery_code()?;
+            return Ok(GeneratedRecoveryCode {
+                code,
+                recovery_generation,
+            });
+        }
         let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.native_archive_run(async {
             let mut session = self.native_archive_deps()?.enable().await.map_err(native_archive_error)?;
             // Set the durable reminder before a code can be minted. A later
             // status-write failure must not make the only displayable code
             // disappear into an error return.
-            self.set_recovery_needs_attention(true)?;
+            let (_, recovery_generation) = self.begin_recovery_generation()?;
             let code = session.create_recovery_code().await.map_err(native_archive_error)?;
             if let Err(error) = self.save_native_archive_status(&session, true) {
                 tracing::warn!(%error, "recovery code created but archive status refresh failed");
             }
-            Ok(code)
+            Ok(GeneratedRecoveryCode { code, recovery_generation })
         })
     }
 
@@ -2516,15 +2594,15 @@ impl CatbirdMlsClient {
             db.read_tx(|tx| {
                 let mut deleted = std::collections::BTreeMap::new();
                 for did in &senders {
-                    if let Some(raw) = tx.get_labyrinth_state(
+                    if tombstoned_dids.contains(did) {
+                        deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
+                    } else if let Some(raw) = tx.get_labyrinth_state(
                         &super::chat_wire::account_deletion_key(conversation_id, did),
                     )? {
                         // An unreadable marker still hides: it can only widen what the deletion covers.
                         let marker = AppliedAccountDeletion::decode(&raw)
                             .unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
                         deleted.insert(did.clone(), marker);
-                    } else if tombstoned_dids.contains(did) {
-                        deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
                     }
                 }
                 Ok(deleted)
@@ -2560,6 +2638,63 @@ impl CatbirdMlsClient {
         Ok(before - messages.len())
     }
 
+    fn conversation_state_with_deletions(
+        &self,
+        cid: &str,
+        device: &str,
+        signer: &SignatureKeyPair,
+    ) -> Result<serde_json::Value, MLSError> {
+        let mut after = 0i64;
+        let mut entries = Vec::new();
+        // Bound work if the sequencer appends new entries continuously.
+        for _ in 0..1024 {
+            let mut state = self.query_signed_chat_ds(
+                "blue.catbird.chat.getConversationState",
+                &[
+                    ("actorDeviceId", device),
+                    ("conversationId", cid),
+                    ("deletionsAfter", &after.to_string()),
+                ],
+                device,
+                signer,
+            )?;
+            let page = state["accountDeletions"]
+                .as_array_mut()
+                .ok_or_else(|| MLSError::Cryptography("missing deletion inventory page".into()))?;
+            if page.len() > 100 {
+                return Err(MLSError::Cryptography(
+                    "oversized deletion inventory page".into(),
+                ));
+            }
+            let mut last = after;
+            for entry in page.iter() {
+                let seq = entry["seq"]
+                    .as_i64()
+                    .filter(|s| *s > last && *s <= 9_007_199_254_740_991)
+                    .ok_or_else(|| {
+                        MLSError::Cryptography("invalid deletion inventory order".into())
+                    })?;
+                last = seq;
+            }
+            entries.append(page);
+            match state.get("deletionsCursor") {
+                None => {
+                    state["accountDeletions"] = serde_json::Value::Array(entries);
+                    return Ok(state);
+                }
+                Some(cursor) if cursor.as_i64() == Some(last) && last > after => after = last,
+                _ => {
+                    return Err(MLSError::Cryptography(
+                        "invalid deletion inventory cursor".into(),
+                    ))
+                }
+            }
+        }
+        Err(MLSError::InvalidState(
+            "ArchiveDeletionInventoryUnavailable".into(),
+        ))
+    }
+
     /// Fetch `getConversationState["accountDeletions"]` prior to `session.load_history` so
     /// deleted accounts are already bound before `LocallyCheckedDirectory` enforces live PDS
     /// device inventory or shared MLS leaf keys. Unpinned conversations avoid DB writes here and
@@ -2578,15 +2713,7 @@ impl CatbirdMlsClient {
             .canonical_uuid_v4_device_id()
             .ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
-        let state = match self.query_signed_chat_ds(
-            "blue.catbird.chat.getConversationState",
-            &[
-                ("actorDeviceId", &device),
-                ("conversationId", conversation_id),
-            ],
-            &device,
-            &signer,
-        ) {
+        let state = match self.conversation_state_with_deletions(conversation_id, &device, &signer) {
             Ok(state) => state,
             Err(MLSError::InvalidState(code))
                 if matches!(
@@ -2695,15 +2822,7 @@ impl CatbirdMlsClient {
                     .canonical_uuid_v4_device_id()
                     .ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
                 let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
-                match self.query_signed_chat_ds(
-                    "blue.catbird.chat.getConversationState",
-                    &[
-                        ("actorDeviceId", &device),
-                        ("conversationId", conversation_id),
-                    ],
-                    &device,
-                    &signer,
-                ) {
+                match self.conversation_state_with_deletions(conversation_id, &device, &signer) {
                     Ok(state) => state,
                     // A denied or forgotten conversation state cannot prove which deletions preceded
                     // this archive. Local markers may be incomplete on a restored device, so stop
@@ -2760,39 +2879,20 @@ impl CatbirdMlsClient {
         }
         // PDS completeness check for foreign message senders whose deletion may have been
         // omitted from `getConversationState["accountDeletions"]`.
-        let foreign_senders: Vec<String> = {
-            let all_senders: std::collections::BTreeSet<String> = history
-                .iter()
-                .filter_map(|m| m.sender.as_deref())
-                .filter(|s| *s != self.normalized_did)
-                .map(str::to_owned)
-                .collect();
-            self.db.read_tx(|tx| {
-                let mut unchecked = Vec::new();
-                for did in all_senders {
-                    let has_seq_marker = tx
-                        .get_labyrinth_state(&super::chat_wire::account_deletion_key(
-                            conversation_id,
-                            &did,
-                        ))?
-                        .is_some();
-                    if !has_seq_marker {
-                        unchecked.push(did);
-                    }
-                }
-                Ok(unchecked)
-            })?
-        };
+        let senders: std::collections::BTreeSet<&str> = history
+            .iter()
+            .filter_map(|message| message.sender.as_deref())
+            .collect();
         let mut tombstoned_dids = std::collections::BTreeSet::new();
-        for sender_did in foreign_senders {
-            if self.verify_foreign_sender_pds_deletion(&sender_did)? {
-                tombstoned_dids.insert(sender_did);
+        for sender in senders {
+            if self.verify_foreign_sender_pds_deletion(conversation_id, sender)? {
+                tombstoned_dids.insert(sender.to_owned());
             }
         }
         Ok(tombstoned_dids)
     }
 
-    fn fetch_pds_record_car(
+    pub(crate) fn fetch_pds_record_car(
         &self,
         pds_endpoint: &str,
         did: &str,
@@ -2833,12 +2933,16 @@ impl CatbirdMlsClient {
         &self,
         pds_endpoint: &str,
         did: &str,
+        expected_records: usize,
     ) -> Result<Option<Vec<serde_json::Value>>, MLSError> {
         let base = pds_endpoint.trim_end_matches('/');
         let mut cursor: Option<String> = None;
         let mut seen_cursors = std::collections::BTreeSet::new();
         let mut all_records = Vec::new();
-        for page_idx in 0..super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES {
+        // A server may return fewer records than requested. Each page must make progress,
+        // and the signed tree bounds the total number of values that can legitimately arrive.
+        let max_pages = expected_records.saturating_add(1);
+        for page_idx in 0..max_pages {
             let mut url = format!(
                 "{base}/xrpc/com.atproto.repo.listRecords?repo={}&collection={}&limit={}",
                 super::chat_wire::urlencode_form_component(did),
@@ -2878,15 +2982,16 @@ impl CatbirdMlsClient {
                 super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
                 &resp.body,
             )?;
+            let empty_page = page_records.is_empty();
             all_records.extend(page_records);
-            if all_records.len() > super::chat_wire::MAX_PDS_LIST_RECORDS_ITEMS {
-                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
+            if all_records.len() > expected_records || empty_page && next_cursor.is_some() {
+                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
             }
             match next_cursor {
                 None => return Ok(Some(all_records)),
                 Some(next) => {
                     if !seen_cursors.insert(next.clone())
-                        || page_idx + 1 == super::chat_wire::MAX_PDS_LIST_RECORDS_PAGES
+                        || page_idx + 1 == max_pages
                     {
                         return Err(MLSError::InvalidState(
                             "ArchiveDeletionInventoryUnavailable".into(),
@@ -2903,7 +3008,11 @@ impl CatbirdMlsClient {
     /// or `RepoTakendown`), `Ok(false)` if the live PDS has no self-deletion revocation record, or
     /// fails closed (`ArchiveDeletionUnverified` / `ArchiveDeletionInventoryUnavailable`) if the live
     /// PDS carries an unsequenced self-deletion record omitted by `getConversationState`.
-    fn verify_foreign_sender_pds_deletion(&self, sender_did: &str) -> Result<bool, MLSError> {
+    fn verify_foreign_sender_pds_deletion(
+        &self,
+        conversation_id: &str,
+        sender_did: &str,
+    ) -> Result<bool, MLSError> {
         let Some(doc_bytes) = self.resolve_did_document(sender_did).ok().flatten() else {
             return Err(MLSError::InvalidState(
                 "ArchiveDeletionInventoryUnavailable".into(),
@@ -2916,16 +3025,130 @@ impl CatbirdMlsClient {
                 "ArchiveDeletionInventoryUnavailable".into(),
             ));
         };
-        let Some(records) = self.list_pds_revocations_or_tombstone(&pds_endpoint, sender_did)?
-        else {
-            // Ephemeral terminal repo tombstone: hide every message from this sender for this
-            // restore pass without writing a permanent marker into local storage.
-            return Ok(true);
+        let unavailable = || MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into());
+        let unverified = || MLSError::InvalidState("ArchiveDeletionUnverified".into());
+        let atproto_key =
+            atproto_spaces::did_resolver::DidDocument::parse_json(sender_did, &doc_bytes)
+                .ok()
+                .and_then(|d| d.atproto_key)
+                .ok_or_else(unavailable)?;
+        let fetch_sync = |method: &str, cid: Option<&str>| {
+            let mut url = format!(
+                "{}/xrpc/com.atproto.sync.{method}?did={}",
+                pds_endpoint.trim_end_matches('/'),
+                super::chat_wire::urlencode_form_component(sender_did)
+            );
+            if let Some(cid) = cid {
+                url.push_str("&cids=");
+                url.push_str(&super::chat_wire::urlencode_form_component(cid));
+            }
+            self.transport
+                .execute_http(PlatformHttpRequest {
+                    method: "GET".into(),
+                    url,
+                    headers: vec![super::PlatformHttpHeader {
+                        name: "cache-control".into(),
+                        value: "no-cache".into(),
+                    }],
+                    body: None,
+                })
+                .map_err(|_| unavailable())
         };
+        let head = fetch_sync("getLatestCommit", None)?;
+        if matches!(head.status, 400 | 404)
+            && serde_json::from_slice::<serde_json::Value>(&head.body)
+                .ok()
+                .is_some_and(|body| {
+                    matches!(
+                        body["error"].as_str(),
+                        Some("RepoNotFound" | "RepoTakendown")
+                    )
+                })
+        {
+            return Ok(true);
+        }
+        if head.status != 200 {
+            return Err(unavailable());
+        }
+        let head: serde_json::Value =
+            serde_json::from_slice(&head.body).map_err(|_| unavailable())?;
+        let head_cid = head["cid"].as_str().ok_or_else(unavailable)?;
+        let head_rev = head["rev"].as_str().ok_or_else(unavailable)?;
+        let mut inventory = crate::labyrinth::repo_proof::RevocationInventory::new(
+            sender_did,
+            head_cid,
+            head_rev,
+            &atproto_key,
+        )
+        .map_err(|_| unverified())?;
+        let authenticated = loop {
+            let Some(cid) = inventory.next_block() else {
+                break inventory.finish().map_err(|_| unverified())?;
+            };
+            let reply = fetch_sync("getBlocks", Some(&cid))?;
+            if reply.status == 200 {
+                inventory.ingest(&reply.body).map_err(|_| unverified())?;
+                continue;
+            }
+            let unsupported = matches!(reply.status, 404 | 405 | 501)
+                || matches!(reply.status, 400)
+                    && serde_json::from_slice::<serde_json::Value>(&reply.body)
+                        .ok()
+                        .is_some_and(|value| {
+                            matches!(
+                                value["error"].as_str(),
+                                Some("MethodNotImplemented" | "XRPCNotSupported")
+                            )
+                        });
+            if !unsupported {
+                return Err(unavailable());
+            }
+            let snapshot = fetch_sync("getRepo", None)?;
+            if snapshot.status != 200 {
+                return Err(unavailable());
+            }
+            break crate::labyrinth::repo_proof::verify_revocation_inventory(
+                &snapshot.body,
+                sender_did,
+                head_cid,
+                head_rev,
+                &atproto_key,
+            )
+            .map_err(|_| unverified())?;
+        };
+        crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+            &self.db,
+            sender_did,
+            head_rev,
+            self.hooks.now_ms(),
+        )
+        .map_err(MLSError::Cryptography)?;
+        let records = self
+            .list_pds_revocations_or_tombstone(&pds_endpoint, sender_did, authenticated.len())?
+            .ok_or_else(unavailable)?;
         let rev_prefix = format!(
             "at://{sender_did}/{}/",
             super::deletion_authority::DEVICE_REVOCATION_COLLECTION
         );
+        let mut listed = Vec::with_capacity(records.len());
+        for row in &records {
+            let rkey = row["uri"]
+                .as_str()
+                .and_then(|uri| uri.strip_prefix(&rev_prefix))
+                .ok_or_else(unverified)?;
+            let cid = row["cid"].as_str().ok_or_else(unverified)?;
+            let (actual, _) =
+                crate::labyrinth::repo_proof::encode_atproto_json_record_dagcbor(&row["value"])
+                    .map_err(|_| unverified())?;
+            if actual.to_string() != cid {
+                return Err(unverified());
+            }
+            listed.push((rkey.to_owned(), cid.to_owned()));
+        }
+        listed.sort_unstable();
+        if listed != authenticated {
+            return Err(unverified());
+        }
         for rec_entry in &records {
             let Some(uri) = rec_entry.get("uri").and_then(serde_json::Value::as_str) else {
                 continue;
@@ -2958,13 +3181,6 @@ impl CatbirdMlsClient {
                 .get("cid")
                 .and_then(serde_json::Value::as_str)
                 .filter(|c| !c.is_empty())
-            else {
-                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
-            };
-            let Some(atproto_key) =
-                atproto_spaces::did_resolver::DidDocument::parse_json(sender_did, &doc_bytes)
-                    .ok()
-                    .and_then(|d| d.atproto_key)
             else {
                 return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
             };
@@ -3017,7 +3233,7 @@ impl CatbirdMlsClient {
                 self.hooks.now_ms(),
             )
             .map_err(MLSError::Cryptography)?;
-            let _ = super::deletion_authority::verify_foreign_self_deletion_from_cars(
+            let verified = super::deletion_authority::verify_foreign_self_deletion_from_cars(
                 &device_car,
                 &revocation_car,
                 sender_did,
@@ -3025,7 +3241,16 @@ impl CatbirdMlsClient {
                 &doc_bytes,
             )
             .ok_or_else(|| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
-            return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+            // A matching operation must have passed sequencer and device proof
+            // verification specifically in this conversation.
+            let recorded = self.db.read_tx(|tx| tx.get_labyrinth_state(
+                &super::chat_wire::account_deletion_key(conversation_id, sender_did),
+            ))?.and_then(|raw| super::deletion_authority::AppliedAccountDeletion::decode(&raw));
+            if !recorded.as_ref().and_then(|m| m.operation(&verified.operation_id))
+                .is_some_and(|op| op.actor_device_id == verified.actor_device_id)
+            {
+                return Err(unverified());
+            }
         }
         Ok(false)
     }
@@ -3826,36 +4051,36 @@ impl CatbirdMlsClient {
                 .values()
                 .filter_map(|(_, _, placeholder_id)| placeholder_id.clone())
                 .collect();
-            let existing_rows = tx.list_messages(conversation_id, None, 100_000)?;
-            let mut purged = 0u32;
-            for existing in &existing_rows {
-                let ev_key = format!("native.message:{conversation_id}:{}", existing.message_id);
-                if replaced_placeholders.contains(&existing.message_id)
-                    || tx.get_labyrinth_state(&ev_key)?.is_some()
-                    || is_stored_unavailable_placeholder(tx, conversation_id, existing)?
-                {
-                    continue;
-                }
-                let matches_verified = chosen_by_id
-                    .get(&existing.message_id)
-                    .is_some_and(|((row, _, _), _, _)| {
-                        row.seq == existing.seq
-                            && row.sender_did == existing.sender_did
-                            && super::chat_wire::archive_frame_matches_local_plaintext(&existing.plaintext_json, &row.plaintext_json)
-                    });
-                if !matches_verified {
-                    tx.conn()
-                        .execute(
-                            "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
-                            rusqlite::params![conversation_id, existing.message_id],
-                        )
-                        .map_err(|e| {
-                            MLSError::Internal(format!("purge unverified history row: {e}"))
-                        })?;
-                    purged = purged.saturating_add(1);
+            // Rebuild rows without local evidence from the authenticated copy.
+            // Scan by primary key inside this transaction so equal sequences,
+            // page boundaries and deletions cannot drop rows between batches.
+            let mut after: Option<String> = None;
+            loop {
+                let mut statement = tx.conn().prepare(
+                    "SELECT message_id FROM messages WHERE conversation_id = ?1
+                     AND (?2 IS NULL OR message_id > ?2)
+                     ORDER BY message_id LIMIT 500"
+                ).map_err(|e| MLSError::Internal(e.to_string()))?;
+                let ids = statement.query_map(rusqlite::params![conversation_id, after], |row| row.get::<_, String>(0))
+                    .map_err(|e| MLSError::Internal(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>().map_err(|e| MLSError::Internal(e.to_string()))?;
+                let Some(last) = ids.last() else { break };
+                after = Some(last.clone());
+                for id in ids {
+                    if replaced_placeholders.contains(&id)
+                        || tx.get_labyrinth_state(&format!("native.message:{conversation_id}:{id}"))?.is_some()
+                        || tx.get_labyrinth_state(&unsent_message_key(conversation_id, &id))?.is_some() {
+                        continue;
+                    }
+                    if let Some(row) = tx.get_message(&id)? {
+                        if is_stored_unavailable_placeholder(tx, conversation_id, &row)? {
+                            continue;
+                        }
+                    }
+                    tx.conn().execute("DELETE FROM messages WHERE conversation_id=?1 AND message_id=?2",
+                        rusqlite::params![conversation_id, id]).map_err(|e| MLSError::Internal(e.to_string()))?;
                 }
             }
-            let _ = purged;
             let mut count = 0u32;
             for ((row, evidence, _), gap_key, replaced_placeholder_id) in
                 chosen_by_id.into_values()
@@ -4784,7 +5009,10 @@ impl CatbirdMlsClient {
     /// Unified peer-device revocation across `mls-ds` (`chat.revokeDevice`), active local MLS
     /// groups, `LabyrinthSession::revoke_chat_device` (atomic recovery-method re-key), and
     /// best-effort PDS `blue.catbird.chat.device/<target_device_id>` cleanup.
-    pub fn revoke_device(&self, target_device_id: &str) -> Result<DeviceRevocationReport, MLSError> {
+    pub fn revoke_device(
+        &self,
+        target_device_id: &str,
+    ) -> Result<DeviceRevocationReport, MLSError> {
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
         }
@@ -4815,14 +5043,17 @@ impl CatbirdMlsClient {
         let target_pubkey_opt: Option<[u8; 32]> =
             <[u8; 32]>::try_from(Self::decode_device_pubkey_field(&target_entry["signaturePublicKey"]).as_slice()).ok();
         let already_revoked = target_entry["status"].as_str() == Some("revoked");
-        let prior_needs_attention = self.labyrinth_status()?.recovery_needs_attention;
-        if target_pubkey_opt.is_some() {
+        let _receipt_guard = self.lock_recovery_receipts()?;
+        let (prior_needs_attention, recovery_generation) = if target_pubkey_opt.is_some() {
             // Fail before changing server or live-group state if a v3 share
             // cannot be deleted on the proven home service. Reserve a durable
             // reminder for a replacement code before any rotation can start.
             self.ensure_recovery_share_home_service_pin()?;
-            self.set_recovery_needs_attention(true)?;
-        }
+            self.begin_recovery_generation()?
+        } else {
+            let status = self.labyrinth_status()?;
+            (status.recovery_needs_attention, status.recovery_generation)
+        };
 
         if !already_revoked {
             let actor_key_id =
@@ -4994,6 +5225,7 @@ impl CatbirdMlsClient {
 
         Ok(DeviceRevocationReport {
             target_device_id: target_trimmed.to_owned(),
+            recovery_generation,
             ds_revoked,
             groups_updated,
             labyrinth_rotated,

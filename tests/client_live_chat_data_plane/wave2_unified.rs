@@ -649,6 +649,19 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
                     ],
                 )
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
+            for index in 0..550 {
+                tx.conn().execute(
+                    "INSERT INTO messages SELECT ?1, conversation_id, group_id, epoch, seq, sender_did,
+                     sender_device_id, plaintext_json, archive_commitment, receipt_json, created_at_ms, is_own
+                     FROM messages WHERE message_id=?2",
+                    rusqlite::params![format!("unverified-row-{index}"), forged_id],
+                ).map_err(|error| MLSError::Internal(error.to_string()))?;
+            }
+            tx.conn().execute("DELETE FROM labyrinth_state WHERE state_key=?1",
+                [format!("native.message:{dm_cid}:{push_msg_id}")])
+                .map_err(|error| MLSError::Internal(error.to_string()))?;
+            tx.conn().execute("UPDATE messages SET epoch=999999, sender_device_id='unverified' WHERE message_id=?1",
+                [&push_msg_id]).map_err(|error| MLSError::Internal(error.to_string()))?;
             Ok(())
         })
         .expect("insert forged unverified message row");
@@ -657,6 +670,16 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
         .verify_and_reindex_history(&dm_cid)
         .expect("verify_and_reindex_history");
     assert!(verified_kept >= 2);
+    alice_d2.db().read_tx(|tx| {
+        let count: i64 = tx.conn().query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND message_id LIKE 'unverified-row-%'",
+            [&dm_cid], |row| row.get(0)).map_err(|error| MLSError::Internal(error.to_string()))?;
+        assert_eq!(count, 0, "reindex must cover every page");
+        let restored = tx.get_message(&push_msg_id)?.expect("verified copy restored");
+        assert_ne!(restored.epoch, 999999);
+        assert_ne!(restored.sender_device_id, "unverified");
+        Ok(())
+    }).unwrap();
     let post_verify_msgs = alice_d2
         .list_messages(&dm_cid, None, 50)
         .expect("messages after verify_and_reindex_history");

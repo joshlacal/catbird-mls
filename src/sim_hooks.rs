@@ -371,40 +371,17 @@ pub fn sim_unix_system_time(now_secs: u64) -> OpenMlsSystemTime {
 
 /// Cryptographically validate `kp_in` (signatures, protocol version, capabilities, distinct keys)
 /// while enforcing `[not_before, not_after)` strictly against `now_secs` instead of real wall-clock.
-///
-/// Under `feature = "sim"` (`openmls/unchecked-conversions`), `KeyPackageIn::validate` runs every
-/// cryptographic/structural check before its final `life_time.validate()` call; if only the real
-/// wall-clock check differs from `now_secs`, we convert the cryptographically verified package and
-/// re-validate its `Lifetime` at `sim_unix_system_time(now_secs)`.
 pub fn validate_key_package_at(
     kp_in: KeyPackageIn,
     crypto: &impl OpenMlsCrypto,
     version: ProtocolVersion,
     now_secs: u64,
 ) -> Result<KeyPackage, KeyPackageVerifyError> {
-    let sim_time = sim_unix_system_time(now_secs);
-    #[cfg(feature = "sim")]
-    {
-        let kp_in_backup = kp_in.clone();
-        match kp_in.validate(crypto, version) {
-            Ok(kp) => {
-                kp.life_time().validate_with_time(sim_time)?;
-                Ok(kp)
-            }
-            Err(KeyPackageVerifyError::LifetimeError(_)) => {
-                let kp = kp_in_backup.into_unchecked();
-                kp.life_time().validate_with_time(sim_time)?;
-                Ok(kp)
-            }
-            Err(err) => Err(err),
-        }
-    }
-    #[cfg(not(feature = "sim"))]
-    {
-        let kp = kp_in.validate(crypto, version)?;
-        kp.life_time().validate_with_time(sim_time)?;
-        Ok(kp)
-    }
+    kp_in.validate_with_lifetime_policy(
+        crypto,
+        version,
+        openmls::prelude::LeafNodeLifetimePolicy::VerifyAt(now_secs),
+    )
 }
 
 /// Stage an MLS `Welcome` via `JoinBuilder::skip_lifetime_validation()` (preserving full GroupInfo

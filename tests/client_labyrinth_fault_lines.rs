@@ -1491,7 +1491,28 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     )
     .unwrap();
     space_client1.ffi_enroll_device(all_scopes).unwrap();
-    let code = space_client1.ffi_setup_recovery_code().unwrap();
+    let previous = space_client1
+        .ffi_setup_recovery_code_with_receipt()
+        .unwrap();
+    let current = space_client1
+        .ffi_setup_recovery_code_with_receipt()
+        .unwrap();
+    assert_ne!(current.recovery_generation, previous.recovery_generation);
+    assert!(matches!(
+        space_client1.ffi_acknowledge_recovery_generation(previous.recovery_generation),
+        Err(MLSError::InvalidState(reason)) if reason == "StaleRecoveryReceipt"
+    ));
+    assert!(
+        space_client1
+            .ffi_labyrinth_status()
+            .unwrap()
+            .recovery_needs_attention
+    );
+    let acknowledged = space_client1
+        .ffi_acknowledge_recovery_generation(current.recovery_generation)
+        .unwrap();
+    assert!(!acknowledged.recovery_needs_attention);
+    let code = current.code;
     space_client1
         .ffi_create_group(
             conv_id.to_string(),

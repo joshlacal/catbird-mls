@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, wipe_pre_cutover_local_artifacts,
     CatbirdMlsClient, CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport,
-    EnrollmentReceipt, LabyrinthBackupStatus, LabyrinthRecoveryMethodInfo,
+    EnrollmentReceipt, GeneratedRecoveryCode, LabyrinthBackupStatus, LabyrinthRecoveryMethodInfo,
     LabyrinthRecoveryPresence, LabyrinthRevocationOutcome, LeaveConversationOutcome,
     MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer,
     PeerRepinProposalInfo, PendingGroupCreationStatus, PlatformChangeObserver, PlatformKeyStore,
@@ -265,6 +265,20 @@ impl CatbirdMlsClient {
         self.send_message(&conversation_id, &message_id, &text)
     }
 
+    #[uniffi::method(name = "history_backup_enabled")]
+    pub fn ffi_history_backup_enabled(&self, conversation_id: String) -> Result<bool, MLSError> {
+        self.history_backup_enabled(&conversation_id)
+    }
+
+    #[uniffi::method(name = "set_history_backup_enabled")]
+    pub fn ffi_set_history_backup_enabled(
+        &self,
+        conversation_id: String,
+        enabled: bool,
+    ) -> Result<MessageRow, MLSError> {
+        self.set_history_backup_enabled(&conversation_id, enabled)
+    }
+
     #[uniffi::method(name = "remove_group_member")]
     pub fn ffi_remove_group_member(
         &self,
@@ -339,6 +353,19 @@ impl CatbirdMlsClient {
     #[uniffi::method(name = "acknowledge_recovery_attention")]
     pub fn ffi_acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
         self.acknowledge_recovery_attention()
+    }
+
+    #[uniffi::method(name = "acknowledge_recovery_generation")]
+    pub fn ffi_acknowledge_recovery_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<LabyrinthBackupStatus, MLSError> {
+        self.acknowledge_recovery_generation(expected_generation)
+    }
+
+    #[uniffi::method(name = "setup_recovery_code_with_receipt")]
+    pub fn ffi_setup_recovery_code_with_receipt(&self) -> Result<GeneratedRecoveryCode, MLSError> {
+        self.setup_recovery_code_with_receipt()
     }
 
     #[uniffi::method(name = "setup_recovery_code")]

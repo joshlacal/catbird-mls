@@ -1083,20 +1083,12 @@ fn deletion_operation_dedupe_is_rechecked_in_the_apply_transaction() {
         .unwrap()
         .and_then(|raw| authority::AppliedAccountDeletion::decode(&raw))
         .unwrap();
-    assert_eq!(marker.seq(), 6);
-    assert_eq!(
-        client
-            .unverified_account_deletions(CONVO_ID)
-            .unwrap()
-            .last()
-            .unwrap()
-            .reason,
-        UnverifiedDeletionReason::Replayed,
-    );
-
-    // Sequenced duplicate `accountDeletedEntry` classified as `Replayed` during live sync
-    // preserves the original `seq = 6` marker and evidence while advancing `last_seq` so
-    // conversation catch-up does not wedge.
+    assert_eq!(marker.seq(), 7);
+    assert!(marker.operation(DELETION_OP).is_some());
+    assert!(marker
+        .operation("fedcba9876543210fedcba9876543210")
+        .is_some());
+    // A replay at another sequence leaves the two original cutoffs intact.
     client
         .db
         .write_tx(|tx| {
@@ -1152,7 +1144,7 @@ fn deletion_operation_dedupe_is_rechecked_in_the_apply_transaction() {
         .unwrap()
         .and_then(|raw| authority::AppliedAccountDeletion::decode(&raw))
         .unwrap();
-    assert_eq!(marker_after.seq(), 6);
+    assert_eq!(marker_after.seq(), 7);
     assert!(client
         .unverified_account_deletions(CONVO_ID)
         .unwrap()

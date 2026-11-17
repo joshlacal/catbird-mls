@@ -383,8 +383,11 @@ impl NativeArchiveAuthFixture {
         let (nsid, query) = target.split_once('?').unwrap_or((target, ""));
         // Only the routes this host serves are parsed strictly; pass-through XRPC
         // keeps repeated array keys (`supportedProtocolVersions=1&...=2`).
+        if nsid == "com.atproto.sync.getBlocks" {
+            return Ok(reply(501, json!({"error":"MethodNotImplemented"})));
+        }
         let served = nsid == "com.atproto.identity.resolveDid"
-            || nsid == "com.atproto.sync.getRecord"
+            || matches!(nsid, "com.atproto.sync.getRecord" | "com.atproto.sync.getLatestCommit" | "com.atproto.sync.getRepo")
             || nsid.starts_with("com.atproto.repo.")
             || nsid.starts_with("com.atproto.space.")
             || matches!(
@@ -395,6 +398,49 @@ impl NativeArchiveAuthFixture {
             return raw(request);
         }
         let params = query_params(query)?;
+        if matches!(
+            nsid,
+            "com.atproto.sync.getLatestCommit" | "com.atproto.sync.getRepo"
+        ) {
+            let did = required(&params, "did")?;
+            let base = request.url.split("/xrpc/").next().unwrap_or_default();
+            let list = raw(&PlatformHttpRequest {
+                method: "GET".into(),
+                url: format!("{base}/xrpc/com.atproto.repo.listRecords?repo={did}&collection=blue.catbird.chat.deviceRevocation&limit=100"),
+                headers: Vec::new(), body: None,
+            })?;
+            if list.status != 200 {
+                return Ok(list);
+            }
+            let world = self.world.lock().unwrap();
+            let mut entries = Vec::new();
+            for ((repo, rkey), record) in &world.chat_device_revocations {
+                if repo == did {
+                    entries.push((
+                        format!("blue.catbird.chat.deviceRevocation/{rkey}"),
+                        record.dagcbor.clone(),
+                    ));
+                }
+            }
+            let signing_key = SpaceSigningKey::from_p256_secret(&key(did, b"sign"), "#atproto");
+            let rev = "3lb2zzzzzzzzz";
+            let (root, car) = catbird_mls::labyrinth::repo_proof::build_repo_proof_car_v1(
+                did,
+                rev,
+                &entries,
+                &signing_key,
+            )
+            .map_err(failure)?;
+            return if nsid == "com.atproto.sync.getLatestCommit" {
+                Ok(reply(200, json!({"cid": root.to_string(), "rev": rev})))
+            } else {
+                Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: car,
+                })
+            };
+        }
         if nsid == "com.atproto.sync.getRecord" {
             let did = required(&params, "did")?;
             let collection = required(&params, "collection")?;

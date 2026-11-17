@@ -3332,9 +3332,6 @@ pub fn archive_frame_matches_local_plaintext(
         return true;
     }
     let canonical_local = canonical_labyrinth_frame_json(local_plaintext_json);
-    if canonical_local == archived_frame_json {
-        return true;
-    }
     let (Ok(mut local_val), Ok(mut arch_val)) = (
         serde_json::from_str::<Value>(&canonical_local),
         serde_json::from_str::<Value>(archived_frame_json),
@@ -3540,6 +3537,22 @@ mod tests {
             "issuedAtMs": 1_762_000_000_000i64,
             "signature": { "$bytes": STANDARD.encode(signed.signature) },
         })
+    }
+
+    #[test]
+    fn normalized_archive_frame_preserves_explicit_no_backup() {
+        let local = r#"{"text":"keep local","noBackup":true}"#;
+        let without_policy = canonical_labyrinth_frame_json(local);
+        assert!(!archive_frame_matches_local_plaintext(
+            local,
+            &without_policy
+        ));
+        let mut with_policy: Value = serde_json::from_str(&without_policy).unwrap();
+        with_policy["noBackup"] = json!(true);
+        assert!(archive_frame_matches_local_plaintext(
+            local,
+            &with_policy.to_string()
+        ));
     }
 
     #[test]

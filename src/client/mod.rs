@@ -95,6 +95,10 @@ pub struct LabyrinthBackupStatus {
     /// replaced by the account owner. Durable across app restarts.
     #[serde(default)]
     pub recovery_needs_attention: bool,
+    /// Identifies the recovery receipt minted on this device. Zero identifies older state.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub recovery_generation: u64,
     pub epoch_seq: u64,
     pub active_device_ids: Vec<String>,
     /// Advisory only: this restored keychain/passkey method passed its
@@ -127,6 +131,14 @@ pub struct LabyrinthRecoveryPresence {
     pub pds_head: bool,
     pub ds_head: bool,
     pub requires_recovery: bool,
+}
+
+/// One displayable recovery code and the local receipt needed to acknowledge it.
+#[derive(uniffi::Record)]
+#[cfg(not(target_arch = "wasm32"))]
+pub struct GeneratedRecoveryCode {
+    pub code: String,
+    pub recovery_generation: u64,
 }
 
 /// One verified virtual recovery method in the account's current epoch.
@@ -226,6 +238,10 @@ pub struct RegisteredDeviceInfo {
 pub struct DeviceRevocationReport {
     pub target_device_id: String,
     pub ds_revoked: bool,
+    /// Identifies the recovery receipt minted on this device. Zero identifies older state.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub recovery_generation: u64,
     pub groups_updated: u32,
     pub labyrinth_rotated: bool,
     pub new_epoch_seq: Option<u64>,
@@ -438,6 +454,24 @@ pub fn execute_pq_otc_handshake(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn all_local_conversation_ids(
+    db: &crate::storage::MlsAccountDb,
+) -> Result<Vec<String>, crate::error::MLSError> {
+    db.read_tx(|tx| {
+        let mut statement = tx
+            .conn()
+            .prepare("SELECT conversation_id FROM conversations")
+            .map_err(|error| crate::error::MLSError::Internal(error.to_string()))?;
+        let ids = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| crate::error::MLSError::Internal(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| crate::error::MLSError::Internal(error.to_string()))?;
+        Ok(ids)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native_client {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -474,13 +508,13 @@ pub(crate) mod native_client {
         account_db_path, account_did_hash_hex, normalize_account_did, personal_mailbox_space_uri,
         probe_and_check_spaces_eligibility, wipe_pre_cutover_local_artifacts,
         CatbirdMlsClientConfig, CircleOwnerStateDto, DeviceRevocationReport, EnrollmentReceipt,
-        LabyrinthBackupStatus, LabyrinthRecoveryMethodInfo, LabyrinthRecoveryPresence,
-        LabyrinthRevocationOutcome, LabyrinthRotationExclusion, MailboxReadStateRecord,
-        OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer, PeerRepinProposalInfo,
-        PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest,
-        PlatformHttpResponse, PlatformKeyStore, PlatformTransport, PreCutoverWipeReport,
-        QueuedLabyrinthArchivePayload, RegisteredDeviceInfo, SignedPushGatewayRegistration,
-        SpacesEligibilityStatus, UploadedConversationAttachment,
+        GeneratedRecoveryCode, LabyrinthBackupStatus, LabyrinthRecoveryMethodInfo,
+        LabyrinthRecoveryPresence, LabyrinthRevocationOutcome, LabyrinthRotationExclusion,
+        MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer,
+        PeerRepinProposalInfo, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
+        PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+        PreCutoverWipeReport, QueuedLabyrinthArchivePayload, RegisteredDeviceInfo,
+        SignedPushGatewayRegistration, SpacesEligibilityStatus, UploadedConversationAttachment,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
@@ -711,6 +745,7 @@ pub(crate) mod native_client {
                         has_recovery_code: false,
                         has_passkey_prf: false,
                         recovery_needs_attention: false,
+                        recovery_generation: 0,
                         epoch_seq: 1,
                         active_device_ids: vec![config.device_id.clone()],
                         recovery_method_stale: false,
@@ -2406,7 +2441,7 @@ pub(crate) mod native_client {
             }
             let now_ms = self.hooks.now_ms();
             #[cfg(feature = "labyrinth")]
-            let prior_needs_attention = {
+            let (_receipt_guard, prior_needs_attention) = {
                 let valid_key = hex::decode(target_device_id.trim())
                     .ok()
                     .is_some_and(|key| key.len() == 32);
@@ -2418,9 +2453,9 @@ pub(crate) mod native_client {
                 self.ensure_recovery_share_home_service_pin()?;
                 // A committed rotation can mint the only copy of a new code.
                 // Persist the reminder before the mutation starts.
-                let prior_needs_attention = self.labyrinth_status()?.recovery_needs_attention;
-                self.set_recovery_needs_attention(true)?;
-                prior_needs_attention
+                let guard = self.lock_recovery_receipts()?;
+                let prior_needs_attention = self.begin_recovery_generation()?.0;
+                (guard, prior_needs_attention)
             };
             let mut fallback_status = self.labyrinth_status()?;
             #[cfg(feature = "labyrinth")]
@@ -2535,7 +2570,9 @@ pub(crate) mod native_client {
                                         i64::MAX,
                                     ),
                                 );
-                        if marker.covers(msg.seq, Some(msg.created_at_ms)) {
+                        if marker.covers(msg.seq, Some(msg.created_at_ms))
+                            || marker.self_deleted_device_post_entry(msg.seq, &msg.sender_device_id)
+                        {
                             continue;
                         }
                     }
@@ -2638,6 +2675,23 @@ pub(crate) mod native_client {
 
         #[cfg(not(feature = "labyrinth"))]
         pub fn acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn setup_recovery_code_with_receipt(&self) -> Result<GeneratedRecoveryCode, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn acknowledge_recovery_generation(
+            &self,
+            _expected_generation: u64,
+        ) -> Result<LabyrinthBackupStatus, MLSError> {
             Err(MLSError::InvalidState(
                 "Labyrinth feature is disabled".into(),
             ))

@@ -61,7 +61,10 @@ pub fn self_deletion_archive_revocation_bound_ms(created_at_ms: u64) -> u64 {
 
 /// Whether `record_val` is a well-formed self-deletion `deviceRevocation/{target_device_id}`
 /// record (`actorDeviceId == target_device_id` and `reason` = `deleteAccountData:{32-hex}`).
-pub fn is_valid_self_deletion_revocation_record(record_val: &Value, target_device_id: &str) -> bool {
+pub fn is_valid_self_deletion_revocation_record(
+    record_val: &Value,
+    target_device_id: &str,
+) -> bool {
     record_val.get("actorDeviceId").and_then(Value::as_str) == Some(target_device_id)
         && record_val
             .get("reason")
@@ -695,51 +698,130 @@ impl AppliedAccountDeletion {
     /// Read a stored marker. A marker written before deletions carried a device-signed instant
     /// holds only the seq: it hides by seq alone, as it always did.
     pub fn decode(raw: &[u8]) -> Option<StoredAccountDeletion> {
-        let text = std::str::from_utf8(raw).ok()?.trim();
-        if let Ok(seq) = text.parse::<i64>() {
-            return Some(StoredAccountDeletion::SeqOnly(seq));
+        let marker: StoredAccountDeletion = serde_json::from_slice(raw).ok()?;
+        if marker.legacy_seq().is_some_and(|seq| seq <= 0)
+            || marker.operations().is_empty() && marker.legacy_seq().is_none()
+        {
+            return None;
         }
-        serde_json::from_str::<Self>(text)
-            .ok()
-            .map(StoredAccountDeletion::Signed)
+        let mut operations = std::collections::BTreeSet::new();
+        let mut sequences = std::collections::BTreeSet::new();
+        for op in marker.operations() {
+            if op.seq <= 0
+                || op.operation_id.is_empty()
+                || !operations.insert(&op.operation_id)
+                || !sequences.insert(op.seq)
+            {
+                return None;
+            }
+        }
+        Some(marker)
     }
 }
 
-/// A stored deletion marker, either form.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StoredAccountDeletion {
-    SeqOnly(i64),
+/// Keep every distinct signed deletion. Clock skew and delayed relays mean two
+/// sequence/time cutoffs cannot safely be represented by their independent maxima.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StoredAccountDeletion {    SeqOnly(i64),
     Signed(AppliedAccountDeletion),
+    History {
+        #[serde(default, rename = "legacySeq", skip_serializing_if = "Option::is_none")]
+        legacy_seq: Option<i64>,
+        operations: Vec<AppliedAccountDeletion>,
+    },
 }
 
 impl StoredAccountDeletion {
-    pub fn seq(&self) -> i64 {
+    fn legacy_seq(&self) -> Option<i64> {
         match self {
-            Self::SeqOnly(seq) => *seq,
-            Self::Signed(applied) => applied.seq,
+            Self::SeqOnly(seq) => Some(*seq),
+            Self::Signed(_) => None,
+            Self::History { legacy_seq, .. } => *legacy_seq,
         }
     }
 
-    /// Whether a message of the deleted account sequenced at `seq` and issued at `issued_at_ms`
-    /// (when known) is covered.
-    pub fn covers(&self, seq: i64, issued_at_ms: Option<i64>) -> bool {
+    fn operations(&self) -> &[AppliedAccountDeletion] {
         match self {
-            Self::SeqOnly(deleted_seq) => seq < *deleted_seq,
-            Self::Signed(applied) => {
-                seq < applied.seq
-                    && issued_at_ms.is_none_or(|issued| issued <= applied.purge_bound_ms())
+            Self::Signed(op) => std::slice::from_ref(op),
+            Self::History { operations, .. } => operations,
+            Self::SeqOnly(_) => &[],
+        }
+    }
+
+    pub fn operation(&self, id: &str) -> Option<&AppliedAccountDeletion> {
+        self.operations().iter().find(|op| op.operation_id == id)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|err| err.to_string())
+    }
+
+    pub fn merge_verified(
+        existing: Option<&Self>,
+        next: AppliedAccountDeletion,
+    ) -> Result<Self, String> {
+        let Some(existing) = existing else {
+            return Ok(Self::Signed(next));
+        };
+        let mut operations = existing.operations().to_vec();
+        if let Some(previous) = operations
+            .iter_mut()
+            .find(|op| op.operation_id == next.operation_id || op.seq == next.seq)
+        {
+            if previous.operation_id != next.operation_id
+                || previous.seq != next.seq
+                || previous.signed_at_ms != next.signed_at_ms
+                || previous.actor_device_id.is_some()
+                    && previous.actor_device_id != next.actor_device_id
+            {
+                return Err("conflicting account deletion operation or sequence".into());
             }
+            if previous.actor_device_id.is_none() {
+                previous.actor_device_id = next.actor_device_id;
+            }
+        } else {
+            operations.push(next);
+            operations.sort_by_key(|op| op.seq);
         }
+        Ok(Self::History {
+            legacy_seq: existing.legacy_seq(),
+            operations,
+        })
     }
 
-    /// Whether `seq` is at or after the deletion entry and names the self-deleted `actor_device_id`.
+    pub fn seq(&self) -> i64 {
+        self.operations()
+            .iter()
+            .map(|op| op.seq)
+            .chain(self.legacy_seq())
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn covers(&self, seq: i64, issued_at_ms: Option<i64>) -> bool {
+        self.legacy_seq().is_some_and(|cut| seq < cut)
+            || self.operations().iter().any(|op| {
+                seq < op.seq && issued_at_ms.is_none_or(|issued| issued <= op.purge_bound_ms())
+            })
+    }
+
+    /// Hold later frames if this device cannot identify the actor in an old
+    /// marker. A newly verified copy of the original entry repairs the marker.
     pub fn self_deleted_device_post_entry(&self, seq: i64, sender_device_id: &str) -> bool {
-        matches!(
-            self,
-            Self::Signed(applied)
-                if seq >= applied.seq
-                    && applied.actor_device_id.as_deref() == Some(sender_device_id)
-        )
+        if self
+            .legacy_seq()
+            .is_some_and(|cut| seq >= cut && !self.operations().iter().any(|op| op.seq == cut))
+        {
+            return true;
+        }
+        self.operations().iter().any(|op| {
+            seq >= op.seq
+                && op
+                    .actor_device_id
+                    .as_deref()
+                    .is_none_or(|actor| actor == sender_device_id)
+        })
     }
 }
 
@@ -968,6 +1050,34 @@ mod tests {
         assert!(!signed.covers(39, Some(1_000_001 + DELETION_CLOCK_SKEW_MS)));
         assert!(signed.covers(39, None));
         assert!(!signed.covers(41, Some(0)));
+    }
+
+    #[test]
+    fn repeated_erasures_keep_independent_cutoffs_and_identify_legacy_actors() {
+        let first = AppliedAccountDeletion {
+            seq: 5,
+            signed_at_ms: 9_000_000,
+            operation_id: "first".into(),
+            actor_device_id: Some("a".into()),
+        };
+        let second = AppliedAccountDeletion {
+            seq: 10,
+            signed_at_ms: 1_000_000,
+            operation_id: "second".into(),
+            actor_device_id: Some("b".into()),
+        };
+        let legacy = AppliedAccountDeletion::decode(b"5").unwrap();
+        assert!(legacy.self_deleted_device_post_entry(6, "c"));
+        let updated = StoredAccountDeletion::merge_verified(Some(&legacy), first).unwrap();
+        assert!(!updated.self_deleted_device_post_entry(6, "c"));
+        assert!(updated.self_deleted_device_post_entry(6, "a"));
+        let history = StoredAccountDeletion::merge_verified(Some(&updated), second).unwrap();
+        let history = AppliedAccountDeletion::decode(&history.encode().unwrap()).unwrap();
+        assert!(history.covers(4, Some(9_000_000)));
+        assert!(history.covers(8, Some(1_000_000)));
+        assert!(!history.covers(8, Some(9_000_000)));
+        assert!(history.self_deleted_device_post_entry(11, "b"));
+        assert!(!history.self_deleted_device_post_entry(11, "c"));
     }
 
     #[cfg(feature = "labyrinth")]

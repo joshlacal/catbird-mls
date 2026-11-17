@@ -103,11 +103,11 @@ impl EpochChain {
         self.start <= from && from <= to && to <= self.current
     }
 
-    fn encode(&self) -> String {
+    pub fn encode(&self) -> String {
         format!("{}:{}", self.start, self.current)
     }
 
-    fn decode(raw: &str) -> Option<Self> {
+    pub fn decode(raw: &str) -> Option<Self> {
         let (start, current) = raw.split_once(':')?;
         let chain = Self {
             start: start.parse().ok()?,
@@ -193,7 +193,7 @@ pub fn peer_send_continuity_key(
     format!("peer_send_continuity:{conversation_id}:{generation}:{sender_did}:{sender_device_id}")
 }
 
-fn peer_send_continuity_prefix(conversation_id: &str, generation: i64) -> String {
+pub fn peer_send_continuity_prefix(conversation_id: &str, generation: i64) -> String {
     format!("peer_send_continuity:{conversation_id}:{generation}:")
 }
 

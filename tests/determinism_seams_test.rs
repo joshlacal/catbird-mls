@@ -1368,9 +1368,8 @@ fn sim_clock_virtual_time_travel_validates_and_expires_welcomes() {
     ));
 }
 
-#[cfg(feature = "sim")]
 #[test]
-fn sim_clock_virtual_time_travel_validates_and_expires_29_day_key_package() {
+fn captured_clock_validates_and_expires_29_day_key_package() {
     let suite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
     let clock = FixedStepClock::new(PINNED_START_MS, 10);
     let t0 = clock.now_secs();
@@ -1432,6 +1431,20 @@ fn sim_clock_virtual_time_travel_validates_and_expires_29_day_key_package() {
         clock.now_secs(),
     )
     .expect("29-day KP must validate at SimClock t0 + 7d");
+
+    let end = t0 + 29 * 86_400;
+    validate_key_package_at(
+        parse_kp_in(&kp_bytes),
+        provider.crypto(),
+        ProtocolVersion::Mls10,
+        end - 1,
+    )
+    .expect("last valid second");
+    assert!(matches!(
+        validate_key_package_at(parse_kp_in(&kp_bytes), provider.crypto(), ProtocolVersion::Mls10, end),
+        Err(KeyPackageVerifyError::LifetimeError(LifetimeError::Expired { not_after, now }))
+            if not_after == end && now == end
+    ));
 
     // Advance SimClock by another `+23 days` (`+30 days` total): deterministically expired!
     clock.advance_ms(23 * 86_400 * 1_000);
