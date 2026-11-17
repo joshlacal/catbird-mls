@@ -2108,6 +2108,8 @@ pub(crate) mod native_client {
         // ---------------------------------------------------------------------
 
         pub fn labyrinth_status(&self) -> Result<LabyrinthBackupStatus, MLSError> {
+            #[cfg(feature = "labyrinth")]
+            self.refresh_pending_native_archive_publication_if_due();
             self.db.read_tx(|tx| {
                 let bytes = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())

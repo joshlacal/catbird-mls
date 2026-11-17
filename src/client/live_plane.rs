@@ -67,12 +67,61 @@ pub(crate) struct PendingApplicationSend {
     pub(crate) archive: QueuedLabyrinthArchivePayload,
 }
 
+/// The AEAD/exporter construction of an authenticated metadata snapshot.
+enum MetadataCarryScheme {
+    Legacy,
+    Canonical { origin_transition_id: String },
+}
+
 /// Authenticated prior metadata held only across one Commit build.
 pub(crate) struct MetadataCarryForward {
     snapshot: Value,
     plaintext: Vec<u8>,
     nonce: [u8; 12],
     ciphertext_len: usize,
+    scheme: MetadataCarryScheme,
+}
+
+fn canonical_metadata_coordinates_from_wire(coordinate: &Value) -> Result<Value, MLSError> {
+    let refused =
+        |what: &str| MLSError::Cryptography(format!("metadata carry-forward: {what}"));
+    let conversation_id = uuid::Uuid::from_slice(&chat_wire::json_bytes(
+        coordinate
+            .get("conversationId")
+            .ok_or_else(|| refused("missing conversation id"))?,
+    )?)
+    .map_err(|_| refused("invalid conversation id"))?;
+    let group_id = chat_wire::json_bytes(
+        coordinate
+            .get("groupId")
+            .ok_or_else(|| refused("missing group id"))?,
+    )?;
+    let generation = coordinate
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| refused("missing generation"))?;
+    let epoch = coordinate
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| refused("missing epoch"))?;
+    let group_context_hash = chat_wire::json_bytes(
+        coordinate
+            .get("groupContextHash")
+            .ok_or_else(|| refused("missing group context hash"))?,
+    )?;
+    let confirmation_tag = chat_wire::json_bytes(
+        coordinate
+            .get("confirmationTag")
+            .ok_or_else(|| refused("missing confirmation tag"))?,
+    )?;
+    Ok(direct_request_bootstrap::canonical_metadata_coordinates(
+        &conversation_id.to_string(),
+        &group_id,
+        generation,
+        epoch,
+        &group_context_hash,
+        &confirmation_tag,
+    ))
 }
 
 pub(crate) use super::chat_wire::PendingCommitTransition;
@@ -2498,6 +2547,17 @@ impl CatbirdMlsClient {
             .map_err(|e| MLSError::Cryptography(format!("C33 opening frame: {e}")))?;
         let coords_str = serde_json::to_string(&bootstrap.coordinates)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
+        let metadata_snapshot_json = serde_json::to_string(
+            verified_publication
+                .body()
+                .pointer("/artifacts/metadataSnapshot")
+                .ok_or_else(|| {
+                    MLSError::Cryptography(
+                        "C33 signed publication missing metadata snapshot".into(),
+                    )
+                })?,
+        )
+        .map_err(|e| MLSError::Internal(format!("serialize C33 metadata snapshot: {e}")))?;
 
         if crate::buggify!("after_http_2xx_before_db_commit") {
             return Err(MLSError::Internal(
@@ -2542,6 +2602,11 @@ impl CatbirdMlsClient {
             tx.put_account_meta(
                 &format!("conversation_coords:{effective_convo_id}"),
                 &coords_str,
+                now_ms,
+            )?;
+            tx.put_account_meta(
+                &format!("metadata_snapshot_json:{effective_convo_id}"),
+                &metadata_snapshot_json,
                 now_ms,
             )?;
             tx.upsert_request(&RequestRow {
@@ -5087,17 +5152,10 @@ impl CatbirdMlsClient {
                     let next_epoch = group.epoch().as_u64();
                     let (next_gch, next_ctag) =
                         chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                    let meta_key = derive_metadata_key_from_group(
-                        &mut group,
-                        provider.crypto(),
-                        provider.storage(),
-                        &convo.group_id,
-                        next_epoch,
-                    )
-                    .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                     let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
                         metadata_carry,
-                        &meta_key,
+                        &mut group,
+                        &provider,
                         &convo.group_id,
                         convo_uuid,
                         prior_gen,
@@ -5605,13 +5663,28 @@ impl CatbirdMlsClient {
             .get("metadataVersion")
             .and_then(Value::as_u64)
             .ok_or_else(|| refused("missing metadata version"))?;
-        if snapshot.get("originTransitionId").and_then(Value::as_str).is_none()
-            || !snapshot
-                .get("authorProof")
-                .is_some_and(Value::is_object)
+        let origin_transition_id = snapshot
+            .get("originTransitionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refused("missing authenticated origin"))?
+            .to_string();
+        if !snapshot
+            .get("authorProof")
+            .is_some_and(Value::is_object)
         {
             return Err(refused("missing authenticated origin"));
         }
+        let scheme = match tx.get_request(&origin_transition_id)? {
+            Some(request) if request.conversation_id == conversation_id => {
+                if metadata_version != 1 {
+                    return Err(refused("canonical metadata version is not 1"));
+                }
+                MetadataCarryScheme::Canonical {
+                    origin_transition_id,
+                }
+            }
+            _ => MetadataCarryScheme::Legacy,
+        };
         let nonce_vec = chat_wire::json_bytes(
             snapshot
                 .get("nonce")
@@ -5640,29 +5713,51 @@ impl CatbirdMlsClient {
         {
             return Err(refused("ciphertext binding mismatch"));
         }
-        let metadata_key = derive_metadata_key_from_group(
-            group,
-            provider.crypto(),
-            provider.storage(),
-            group_id,
-            epoch,
-        )
-        .map_err(|e| refused(&format!("derive prior key: {e}")))?;
-        let plaintext = decrypt_metadata_snapshot_plaintext(
-            &metadata_key,
-            group_id,
-            epoch,
-            metadata_version,
-            &nonce,
-            &ciphertext,
-        )
-        .map_err(|e| refused(&format!("decrypt prior snapshot: {e}")))?;
+        let plaintext = match &scheme {
+            MetadataCarryScheme::Legacy => {
+                let metadata_key = derive_metadata_key_from_group(
+                    group,
+                    provider.crypto(),
+                    provider.storage(),
+                    group_id,
+                    epoch,
+                )
+                .map_err(|e| refused(&format!("derive prior key: {e}")))?;
+                decrypt_metadata_snapshot_plaintext(
+                    &metadata_key,
+                    group_id,
+                    epoch,
+                    metadata_version,
+                    &nonce,
+                    &ciphertext,
+                )
+                .map_err(|e| refused(&format!("decrypt prior snapshot: {e}")))?
+            }
+            MetadataCarryScheme::Canonical {
+                origin_transition_id,
+            } => {
+                let coordinates =
+                    canonical_metadata_coordinates_from_wire(&snapshot["coordinate"])?;
+                let metadata_key =
+                    direct_request_bootstrap::request_metadata_key(group, provider, &coordinates)
+                        .map_err(|e| refused(&format!("derive prior canonical key: {e}")))?;
+                direct_request_bootstrap::open_request_metadata(
+                    &metadata_key,
+                    &coordinates,
+                    origin_transition_id,
+                    &nonce,
+                    &ciphertext,
+                )
+                .map_err(|e| refused(&format!("decrypt prior canonical snapshot: {e}")))?
+            }
+        };
         validate_metadata_snapshot_size(&plaintext)?;
         Ok(MetadataCarryForward {
             snapshot,
             plaintext,
             nonce,
             ciphertext_len: ciphertext.len(),
+            scheme,
         })
     }
 
@@ -5670,10 +5765,11 @@ impl CatbirdMlsClient {
     /// coordinate bindings change; metadata version, origin, author proof, avatar binding, unknown
     /// envelope fields, and every plaintext byte remain untouched.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reencrypt_metadata_snapshot_for_epoch(
+    pub(crate) fn reencrypt_metadata_snapshot_for_epoch<P: OpenMlsProvider>(
         &self,
         carry: MetadataCarryForward,
-        metadata_key: &[u8; 32],
+        group: &mut MlsGroup,
+        provider: &P,
         group_id: &[u8],
         convo_uuid: &uuid::Uuid,
         generation: i64,
@@ -5688,6 +5784,7 @@ impl CatbirdMlsClient {
             plaintext,
             nonce: previous_nonce,
             ciphertext_len: previous_len,
+            scheme,
         } = carry;
         let metadata_version = snapshot
             .get("metadataVersion")
@@ -5697,15 +5794,55 @@ impl CatbirdMlsClient {
         if previous_nonce == nonce {
             return Err(refused("nonce repeated across epochs"));
         }
-        let ciphertext = encrypt_metadata_snapshot_plaintext_with_nonce(
-            metadata_key,
-            group_id,
-            target_epoch,
-            metadata_version,
-            &nonce,
-            &plaintext,
-        )
-        .map_err(|e| refused(&format!("encrypt next snapshot: {e}")))?;
+        let ciphertext = match scheme {
+            MetadataCarryScheme::Legacy => {
+                let metadata_key = derive_metadata_key_from_group(
+                    group,
+                    provider.crypto(),
+                    provider.storage(),
+                    group_id,
+                    target_epoch,
+                )
+                .map_err(|e| refused(&format!("derive next key: {e}")))?;
+                encrypt_metadata_snapshot_plaintext_with_nonce(
+                    &metadata_key,
+                    group_id,
+                    target_epoch,
+                    metadata_version,
+                    &nonce,
+                    &plaintext,
+                )
+                .map_err(|e| refused(&format!("encrypt next snapshot: {e}")))?
+            }
+            MetadataCarryScheme::Canonical {
+                origin_transition_id,
+            } => {
+                if metadata_version != 1 {
+                    return Err(refused("canonical metadata version is not 1"));
+                }
+                let generation = u64::try_from(generation)
+                    .map_err(|_| refused("negative canonical generation"))?;
+                let coordinates = direct_request_bootstrap::canonical_metadata_coordinates(
+                    &convo_uuid.to_string(),
+                    group_id,
+                    generation,
+                    target_epoch,
+                    next_gch,
+                    next_ctag,
+                );
+                let metadata_key =
+                    direct_request_bootstrap::request_metadata_key(group, provider, &coordinates)
+                        .map_err(|e| refused(&format!("derive next canonical key: {e}")))?;
+                direct_request_bootstrap::seal_request_metadata(
+                    &metadata_key,
+                    &coordinates,
+                    &origin_transition_id,
+                    &nonce,
+                    &plaintext,
+                )
+                .map_err(|e| refused(&format!("encrypt next canonical snapshot: {e}")))?
+            }
+        };
         if ciphertext.len() != previous_len {
             return Err(refused("plaintext length changed"));
         }
@@ -5807,6 +5944,7 @@ impl CatbirdMlsClient {
             plaintext: prior_plaintext,
             nonce: prior_nonce,
             ciphertext_len: prior_ciphertext_len,
+            scheme,
         } = carry;
         let prior_coordinate = prior_snapshot
             .get("coordinate")
@@ -5868,29 +6006,58 @@ impl CatbirdMlsClient {
             return Err(refused("ciphertext binding changed"));
         }
         let group_id = group.group_id().as_slice().to_vec();
-        let metadata_key = derive_metadata_key_from_group(
-            group,
-            provider.crypto(),
-            provider.storage(),
-            &group_id,
-            target_epoch,
-        )
-        .map_err(|e| refused(&format!("derive next key: {e}")))?;
-        let plaintext = decrypt_metadata_snapshot_plaintext(
-            &metadata_key,
-            &group_id,
-            target_epoch,
-            metadata_version,
-            &nonce,
-            &ciphertext,
-        )
-        .map_err(|e| refused(&format!("decrypt next snapshot: {e}")))?;
+        let plaintext = match &scheme {
+            MetadataCarryScheme::Legacy => {
+                let metadata_key = derive_metadata_key_from_group(
+                    group,
+                    provider.crypto(),
+                    provider.storage(),
+                    &group_id,
+                    target_epoch,
+                )
+                .map_err(|e| refused(&format!("derive next key: {e}")))?;
+                decrypt_metadata_snapshot_plaintext(
+                    &metadata_key,
+                    &group_id,
+                    target_epoch,
+                    metadata_version,
+                    &nonce,
+                    &ciphertext,
+                )
+                .map_err(|e| refused(&format!("decrypt next snapshot: {e}")))?
+            }
+            MetadataCarryScheme::Canonical {
+                origin_transition_id,
+            } => {
+                if metadata_version != 1 {
+                    return Err(refused("canonical metadata version is not 1"));
+                }
+                let coordinates = canonical_metadata_coordinates_from_wire(coordinate)?;
+                let metadata_key =
+                    direct_request_bootstrap::request_metadata_key(group, provider, &coordinates)
+                        .map_err(|e| refused(&format!("derive next canonical key: {e}")))?;
+                direct_request_bootstrap::open_request_metadata(
+                    &metadata_key,
+                    &coordinates,
+                    origin_transition_id,
+                    &nonce,
+                    &ciphertext,
+                )
+                .map_err(|e| refused(&format!("decrypt next canonical snapshot: {e}")))?
+            }
+        };
         validate_metadata_snapshot_size(&plaintext)?;
         if plaintext != prior_plaintext {
             return Err(refused("plaintext changed"));
         }
-        let metadata: GroupMetadataV1 = serde_json::from_slice(&plaintext)
-            .map_err(|e| refused(&format!("invalid metadata plaintext: {e}")))?;
+        let metadata = match scheme {
+            MetadataCarryScheme::Legacy => serde_json::from_slice(&plaintext)
+                .map_err(|e| refused(&format!("invalid metadata plaintext: {e}")))?,
+            MetadataCarryScheme::Canonical { .. } => {
+                direct_request_bootstrap::decode_request_metadata(&plaintext)
+                    .map_err(|e| refused(&format!("invalid canonical metadata plaintext: {e}")))?
+            }
+        };
         Ok((
             i64::try_from(target_epoch).map_err(|_| refused("epoch overflows storage"))?,
             i64::try_from(metadata_version)
@@ -7699,17 +7866,10 @@ impl CatbirdMlsClient {
                 let next_epoch = group.epoch().as_u64();
                 let (next_gch, next_ctag) =
                     chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_key = derive_metadata_key_from_group(
-                    &mut group,
-                    provider.crypto(),
-                    provider.storage(),
-                    &convo.group_id,
-                    next_epoch,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                 let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
                     metadata_carry,
-                    &meta_key,
+                    &mut group,
+                    &provider,
                     &convo.group_id,
                     convo_uuid,
                     prior_gen,

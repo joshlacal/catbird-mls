@@ -512,13 +512,34 @@ mod tests {
         assert!(store.get_share(&vid, &token).await.is_err());
         let requests = gateway.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].nsid, CAPABILITY_NSID);
-        assert_eq!(requests[0].method, "GET");
-        assert!(requests[0].body.is_none());
-        assert!(requests[0]
+        let capability_request = &requests[0];
+        assert_eq!(capability_request.nsid, CAPABILITY_NSID);
+        assert_eq!(capability_request.method, "GET");
+        assert_eq!(
+            capability_request.path,
+            format!("/xrpc/{CAPABILITY_NSID}"),
+            "the zero-parameter lexicon rejects legacy actorDeviceId query injection"
+        );
+        assert!(capability_request.body.is_none());
+        let read_header = capability_request
             .headers
             .iter()
-            .any(|(name, _)| name == super::super::write_auth::READ_HEADER));
+            .find(|(name, _)| name == super::super::write_auth::READ_HEADER)
+            .map(|(_, value)| value)
+            .expect("signed read claim");
+        let claim: super::super::write_auth::ReadClaim = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(read_header)
+                .expect("read claim base64"),
+        )
+        .expect("read claim JSON");
+        assert_eq!(claim.nsid, CAPABILITY_NSID);
+        assert_eq!(claim.did, DID);
+        assert_eq!(claim.device_id, "device-a");
+        assert!(claim.query.is_empty());
+        assert!(capability_request.headers.iter().any(|(name, _)| {
+            name == super::super::write_auth::READ_SIGNATURE_HEADER
+        }));
 
         *gateway.supported.lock().unwrap() = true;
         assert!(store.get_share(&vid, &token).await.unwrap().is_none());

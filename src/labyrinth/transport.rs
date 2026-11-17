@@ -31,6 +31,8 @@ use crate::orchestrator::canonical_transport::{
 
 /// NSID prefix of every `mls-ds` Labyrinth endpoint.
 pub const NSID_PREFIX: &str = "blue.catbird.labyrinth.";
+const RECOVERY_SHARE_CAPABILITY_NSID: &str =
+    "blue.catbird.labyrinth.getRecoveryShareCapabilities";
 
 /// Transport-level error from a Labyrinth XRPC call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,9 +314,16 @@ impl GatewayXrpcTransport {
         self.clock.now_ms()
     }
 
-    fn wire_params<'a>(&self, params: &[(&'a str, String)]) -> Vec<(&'a str, String)> {
-        let mut all = Vec::with_capacity(params.len() + 1);
-        all.push(("actorDeviceId", self.device_id.clone()));
+    fn wire_params<'a>(
+        &self,
+        nsid: &str,
+        params: &[(&'a str, String)],
+    ) -> Vec<(&'a str, String)> {
+        let include_device = nsid != RECOVERY_SHARE_CAPABILITY_NSID;
+        let mut all = Vec::with_capacity(params.len() + usize::from(include_device));
+        if include_device {
+            all.push(("actorDeviceId", self.device_id.clone()));
+        }
         all.extend(params.iter().cloned());
         all
     }
@@ -324,7 +333,11 @@ impl GatewayXrpcTransport {
             .iter()
             .map(|(k, v)| format!("{}={}", encode_query(k), encode_query(v)))
             .collect();
-        format!("/xrpc/{nsid}?{}", query.join("&"))
+        if query.is_empty() {
+            format!("/xrpc/{nsid}")
+        } else {
+            format!("/xrpc/{nsid}?{}", query.join("&"))
+        }
     }
 
     fn read_headers(
@@ -366,7 +379,7 @@ impl GatewayXrpcTransport {
                 "refusing a non-Labyrinth query: {nsid}"
             )));
         }
-        let params = self.wire_params(params);
+        let params = self.wire_params(nsid, params);
         let path = Self::query_path(nsid, &params);
         let mut all = headers.to_vec();
         all.extend(self.read_headers(nsid, &params)?);

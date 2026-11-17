@@ -24,6 +24,7 @@ use crate::client::traits::{
     PlatformTransport,
 };
 use crate::messaging::receive::OriginalSenderArchiveAttestationEnvelope;
+use crate::metadata::derive_metadata_key_from_group;
 use crate::orchestrator::canonical_transport::{derive_key_id, CanonicalOperation};
 use crate::orchestrator::MLSMessagePayload;
 use crate::storage::{ConversationRow, MessageRow, OpenMlsKvStorage, RusqliteKvBackend};

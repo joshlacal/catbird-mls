@@ -1,6 +1,6 @@
 //! Deep live data-plane & sync engine tests for `CatbirdMlsClient` (`Spec §6.3`, `I2`, `I4`, `I6`, `I13`, `I14`, `C33`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -273,6 +273,9 @@ struct MockDsState {
     // Wave 2 opt-in controls: second-device pending_approval, per-device status/revokedAt, and durable leave requests.
     enroll_second_device_pending: bool,
     device_statuses: BTreeMap<(String, String), String>,
+    pending_epoch_publication_rejections: usize,
+    aged_pending_notices: BTreeSet<(String, String)>,
+    dormant_devices: BTreeSet<(String, String)>,
     revoked_device_at: BTreeMap<(String, String), String>,
     leave_requests: BTreeMap<String, Vec<Value>>,
 }
@@ -357,6 +360,9 @@ impl SharedMockDs {
                 fake_pending_reset_seq: None,
                 enroll_second_device_pending: false,
                 device_statuses: BTreeMap::new(),
+                pending_epoch_publication_rejections: 0,
+                aged_pending_notices: BTreeSet::new(),
+                dormant_devices: BTreeSet::new(),
                 revoked_device_at: BTreeMap::new(),
                 leave_requests: BTreeMap::new(),
             }),
@@ -821,7 +827,7 @@ impl SharedMockDs {
                 account,
                 &req,
                 "blue.catbird.labyrinth.getRecoveryShareCapabilities",
-                true,
+                false,
             ) {
                 return xrpc_error(401, "InvalidSignature", message);
             }
@@ -963,20 +969,35 @@ impl SharedMockDs {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
+            let caller = (account.to_owned(), caller_dev.clone());
+            let caller_pending = g.device_statuses.get(&caller).map(String::as_str)
+                == Some("pending_approval");
+            if caller_pending {
+                let notice_aged = g.aged_pending_notices.contains(&caller);
+                let has_awake_active_sibling =
+                    g.device_statuses.iter().any(|((did, device_id), status)| {
+                        did == account
+                            && device_id != &caller_dev
+                            && status == "active"
+                            && !g
+                                .dormant_devices
+                                .contains(&(did.clone(), device_id.clone()))
+                    });
+                if !notice_aged || has_awake_active_sibling {
+                    g.pending_epoch_publication_rejections += 1;
+                    return xrpc_error(
+                        401,
+                        "NotAuthorized",
+                        "pending device must wait for the recovery notice hold and dormant siblings",
+                    );
+                }
+            }
             let chain = g.labyrinth_epochs.entry(account.to_owned()).or_default();
             if let Some(existing) = chain
                 .iter()
                 .find(|e| e["epochNumber"] == epoch_json["epochNumber"])
             {
                 return if *existing == epoch_json {
-                    if g.device_statuses
-                        .get(&(account.to_owned(), caller_dev.clone()))
-                        .map(String::as_str)
-                        == Some("pending_approval")
-                    {
-                        g.device_statuses
-                            .insert((account.to_owned(), caller_dev), "active".into());
-                    }
                     ok_json(json!({}))
                 } else {
                     xrpc_error(409, "EpochHeadConflict", "different head at this epoch")
@@ -992,13 +1013,8 @@ impl SharedMockDs {
                 return xrpc_error(400, "InvalidEpochChain", "head does not extend the chain");
             }
             chain.push(epoch_json);
-            if g.device_statuses
-                .get(&(account.to_owned(), caller_dev.clone()))
-                .map(String::as_str)
-                == Some("pending_approval")
-            {
-                g.device_statuses
-                    .insert((account.to_owned(), caller_dev), "active".into());
+            if caller_pending {
+                g.device_statuses.insert(caller, "active".into());
             }
             return ok_json(json!({}));
         }

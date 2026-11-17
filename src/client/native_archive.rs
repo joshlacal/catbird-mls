@@ -1,6 +1,8 @@
 use std::future::Future;
 
 // Native adapters for the shared, verified Labyrinth session. Included in native_client.
+const PENDING_DEVICE_ACTIVATION_REFRESH_STATE: &str =
+    "pending_device_activation_refresh";
 
 #[cfg(feature = "labyrinth")]
 struct NativeArchiveClock(crate::sim_hooks::SimClientHooks);
@@ -1082,6 +1084,7 @@ impl NativeArchiveEvidence {
 #[cfg(feature = "labyrinth")]
 type RestoreCopy = (MessageRow, NativeArchiveEvidence, super::chat_wire::StoredArchivedReceipt);
 
+
 /// Verified archive copies as restorable rows, grouped by message id with equal rows merged.
 /// Labyrinth never returns a witness copy that contradicts an accepted one (ruling 3); what can
 /// still differ under one id are two members' own copies.
@@ -1166,6 +1169,162 @@ fn select_restore_copy<'a>(copies: &'a [RestoreCopy], local: Option<&MessageRow>
     });
     let first = matching.next()?;
     (!local_gap || matching.next().is_none()).then_some(first)
+}
+
+#[cfg(feature = "labyrinth")]
+fn unavailable_placeholder_matches_restore_copy(
+    conversation_id: &str,
+    placeholder: &MessageRow,
+    unavailable: &super::chat_wire::UnavailableEntryEvidence,
+    copy: &RestoreCopy,
+) -> Result<bool, MLSError> {
+    let (row, _, receipt) = copy;
+    let Some(seq) = u64::try_from(unavailable.seq).ok() else {
+        return Ok(false);
+    };
+    let Some(epoch) = u64::try_from(unavailable.epoch).ok() else {
+        return Ok(false);
+    };
+    let Some(generation) = u64::try_from(unavailable.generation).ok() else {
+        return Ok(false);
+    };
+    if unavailable.version != 1
+        || unavailable.reason != super::chat_wire::PAYLOAD_PRUNED_REASON
+        || unavailable.conversation_id != conversation_id
+        || unavailable.message_id != unavailable.entry_id
+        || unavailable.entry_id != receipt.entry_id
+        || seq != receipt.seq
+        || epoch != receipt.epoch
+        || generation != receipt.generation
+        || row.conversation_id != conversation_id
+        || row.group_id != receipt.group_id
+        || row.seq != unavailable.seq
+        || row.epoch != unavailable.epoch
+        || row.sender_did != unavailable.sender_did
+        || row.sender_device_id != unavailable.sender_device_id
+        || receipt.conversation_id != conversation_id
+        || receipt.sender_device_did_url
+            != format!(
+                "{}#{}",
+                unavailable.sender_did, unavailable.sender_device_id
+            )
+        || unavailable.placeholder_row(&receipt.group_id, placeholder.is_own)? != *placeholder
+    {
+        return Ok(false);
+    }
+
+    let wire = &unavailable.receipt;
+    if wire.get("sequencerDid").and_then(serde_json::Value::as_str)
+        != Some(receipt.sequencer_did.as_str())
+        || wire.get("conversationId").and_then(serde_json::Value::as_str)
+            != Some(receipt.conversation_id.as_str())
+        || wire.get("generation").and_then(serde_json::Value::as_u64)
+            != Some(receipt.generation)
+        || super::chat_wire::json_bytes(
+            wire.get("groupId")
+                .ok_or_else(|| MLSError::Cryptography("unavailable receipt missing groupId".into()))?,
+        )? != receipt.group_id
+        || wire.get("epoch").and_then(serde_json::Value::as_u64) != Some(receipt.epoch)
+        || wire.get("seq").and_then(serde_json::Value::as_u64) != Some(receipt.seq)
+        || wire.get("entryId").and_then(serde_json::Value::as_str)
+            != Some(receipt.entry_id.as_str())
+        || wire.get("senderDid").and_then(serde_json::Value::as_str)
+            != Some(unavailable.sender_did.as_str())
+        || wire.get("senderDeviceId").and_then(serde_json::Value::as_str)
+            != Some(unavailable.sender_device_id.as_str())
+        || super::chat_wire::json_bytes(
+            wire.get("archiveCommitment").ok_or_else(|| {
+                MLSError::Cryptography("unavailable receipt missing archiveCommitment".into())
+            })?,
+        )? != receipt.archive_commitment
+        || wire.get("issuedAtMs").and_then(serde_json::Value::as_i64)
+            != Some(receipt.issued_at_ms)
+        || wire.get("kid").and_then(serde_json::Value::as_str)
+            != Some(receipt.key_id.as_str())
+        || super::chat_wire::json_bytes(
+            wire.get("signature").ok_or_else(|| {
+                MLSError::Cryptography("unavailable receipt missing signature".into())
+            })?,
+        )? != receipt.signature
+    {
+        return Ok(false);
+    }
+
+    let commitment: [u8; 32] = receipt
+        .archive_commitment
+        .as_slice()
+        .try_into()
+        .map_err(|_| MLSError::Cryptography("archive commitment must be 32 bytes".into()))?;
+    let attestation = receipt
+        .original_sender_attestation
+        .as_ref()
+        .ok_or_else(|| {
+            MLSError::Cryptography("archive copy missing original sender attestation".into())
+        })?;
+    if attestation.sender_did != row.sender_did
+        || attestation.sender_device_id != row.sender_device_id
+    {
+        return Ok(false);
+    }
+    attestation.verify(conversation_id, &row.message_id, &commitment)?;
+    Ok(true)
+}
+
+#[cfg(feature = "labyrinth")]
+fn bound_unavailable_placeholder(
+    tx: &crate::storage::SqlTx<'_>,
+    conversation_id: &str,
+    copies: &[RestoreCopy],
+) -> Result<Option<(MessageRow, String)>, MLSError> {
+    let [copy] = copies else {
+        return Ok(None);
+    };
+    let evidence_key =
+        super::chat_wire::unavailable_message_key(conversation_id, &copy.2.entry_id);
+    let Some(raw) = tx.get_labyrinth_state(&evidence_key)? else {
+        return Ok(None);
+    };
+    let unavailable: super::chat_wire::UnavailableEntryEvidence =
+        serde_json::from_slice(&raw).map_err(|_| {
+            MLSError::Cryptography("invalid unavailable-entry evidence".into())
+        })?;
+    let Some(placeholder) = tx.get_message(&unavailable.message_id)? else {
+        return Ok(None);
+    };
+    if unavailable_placeholder_matches_restore_copy(
+        conversation_id,
+        &placeholder,
+        &unavailable,
+        copy,
+    )? {
+        Ok(Some((placeholder, evidence_key)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "labyrinth")]
+fn is_stored_unavailable_placeholder(
+    tx: &crate::storage::SqlTx<'_>,
+    conversation_id: &str,
+    row: &MessageRow,
+) -> Result<bool, MLSError> {
+    let key = super::chat_wire::unavailable_message_key(conversation_id, &row.message_id);
+    let Some(raw) = tx.get_labyrinth_state(&key)? else {
+        return Ok(false);
+    };
+    let evidence: super::chat_wire::UnavailableEntryEvidence =
+        serde_json::from_slice(&raw).map_err(|_| {
+            MLSError::Cryptography("invalid unavailable-entry evidence".into())
+        })?;
+    let group_id = super::chat_wire::json_bytes(
+        evidence
+            .receipt
+            .get("groupId")
+            .ok_or_else(|| MLSError::Cryptography("unavailable receipt missing groupId".into()))?,
+    )?;
+    Ok(evidence.message_id == row.message_id
+        && evidence.placeholder_row(&group_id, row.is_own)? == *row)
 }
 
 #[cfg(feature = "labyrinth")]
@@ -1279,10 +1438,54 @@ impl CatbirdMlsClient {
             .ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))
     }
 
+    /// Retry only a durably recorded held publication/activation completion. Status reads are
+    /// otherwise local-only, and callers already holding the archive lifecycle lock keep their
+    /// existing operation responsible for the retry.
+    fn refresh_pending_native_archive_publication_if_due(&self) {
+        let due = self
+            .db
+            .read_tx(|tx| {
+                let pending = tx
+                    .get_labyrinth_state("status_json")?
+                    .and_then(|raw| {
+                        serde_json::from_slice::<LabyrinthBackupStatus>(&raw)
+                            .ok()
+                            .and_then(|status| status.pending_directory_epoch)
+                    })
+                    .is_some();
+                Ok(pending
+                    || tx
+                        .get_labyrinth_state(PENDING_DEVICE_ACTIVATION_REFRESH_STATE)?
+                        .is_some())
+            })
+            .unwrap_or(false);
+        if !due {
+            return;
+        }
+        let Ok(_guard) = self.outbox_flush_lock.try_lock() else {
+            return;
+        };
+        if let Err(error) = self.native_archive_run(async {
+            let Some(session) = self
+                .native_archive_deps()?
+                .open()
+                .await
+                .map_err(native_archive_error)?
+            else {
+                return Ok(());
+            };
+            self.save_native_archive_status(&session, false)?;
+            Ok::<_, MLSError>(())
+        }) {
+            tracing::warn!(%error, "held archive directory publication refresh failed");
+        }
+    }
+
     fn save_native_archive_status(&self, session: &crate::labyrinth::LabyrinthSession, recovery_code: bool) -> Result<LabyrinthBackupStatus, MLSError> {
-        let status = self.db.write_tx(|tx| {
+        let (status, activation_refresh_due) = self.db.write_tx(|tx| {
             let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| MLSError::InvalidState("archive status missing".into()))?;
             let mut status: LabyrinthBackupStatus = serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+            let had_pending_publication = status.pending_directory_epoch.is_some();
             status.epoch_seq = session.latest_epoch();
             status.recovery_method_stale |= session.recovery_method_stale();
             status.has_recovery_code |= recovery_code;
@@ -1300,10 +1503,24 @@ impl CatbirdMlsClient {
                     .rotation_exclusions
                     .retain(|exclusion| exclusion.recovery_method.as_deref() != Some("code"));
             }
+            let completed_held_publication =
+                had_pending_publication && status.pending_directory_epoch.is_none();
+            if completed_held_publication {
+                tx.put_labyrinth_state(
+                    PENDING_DEVICE_ACTIVATION_REFRESH_STATE,
+                    b"1",
+                    self.hooks.now_ms(),
+                )?;
+            }
             tx.put_labyrinth_state("status_json", &serde_json::to_vec(&status).map_err(|e| MLSError::Internal(e.to_string()))?, self.hooks.now_ms())?;
-            Ok(status)
+            let activation_refresh_due = status.pending_directory_epoch.is_none()
+                && tx
+                    .get_labyrinth_state(PENDING_DEVICE_ACTIVATION_REFRESH_STATE)?
+                    .is_some();
+            Ok((status, activation_refresh_due))
         })?;
         self.notify(PlatformChangeEvent::LabyrinthStatusChanged { epoch_seq: status.epoch_seq });
+        self.finish_pending_approval_after_archive_promotion(activation_refresh_due);
         Ok(status)
     }
 
@@ -1431,16 +1648,42 @@ impl CatbirdMlsClient {
         })
     }
 
-    fn finish_pending_approval_after_archive_promotion(&self, promoted: bool) {
-        if !promoted || !self.is_device_pending_approval().unwrap_or(false) {
+    fn finish_pending_approval_after_archive_promotion(&self, refresh_due: bool) {
+        if !refresh_due {
             return;
         }
-        let scopes = super::REQUIRED_LABYRINTH_OAUTH_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_owned())
-            .collect::<Vec<_>>();
-        if self.enroll_device(&scopes).is_err() {
-            let _ = self.db.write_tx(|tx| tx.delete_account_meta("enrollment_status"));
+        let pending = match self.is_device_pending_approval() {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "could not read pending device activation state");
+                return;
+            }
+        };
+        if pending {
+            let scopes = super::REQUIRED_LABYRINTH_OAUTH_SCOPES
+                .iter()
+                .map(|scope| (*scope).to_owned())
+                .collect::<Vec<_>>();
+            if let Err(error) = self.enroll_device(&scopes) {
+                tracing::warn!(
+                    %error,
+                    "directory publication completed but device activation refresh failed"
+                );
+                return;
+            }
+        }
+        if let Err(error) = self.db.write_tx(|tx| {
+            tx.conn()
+                .execute(
+                    "DELETE FROM labyrinth_state WHERE state_key = ?1",
+                    [PENDING_DEVICE_ACTIVATION_REFRESH_STATE],
+                )
+                .map_err(|e| {
+                    MLSError::Internal(format!("clear pending device activation refresh: {e}"))
+                })?;
+            Ok(())
+        }) {
+            tracing::warn!(%error, "could not clear completed device activation refresh");
         }
     }
 
@@ -1465,12 +1708,20 @@ impl CatbirdMlsClient {
             let _guard = self.outbox_flush_lock.lock().map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
             self.native_archive_run(async {
                 let session = self.native_archive_deps()?.restore_with_recovery_code(code).await.map_err(native_archive_error)?;
+                if session.pending_directory_epoch().is_none()
+                    && self.is_device_pending_approval()?
+                {
+                    self.db.write_tx(|tx| {
+                        tx.put_labyrinth_state(
+                            PENDING_DEVICE_ACTIVATION_REFRESH_STATE,
+                            b"1",
+                            self.hooks.now_ms(),
+                        )
+                    })?;
+                }
                 self.save_native_archive_status(&session, true)
             })?
         };
-        self.finish_pending_approval_after_archive_promotion(
-            status.pending_directory_epoch.is_none(),
-        );
         Ok(status)
     }
 
@@ -2276,23 +2527,58 @@ impl CatbirdMlsClient {
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
                 let local = tx.get_message(message_id)?;
-                // An undecryptable or unavailable placeholder yields to a verified copy.
+                // A placeholder under the original message id is the ordinary undecryptable
+                // case. A pruned entry has no message id on the wire, so its unavailable
+                // placeholder is keyed by entry id; replace that distinct row only when the
+                // exact signed receipt and original-sender attestation bind it to one copy.
                 let mut gap_key = None;
                 for key in [super::chat_wire::undecryptable_evidence_key(conversation_id, message_id),
                     super::chat_wire::unavailable_message_key(conversation_id, message_id)] {
                     if gap_key.is_none() && tx.get_labyrinth_state(&key)?.is_some() { gap_key = Some(key); }
                 }
-                let gap = local.is_some() && gap_key.is_some();
-                match select_restore_copy(group, local.as_ref(), gap) {
-                    Some(copy) => chosen.push((copy, local.is_none() || gap, if gap { gap_key } else { None })),
+                let direct_gap = local.is_some() && gap_key.is_some();
+                let bound_placeholder = if local.is_none() {
+                    bound_unavailable_placeholder(tx, conversation_id, group)?
+                } else {
+                    None
+                };
+                if let Some((_, evidence_key)) = &bound_placeholder {
+                    gap_key = Some(evidence_key.clone());
+                }
+                let replaced_placeholder_id = bound_placeholder
+                    .as_ref()
+                    .map(|(placeholder, _)| placeholder.message_id.clone());
+                let effective_local = local
+                    .as_ref()
+                    .or_else(|| bound_placeholder.as_ref().map(|(placeholder, _)| placeholder));
+                let gap = direct_gap || bound_placeholder.is_some();
+                match select_restore_copy(group, effective_local, gap) {
+                    Some(copy) => chosen.push((
+                        copy,
+                        local.is_none() || gap,
+                        if gap { gap_key } else { None },
+                        replaced_placeholder_id,
+                    )),
                     None => skipped += 1,
                 }
             }
-            chosen.sort_by(|((a, _, _), _, _), ((b, _, _), _, _)| a.seq.cmp(&b.seq).then_with(|| a.message_id.cmp(&b.message_id)));
+            chosen.sort_by(|((a, _, _), _, _, _), ((b, _, _), _, _, _)| a.seq.cmp(&b.seq).then_with(|| a.message_id.cmp(&b.message_id)));
             let mut count: u32 = 0;
-            for ((row, evidence, _), write, gap_key) in &chosen {
+            for ((row, evidence, _), write, gap_key, replaced_placeholder_id) in &chosen {
+                if let Some(placeholder_id) = replaced_placeholder_id {
+                    tx.conn()
+                        .execute(
+                            "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+                            rusqlite::params![conversation_id, placeholder_id],
+                        )
+                        .map_err(|e| {
+                            MLSError::Internal(format!(
+                                "replace authenticated unavailable placeholder: {e}"
+                            ))
+                        })?;
+                }
                 if *write { tx.insert_message(row)?; count += 1; }
-                // The verified copy now stands in for the undecryptable gap row.
+                // The verified copy now stands in for the authenticated gap row.
                 if let Some(gap_key) = gap_key {
                     tx.conn().execute("DELETE FROM labyrinth_state WHERE state_key = ?1", [gap_key])
                         .map_err(|e| MLSError::Internal(format!("clear undecryptable evidence: {e}")))?;
@@ -2302,7 +2588,7 @@ impl CatbirdMlsClient {
             }
             // Archive recovery does not create MLS state or advance a live delivery cursor.
             if tx.get_conversation(conversation_id)?.is_none() {
-                if let Some(((row, _, receipt), _, _)) = chosen.last() {
+                if let Some(((row, _, receipt), _, _, _)) = chosen.last() {
                     tx.upsert_conversation(&ConversationRow {
                         conversation_id: conversation_id.into(), group_id: row.group_id.clone(),
                         generation: i64::try_from(receipt.generation).map_err(|_| MLSError::Cryptography("archive generation overflow".into()))?,
@@ -2507,9 +2793,20 @@ impl CatbirdMlsClient {
             .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.native_archive_run(async {
             let deps = self.native_archive_deps()?;
-            if deps.clone().open().await.map_err(native_archive_error)?.is_none() {
-                let session = deps.enable().await.map_err(native_archive_error)?;
-                self.save_native_archive_status(&session, false)?;
+            let session = match deps.clone().open().await.map_err(native_archive_error)? {
+                Some(session) => session,
+                None => deps.enable().await.map_err(native_archive_error)?,
+            };
+            let status = self.save_native_archive_status(&session, false)?;
+            if let Some(error) = status.directory_publication_error {
+                return Err(MLSError::InvalidState(format!(
+                    "archive directory is not ready for an OTC offer: {error}"
+                )));
+            }
+            if let Some(epoch) = status.pending_directory_epoch {
+                return Err(MLSError::InvalidState(format!(
+                    "archive epoch {epoch} is still pending directory publication"
+                )));
             }
             Ok(())
         })
@@ -2835,58 +3132,112 @@ impl CatbirdMlsClient {
                 let has_local_evidence = tx
                     .get_labyrinth_state(&format!("native.message:{conversation_id}:{message_id}"))?
                     .is_some();
-                let gap_key =
-                    super::chat_wire::undecryptable_evidence_key(conversation_id, message_id);
-                let gap = local.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
-                let effective_local = if has_local_evidence {
-                    local.as_ref()
+                let mut gap_key = None;
+                for key in [
+                    super::chat_wire::undecryptable_evidence_key(
+                        conversation_id,
+                        message_id,
+                    ),
+                    super::chat_wire::unavailable_message_key(conversation_id, message_id),
+                ] {
+                    if gap_key.is_none() && tx.get_labyrinth_state(&key)?.is_some() {
+                        gap_key = Some(key);
+                    }
+                }
+                let direct_gap = local.is_some() && gap_key.is_some();
+                let bound_placeholder = if local.is_none() {
+                    bound_unavailable_placeholder(tx, conversation_id, group)?
                 } else {
                     None
                 };
+                if let Some((_, evidence_key)) = &bound_placeholder {
+                    gap_key = Some(evidence_key.clone());
+                }
+                let effective_local = if has_local_evidence || direct_gap {
+                    local.as_ref()
+                } else {
+                    bound_placeholder
+                        .as_ref()
+                        .map(|(placeholder, _)| placeholder)
+                };
+                let gap = direct_gap || bound_placeholder.is_some();
                 if let Some(copy) = select_restore_copy(group, effective_local, gap) {
-                    chosen_by_id.insert(message_id.clone(), copy);
+                    chosen_by_id.insert(
+                        message_id.clone(),
+                        (
+                            copy,
+                            gap.then_some(gap_key).flatten(),
+                            bound_placeholder
+                                .map(|(placeholder, _)| placeholder.message_id),
+                        ),
+                    );
                 }
             }
+            let replaced_placeholders: std::collections::BTreeSet<_> = chosen_by_id
+                .values()
+                .filter_map(|(_, _, placeholder_id)| placeholder_id.clone())
+                .collect();
             let existing_rows = tx.list_messages(conversation_id, None, 100_000)?;
             let mut purged = 0u32;
             for existing in &existing_rows {
                 let ev_key = format!("native.message:{conversation_id}:{}", existing.message_id);
-                if tx.get_labyrinth_state(&ev_key)?.is_some() {
+                if replaced_placeholders.contains(&existing.message_id)
+                    || tx.get_labyrinth_state(&ev_key)?.is_some()
+                    || is_stored_unavailable_placeholder(tx, conversation_id, existing)?
+                {
                     continue;
                 }
-                let matches_verified = chosen_by_id.get(&existing.message_id).is_some_and(|(row, _, _)| {
-                    row.seq == existing.seq
-                        && row.sender_did == existing.sender_did
-                        && row.plaintext_json == existing.plaintext_json
-                });
+                let matches_verified = chosen_by_id
+                    .get(&existing.message_id)
+                    .is_some_and(|((row, _, _), _, _)| {
+                        row.seq == existing.seq
+                            && row.sender_did == existing.sender_did
+                            && row.plaintext_json == existing.plaintext_json
+                    });
                 if !matches_verified {
                     tx.conn()
                         .execute(
                             "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
                             rusqlite::params![conversation_id, existing.message_id],
                         )
-                        .map_err(|e| MLSError::Internal(format!("purge unverified history row: {e}")))?;
+                        .map_err(|e| {
+                            MLSError::Internal(format!("purge unverified history row: {e}"))
+                        })?;
                     purged = purged.saturating_add(1);
                 }
             }
             let _ = purged;
             let mut count = 0u32;
-            for (row, evidence, _) in chosen_by_id.into_values() {
+            for ((row, evidence, _), gap_key, replaced_placeholder_id) in
+                chosen_by_id.into_values()
+            {
+                if let Some(placeholder_id) = replaced_placeholder_id {
+                    tx.conn()
+                        .execute(
+                            "DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2",
+                            rusqlite::params![conversation_id, placeholder_id],
+                        )
+                        .map_err(|e| {
+                            MLSError::Internal(format!(
+                                "replace authenticated unavailable placeholder: {e}"
+                            ))
+                        })?;
+                }
                 let existing = tx.get_message(&row.message_id)?;
-                let gap_key =
-                    super::chat_wire::undecryptable_evidence_key(conversation_id, &row.message_id);
-                let gap = existing.is_some() && tx.get_labyrinth_state(&gap_key)?.is_some();
-                if existing.is_none() || gap {
+                if existing.is_none() || gap_key.is_some() {
                     tx.insert_message(row)?;
                 }
-                if gap {
+                if let Some(gap_key) = gap_key {
                     tx.conn()
                         .execute("DELETE FROM labyrinth_state WHERE state_key = ?1", [&gap_key])
-                        .map_err(|e| MLSError::Internal(format!("clear undecryptable evidence: {e}")))?;
+                        .map_err(|e| {
+                            MLSError::Internal(format!("clear undecryptable evidence: {e}"))
+                        })?;
                 }
                 tx.put_labyrinth_state(
                     &format!("native.message:{conversation_id}:{}", row.message_id),
-                    &serde_json::to_vec(&evidence).map_err(|e| MLSError::Internal(e.to_string()))?,
+                    &serde_json::to_vec(&evidence)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?,
                     self.hooks.now_ms(),
                 )?;
                 count = count.saturating_add(1);
@@ -4069,8 +4420,9 @@ impl CatbirdMlsClient {
 mod native_restore_tests {
     use super::{
         block_on_sync, native_restore_copies, parse_mailbox_keys_record, select_restore_copy,
-        MessageRow,
+        unavailable_placeholder_matches_restore_copy, MessageRow,
     };
+    use base64::Engine as _;
     use labyrinth::client::{Backends, Clock, Labyrinth};
     use labyrinth::message::{ArchivedReceipt, OriginalSenderArchiveAttestation};
     use labyrinth::protocol::receipt::{
@@ -4202,6 +4554,82 @@ mod native_restore_tests {
             .filter_map(|group| select_restore_copy(group, local.iter().find(|row| row.message_id == group[0].0.message_id), false))
             .map(|(row, _, _)| (row.message_id.clone(), row.sender_did.clone(), row.plaintext_json.clone().into_bytes()))
             .collect()
+    }
+
+    #[test]
+    fn unavailable_placeholder_replacement_requires_the_exact_archived_receipt_tuple() {
+        let w = World::new();
+        let mut alice = w.join(ALICE, 1);
+        let mut bob = w.join(BOB, 2);
+        let _carol = w.join(CAROL, 3);
+        let sent = w.sequence(ALICE, "gap-message", "restored");
+        archive(&mut alice, "gap-message", &sent, 100);
+
+        let history =
+            block_on_sync(bob.load_thread(CONVERSATION, TimeRange::ALL)).expect("load history");
+        // A sibling device of the sender stored the pruned placeholder as not-own, while the
+        // restored account-level archive row is own. That UI bit is not receipt authority.
+        let copies = native_restore_copies(CONVERSATION, ALICE, history.messages)
+            .expect("verified restore copies");
+        let copy = &copies["gap-message"][0];
+        let (row, _, receipt) = copy;
+        let bytes = |value: &[u8]| {
+            serde_json::json!({
+                "$bytes": base64::engine::general_purpose::STANDARD.encode(value)
+            })
+        };
+        let unavailable = super::super::chat_wire::UnavailableEntryEvidence {
+            version: 1,
+            conversation_id: CONVERSATION.into(),
+            message_id: receipt.entry_id.clone(),
+            entry_id: receipt.entry_id.clone(),
+            seq: i64::try_from(receipt.seq).unwrap(),
+            generation: i64::try_from(receipt.generation).unwrap(),
+            epoch: i64::try_from(receipt.epoch).unwrap(),
+            sender_did: row.sender_did.clone(),
+            sender_device_id: row.sender_device_id.clone(),
+            reason: super::super::chat_wire::PAYLOAD_PRUNED_REASON.into(),
+            receipt: serde_json::json!({
+                "kid": receipt.key_id,
+                "sequencerDid": receipt.sequencer_did,
+                "conversationId": receipt.conversation_id,
+                "generation": receipt.generation,
+                "groupId": bytes(&receipt.group_id),
+                "epoch": receipt.epoch,
+                "seq": receipt.seq,
+                "entryId": receipt.entry_id,
+                "senderDid": row.sender_did,
+                "senderDeviceId": row.sender_device_id,
+                "archiveCommitment": bytes(&receipt.archive_commitment),
+                "issuedAtMs": receipt.issued_at_ms,
+                "signature": bytes(&receipt.signature),
+            }),
+            recorded_at_ms: 1_791_000_000_123,
+        };
+        let placeholder = unavailable
+            .placeholder_row(&receipt.group_id, false)
+            .expect("placeholder");
+        assert!(
+            unavailable_placeholder_matches_restore_copy(
+                CONVERSATION,
+                &placeholder,
+                &unavailable,
+                copy,
+            )
+            .expect("match")
+        );
+
+        let mut wrong_coordinate = unavailable.clone();
+        wrong_coordinate.seq += 1;
+        assert!(
+            !unavailable_placeholder_matches_restore_copy(
+                CONVERSATION,
+                &placeholder,
+                &wrong_coordinate,
+                copy,
+            )
+            .expect("mismatch")
+        );
     }
 
     #[test]

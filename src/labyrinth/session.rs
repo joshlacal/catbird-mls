@@ -869,6 +869,18 @@ impl SessionDeps {
             head.as_ref()
                 .is_some_and(|head| head.seq == local.seq && head.head == local.head)
         };
+        // Another enrolled device may have advanced both authenticated sources while this
+        // device was dormant. Do not republish this device's stale local head first: that can
+        // create the very PDS/DS split that `open` is meant to reconcile. Let the strict
+        // CompositeDirectory sync below verify and adopt the remote chain.
+        if pds_latest.is_some() && ds_latest.is_some() {
+            let anchored = self.directory().latest(&self.did).await?;
+            if anchored.as_ref().is_some_and(|head| {
+                head.seq > local.seq || (head.seq == local.seq && head.head != local.head)
+            }) {
+                return Ok(());
+            }
+        }
         if (!agrees(&pds_latest) || !agrees(&ds_latest))
             && local.attestation.transport_public_key == self.signer.public_key()
         {

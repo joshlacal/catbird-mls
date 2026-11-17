@@ -319,9 +319,22 @@ pub fn prepare_with_provider<P: OpenMlsProvider>(
         crate::chat_v2::transcript::direct_request::direct_request_commit_aad(&context_hash)
             .map_err(crypto_error)?,
     );
-    let (commit, welcome, _) = group
-        .add_members(provider, signer, &packages)
+    let bundle = group
+        .commit_builder()
+        .propose_adds(packages.iter().cloned())
+        .force_self_update(true)
+        .leaf_node_lifetime_policy(LeafNodeLifetimePolicy::VerifyAt(now))
+        .load_psks(provider.storage())
+        .map_err(crypto_error)?
+        .build(provider.rand(), provider.crypto(), signer, |_| true)
+        .map_err(crypto_error)?
+        .stage_commit(provider)
         .map_err(crypto_error)?;
+    let welcome = bundle
+        .to_welcome_msg()
+        .ok_or_else(|| crypto_error("No secrets to generate commit message."))?;
+    let (commit, _, _) = bundle.into_contents();
+    group.set_aad(Vec::new());
     let welcome = welcome.tls_serialize_detached().map_err(crypto_error)?;
     let MlsMessageBodyIn::Welcome(w) = MlsMessageIn::tls_deserialize_exact(&welcome)
         .map_err(crypto_error)?

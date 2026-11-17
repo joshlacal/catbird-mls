@@ -193,7 +193,7 @@ fn carv1_repo_proof_blocks_tampered_peer_keys_with_zero_mek_wraps_and_leaf_attes
 }
 
 #[test]
-fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_supports_recovery_promotion(
+fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_holds_recovery_promotion(
 ) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
@@ -212,6 +212,15 @@ fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_supp
     let recovery_code = alice_d1
         .setup_recovery_code()
         .expect("alice_d1 setup recovery code");
+    {
+        let state = ds.inner.lock().unwrap();
+        let anchored = state
+            .labyrinth_epochs
+            .get(ALICE_DID)
+            .expect("active device must publish authenticated genesis to mls-ds");
+        assert_eq!(anchored.len(), 1);
+        assert_eq!(anchored[0]["epochNumber"], 0);
+    }
 
     let alice_d2_keys = Arc::new(MemKeyStore::new());
     let alice_d2 = live_client(
@@ -282,8 +291,9 @@ fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_supp
     );
     assert!(alice_d2.replenish_key_packages(2).expect("d2 replenish") >= 2);
 
-    // Lost-device recovery promotion: d3 enrolls pending_approval, then restore_with_recovery_code
-    // publishes epoch E+1 via publishEpochHead and promotes d3 to active without sibling approval.
+    // A recovery code authenticates archive access, not immediate chat-device activation.
+    // While an active sibling can approve this device, the authenticated epoch publication is
+    // held for the server's durable recovery notice + sibling-dormancy gate.
     let alice_d3_keys = Arc::new(MemKeyStore::new());
     let alice_d3 = live_client(
         tmp.path(),
@@ -295,20 +305,136 @@ fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_supp
     );
     alice_d3.enroll_device(&scopes).expect("enroll alice_d3");
     assert!(alice_d3.is_device_pending_approval().expect("d3 pending"));
-    alice_d3
+    let recovery_status = alice_d3
         .restore_with_recovery_code(&recovery_code)
-        .expect("d3 restore_with_recovery_code promotes pending device");
-    assert!(!alice_d3
-        .is_device_pending_approval()
-        .expect("d3 promoted active"));
+        .expect("d3 restores archive state while directory publication is held");
+    assert!(
+        recovery_status.pending_directory_epoch.is_some(),
+        "held directory publication must remain pending"
+    );
     assert_eq!(
-        ds.inner
+        recovery_status.directory_publication_error.as_deref(),
+        Some("store refused access"),
+        "held publication must retain the mapped authorization rejection"
+    );
+    {
+        let state = ds.inner.lock().unwrap();
+        assert_eq!(
+            state.pending_epoch_publication_rejections, 1,
+            "authenticated pending publication must reach the NotAuthorized admission gate"
+        );
+        assert_eq!(
+            state.labyrinth_epochs.get(ALICE_DID).map(Vec::len),
+            Some(1),
+            "NotAuthorized pending publication must not advance the mls-ds head"
+        );
+    }
+    assert!(
+        alice_d3
+            .is_device_pending_approval()
+            .expect("d3 remains pending"),
+        "recovery code alone must not bypass an awake sibling's approval"
+    );
+    assert!(
+        !ds.inner
             .lock()
             .unwrap()
             .dr_revisions
-            .get(&(ALICE_DID.to_owned(), alice_d3_dev)),
-        Some(&1),
-        "recovery self-promotion must also complete deferred direct-request key publication"
+            .contains_key(&(ALICE_DID.to_owned(), alice_d3_dev.clone())),
+        "held recovery must not publish active-only direct-request keys"
+    );
+
+    // Once the server-authoritative notice is old enough and every active sibling is dormant,
+    // opening the archive retries the exact held head. The DS atomically admits that head and
+    // activates d3; the native completion path then refreshes enrollment and deferred keys.
+    {
+        let mut state = ds.inner.lock().unwrap();
+        state
+            .aged_pending_notices
+            .insert((ALICE_DID.to_owned(), alice_d3_dev.clone()));
+        state
+            .dormant_devices
+            .insert((ALICE_DID.to_owned(), alice_d1_dev));
+        state
+            .dormant_devices
+            .insert((ALICE_DID.to_owned(), alice_d2_dev));
+        state.xrpc_failures.push((
+            "/xrpc/blue.catbird.chat.getOwnDevices",
+            503,
+            "Unavailable",
+            None,
+        ));
+    }
+    assert_eq!(
+        alice_d3
+            .flush_labyrinth_queue()
+            .expect("eligible held publication retry"),
+        0
+    );
+    assert!(
+        alice_d3
+            .is_device_pending_approval()
+            .expect("d3 remains locally pending after refresh failure"),
+        "a transient enrollment refresh failure must retain local pending state"
+    );
+    {
+        let state = ds.inner.lock().unwrap();
+        assert_eq!(
+            state
+                .device_statuses
+                .get(&(ALICE_DID.to_owned(), alice_d3_dev.clone()))
+                .map(String::as_str),
+            Some("active"),
+            "eligible held publication must atomically activate d3 on the DS"
+        );
+        assert!(
+            !state
+                .dr_revisions
+                .contains_key(&(ALICE_DID.to_owned(), alice_d3_dev.clone())),
+            "failed activation refresh must not fake deferred key publication"
+        );
+    }
+    assert_eq!(
+        alice_d3
+            .flush_labyrinth_queue()
+            .expect("ordinary reopen retries durable activation refresh"),
+        0
+    );
+    assert!(
+        !alice_d3
+            .is_device_pending_approval()
+            .expect("d3 activation refresh retry"),
+        "later ordinary archive open must retry and complete verified DS activation"
+    );
+    let activated_status = alice_d3.labyrinth_status().expect("activated archive status");
+    assert_eq!(activated_status.pending_directory_epoch, None);
+    assert_eq!(activated_status.directory_publication_error, None);
+    {
+        let state = ds.inner.lock().unwrap();
+        assert_eq!(
+            state
+                .device_statuses
+                .get(&(ALICE_DID.to_owned(), alice_d3_dev.clone()))
+                .map(String::as_str),
+            Some("active")
+        );
+        assert_eq!(
+            state.labyrinth_epochs.get(ALICE_DID).map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            state
+                .dr_revisions
+                .get(&(ALICE_DID.to_owned(), alice_d3_dev.clone())),
+            Some(&1),
+            "activation refresh must publish deferred direct-request keys"
+        );
+    }
+    assert!(
+        alice_d3
+            .replenish_key_packages(2)
+            .expect("activated d3 replenishes key packages")
+            >= 2
     );
 }
 

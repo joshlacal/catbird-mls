@@ -34,7 +34,6 @@ use crate::error::{ConversationSyncFailure, MLSError};
 use crate::messaging::receive::{
     extract_plaintext_body_and_verify_aad, verify_application_aad_archive_evidence,
 };
-use crate::metadata::derive_metadata_key_from_group;
 use crate::orchestrator::canonical_transport::{
     canonical_application_aad_bytes, canonical_commit_aad_bytes, derive_key_id, CanonicalOperation,
 };
@@ -2088,6 +2087,8 @@ impl CatbirdMlsClient {
         let coords_canon = chat_wire::canonicalize_wire_coordinate(&vp["next"], Some(cid))?;
         let coords_str =
             serde_json::to_string(&coords_canon).map_err(|e| MLSError::Internal(e.to_string()))?;
+        let metadata_snapshot_str = serde_json::to_string(&artifact["metadataSnapshot"])
+            .map_err(|e| MLSError::Internal(format!("serialize C33 metadata snapshot: {e}")))?;
 
         let imported = self.db.write_tx(|tx| {
             let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
@@ -2168,6 +2169,11 @@ impl CatbirdMlsClient {
             tx.put_account_meta(
                 &format!("c33_publication_json:{cid}"),
                 &pub_norm_str,
+                now_ms,
+            )?;
+            tx.put_account_meta(
+                &format!("metadata_snapshot_json:{cid}"),
+                &metadata_snapshot_str,
                 now_ms,
             )?;
 
@@ -3154,6 +3160,7 @@ impl CatbirdMlsClient {
             let transition_id = transition_uuid.to_string();
             let welcome_id = self.hooks.uuid_v4().to_string();
             let now_ms = self.hooks.now_ms();
+            let now_secs = (now_ms.max(0) as u64) / 1_000;
 
             // Stage without changing `openmls_kv`; retain the merged batch in the journal
             // across an uncertain response so sync can recover the accepted own Commit.
@@ -3179,7 +3186,7 @@ impl CatbirdMlsClient {
                     kp_for_attempt,
                     provider.crypto(),
                     ProtocolVersion::Mls10,
-                    (now_ms.max(0) as u64) / 1_000,
+                    now_secs,
                 )
                 .map_err(|e| MLSError::Cryptography(format!("validate recovery KP: {e:?}")))?;
                 chat_wire::require_recovery_key_package(
@@ -3273,6 +3280,7 @@ impl CatbirdMlsClient {
                     .propose_removals(held)
                     .propose_adds([validated_kp])
                     .force_self_update(true)
+                    .leaf_node_lifetime_policy(LeafNodeLifetimePolicy::VerifyAt(now_secs))
                     .load_psks(provider.storage())
                     .map_err(|e| MLSError::Cryptography(format!("recovery commit: {e:?}")))?;
                 builder = builder
@@ -3304,17 +3312,10 @@ impl CatbirdMlsClient {
                 let next_epoch = group.epoch().as_u64();
                 let (next_gch, next_ctag) =
                     chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-                let meta_key = derive_metadata_key_from_group(
-                    &mut group,
-                    provider.crypto(),
-                    provider.storage(),
-                    &convo.group_id,
-                    next_epoch,
-                )
-                .map_err(|e| MLSError::Cryptography(format!("derive metadata key: {e}")))?;
                 let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
                     metadata_carry,
-                    &meta_key,
+                    &mut group,
+                    &provider,
                     &convo.group_id,
                     &convo_uuid,
                     prior_gen,
@@ -4837,8 +4838,15 @@ impl CatbirdMlsClient {
                         ) && group.pending_commit().is_some();
                         let mut metadata_carry = None;
                         if !retain_loser {
-                            let processed =
-                                group.process_message(&provider, proto).map_err(|e| {
+                            let processed = group
+                                .process_message_with_lifetime_policy(
+                                    &provider,
+                                    proto,
+                                    LeafNodeLifetimePolicy::VerifyAt(
+                                        (now_ms.max(0) as u64) / 1_000,
+                                    ),
+                                )
+                                .map_err(|e| {
                                     MLSError::Cryptography(format!("process Commit: {e:?}"))
                                 })?;
                             if processed.credential().serialized_content()
@@ -5850,17 +5858,10 @@ impl CatbirdMlsClient {
             let next_epoch = group.epoch().as_u64();
             let (next_gch, next_ctag) =
                 chat_wire::compute_group_context_hash_and_tag(&group, &provider)?;
-            let meta_key = derive_metadata_key_from_group(
-                &mut group,
-                provider.crypto(),
-                provider.storage(),
-                &convo.group_id,
-                next_epoch,
-            )
-            .map_err(|e| MLSError::Cryptography(format!("P9 metadata key: {e}")))?;
             let carried_snap = self.reencrypt_metadata_snapshot_for_epoch(
                 metadata_carry,
-                &meta_key,
+                &mut group,
+                &provider,
                 &convo.group_id,
                 &convo_uuid,
                 prior_gen,

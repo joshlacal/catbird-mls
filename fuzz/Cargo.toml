@@ -15,11 +15,11 @@ catbird_mls = { path = "..", features = ["sim"] }
 atproto-spaces = { path = "../../catbird-atproto/atproto-spaces", default-features = false }
 labyrinth = { path = "../../labyrinth", features = ["space"] }
 labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
-openmls = { version = "=0.9.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["js", "extensions-draft", "fork-resolution", "draft-ietf-mls-pq-ciphersuites"] }
-openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
-openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["draft-ietf-mls-pq-ciphersuites"] }
-openmls_libcrux_crypto = { version = "=0.4.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
-openmls_memory_storage = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls = { version = "=0.9.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["js", "extensions-draft", "fork-resolution", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_libcrux_crypto = { version = "=0.4.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = { version = "=0.6.0-rc.3", git = "https://github.com/joshlacal/openmls", rev = "679bdc31ef44dc919f28aee9ce442ec8eb0682c0", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
 tls_codec = "=0.5.0"
 serde_ipld_dagcbor = "0.6"
 serde_json = "1"
