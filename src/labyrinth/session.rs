@@ -206,6 +206,19 @@ pub trait LocalConversationAuthority: MaybeSend + MaybeSync {
         let _ = did;
         Ok(None)
     }
+
+    /// Earliest verified account deletion instant (`signed_at_ms`) recorded for `did`
+    /// from an authenticated `accountDeletedEntry`, when known locally.
+    async fn verified_deleted_account_ms(&self, did: &str) -> Result<Option<u64>> {
+        let _ = did;
+        Ok(None)
+    }
+
+    /// Whether `did`'s PDS repository returned a terminal tombstone (`RepoNotFound` / `RepoTakendown`).
+    async fn is_pds_repo_tombstoned(&self, did: &str) -> Result<bool> {
+        let _ = did;
+        Ok(false)
+    }
 }
 
 /// `mls-ds` reports which devices are conversation members; this device's MLS
@@ -255,6 +268,13 @@ impl MailboxDirectory for LocallyCheckedDirectory {
 
     async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         let mut reported = self.inner.device_transport_keys(did).await?;
+        let verified_deleted_ms = self
+            .authority
+            .verified_deleted_account_ms(did)
+            .await
+            .map_err(|error| {
+                labyrinth::Error::Backend(format!("verified deleted account: {error}"))
+            })?;
         let mut revoked_times = std::collections::BTreeMap::<[u8; 32], u64>::new();
         for (key, at_ms) in self
             .authority
@@ -291,23 +311,43 @@ impl MailboxDirectory for LocallyCheckedDirectory {
                 }
             }
         }
-        if let Some(shared_leaves) = self
+        let is_tombstoned = self
             .authority
-            .shared_group_leaf_keys(did)
+            .is_pds_repo_tombstoned(did)
             .await
-            .map_err(|error| labyrinth::Error::Backend(format!("shared MLS leaves: {error}")))?
-        {
-            let active_reported: std::collections::BTreeSet<[u8; 32]> = reported
-                .iter()
-                .filter(|entry| entry.removed_at.is_none())
-                .map(|entry| entry.key)
-                .collect();
-            for leaf_key in shared_leaves {
-                if !active_reported.contains(&leaf_key) {
-                    return Err(labyrinth::Error::Backend(
-                        "chat device directory omits or revokes a live shared MLS group leaf"
-                            .into(),
-                    ));
+            .map_err(|error| {
+                labyrinth::Error::Backend(format!("PDS repo tombstone check: {error}"))
+            })?;
+        if let Some(del_ms) = verified_deleted_ms {
+            for entry in &mut reported {
+                entry.removed_at = Some(entry.removed_at.map_or(del_ms, |ds| ds.min(del_ms)));
+            }
+        } else if is_tombstoned {
+            for entry in &mut reported {
+                entry.removed_at.get_or_insert(u64::MAX);
+            }
+        }
+        if verified_deleted_ms.is_none() && !is_tombstoned {
+            if let Some(shared_leaves) = self
+                .authority
+                .shared_group_leaf_keys(did)
+                .await
+                .map_err(|error| labyrinth::Error::Backend(format!("shared MLS leaves: {error}")))?
+            {
+                let active_reported: std::collections::BTreeSet<[u8; 32]> = reported
+                    .iter()
+                    .filter(|entry| entry.removed_at.is_none())
+                    .map(|entry| entry.key)
+                    .collect();
+                for leaf_key in shared_leaves {
+                    let accounted_as_revoked = reported.iter().any(|entry| entry.key == leaf_key)
+                        && revoked_times.contains_key(&leaf_key);
+                    if !active_reported.contains(&leaf_key) && !accounted_as_revoked {
+                        return Err(labyrinth::Error::Backend(
+                            "chat device directory omits or revokes a live shared MLS group leaf"
+                                .into(),
+                        ));
+                    }
                 }
             }
         }

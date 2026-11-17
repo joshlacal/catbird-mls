@@ -242,6 +242,9 @@ fn extract_device_key_and_enrolled_at_from_car(
     device_id: &str,
     atproto_key: &atproto_spaces::tokens::SpaceVerifyingKey,
 ) -> Option<([u8; 32], i64)> {
+    if key_proof.is_empty() || key_proof.len() > MAX_KEY_PROOF_BYTES {
+        return None;
+    }
     let (_, record) = crate::labyrinth::repo_proof::verify_car_record_proof(
         key_proof,
         did,
@@ -348,7 +351,7 @@ fn verify_self_deletion_parts(
     let created_at_dt = chrono::DateTime::parse_from_rfc3339(created_at)
         .map_err(|_| UnverifiedDeletionReason::MalformedActorWrite)?
         .with_timezone(&chrono::Utc);
-    if expected_signed_at.is_some_and(|expected| expected != created_at_dt) {
+    if expected_signed_at.is_some_and(|expected| created_at_dt > expected) {
         return Err(UnverifiedDeletionReason::DeviceRevokedAtSignedAt);
     }
     let sig_bytes: [u8; 64] = signature
@@ -738,6 +741,18 @@ pub fn verified_device_revocation_key(did: &str, device_id: &str) -> String {
     format!("native.verified_device_revocation_at:{did}:{device_id}")
 }
 
+/// Cached `operationId` of the earliest repository-proven self-deletion revocation record for
+/// `(did, device_id)`, when that earliest revocation was a self-deletion (`deleteAccountData:<op>`).
+/// Cleared if an earlier or equal-timestamp sibling revocation overrides it.
+pub fn verified_device_revocation_self_op_key(did: &str, device_id: &str) -> String {
+    format!("native.verified_device_revocation_self_op:{did}:{device_id}")
+}
+
+/// Cached earliest verified self-deletion timestamp (`signed_at_ms`) for `did`.
+pub fn verified_deleted_account_key(did: &str) -> String {
+    format!("native.verified_deleted_account_at:{did}")
+}
+
 /// `labyrinth_state` key storing a PDS-verified self-deletion marker learned on fresh restore
 /// when `getConversationState["accountDeletions"]` omitted the deletion. Stored separately from
 /// `chat_wire::account_deletion_key` so a later sequenced `accountDeletedEntry` never collides.
@@ -1046,8 +1061,8 @@ mod tests {
             Err(UnverifiedDeletionReason::DeviceRevokedAtSignedAt)
         );
 
-        // 5. Mismatched createdAt fails closed.
-        let wrong_ts_car = build_car(
+        // 5. Prior createdAt <= signedAt succeeds (retry after skew window), while postdated createdAt fails closed.
+        let prior_ts_car = build_car(
             device_id,
             device_id,
             &device_key,
@@ -1056,13 +1071,41 @@ mod tests {
         );
         assert_eq!(
             verify_self_deletion_revocation_proof(
-                &wrong_ts_car,
+                &prior_ts_car,
+                deleted_did,
+                &parsed_write,
+                &device_vk,
+                &did_doc,
+            ),
+            Ok(())
+        );
+        let postdated_ts_car = build_car(
+            device_id,
+            device_id,
+            &device_key,
+            "2026-11-16T11:59:01.000Z",
+            Some(&format!("deleteAccountData:{op_id}")),
+        );
+        assert_eq!(
+            verify_self_deletion_revocation_proof(
+                &postdated_ts_car,
                 deleted_did,
                 &parsed_write,
                 &device_vk,
                 &did_doc,
             ),
             Err(UnverifiedDeletionReason::DeviceRevokedAtSignedAt)
+        );
+        assert!(
+            verify_foreign_self_deletion_from_cars(
+                &vec![0u8; MAX_KEY_PROOF_BYTES + 1],
+                &valid_car,
+                deleted_did,
+                device_id,
+                &did_doc,
+            )
+            .is_none(),
+            "oversized keyProof must be rejected before IPLD parse"
         );
     }
 }

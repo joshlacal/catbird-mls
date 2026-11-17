@@ -339,16 +339,23 @@ impl CatbirdMlsClient {
             };
             return unverified(reason, Some(&write));
         };
-        let revoked_at = self
-            .db
-            .read_tx(|tx| {
-                tx.get_account_meta(&authority::verified_device_revocation_key(
+        let (revoked_at, self_op) = self.db.read_tx(|tx| {
+            let revoked_at = tx
+                .get_account_meta(&authority::verified_device_revocation_key(
                     &deleted_did,
                     &write.actor_device_id,
-                ))
-            })?
-            .and_then(|raw| raw.parse::<i64>().ok());
-        if authority::revoked_at_signed_instant(revoked_at, write.signed_at_ms) {
+                ))?
+                .and_then(|raw| raw.parse::<i64>().ok());
+            let self_op =
+                tx.get_account_meta(&authority::verified_device_revocation_self_op_key(
+                    &deleted_did,
+                    &write.actor_device_id,
+                ))?;
+            Ok((revoked_at, self_op))
+        })?;
+        if self_op.as_deref() != Some(write.operation_id.as_str())
+            && authority::revoked_at_signed_instant(revoked_at, write.signed_at_ms)
+        {
             return unverified(
                 UnverifiedDeletionReason::DeviceRevokedAtSignedAt,
                 Some(&write),
@@ -475,6 +482,13 @@ impl CatbirdMlsClient {
                     }
                     tx.put_labyrinth_state(&marker_key, &serde_json::to_vec(&applied)?, now_ms)?;
                     tx.put_labyrinth_state(&op_key, seq.to_string().as_bytes(), now_ms)?;
+                    let del_meta_key = authority::verified_deleted_account_key(deleted_did);
+                    let del_ms = applied.signed_at_ms.max(0);
+                    let earliest_del_ms = tx
+                        .get_account_meta(&del_meta_key)?
+                        .and_then(|raw| raw.parse::<i64>().ok())
+                        .map_or(del_ms, |old| old.min(del_ms));
+                    tx.put_account_meta(&del_meta_key, &earliest_del_ms.to_string(), now_ms)?;
                     delete_state(
                         tx,
                         &authority::unverified_deletion_key(cid, deleted_did, *seq),

@@ -406,7 +406,9 @@ fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_hold
             .expect("d3 activation refresh retry"),
         "later ordinary archive open must retry and complete verified DS activation"
     );
-    let activated_status = alice_d3.labyrinth_status().expect("activated archive status");
+    let activated_status = alice_d3
+        .labyrinth_status()
+        .expect("activated archive status");
     assert_eq!(activated_status.pending_directory_epoch, None);
     assert_eq!(activated_status.directory_publication_error, None);
     {
@@ -418,10 +420,7 @@ fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_hold
                 .map(String::as_str),
             Some("active")
         );
-        assert_eq!(
-            state.labyrinth_epochs.get(ALICE_DID).map(Vec::len),
-            Some(2)
-        );
+        assert_eq!(state.labyrinth_epochs.get(ALICE_DID).map(Vec::len), Some(2));
         assert_eq!(
             state
                 .dr_revisions
@@ -878,9 +877,8 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
     assert!(
         alice_d1
             .db()
-            .read_tx(|tx| tx.get_labyrinth_state(&format!(
-                "native.account_deleted:{grp_cid}:{CAROL_DID}"
-            )))
+            .read_tx(|tx| tx
+                .get_labyrinth_state(&format!("native.account_deleted:{grp_cid}:{CAROL_DID}")))
             .unwrap()
             .is_some(),
         "verified deletion must install the applied deletion marker"
@@ -1037,14 +1035,15 @@ fn pds_revocation_proof_blocks_sibling_revoked_quarantines_unproven_and_hides_on
         .iter()
         .any(|m| m.message_id == carol_msg_id));
 
-    // 3. Fresh restore PDS completeness: even if mls-ds omits Carol from getConversationState
-    //    ["accountDeletions"], Alice's fresh device queries Carol's PDS deviceRevocation CARv1
-    //    and hides Carol's archived message while keeping Bob's visible.
-    ds.inner
+    // 3a. Fresh restore fail-closed when mls-ds omits Carol from getConversationState
+    //     ["accountDeletions"] while Carol's PDS still carries her live deleteAccountData record.
+    let saved_deletions = ds
+        .inner
         .lock()
         .unwrap()
         .account_deletions
-        .remove(&grp_cid);
+        .remove(&grp_cid)
+        .expect("saved carol deletion entry");
     let alice_d2 = live_client(
         tmp.path(),
         &ds,
@@ -1057,15 +1056,208 @@ fn pds_revocation_proof_blocks_sibling_revoked_quarantines_unproven_and_hides_on
     alice_d2
         .restore_with_recovery_code(&alice_code)
         .expect("alice_d2 recover archive keys");
+    let omitted_live_err = alice_d2
+        .restore_conversation_from_owner_mailbox(&grp_cid)
+        .expect_err("live PDS self-deletion omitted from accountDeletions must fail closed");
+    assert!(
+        matches!(&omitted_live_err, MLSError::InvalidState(code) if code == "ArchiveDeletionUnverified"),
+        "expected ArchiveDeletionUnverified, got {omitted_live_err:?}"
+    );
+
+    // 3b. When mls-ds serves Carol's verified accountDeletedEntry and Carol's PDS repo is
+    //     tombstoned (400 RepoNotFound), fresh restore succeeds, hides Carol's message, and
+    //     keeps Bob's visible.
+    ds.inner
+        .lock()
+        .unwrap()
+        .account_deletions
+        .insert(grp_cid.clone(), saved_deletions);
+    ds.inner
+        .lock()
+        .unwrap()
+        .pds_repo_status_for
+        .insert(CAROL_DID.into(), (400, "RepoNotFound".into()));
     let restored = alice_d2
         .restore_conversation_from_owner_mailbox(&grp_cid)
-        .expect("fresh restore succeeds with PDS completeness check");
+        .expect("fresh restore succeeds with verified deletion + tombstoned PDS");
     let restored_msgs = alice_d2
         .list_messages(&grp_cid, None, 50)
         .expect("list restored messages");
     assert_eq!(restored, 1);
     assert!(!restored_msgs.iter().any(|m| m.message_id == carol_msg_id));
     assert!(restored_msgs.iter().any(|m| m.message_id == bob_msg_id));
+
+    // 3c. When DS omits accountDeletions: transient `RepoDeactivated` fails closed as
+    //     `ArchiveDeletionInventoryUnavailable`, whereas terminal `RepoNotFound` ephemerally
+    //     hides the tombstoned sender's messages without writing a permanent DB tombstone marker.
+    ds.inner.lock().unwrap().account_deletions.remove(&grp_cid);
+    ds.inner
+        .lock()
+        .unwrap()
+        .pds_repo_status_for
+        .insert(CAROL_DID.into(), (400, "RepoDeactivated".into()));
+    let alice_d3 = live_client(
+        tmp.path(),
+        &ds,
+        "w2-revp-a3",
+        ALICE_DID,
+        &new_id(),
+        &Arc::new(MemKeyStore::new()),
+    );
+    alice_d3.enroll_device(&scopes).expect("enroll alice_d3");
+    alice_d3
+        .restore_with_recovery_code(&alice_code)
+        .expect("alice_d3 recover archive keys");
+    let deactivated_err = alice_d3
+        .restore_conversation_from_owner_mailbox(&grp_cid)
+        .expect_err(
+            "RepoDeactivated must fail closed rather than treating deactivation as tombstone",
+        );
+    assert!(
+        matches!(&deactivated_err, MLSError::InvalidState(code) if code == "ArchiveDeletionInventoryUnavailable")
+            || matches!(&deactivated_err, MLSError::Cryptography(msg) if msg.contains("corrupt or unverified")),
+        "expected fail-closed RepoDeactivated refusal, got {deactivated_err:?}"
+    );
+    assert!(
+        alice_d3
+            .list_messages(&grp_cid, None, 50)
+            .expect("list messages after failed RepoDeactivated restore")
+            .is_empty(),
+        "failed RepoDeactivated restore must expose zero messages"
+    );
+    ds.inner
+        .lock()
+        .unwrap()
+        .pds_repo_status_for
+        .insert(CAROL_DID.into(), (400, "RepoNotFound".into()));
+    let restored_tombstone = alice_d3
+        .restore_conversation_from_owner_mailbox(&grp_cid)
+        .expect("RepoNotFound hides tombstoned foreign sender");
+    let d3_msgs = alice_d3
+        .list_messages(&grp_cid, None, 50)
+        .expect("list alice_d3 restored messages");
+    assert_eq!(restored_tombstone, 1);
+    assert!(!d3_msgs.iter().any(|m| m.message_id == carol_msg_id));
+    assert!(d3_msgs.iter().any(|m| m.message_id == bob_msg_id));
+    let permanent_marker = alice_d3
+        .db()
+        .read_tx(|tx| {
+            tx.get_labyrinth_state(
+                &catbird_mls::client::deletion_authority::pds_deletion_marker_key(
+                    &grp_cid, CAROL_DID,
+                ),
+            )
+        })
+        .unwrap();
+    assert!(
+        permanent_marker.is_none(),
+        "ephemeral RepoNotFound tombstone must not write permanent i64::MAX marker to SQLite"
+    );
+}
+
+#[test]
+fn pds_revocation_proof_delete_retry_past_300s_refreshes_signed_at_and_keeps_pds_created_at() {
+    use catbird_mls::sim_hooks::{FixedStepClock, OsSimEntropy, SimClientHooks, SimClock as _};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let start_ms = chrono::Utc::now().timestamp_millis();
+    let clock = Arc::new(FixedStepClock::new(start_ms, 0));
+    let ds = SharedMockDs::new_with_now_fn(Arc::new({
+        let clock = clock.clone();
+        move || clock.now_ms()
+    }));
+    let scopes = oauth_scopes();
+    let carol_dev = new_id();
+    let alice_dev = new_id();
+    let carol = CatbirdMlsClient::open_with_hooks(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("w2-revp-retry-c").to_string_lossy().into(),
+            account_did: CAROL_DID.into(),
+            device_id: carol_dev.clone(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(CAROL_DID),
+        None,
+        SimClientHooks::new(clock.clone(), Arc::new(OsSimEntropy)),
+    )
+    .expect("open clocked carol");
+    let alice = CatbirdMlsClient::open_with_hooks(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("w2-revp-retry-a").to_string_lossy().into(),
+            account_did: ALICE_DID.into(),
+            device_id: alice_dev,
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(ALICE_DID),
+        None,
+        SimClientHooks::new(clock.clone(), Arc::new(OsSimEntropy)),
+    )
+    .expect("open clocked alice");
+    alice.enroll_device(&scopes).expect("enroll alice");
+    carol.enroll_device(&scopes).expect("enroll carol");
+    carol.setup_recovery_code().expect("carol recovery");
+    alice.setup_recovery_code().expect("alice recovery");
+
+    let dm_cid = new_id();
+    carol
+        .create_group(
+            &dm_cid,
+            DS_DID,
+            vec![ALICE_DID.into()],
+            None,
+            Some("Clocked deletion retry".into()),
+        )
+        .expect("create DM");
+    alice.sync().expect("alice sync DM");
+    let reqs = alice.list_requests(Some("incomingPending")).expect("reqs");
+    alice
+        .accept_direct_request(&reqs[0].request_id)
+        .expect("alice accept DM");
+    carol.sync().expect("carol sync DM acceptance");
+
+    // First delete_account_data attempt fails at DS with 500 after persisting PDS deviceRevocation.
+    ds.inner.lock().unwrap().xrpc_failures.push((
+        "/blue.catbird.labyrinth.deleteAccountData",
+        500,
+        "InternalServerError",
+        None,
+    ));
+    assert!(carol.delete_account_data().is_err());
+    assert!(!carol.is_handle_closed());
+    let first_created_at = ds.inner.lock().unwrap().pds_records[&(
+        CAROL_DID.to_string(),
+        "blue.catbird.chat.deviceRevocation".to_string(),
+        carol_dev.clone(),
+    )]["createdAt"]
+        .as_str()
+        .expect("first PDS createdAt")
+        .to_string();
+
+    // Advance clock +360s past the 300s skew window and enable DS clock enforcement.
+    clock.advance_ms(360_000);
+    ds.inner.lock().unwrap().mock_clock_ms = Some(clock.now_ms());
+    carol
+        .delete_account_data()
+        .expect("retry past 300s must refresh actorWrite signedAt while keeping PDS createdAt");
+    assert!(carol.is_handle_closed());
+    let after_created_at = ds.inner.lock().unwrap().pds_records[&(
+        CAROL_DID.to_string(),
+        "blue.catbird.chat.deviceRevocation".to_string(),
+        carol_dev,
+    )]["createdAt"]
+        .as_str()
+        .expect("retained PDS createdAt")
+        .to_string();
+    assert_eq!(after_created_at, first_created_at);
+    alice
+        .sync()
+        .expect("alice accepts retried deletion whose PDS createdAt precedes refreshed signedAt");
 }
 
 #[test]

@@ -975,7 +975,21 @@ impl CatbirdMlsClient {
             p.as_str()
                 .or_else(|| p.get("$bytes").and_then(Value::as_str))
         });
+        let max_car_bytes = if matches!(
+            collection,
+            super::deletion_authority::DEVICE_RECORD_COLLECTION
+                | super::deletion_authority::DEVICE_REVOCATION_COLLECTION
+        ) {
+            super::deletion_authority::MAX_REVOCATION_PROOF_BYTES
+        } else {
+            crate::labyrinth::repo_proof::MAX_CAR_ARCHIVE_BYTES
+        };
         let car_bytes = if let Some(b64) = inline_proof {
+            if b64.len() > max_car_bytes.saturating_mul(2) {
+                return Err(MLSError::Cryptography(format!(
+                    "I4 inline CAR proof exceeds {max_car_bytes}-byte ceiling for `{expected_uri}`"
+                )));
+            }
             STANDARD.decode(b64).map_err(|error| {
                 MLSError::Cryptography(format!(
                     "I4 inline CAR proof base64 decode failed for `{expected_uri}`: {error}"
@@ -1003,6 +1017,12 @@ impl CatbirdMlsClient {
             }
             proof_resp.body
         };
+        if car_bytes.is_empty() || car_bytes.len() > max_car_bytes {
+            return Err(MLSError::Cryptography(format!(
+                "I4 CAR proof for `{expected_uri}` has invalid length {} (limit {max_car_bytes})",
+                car_bytes.len()
+            )));
+        }
         let (_, commit_rev) = crate::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
             &car_bytes,
             target_did,
@@ -1188,33 +1208,53 @@ impl CatbirdMlsClient {
                                     "I4 verified revocation has invalid createdAt".into(),
                                 )
                             })?;
-                        // Self-deletion revocations authorize the deletion at `revoked_at_ms`
-                        // and revoke the device strictly afterward (`revoked_at_ms + 1`), whereas
-                        // sibling revocations block `deleteAccountData` at or after `revoked_at_ms`.
-                        let is_self_deletion = record_val["actorDeviceId"]
+                        // Record the exact revocation timestamp plus, only when the earliest
+                        // revocation is a self-deletion (`deleteAccountData:<op>`), that specific
+                        // operation ID. A sibling revocation at or before that timestamp clears the
+                        // self-op allowance so it always blocks `deleteAccountData`.
+                        let self_op_id = record_val["actorDeviceId"]
                             .as_str()
-                            .is_some_and(|actor| actor == target_id)
-                            && record_val["reason"].as_str().is_some_and(|r| {
-                                r.starts_with(
+                            .filter(|actor| *actor == target_id.as_str())
+                            .and_then(|_| record_val["reason"].as_str())
+                            .and_then(|r| {
+                                r.strip_prefix(
                                     super::deletion_authority::DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX,
                                 )
+                            })
+                            .filter(|op| {
+                                op.len() == 32
+                                    && op
+                                        .bytes()
+                                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                             });
-                        let effective_revoked_at_ms = if is_self_deletion {
-                            revoked_at_ms.saturating_add(1)
-                        } else {
-                            revoked_at_ms
-                        };
                         let key = super::deletion_authority::verified_device_revocation_key(
                             target_did, &target_id,
                         );
+                        let self_op_key =
+                            super::deletion_authority::verified_device_revocation_self_op_key(
+                                target_did, &target_id,
+                            );
+                        let now_ms = self.hooks.now_ms();
                         self.db.write_tx(|tx| {
-                            let earliest = tx
+                            let old_earliest = tx
                                 .get_account_meta(&key)?
-                                .and_then(|raw| raw.parse::<i64>().ok())
-                                .map_or(effective_revoked_at_ms, |old| {
-                                    old.min(effective_revoked_at_ms)
-                                });
-                            tx.put_account_meta(&key, &earliest.to_string(), self.hooks.now_ms())
+                                .and_then(|raw| raw.parse::<i64>().ok());
+                            let existing_self_op = tx.get_account_meta(&self_op_key)?;
+                            let earliest = old_earliest
+                                .map_or(revoked_at_ms, |old| old.min(revoked_at_ms));
+                            tx.put_account_meta(&key, &earliest.to_string(), now_ms)?;
+                            if let Some(op) = self_op_id {
+                                let should_store = old_earliest.is_none()
+                                    || old_earliest.is_some_and(|old| revoked_at_ms < old)
+                                    || (old_earliest == Some(revoked_at_ms)
+                                        && existing_self_op.as_deref() == Some(op));
+                                if should_store {
+                                    tx.put_account_meta(&self_op_key, op, now_ms)?;
+                                }
+                            } else if old_earliest.is_none_or(|old| revoked_at_ms <= old) {
+                                tx.delete_account_meta(&self_op_key)?;
+                            }
+                            Ok(())
                         })?;
                     }
                     revoked_device_ids.insert(target_id);

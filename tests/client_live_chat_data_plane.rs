@@ -278,6 +278,8 @@ struct MockDsState {
     dormant_devices: BTreeSet<(String, String)>,
     revoked_device_at: BTreeMap<(String, String), String>,
     leave_requests: BTreeMap<String, Vec<Value>>,
+    pds_repo_status_for: BTreeMap<String, (u16, String)>,
+    mock_clock_ms: Option<i64>,
 }
 
 struct SharedMockDs {
@@ -287,6 +289,10 @@ struct SharedMockDs {
 
 impl SharedMockDs {
     fn new() -> Arc<Self> {
+        Self::new_with_now_fn(Arc::new(|| chrono::Utc::now().timestamp_millis()))
+    }
+
+    fn new_with_now_fn(now_fn: Arc<dyn Fn() -> i64 + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(MockDsState {
                 receipt_sk: P256SigningKey::random(&mut rand::rngs::OsRng),
@@ -365,11 +371,10 @@ impl SharedMockDs {
                 dormant_devices: BTreeSet::new(),
                 revoked_device_at: BTreeMap::new(),
                 leave_requests: BTreeMap::new(),
+                pds_repo_status_for: BTreeMap::new(),
+                mock_clock_ms: None,
             }),
-            archive_auth: NativeArchiveAuthFixture::new(
-                ALICE_DID,
-                Arc::new(|| chrono::Utc::now().timestamp_millis()),
-            ),
+            archive_auth: NativeArchiveAuthFixture::new(ALICE_DID, now_fn),
         })
     }
 
@@ -783,6 +788,9 @@ impl SharedMockDs {
 
         if url.contains("/xrpc/com.atproto.repo.listRecords") {
             let repo = q.get("repo").cloned().unwrap_or_default();
+            if let Some((status, code)) = g.pds_repo_status_for.get(&repo) {
+                return xrpc_error(*status, code, "mock PDS repo status");
+            }
             let coll = q.get("collection").cloned().unwrap_or_default();
             let limit = q
                 .get("limit")
@@ -908,8 +916,12 @@ impl SharedMockDs {
         }
 
         if url.contains("/xrpc/com.atproto.repo.getRecord") {
+            let repo_did = q.get("repo").cloned().unwrap_or_default();
+            if let Some((status, code)) = g.pds_repo_status_for.get(&repo_did) {
+                return xrpc_error(*status, code, "mock PDS repo status");
+            }
             let key = (
-                q.get("repo").cloned().unwrap_or_default(),
+                repo_did,
                 q.get("collection").cloned().unwrap_or_default(),
                 q.get("rkey").cloned().unwrap_or_default(),
             );
@@ -970,8 +982,8 @@ impl SharedMockDs {
                 .unwrap_or_default()
                 .to_string();
             let caller = (account.to_owned(), caller_dev.clone());
-            let caller_pending = g.device_statuses.get(&caller).map(String::as_str)
-                == Some("pending_approval");
+            let caller_pending =
+                g.device_statuses.get(&caller).map(String::as_str) == Some("pending_approval");
             if caller_pending {
                 let notice_aged = g.aged_pending_notices.contains(&caller);
                 let has_awake_active_sibling =
@@ -1056,6 +1068,20 @@ impl SharedMockDs {
                     "write body does not bind this payload",
                 );
             }
+            if let Some(mock_now_ms) = g.mock_clock_ms {
+                let signed_at_ms = write["signedAt"]
+                    .as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp_millis())
+                    .unwrap_or(i64::MIN);
+                if (signed_at_ms - mock_now_ms).abs() > 300_000 {
+                    return xrpc_error(
+                        401,
+                        "WriteSkew",
+                        "mock deleteAccountData signedAt outside 300s skew window",
+                    );
+                }
+            }
             let actor_write = {
                 let header = |name: &str| {
                     req.headers
@@ -1088,13 +1114,14 @@ impl SharedMockDs {
                 .collect();
             for cid in affected_cids {
                 let next_seq = g.entries.get(&cid).map_or(0, Vec::len) as i64 + 1;
-                let mut del_entry = signed_account_deletion(
+                let mut del_entry = signed_account_deletion_at(
                     &g.receipt_sk,
                     &receipt_key_id,
                     DS_DID,
                     &cid,
                     account,
                     next_seq,
+                    g.mock_clock_ms,
                 );
                 del_entry["actorWrite"] = actor_write.clone();
                 del_entry["keyProof"] = json!({ "$bytes": STANDARD.encode(&key_proof) });
@@ -2694,8 +2721,23 @@ fn signed_account_deletion(
     deleted: &str,
     seq: i64,
 ) -> Value {
+    signed_account_deletion_at(key, key_id, sequencer, cid, deleted, seq, None)
+}
+
+fn signed_account_deletion_at(
+    key: &P256SigningKey,
+    key_id: &str,
+    sequencer: &str,
+    cid: &str,
+    deleted: &str,
+    seq: i64,
+    at_ms: Option<i64>,
+) -> Value {
     let entry_id = uuid::Uuid::new_v4().to_string();
-    let received_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let received_at = at_ms
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let received_at = received_at.as_str();
     let seq_text = seq.to_string();
     let fields = [sequencer, cid, deleted, &seq_text, &entry_id, received_at];
@@ -5599,7 +5641,6 @@ fn c33_peer_quarantines_account_deletion_and_restore_reconciles_complete_invento
             .any(|item| item.message_id == a2),
         "queued witness duty remains while deletion is unresolved"
     );
-
 
     // A recovered device has no local MLS leaf for Alice. Restoration must retain all
     // archived rows out of view until the deletion's historical status can be proven.
@@ -9933,13 +9974,7 @@ fn sync_paginates_conversation_inventory_past_the_server_page_limit() {
 fn sync_reports_repeated_conversation_inventory_cursor_as_incomplete() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ds = SharedMockDs::new();
-    let alice = enrolled(
-        &tmp,
-        &ds,
-        "inventory-repeat-alice",
-        ALICE_DID,
-        &new_id(),
-    );
+    let alice = enrolled(&tmp, &ds, "inventory-repeat-alice", ALICE_DID, &new_id());
     let ids = seed_inert_conversation_inventory(&ds, 101);
     let mut state = ds.inner.lock().unwrap();
     state.repeat_conversation_cursor = true;
@@ -9960,9 +9995,7 @@ fn sync_reports_repeated_conversation_inventory_cursor_as_incomplete() {
             .unwrap()
             .http_log
             .iter()
-            .filter(|(_, url, _)| {
-                url.contains("/xrpc/blue.catbird.chat.getConversations")
-            })
+            .filter(|(_, url, _)| { url.contains("/xrpc/blue.catbird.chat.getConversations") })
             .count(),
         2,
         "a repeated cursor must stop after the repeated page"
@@ -12638,7 +12671,10 @@ fn sync_paginates_more_than_one_hundred_cryptographic_entries() {
                 && query_map(url).get("conversationId") == Some(&cid)
         })
         .count();
-    assert_eq!(entry_reads, 2, "101 user messages require exactly two pages");
+    assert_eq!(
+        entry_reads, 2,
+        "101 user messages require exactly two pages"
+    );
 }
 
 #[test]

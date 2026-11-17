@@ -200,7 +200,6 @@ fn serve_fulfillment(
     )
     .unwrap();
 
-
     let (request, transition, welcome_id) = (new_id(), new_id(), new_id());
     let reference = &reserved["keyPackageRef"];
     let mut body = template.clone();
@@ -521,8 +520,7 @@ fn recovery_welcome_attests_the_fulfillers_roster_and_nothing_else_does() {
         }
     };
     let valid = serve_fulfillment(ds, &template, carol, carol, &f.bob_dev, attest(0, &carols));
-    let no_attestation =
-        serve_fulfillment(ds, &template, carol, carol, &f.bob_dev, |_| None);
+    let no_attestation = serve_fulfillment(ds, &template, carol, carol, &f.bob_dev, |_| None);
     let refused = [
         ("no attestation", no_attestation.clone()),
         (

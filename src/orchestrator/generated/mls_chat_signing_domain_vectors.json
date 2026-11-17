@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json",
-    "sourceRevision": "1ae32f7c8f1552ea120d98fc8d8d99c447209a9d",
+    "sourceRevision": "6b42994740eb222b1192975eba0c274e066d9c5c",
     "sourceSha256": "ed6ae218b707ab8199f5104365c0b04e12b7db114313a955cb080ee324a23bdb",
-    "sourceTree": "076ec95c86ec727bfec8b27dc445e99b515a05ad",
+    "sourceTree": "e6068edca31d6c305c36ee5f5fcf02137a85150f",
     "vectorCaseCount": 11,
     "vectorSet": "signed-mutation",
     "vectorSetCount": 25

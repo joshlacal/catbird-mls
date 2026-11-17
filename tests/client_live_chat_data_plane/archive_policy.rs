@@ -158,9 +158,7 @@ fn joining_member_inherits_effective_backup_off_from_verified_welcome() {
     admit_eve(&f);
     assert!(!f.eve.history_backup_enabled(cid).unwrap());
     assert!(
-        stored_metadata(&f.eve, cid)
-            .get("historyBackup")
-            .is_none(),
+        stored_metadata(&f.eve, cid).get("historyBackup").is_none(),
         "the Commit carries exact prior metadata; OFF arrives in the verified Welcome"
     );
 }
@@ -176,9 +174,7 @@ fn missing_backup_field_survives_first_membership_commit_without_normalization()
     admit_eve(&f);
 
     assert!(f.eve.history_backup_enabled(cid).unwrap());
-    assert!(stored_metadata(&f.eve, cid)
-        .get("historyBackup")
-        .is_none());
+    assert!(stored_metadata(&f.eve, cid).get("historyBackup").is_none());
 }
 
 #[test]
@@ -201,20 +197,14 @@ fn explicit_backup_policy_survives_generic_commit_and_leave_carry_forward() {
         .update_group_metadata(cid, "Explicit policy".into(), String::new(), None)
         .expect("publish explicit policy metadata");
     f.bob.sync().expect("bob applies metadata transition");
-    assert_eq!(
-        stored_metadata(&f.bob, cid)["historyBackup"],
-        json!(false)
-    );
+    assert_eq!(stored_metadata(&f.bob, cid)["historyBackup"], json!(false));
 
     admit_eve(&f);
     f.alice
         .remove_group_member(MemberRole::Admin, cid, EVE_DID)
         .expect("generic Commit removes Eve");
     f.bob.sync().expect("bob applies Eve removal");
-    assert_eq!(
-        stored_metadata(&f.bob, cid)["historyBackup"],
-        json!(false)
-    );
+    assert_eq!(stored_metadata(&f.bob, cid)["historyBackup"], json!(false));
 
     let leave = f
         .bob
@@ -252,10 +242,7 @@ fn authored_retitle_stamps_completed_off_over_stale_metadata() {
         .expect("author metadata after OFF");
     f.bob.sync().expect("bob applies authored metadata");
 
-    assert_eq!(
-        stored_metadata(&f.bob, cid)["historyBackup"],
-        json!(false)
-    );
+    assert_eq!(stored_metadata(&f.bob, cid)["historyBackup"], json!(false));
     assert!(!f.alice.history_backup_enabled(cid).unwrap());
     assert!(!f.bob.history_backup_enabled(cid).unwrap());
 }
@@ -276,10 +263,7 @@ fn stale_off_epoch_carry_does_not_override_later_explicit_on() {
         .update_group_metadata(cid, "Metadata authored off".into(), String::new(), None)
         .expect("author OFF metadata");
     f.bob.sync().expect("bob applies OFF metadata");
-    assert_eq!(
-        stored_metadata(&f.bob, cid)["historyBackup"],
-        json!(false)
-    );
+    assert_eq!(stored_metadata(&f.bob, cid)["historyBackup"], json!(false));
 
     f.alice
         .set_history_backup_enabled(cid, true)
@@ -302,8 +286,7 @@ fn stale_off_epoch_carry_does_not_override_later_explicit_on() {
                 .and_then(Value::as_str)
                 .expect("canonical author key")
                 .to_string();
-            snapshot["authorProof"]["signaturePublicKey"] =
-                json!({ "$bytes": public_key });
+            snapshot["authorProof"]["signaturePublicKey"] = json!({ "$bytes": public_key });
             tx.put_account_meta(&key, &snapshot.to_string(), 0)
         })
         .unwrap();

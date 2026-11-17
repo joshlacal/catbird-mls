@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json",
-    "sourceRevision": "1ae32f7c8f1552ea120d98fc8d8d99c447209a9d",
+    "sourceRevision": "6b42994740eb222b1192975eba0c274e066d9c5c",
     "sourceSha256": "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311",
-    "sourceTree": "076ec95c86ec727bfec8b27dc445e99b515a05ad",
+    "sourceTree": "e6068edca31d6c305c36ee5f5fcf02137a85150f",
     "vectorCaseCount": 13,
     "vectorSet": "signed-mutation",
     "vectorSetCount": 25

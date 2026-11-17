@@ -455,6 +455,8 @@ struct NativeLocalAuthority {
     hooks: crate::sim_hooks::SimClientHooks,
     account_did: String,
     gateway: Arc<NativeArchiveGateway>,
+    tombstoned_pds_dids: Mutex<std::collections::BTreeSet<String>>,
+    preverified_deleted_dids: std::collections::BTreeMap<String, u64>,
 }
 
 #[cfg(feature = "labyrinth")]
@@ -462,6 +464,46 @@ type NativeLocalGroup = (Vec<u8>, u64, i64, Vec<(String, Vec<u8>)>);
 
 #[cfg(feature = "labyrinth")]
 impl NativeLocalAuthority {
+    fn is_pds_repo_tombstone_response(status: u16, body: &[u8]) -> bool {
+        if !matches!(status, 400 | 404) {
+            return false;
+        }
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|code| matches!(code.as_str(), "RepoNotFound" | "RepoTakendown"))
+    }
+
+    fn is_pds_repo_tombstoned_sync(&self, did: &str) -> bool {
+        self.tombstoned_pds_dids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(did)
+    }
+
+    fn verified_deleted_ms_sync(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Option<u64>> {
+        let key = super::deletion_authority::verified_deleted_account_key(did);
+        let db_ms = self
+            .db
+            .read_tx(|tx| tx.get_account_meta(&key))
+            .map_err(crate::orchestrator::error::OrchestratorError::Mls)?
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .map(|ms| u64::try_from(ms.max(0)).unwrap_or(0));
+        let pre_ms = self.preverified_deleted_dids.get(did).copied();
+        Ok(match (db_ms, pre_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
+    }
+
     /// `(group id, MLS epoch, last applied entry seq, leaves as (root DID, signing key))`.
     fn group(&self, conversation_id: &str) -> crate::orchestrator::error::Result<Option<NativeLocalGroup>> {
         let group = self.db.read_tx(|tx| {
@@ -511,6 +553,13 @@ impl NativeLocalAuthority {
                 .gateway
                 .execute(pds_endpoint, "GET".into(), path, vec![], None)
                 .map_err(crate::orchestrator::error::OrchestratorError::Credential)?;
+            if page_idx == 0 && Self::is_pds_repo_tombstone_response(resp.status, &resp.body) {
+                self.tombstoned_pds_dids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(did.to_owned());
+                return Ok(None);
+            }
             if page_idx == 0 && allow_not_found && resp.status == 404 {
                 return Ok(None);
             }
@@ -586,7 +635,23 @@ impl NativeLocalAuthority {
             p.as_str()
                 .or_else(|| p.get("$bytes").and_then(serde_json::Value::as_str))
         });
+        let max_car_bytes = if matches!(
+            collection,
+            super::deletion_authority::DEVICE_RECORD_COLLECTION
+                | super::deletion_authority::DEVICE_REVOCATION_COLLECTION
+        ) {
+            super::deletion_authority::MAX_REVOCATION_PROOF_BYTES
+        } else {
+            crate::labyrinth::repo_proof::MAX_CAR_ARCHIVE_BYTES
+        };
         let car_bytes = if let Some(b64) = inline_proof {
+            if b64.len() > max_car_bytes.saturating_mul(2) {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!(
+                        "inline CAR proof exceeds {max_car_bytes}-byte ceiling on `{expected_uri}`"
+                    ),
+                ));
+            }
             BASE64_STANDARD.decode(b64).map_err(|e| {
                 crate::orchestrator::error::OrchestratorError::Credential(format!(
                     "inline CAR proof decode on `{expected_uri}`: {e}"
@@ -613,6 +678,14 @@ impl NativeLocalAuthority {
             }
             proof_resp.body
         };
+        if car_bytes.is_empty() || car_bytes.len() > max_car_bytes {
+            return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                format!(
+                    "CARv1 proof on `{expected_uri}` has invalid length {} (limit {max_car_bytes})",
+                    car_bytes.len()
+                ),
+            ));
+        }
         let (_, commit_rev) =
             crate::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
                 &car_bytes,
@@ -693,6 +766,13 @@ impl NativeLocalAuthority {
             let parsed_doc =
                 atproto_spaces::did_resolver::DidDocument::parse_json(did, &doc_bytes).ok();
             let atproto_key = parsed_doc.as_ref().and_then(|d| d.atproto_key.clone());
+            #[cfg(not(test))]
+            if atproto_key.is_none() {
+                return Err(crate::orchestrator::error::OrchestratorError::Credential(
+                    format!("missing #atproto repository signing key in DID document for `{did}`"),
+                ));
+            }
+            let allow_test_fallback = cfg!(test) && atproto_key.is_none();
             let pds_endpoint = super::chat_wire::extract_pds_endpoint_from_did_doc(&doc_bytes, did)
                 .ok_or_else(|| crate::orchestrator::error::OrchestratorError::Credential(
                     format!("no #atproto_pds service in the DID document of own account `{did}`"),
@@ -702,11 +782,11 @@ impl NativeLocalAuthority {
                 &pds_endpoint,
                 did,
                 "blue.catbird.chat.device",
-                true,
+                allow_test_fallback,
             ) {
                 Ok(Some(records)) => records,
                 Ok(None) => return Ok(None),
-                Err(_) if atproto_key.is_none() => return Ok(None),
+                Err(_) if allow_test_fallback => return Ok(None),
                 Err(error) => return Err(error),
             };
             let entries = super::chat_wire::parse_pds_device_entries(did, &raw_devices);
@@ -837,6 +917,11 @@ impl NativeLocalAuthority {
         )? {
             Some(records) => records,
             None => {
+                if self.is_pds_repo_tombstoned_sync(did)
+                    || self.verified_deleted_ms_sync(did)?.is_some()
+                {
+                    return Ok(None);
+                }
                 #[cfg(test)]
                 {
                     return Ok(self
@@ -853,6 +938,9 @@ impl NativeLocalAuthority {
         };
         let entries = super::chat_wire::parse_pds_device_entries(did, &raw_devices);
         if entries.is_empty() {
+            if self.is_pds_repo_tombstoned_sync(did) || self.verified_deleted_ms_sync(did)?.is_some() {
+                return Ok(None);
+            }
             return Err(crate::orchestrator::error::OrchestratorError::Credential(
                 format!("peer PDS holds zero valid chat.device records for `{did}`"),
             ));
@@ -1067,6 +1155,17 @@ impl crate::labyrinth::session::LocalConversationAuthority for NativeLocalAuthor
             return Ok(None);
         }
         Ok(Some(shared.into_iter().collect()))
+    }
+
+    async fn verified_deleted_account_ms(
+        &self,
+        did: &str,
+    ) -> crate::orchestrator::error::Result<Option<u64>> {
+        self.verified_deleted_ms_sync(did)
+    }
+
+    async fn is_pds_repo_tombstoned(&self, did: &str) -> crate::orchestrator::error::Result<bool> {
+        Ok(self.is_pds_repo_tombstoned_sync(did))
     }
 }
 
@@ -1410,6 +1509,13 @@ impl CatbirdMlsClient {
     fn native_archive_deps_with_gateway(
         &self,
     ) -> Result<(crate::labyrinth::SessionDeps, Arc<NativeArchiveGateway>), MLSError> {
+        self.native_archive_deps_with_gateway_preverified(std::collections::BTreeMap::new())
+    }
+
+    fn native_archive_deps_with_gateway_preverified(
+        &self,
+        preverified_deleted_dids: std::collections::BTreeMap<String, u64>,
+    ) -> Result<(crate::labyrinth::SessionDeps, Arc<NativeArchiveGateway>), MLSError> {
         if self.is_handle_closed() { return Err(MLSError::ContextClosed); }
         let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
         let _: [u8; 32] = signer.public().try_into().map_err(|_| MLSError::Cryptography("archive chat key is not Ed25519".into()))?;
@@ -1438,6 +1544,8 @@ impl CatbirdMlsClient {
                 hooks: self.hooks.clone(),
                 account_did: self.normalized_did.clone(),
                 gateway: gateway.clone(),
+                tombstoned_pds_dids: Mutex::new(std::collections::BTreeSet::new()),
+                preverified_deleted_dids,
             })),
             sequencer_receipt_key: None,
             default_conversation_authority_did: None,
@@ -1447,6 +1555,14 @@ impl CatbirdMlsClient {
 
     fn native_archive_deps(&self) -> Result<crate::labyrinth::SessionDeps, MLSError> {
         self.native_archive_deps_with_gateway().map(|(deps, _)| deps)
+    }
+
+    fn native_archive_deps_preverified(
+        &self,
+        preverified_deleted_dids: std::collections::BTreeMap<String, u64>,
+    ) -> Result<crate::labyrinth::SessionDeps, MLSError> {
+        self.native_archive_deps_with_gateway_preverified(preverified_deleted_dids)
+            .map(|(deps, _)| deps)
     }
 
     /// Runs an E2EE Circles operation (`crate::ffi::circles_ffi`) on the native
@@ -2367,25 +2483,36 @@ impl CatbirdMlsClient {
     /// Hides every copy (sender, witness or owner) attributed to an account whose deletion
     /// was previously applied for `conversation_id`. Live sync and restore quarantine new
     /// deletions until historical non-revocation is proven; no
+    /// Hide every restored message of any account deleted in this conversation, closing the gap
     /// server redaction covers the witness and owner copies other members already published. A
-    /// copy stays only if its sequencer receipt orders it after the deletion. Returns how many it hid.
-    fn hide_deleted_accounts(db: &MlsAccountDb, conversation_id: &str, messages: &mut Vec<labyrinth::client::LoadedMessage>) -> Result<usize, MLSError> {
-        let senders: std::collections::BTreeSet<String> = messages.iter().filter_map(|m| m.sender.clone()).collect();
+    /// copy stays only if its sequencer receipt orders it after the deletion (and is not from an
+    /// ephemeral PDS repo tombstone discovered on this restore). Returns how many it hid.
+    fn hide_deleted_accounts(
+        db: &MlsAccountDb,
+        conversation_id: &str,
+        tombstoned_dids: &std::collections::BTreeSet<String>,
+        messages: &mut Vec<labyrinth::client::LoadedMessage>,
+    ) -> Result<usize, MLSError> {
+        let senders: std::collections::BTreeSet<String> =
+            messages.iter().filter_map(|m| m.sender.clone()).collect();
         use super::deletion_authority::{AppliedAccountDeletion, StoredAccountDeletion};
-        let deleted: std::collections::BTreeMap<String, StoredAccountDeletion> = db.read_tx(|tx| {
-            let mut deleted = std::collections::BTreeMap::new();
-            for did in &senders {
-                if let Some(raw) = tx.get_labyrinth_state(&super::chat_wire::account_deletion_key(conversation_id, did))? {
-                    // An unreadable marker still hides: it can only widen what the deletion covers.
-                    let marker = AppliedAccountDeletion::decode(&raw).unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
-                    deleted.insert(did.clone(), marker);
-                } else if let Some(raw) = tx.get_labyrinth_state(&super::deletion_authority::pds_deletion_marker_key(conversation_id, did))? {
-                    let marker = AppliedAccountDeletion::decode(&raw).unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
-                    deleted.insert(did.clone(), marker);
+        let deleted: std::collections::BTreeMap<String, StoredAccountDeletion> =
+            db.read_tx(|tx| {
+                let mut deleted = std::collections::BTreeMap::new();
+                for did in &senders {
+                    if let Some(raw) = tx.get_labyrinth_state(
+                        &super::chat_wire::account_deletion_key(conversation_id, did),
+                    )? {
+                        // An unreadable marker still hides: it can only widen what the deletion covers.
+                        let marker = AppliedAccountDeletion::decode(&raw)
+                            .unwrap_or(StoredAccountDeletion::SeqOnly(i64::MAX));
+                        deleted.insert(did.clone(), marker);
+                    } else if tombstoned_dids.contains(did) {
+                        deleted.insert(did.clone(), StoredAccountDeletion::SeqOnly(i64::MAX));
+                    }
                 }
-            }
-            Ok(deleted)
-        })?;
+                Ok(deleted)
+            })?;
         let before = messages.len();
         // A copy stays unless the deletion covers it: ordered before the deletion and, for a
         // device-signed deletion, issued no later than its signed instant. A copy without a
@@ -2402,34 +2529,169 @@ impl CatbirdMlsClient {
         Ok(before - messages.len())
     }
 
+    /// Fetch `getConversationState["accountDeletions"]` prior to `session.load_history` so
+    /// deleted accounts are already bound before `LocallyCheckedDirectory` enforces live PDS
+    /// device inventory or shared MLS leaf keys. Unpinned conversations avoid DB writes here and
+    /// return an in-memory map until `load_history` authenticates the sequencer receipt.
+    fn preverify_conversation_deletions(
+        &self,
+        conversation_id: &str,
+    ) -> Result<
+        (
+            Option<serde_json::Value>,
+            std::collections::BTreeMap<String, u64>,
+        ),
+        MLSError,
+    > {
+        let device = self
+            .canonical_uuid_v4_device_id()
+            .ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
+        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+        let state = match self.query_signed_chat_ds(
+            "blue.catbird.chat.getConversationState",
+            &[
+                ("actorDeviceId", &device),
+                ("conversationId", conversation_id),
+            ],
+            &device,
+            &signer,
+        ) {
+            Ok(state) => state,
+            Err(MLSError::InvalidState(code))
+                if matches!(
+                    code.as_str(),
+                    "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval"
+                ) =>
+            {
+                return Ok((None, std::collections::BTreeMap::new()));
+            }
+            Err(error) => return Err(error),
+        };
+        let pinned = self
+            .db
+            .read_tx(|tx| tx.get_conversation(conversation_id))?
+            .map(|row| row.sequencer_did)
+            .filter(|did| !did.is_empty());
+        let candidate_sequencer = pinned.clone().or_else(|| {
+            state["state"]["sequencerDid"]
+                .as_str()
+                .or_else(|| state["sequencerDid"].as_str())
+                .filter(|did| !did.is_empty())
+                .map(str::to_owned)
+        });
+        let mut preverified = std::collections::BTreeMap::new();
+        if let Some(sequencer) = candidate_sequencer {
+            let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
+                MLSError::Cryptography("getConversationState is missing accountDeletions".into())
+            })?;
+            for entry in deletions {
+                let decision =
+                    self.authorize_account_deletion(conversation_id, &sequencer, entry)?;
+                if pinned.is_some() {
+                    self.apply_account_deletion_decision(conversation_id, entry, &decision)?;
+                    if let super::live_sync::live_integrity::AccountDeletionDecision::Unverified {
+                        reason,
+                        ..
+                    } = &decision
+                    {
+                        if *reason
+                            != super::deletion_authority::UnverifiedDeletionReason::OtherConversation
+                        {
+                            tracing::warn!(
+                                conversation_id,
+                                ?reason,
+                                "archive restore blocked on unverified account deletion"
+                            );
+                            return Err(MLSError::InvalidState(
+                                "ArchiveDeletionUnverified".into(),
+                            ));
+                        }
+                    }
+                } else if let super::live_sync::live_integrity::AccountDeletionDecision::Apply {
+                    deleted_did,
+                    write,
+                    ..
+                } = decision
+                {
+                    let ms = u64::try_from(write.signed_at_ms.max(0)).unwrap_or(0);
+                    preverified
+                        .entry(deleted_did)
+                        .and_modify(|prev: &mut u64| *prev = (*prev).min(ms))
+                        .or_insert(ms);
+                }
+            }
+        }
+        Ok((Some(state), preverified))
+    }
+
     /// A fresh device never sees `accountDeletedEntry` in `getEntries`, so archive reads verify
     /// every deletion the conversation state lists under the pinned sequencer, or without local
     /// state under the sequencer authenticated by restored receipts. Inaccessible state holds
     /// nonempty history because the local deletion-marker set may be incomplete.
-    fn apply_listed_account_deletions(&self, conversation_id: &str, history: &[labyrinth::client::LoadedMessage]) -> Result<(), MLSError> {
+    fn apply_listed_account_deletions(
+        &self,
+        conversation_id: &str,
+        history: &[labyrinth::client::LoadedMessage],
+        prefetched_state: Option<serde_json::Value>,
+    ) -> Result<std::collections::BTreeSet<String>, MLSError> {
         if history.is_empty() {
-            return Ok(());
+            return Ok(std::collections::BTreeSet::new());
         }
-        let pinned = self.db.read_tx(|tx| tx.get_conversation(conversation_id))?.map(|row| row.sequencer_did).filter(|did| !did.is_empty());
-        let Some(sequencer) = pinned.or_else(|| history.iter().filter_map(|m| m.archived_receipt.as_ref())
-            .max_by_key(|r| r.signed.payload.seq).map(|r| r.signed.payload.sequencer_did.clone())) else {
-                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
-            };
-        let device = self.canonical_uuid_v4_device_id().ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
-        let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
-        let state = match self.query_signed_chat_ds("blue.catbird.chat.getConversationState",
-            &[("actorDeviceId", &device), ("conversationId", conversation_id)], &device, &signer) {
-            Ok(state) => state,
-            // A denied or forgotten conversation state cannot prove which deletions preceded
-            // this archive. Local markers may be incomplete on a restored device, so stop before
-            // returning or importing any plaintext copies.
-            Err(MLSError::InvalidState(code)) if matches!(code.as_str(), "ConversationNotFound" | "NotEntitled" | "AccessOutsideMembershipInterval") => {
-                return Err(MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()));
-            }
-            Err(error) => return Err(error),
+        let pinned = self
+            .db
+            .read_tx(|tx| tx.get_conversation(conversation_id))?
+            .map(|row| row.sequencer_did)
+            .filter(|did| !did.is_empty());
+        let Some(sequencer) = pinned.or_else(|| {
+            history
+                .iter()
+                .filter_map(|m| m.archived_receipt.as_ref())
+                .max_by_key(|r| r.signed.payload.seq)
+                .map(|r| r.signed.payload.sequencer_did.clone())
+        }) else {
+            return Err(MLSError::InvalidState(
+                "ArchiveDeletionInventoryUnavailable".into(),
+            ));
         };
-        let deletions = state["accountDeletions"].as_array()
-            .ok_or_else(|| MLSError::Cryptography("getConversationState is missing accountDeletions".into()))?;
+        let state = match prefetched_state {
+            Some(state) => state,
+            None => {
+                let device = self
+                    .canonical_uuid_v4_device_id()
+                    .ok_or_else(|| MLSError::invalid_input("archive requires UUIDv4 device_id"))?;
+                let (signer, _) = self.load_enrolled_signer_and_auth_gen()?;
+                match self.query_signed_chat_ds(
+                    "blue.catbird.chat.getConversationState",
+                    &[
+                        ("actorDeviceId", &device),
+                        ("conversationId", conversation_id),
+                    ],
+                    &device,
+                    &signer,
+                ) {
+                    Ok(state) => state,
+                    // A denied or forgotten conversation state cannot prove which deletions preceded
+                    // this archive. Local markers may be incomplete on a restored device, so stop
+                    // before returning or importing any plaintext copies.
+                    Err(MLSError::InvalidState(code))
+                        if matches!(
+                            code.as_str(),
+                            "ConversationNotFound"
+                                | "NotEntitled"
+                                | "AccessOutsideMembershipInterval"
+                        ) =>
+                    {
+                        return Err(MLSError::InvalidState(
+                            "ArchiveDeletionInventoryUnavailable".into(),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        let deletions = state["accountDeletions"].as_array().ok_or_else(|| {
+            MLSError::Cryptography("getConversationState is missing accountDeletions".into())
+        })?;
         // Each listed deletion needs the deleting device's signature and historical status.
         // A key proof can verify the device key when this device holds no leaf of it.
         for entry in deletions {
@@ -2440,13 +2702,20 @@ impl CatbirdMlsClient {
                 ..
             } = decision
             {
-                if reason == super::deletion_authority::UnverifiedDeletionReason::OtherConversation {
+                if reason == super::deletion_authority::UnverifiedDeletionReason::OtherConversation
+                {
                     continue;
                 }
                 // No archived row is made visible while a sequencer-listed deletion remains
                 // unauthorised, including after DID-key rotation or missing revocation proof.
-                tracing::warn!(conversation_id, ?reason, "archive restore blocked on unverified account deletion");
-                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+                tracing::warn!(
+                    conversation_id,
+                    ?reason,
+                    "archive restore blocked on unverified account deletion"
+                );
+                return Err(MLSError::InvalidState(
+                    "ArchiveDeletionUnverified".into(),
+                ));
             }
         }
         // PDS completeness check for foreign message senders whose deletion may have been
@@ -2462,22 +2731,25 @@ impl CatbirdMlsClient {
                 let mut unchecked = Vec::new();
                 for did in all_senders {
                     let has_seq_marker = tx
-                        .get_labyrinth_state(&super::chat_wire::account_deletion_key(conversation_id, &did))?
+                        .get_labyrinth_state(&super::chat_wire::account_deletion_key(
+                            conversation_id,
+                            &did,
+                        ))?
                         .is_some();
-                    let has_pds_marker = tx
-                        .get_labyrinth_state(&super::deletion_authority::pds_deletion_marker_key(conversation_id, &did))?
-                        .is_some();
-                    if !has_seq_marker && !has_pds_marker {
+                    if !has_seq_marker {
                         unchecked.push(did);
                     }
                 }
                 Ok(unchecked)
             })?
         };
+        let mut tombstoned_dids = std::collections::BTreeSet::new();
         for sender_did in foreign_senders {
-            self.verify_foreign_sender_pds_deletion(conversation_id, &sender_did)?;
+            if self.verify_foreign_sender_pds_deletion(&sender_did)? {
+                tombstoned_dids.insert(sender_did);
+            }
         }
-        Ok(())
+        Ok(tombstoned_dids)
     }
 
     fn fetch_pds_record_car(
@@ -2504,6 +2776,14 @@ impl CatbirdMlsClient {
             return Err(MLSError::Cryptography(format!(
                 "CARv1 sync.getRecord(at://{did}/{collection}/{rkey}) failed with HTTP {}",
                 resp.status
+            )));
+        }
+        if resp.body.is_empty()
+            || resp.body.len() > super::deletion_authority::MAX_REVOCATION_PROOF_BYTES
+        {
+            return Err(MLSError::Cryptography(format!(
+                "CARv1 sync.getRecord(at://{did}/{collection}/{rkey}) size {} out of bounds",
+                resp.body.len()
             )));
         }
         Ok(resp.body)
@@ -2547,10 +2827,7 @@ impl CatbirdMlsClient {
                     .ok()
                     .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned));
                 if matches!(resp.status, 400 | 404)
-                    && matches!(
-                        err_code.as_deref(),
-                        Some("RepoNotFound" | "RepoDeactivated" | "RepoTakendown")
-                    )
+                    && matches!(err_code.as_deref(), Some("RepoNotFound" | "RepoTakendown"))
                 {
                     return Ok(None);
                 }
@@ -2582,11 +2859,11 @@ impl CatbirdMlsClient {
         Ok(Some(all_records))
     }
 
-    fn verify_foreign_sender_pds_deletion(
-        &self,
-        conversation_id: &str,
-        sender_did: &str,
-    ) -> Result<(), MLSError> {
+    /// Returns `Ok(true)` if `sender_did`'s PDS repo returned a terminal tombstone (`RepoNotFound`
+    /// or `RepoTakendown`), `Ok(false)` if the live PDS has no self-deletion revocation record, or
+    /// fails closed (`ArchiveDeletionUnverified` / `ArchiveDeletionInventoryUnavailable`) if the live
+    /// PDS carries an unsequenced self-deletion record omitted by `getConversationState`.
+    fn verify_foreign_sender_pds_deletion(&self, sender_did: &str) -> Result<bool, MLSError> {
         let Some(doc_bytes) = self.resolve_did_document(sender_did).ok().flatten() else {
             return Err(MLSError::InvalidState(
                 "ArchiveDeletionInventoryUnavailable".into(),
@@ -2601,20 +2878,14 @@ impl CatbirdMlsClient {
         };
         let Some(records) = self.list_pds_revocations_or_tombstone(&pds_endpoint, sender_did)?
         else {
-            // Permanent repo tombstone: hide every message from this sender without blocking
-            // the remaining restored archive.
-            let key = super::deletion_authority::pds_deletion_marker_key(conversation_id, sender_did);
-            let now_ms = self.hooks.now_ms();
-            self.db.write_tx(|tx| {
-                tx.put_labyrinth_state(&key, i64::MAX.to_string().as_bytes(), now_ms)
-            })?;
-            return Ok(());
+            // Ephemeral terminal repo tombstone: hide every message from this sender for this
+            // restore pass without writing a permanent marker into local storage.
+            return Ok(true);
         };
         let rev_prefix = format!(
             "at://{sender_did}/{}/",
             super::deletion_authority::DEVICE_REVOCATION_COLLECTION
         );
-        let mut verified_deletion: Option<super::deletion_authority::AppliedAccountDeletion> = None;
         for rec_entry in &records {
             let Some(uri) = rec_entry.get("uri").and_then(serde_json::Value::as_str) else {
                 continue;
@@ -2643,6 +2914,20 @@ impl CatbirdMlsClient {
             if !is_self_deletion {
                 continue;
             }
+            let Some(rev_cid) = rec_entry
+                .get("cid")
+                .and_then(serde_json::Value::as_str)
+                .filter(|c| !c.is_empty())
+            else {
+                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+            };
+            let Some(atproto_key) =
+                atproto_spaces::did_resolver::DidDocument::parse_json(sender_did, &doc_bytes)
+                    .ok()
+                    .and_then(|d| d.atproto_key)
+            else {
+                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
+            };
             let device_car = self
                 .fetch_pds_record_car(
                     &pds_endpoint,
@@ -2659,30 +2944,50 @@ impl CatbirdMlsClient {
                     rkey,
                 )
                 .map_err(|_| MLSError::InvalidState("ArchiveDeletionInventoryUnavailable".into()))?;
-            let Some(applied) = super::deletion_authority::verify_foreign_self_deletion_from_cars(
+            let (_, dev_rev) = crate::labyrinth::repo_proof::verify_car_record_proof_with_rev(
+                &device_car,
+                sender_did,
+                super::deletion_authority::DEVICE_RECORD_COLLECTION,
+                rkey,
+                &atproto_key,
+            )
+            .map_err(|_| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+                &self.db,
+                sender_did,
+                &dev_rev,
+                self.hooks.now_ms(),
+            )
+            .map_err(MLSError::Cryptography)?;
+            let (_, rev_rev) =
+                crate::labyrinth::repo_proof::verify_car_record_json_match_with_rev(
+                    &revocation_car,
+                    sender_did,
+                    super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                    rkey,
+                    Some(rev_cid),
+                    val,
+                    &atproto_key,
+                )
+                .map_err(|_| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            crate::labyrinth::repo_proof::observe_pds_repo_rev_floor(
+                &self.db,
+                sender_did,
+                &rev_rev,
+                self.hooks.now_ms(),
+            )
+            .map_err(MLSError::Cryptography)?;
+            let _ = super::deletion_authority::verify_foreign_self_deletion_from_cars(
                 &device_car,
                 &revocation_car,
                 sender_did,
                 rkey,
                 &doc_bytes,
-            ) else {
-                return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
-            };
-            if verified_deletion
-                .as_ref()
-                .is_none_or(|prev| applied.signed_at_ms > prev.signed_at_ms)
-            {
-                verified_deletion = Some(applied);
-            }
+            )
+            .ok_or_else(|| MLSError::InvalidState("ArchiveDeletionUnverified".into()))?;
+            return Err(MLSError::InvalidState("ArchiveDeletionUnverified".into()));
         }
-        if let Some(applied) = verified_deletion {
-            let key = super::deletion_authority::pds_deletion_marker_key(conversation_id, sender_did);
-            let now_ms = self.hooks.now_ms();
-            let raw = serde_json::to_vec(&applied)?;
-            self.db
-                .write_tx(|tx| tx.put_labyrinth_state(&key, &raw, now_ms))?;
-        }
-        Ok(())
+        Ok(false)
     }
 
     pub fn open_rescued_owner_batch(&self, batch_json: &[u8]) -> Result<Vec<(String, Option<String>, Vec<u8>)>, MLSError> {
@@ -2691,12 +2996,23 @@ impl CatbirdMlsClient {
         let batch: labyrinth::records::OwnerBatch = serde_json::from_slice(batch_json).map_err(|e| MLSError::Cryptography(e.to_string()))?;
         self.pin_native_conversation(&batch.thread_id)?;
         let conversation_id = batch.thread_id.clone();
+        let (prefetched_state, preverified_deletions) =
+            self.preverify_conversation_deletions(&conversation_id)?;
         let mut messages = self.native_archive_run(async {
-            let mut session = self.native_archive_deps()?.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
+            let mut session = self
+                .native_archive_deps_preverified(preverified_deletions)?
+                .open()
+                .await
+                .map_err(native_archive_error)?
+                .ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
             session.open_owner_record(batch).await.map_err(native_archive_error)
         })?;
-        self.apply_listed_account_deletions(&conversation_id, &messages)?;
-        Self::hide_deleted_accounts(&self.db, &conversation_id, &mut messages)?;
+        let tombstoned_dids = self.apply_listed_account_deletions(
+            &conversation_id,
+            &messages,
+            prefetched_state,
+        )?;
+        Self::hide_deleted_accounts(&self.db, &conversation_id, &tombstoned_dids, &mut messages)?;
         messages.into_iter().map(|message| {
             if message.archived_receipt.is_none() || message.frame_nonce.is_none() {
                 return Err(MLSError::Cryptography("owner frame missing I13 evidence".into()));
@@ -2717,8 +3033,10 @@ impl CatbirdMlsClient {
             Err(MLSError::GroupNotFound { .. }) => None,
             Err(error) => return Err(error),
         };
+        let (prefetched_state, preverified_deletions) =
+            self.preverify_conversation_deletions(conversation_id)?;
         let (mut history, rejected) = self.native_archive_run(async {
-            let deps = self.native_archive_deps()?;
+            let deps = self.native_archive_deps_preverified(preverified_deletions)?;
             // A verified local roster that excludes this account is sufficient removal proof.
             // Without MLS state, the home DS's ConversationNotFound or NotEntitled is only a lead
             // (`Some(conversation unknown)`): authenticated owner evidence must pin the
@@ -2791,8 +3109,17 @@ impl CatbirdMlsClient {
         if rejected > 0 {
             tracing::warn!(conversation_id, rejected, "labyrinth restore: ignored witness copies that contradict accepted archive copies");
         }
-        self.apply_listed_account_deletions(conversation_id, &history)?;
-        let deleted = Self::hide_deleted_accounts(&self.db, conversation_id, &mut history)?;
+        let tombstoned_dids = self.apply_listed_account_deletions(
+            conversation_id,
+            &history,
+            prefetched_state,
+        )?;
+        let deleted = Self::hide_deleted_accounts(
+            &self.db,
+            conversation_id,
+            &tombstoned_dids,
+            &mut history,
+        )?;
         if deleted > 0 {
             tracing::info!(conversation_id, deleted, "labyrinth restore: hid archive copies of deleted accounts' messages");
         }
@@ -3373,8 +3700,10 @@ impl CatbirdMlsClient {
             .lock()
             .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
         self.pin_native_conversation(conversation_id)?;
+        let (prefetched_state, preverified_deletions) =
+            self.preverify_conversation_deletions(conversation_id)?;
         let mut history = self.native_archive_run(async {
-            let deps = self.native_archive_deps()?;
+            let deps = self.native_archive_deps_preverified(preverified_deletions)?;
             let mut session = deps
                 .open()
                 .await
@@ -3391,8 +3720,12 @@ impl CatbirdMlsClient {
             }
             Ok::<_, MLSError>(page.messages)
         })?;
-        self.apply_listed_account_deletions(conversation_id, &history)?;
-        Self::hide_deleted_accounts(&self.db, conversation_id, &mut history)?;
+        let tombstoned_dids = self.apply_listed_account_deletions(
+            conversation_id,
+            &history,
+            prefetched_state,
+        )?;
+        Self::hide_deleted_accounts(&self.db, conversation_id, &tombstoned_dids, &mut history)?;
         let copies = native_restore_copies(conversation_id, &self.normalized_did, history)?;
         let verified = self.db.write_tx(|tx| {
             let mut chosen_by_id = std::collections::BTreeMap::new();
@@ -3950,7 +4283,8 @@ impl CatbirdMlsClient {
         #[serde(rename_all = "camelCase")]
         struct DeleteAccountRetryState {
             operation_id: String,
-            signed_at_ms: i64,
+            #[serde(alias = "signedAtMs")]
+            created_at_ms: i64,
         }
         const RETRY_META_KEY: &str = "delete_account_retry_state";
         {
@@ -3975,25 +4309,54 @@ impl CatbirdMlsClient {
                 .and_then(|state| {
                     let op_vec = hex::decode(&state.operation_id).ok()?;
                     let op_id: [u8; 16] = op_vec.try_into().ok()?;
-                    let signed_at = chrono::DateTime::from_timestamp_millis(state.signed_at_ms)?;
-                    Some((op_id, state.operation_id, state.signed_at_ms, signed_at))
+                    let _ = chrono::DateTime::from_timestamp_millis(state.created_at_ms)?;
+                    Some((op_id, state.operation_id, state.created_at_ms))
                 });
-            let (operation_id, op_hex, signed_at_ms, signed_at) = match existing_retry {
+            let (operation_id, op_hex, created_at_ms) = match existing_retry {
                 Some(loaded) => loaded,
                 None => {
+                    // Probe PDS for an existing deviceRevocation record (e.g. sibling revocation)
+                    // before persisting local retry state so we never poison `RETRY_META_KEY`.
+                    let probe_url = format!(
+                        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+                        self.pds_base(),
+                        super::chat_wire::urlencode_form_component(&self.normalized_did),
+                        super::chat_wire::urlencode_form_component(
+                            super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
+                        ),
+                        super::chat_wire::urlencode_form_component(&own_device_id),
+                    );
+                    if let Ok(probe_resp) = self.transport.execute_http(PlatformHttpRequest {
+                        method: "GET".to_string(),
+                        url: probe_url,
+                        headers: Vec::new(),
+                        body: None,
+                    }) {
+                        if probe_resp.status == 200
+                            && serde_json::from_slice::<serde_json::Value>(&probe_resp.body)
+                                .ok()
+                                .and_then(|v| v.get("value").cloned())
+                                .is_some()
+                        {
+                            return Err(MLSError::InvalidState(format!(
+                                "EnrollmentPdsRecordConflict:{}/{own_device_id}",
+                                super::deletion_authority::DEVICE_REVOCATION_COLLECTION
+                            )));
+                        }
+                    }
                     let mut op_id = [0u8; 16];
                     self.hooks
                         .with_labyrinth_rng(|| labyrinth::encoding::random(&mut op_id))
                         .map_err(|e| native_archive_error(crate::labyrinth::map_error(e)))?;
-                    let signed_at_ms = self.hooks.now_ms().max(0);
-                    let signed_at = chrono::DateTime::from_timestamp_millis(signed_at_ms)
+                    let created_at_ms = self.hooks.now_ms().max(0);
+                    let _ = chrono::DateTime::from_timestamp_millis(created_at_ms)
                         .ok_or_else(|| {
                             MLSError::Cryptography("invalid archive deletion clock".into())
                         })?;
                     let op_hex = hex::encode(op_id);
                     let serialized = serde_json::to_string(&DeleteAccountRetryState {
                         operation_id: op_hex.clone(),
-                        signed_at_ms,
+                        created_at_ms,
                     })
                     .map_err(|e| {
                         MLSError::Internal(format!("serialize delete_account_retry_state: {e}"))
@@ -4001,11 +4364,21 @@ impl CatbirdMlsClient {
                     let now_ms = self.hooks.now_ms();
                     self.db
                         .write_tx(|tx| tx.put_account_meta(RETRY_META_KEY, &serialized, now_ms))?;
-                    (op_id, op_hex, signed_at_ms, signed_at)
+                    (op_id, op_hex, created_at_ms)
                 }
             };
 
-            let signed_at_str = signed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let now_ms = self.hooks.now_ms().max(created_at_ms);
+            let write_signed_at_ms = if now_ms.saturating_sub(created_at_ms) > 120_000 {
+                now_ms
+            } else {
+                created_at_ms
+            };
+            let created_at = chrono::DateTime::from_timestamp_millis(created_at_ms)
+                .ok_or_else(|| MLSError::Cryptography("invalid archive deletion creation clock".into()))?;
+            let write_signed_at = chrono::DateTime::from_timestamp_millis(write_signed_at_ms)
+                .ok_or_else(|| MLSError::Cryptography("invalid archive deletion clock".into()))?;
+            let created_at_str = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             let reason = format!(
                 "{}{op_hex}",
                 super::deletion_authority::DELETE_ACCOUNT_DATA_REVOCATION_REASON_PREFIX
@@ -4015,11 +4388,11 @@ impl CatbirdMlsClient {
                     &self.normalized_did,
                     &own_device_id,
                     &own_device_id,
-                    &signed_at_str,
+                    &created_at_str,
                     &signer,
                     Some(&reason),
                 )?;
-            self.publish_pds_record_create_only(
+            if let Err(error) = self.publish_pds_record_create_only(
                 super::deletion_authority::DEVICE_REVOCATION_COLLECTION,
                 &own_device_id,
                 create_body,
@@ -4028,12 +4401,21 @@ impl CatbirdMlsClient {
                         &self.normalized_did,
                         &own_device_id,
                         &op_hex,
-                        signed_at,
+                        write_signed_at,
                         &signer_pk,
                         existing,
                     )
                 },
-            )?;
+            ) {
+                if matches!(
+                    &error,
+                    MLSError::InvalidState(code)
+                        if code.starts_with("EnrollmentPdsRecordConflict:")
+                ) {
+                    let _ = self.db.write_tx(|tx| tx.delete_account_meta(RETRY_META_KEY));
+                }
+                return Err(error);
+            }
 
             let doc_bytes = self
                 .resolve_did_document(&self.normalized_did)?
@@ -4063,7 +4445,7 @@ impl CatbirdMlsClient {
                 &key_proof,
                 &self.normalized_did,
                 &own_device_id,
-                signed_at_ms,
+                write_signed_at_ms,
                 &doc_bytes,
             );
             if proved_key.as_deref() != Some(signer_pk.as_slice()) {
@@ -4082,7 +4464,7 @@ impl CatbirdMlsClient {
                 &self.normalized_did,
                 &own_device_id,
                 &op_hex,
-                signed_at,
+                write_signed_at,
                 &signer_pk,
                 &doc_bytes,
             ) {
@@ -4092,7 +4474,7 @@ impl CatbirdMlsClient {
             }
             let prepared = crate::labyrinth::PreparedAccountDeletion {
                 operation_id,
-                signed_at,
+                signed_at: write_signed_at,
                 key_proof,
                 revocation_proof,
             };
@@ -5127,7 +5509,13 @@ mod native_restore_tests {
             .unwrap();
             assert!(history.undecryptable.is_empty(), "{:?}", history.undecryptable);
             let mut messages = history.messages;
-            CatbirdMlsClient::hide_deleted_accounts(db, deletion_cid, &mut messages).unwrap();
+            CatbirdMlsClient::hide_deleted_accounts(
+                db,
+                deletion_cid,
+                &std::collections::BTreeSet::new(),
+                &mut messages,
+            )
+            .unwrap();
             messages.into_iter().map(|m| m.message_id).collect()
         }
         let w = World::new();
