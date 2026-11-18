@@ -410,6 +410,9 @@ plant_p17 = ["sim"]
 plant_mutation_journal_roll_forward = ["sim"]
 plant_oversized_inline_push = ["sim"]
 
+[target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }

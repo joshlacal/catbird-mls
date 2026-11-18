@@ -1743,7 +1743,22 @@ impl CatbirdMlsClient {
             .truncate(false)
             .open(self.db_path.with_extension("recovery.lock"))
             .map_err(|e| MLSError::Internal(format!("open recovery receipt lock: {e}")))?;
-        match file.try_lock() {
+        // Mobile std file locking may report Unsupported. The kernel holds this advisory
+        // lock for the open file description and releases it on close or process exit.
+        #[cfg(unix)]
+        let acquired =
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+                |error| {
+                    if error == rustix::io::Errno::WOULDBLOCK {
+                        std::fs::TryLockError::WouldBlock
+                    } else {
+                        std::fs::TryLockError::Error(std::io::Error::from(error))
+                    }
+                },
+            );
+        #[cfg(not(unix))]
+        let acquired = file.try_lock();
+        match acquired {
             Ok(()) => Ok(file),
             Err(std::fs::TryLockError::WouldBlock) => {
                 Err(MLSError::InvalidState("RecoveryOperationInProgress".into()))

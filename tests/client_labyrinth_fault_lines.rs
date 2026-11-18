@@ -1494,6 +1494,32 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     let previous = space_client1
         .ffi_setup_recovery_code_with_receipt()
         .unwrap();
+    #[cfg(unix)]
+    {
+        let recovery_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(space_client1.db_path().with_extension("recovery.lock"))
+            .unwrap();
+        rustix::fs::flock(
+            &recovery_lock,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .unwrap();
+        assert!(
+            matches!(space_client1.ffi_setup_recovery_code_with_receipt(),
+            Err(MLSError::InvalidState(reason)) if reason == "RecoveryOperationInProgress")
+        );
+        assert_eq!(
+            space_client1
+                .ffi_labyrinth_status()
+                .unwrap()
+                .recovery_generation,
+            previous.recovery_generation
+        );
+        // A separate handle can proceed as soon as the lock-holding descriptor closes.
+        drop(recovery_lock);
+    }
     let current = space_client1
         .ffi_setup_recovery_code_with_receipt()
         .unwrap();
