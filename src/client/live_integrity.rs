@@ -762,6 +762,10 @@ impl CatbirdMlsClient {
                     .map(|_| ())
                 })?;
                 self.clear_cached_groups();
+                self.notify_change(super::PlatformChangeEvent::MessagesUpdated {
+                    conversation_id: cid.to_owned(),
+                });
+                self.notify_change(super::PlatformChangeEvent::RequestsUpdated);
                 Ok(())
             }
             AccountDeletionDecision::Unverified {

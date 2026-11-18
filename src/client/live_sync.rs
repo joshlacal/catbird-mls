@@ -3745,7 +3745,33 @@ impl CatbirdMlsClient {
             max_seq: convo.last_seq,
             ..EntryPass::default()
         };
-        let outcome = self.apply_conversation_entries(canonical_dev_id, signer, convo, &mut pass);
+        let mut fetched_entries = Vec::new();
+        let outcome = self.apply_conversation_entries(
+            canonical_dev_id,
+            signer,
+            convo,
+            &mut pass,
+            &mut fetched_entries,
+        );
+        if outcome.is_err() {
+            // Membership loss or pruning may make the contiguous prefix unavailable. A deletion
+            // carries its own sequencer, device and historical authority evidence. Apply that
+            // bounded effect independently, without consuming a missing entry or issuing an ACK.
+            let mut deletions: Vec<_> = fetched_entries
+                .iter()
+                .filter(|entry| {
+                    entry["$type"].as_str()
+                        == Some(crate::chat_v2::wire::ACCOUNT_DELETED_ENTRY_KIND)
+                        && entry["seq"].as_i64().is_some_and(|seq| seq > pass.max_seq)
+                })
+                .collect();
+            deletions.sort_by_key(|entry| entry["seq"].as_i64());
+            for entry in deletions {
+                if let Err(error) = self.apply_live_account_deletion(convo, entry) {
+                    tracing::warn!(cid = %convo.conversation_id, %error, "could not verify or apply independently received account deletion");
+                }
+            }
+        }
         let finished = self.finish_entry_pass(&convo.conversation_id, &pass);
         outcome.and(finished)?;
 
@@ -3799,6 +3825,44 @@ impl CatbirdMlsClient {
         Ok(())
     }
 
+    fn apply_live_account_deletion(
+        &self,
+        convo: &ConversationRow,
+        entry: &Value,
+    ) -> Result<(), MLSError> {
+        let cid = &convo.conversation_id;
+        let decision = self.authorize_account_deletion(cid, &convo.sequencer_did, entry)?;
+        if matches!(
+            &decision,
+            live_integrity::AccountDeletionDecision::Unverified {
+                reason:
+                    crate::client::deletion_authority::UnverifiedDeletionReason::SequencerUnverified,
+                ..
+            }
+        ) {
+            return Err(MLSError::Cryptography(
+                "I13: account deletion authority does not verify".into(),
+            ));
+        }
+        self.apply_account_deletion_decision(cid, entry, &decision)?;
+        if let live_integrity::AccountDeletionDecision::Unverified { reason, .. } = decision {
+            if !matches!(
+                reason,
+                crate::client::deletion_authority::UnverifiedDeletionReason::OtherConversation
+                    | crate::client::deletion_authority::UnverifiedDeletionReason::Replayed
+            ) {
+                tracing::warn!(
+                    cid,
+                    seq = entry["seq"].as_i64(),
+                    ?reason,
+                    "account deletion remains unverified; sync will retry at this entry"
+                );
+                return Err(MLSError::InvalidState("AccountDeletionUnverified".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Every entry of `convo` past its cursor, in seq order, each verified before any effect and
     /// recorded in `pass` as it applies. Returns at the first that does not verify or apply.
     fn apply_conversation_entries(
@@ -3807,6 +3871,7 @@ impl CatbirdMlsClient {
         signer: &SignatureKeyPair,
         convo: &ConversationRow,
         pass: &mut EntryPass,
+        sorted_entries: &mut Vec<Value>,
     ) -> Result<(), MLSError> {
         let cid = convo.conversation_id.as_str();
         if self.is_conversation_closed(cid)? {
@@ -3820,7 +3885,6 @@ impl CatbirdMlsClient {
             return Ok(());
         }
 
-        let mut sorted_entries: Vec<Value> = Vec::new();
         let mut cursor_seq = convo.last_seq.max(0);
         let pending_receipts: BTreeMap<i64, (String, Option<String>)> = self.db.read_tx(|tx| {
             let mut stmt = tx
@@ -3949,7 +4013,7 @@ impl CatbirdMlsClient {
             })
             .filter_map(|entry| entry["deletedDid"].as_str().map(str::to_owned))
             .collect();
-        for entry in &sorted_entries {
+        for entry in sorted_entries.iter() {
             chat_wire::collect_dids_from_json(entry, &mut candidate_dids);
         }
         let existing_member_dids: Vec<String> = self.db.read_tx(|tx| {
@@ -4069,30 +4133,7 @@ impl CatbirdMlsClient {
                 // A deletion takes effect only under its deleting device's own signature. Keep
                 // any unverified entry as evidence, then leave the cursor below it so later
                 // messages cannot make an unresolved deletion silently permanent.
-                let decision = self.authorize_account_deletion(cid, &convo.sequencer_did, entry)?;
-                if matches!(
-                    &decision,
-                    live_integrity::AccountDeletionDecision::Unverified {
-                        reason: crate::client::deletion_authority::UnverifiedDeletionReason::SequencerUnverified,
-                        ..
-                    }
-                ) {
-                    return Err(MLSError::Cryptography(
-                        "I13: account deletion authority does not verify".into(),
-                    ));
-                }
-                self.apply_account_deletion_decision(cid, entry, &decision)?;
-                if let live_integrity::AccountDeletionDecision::Unverified { reason, .. } = decision
-                {
-                    if !matches!(
-                        reason,
-                        crate::client::deletion_authority::UnverifiedDeletionReason::OtherConversation
-                            | crate::client::deletion_authority::UnverifiedDeletionReason::Replayed
-                    ) {
-                        tracing::warn!(cid, entry_seq, ?reason, "account deletion remains unverified; sync will retry at this entry");
-                        return Err(MLSError::InvalidState("AccountDeletionUnverified".into()));
-                    }
-                }
+                self.apply_live_account_deletion(convo, entry)?;
                 let now_ms = self.hooks.now_ms();
                 self.db.write_tx(|tx| {
                     if let Some(mut c) = tx.get_conversation(cid)? {

@@ -966,6 +966,145 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
 }
 
 #[test]
+fn independently_verified_account_deletions_purge_across_an_unavailable_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let alice_device = new_id();
+    use catbird_mls::client::{PlatformChangeEvent, PlatformChangeObserver};
+
+    #[derive(Default)]
+    struct Observer(Mutex<Vec<PlatformChangeEvent>>);
+    impl PlatformChangeObserver for Observer {
+        fn on_change(&self, event: PlatformChangeEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let observer = Arc::new(Observer::default());
+    let alice = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("gap-alice").to_string_lossy().into_owned(),
+            account_did: ALICE_DID.into(),
+            device_id: alice_device.clone(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(ALICE_DID),
+        Some(observer.clone()),
+    )
+    .unwrap();
+    alice.enroll_device(&oauth_scopes()).unwrap();
+    let bob = enrolled(&tmp, &ds, "gap-bob", BOB_DID, &new_id());
+    let carol = enrolled(&tmp, &ds, "gap-carol", CAROL_DID, &new_id());
+    let cid = new_id();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.into(), CAROL_DID.into()],
+            Some("Offline room".into()),
+            Some("group".into()),
+        )
+        .unwrap();
+    join_invited_group(&alice, &[&bob, &carol]);
+
+    let alice_message = new_id();
+    alice.send_message(&cid, &alice_message, "keep").unwrap();
+    let bob_message = new_id();
+    bob.send_message(&cid, &bob_message, "Bob before deletion")
+        .unwrap();
+    let carol_message = new_id();
+    carol
+        .send_message(&cid, &carol_message, "Carol before deletion")
+        .unwrap();
+    alice.sync().unwrap();
+    let visible = |id: &str| {
+        alice
+            .list_messages(&cid, None, 50)
+            .unwrap()
+            .iter()
+            .any(|m| m.message_id == id)
+    };
+    assert!(visible(&alice_message) && visible(&bob_message) && visible(&carol_message));
+
+    let cursor = last_seq(&alice, &cid);
+    let ack = || {
+        ds.inner
+            .lock()
+            .unwrap()
+            .acked_watermarks
+            .get(&(cid.clone(), alice_device.clone()))
+            .copied()
+    };
+    let last_ack = ack();
+    bob.send_message(&cid, &new_id(), "unavailable while Alice was offline")
+        .unwrap();
+    bob.delete_account_data().unwrap();
+    carol.delete_account_data().unwrap();
+    let proof = {
+        let mut state = ds.inner.lock().unwrap();
+        let first = state
+            .entries
+            .get_mut(&cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["deletedDid"] == BOB_DID)
+            .unwrap();
+        let seq = first["seq"].as_i64().unwrap();
+        assert!(seq > cursor + 1);
+        let proof = first
+            .as_object_mut()
+            .unwrap()
+            .remove("revocationProof")
+            .unwrap();
+        state.readable_from.insert(alice_device.clone(), seq);
+        proof
+    };
+    let sync_across_gap = |newly_applied: bool| {
+        observer.0.lock().unwrap().clear();
+        let error = alice
+            .sync()
+            .expect_err("the missing sequence remains unresolved");
+        assert!(
+            error
+                .to_string()
+                .contains("non-contiguous conversation sequence"),
+            "{error}"
+        );
+        assert_eq!(last_seq(&alice, &cid), cursor);
+        assert_eq!(ack(), last_ack);
+        assert!(visible(&alice_message));
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events.contains(&PlatformChangeEvent::MessagesUpdated {
+                conversation_id: cid.clone()
+            }),
+            newly_applied
+        );
+    };
+    // Bob's missing historical proof must not suppress Carol's independently verified cut.
+    sync_across_gap(true);
+    assert!(visible(&bob_message));
+    assert!(!visible(&carol_message));
+    {
+        let mut state = ds.inner.lock().unwrap();
+        let first = state
+            .entries
+            .get_mut(&cid)
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["deletedDid"] == BOB_DID)
+            .unwrap();
+        first["revocationProof"] = proof;
+    }
+    sync_across_gap(true);
+    assert!(!visible(&bob_message));
+    sync_across_gap(false);
+    assert!(!visible(&bob_message) && !visible(&carol_message));
+}
+
+#[test]
 fn previously_applied_deletion_suppresses_a_delayed_live_delivery_from_an_active_sibling() {
     use catbird_mls::client::deletion_authority::{AppliedAccountDeletion, StoredAccountDeletion};
     let tmp = tempfile::tempdir().unwrap();
