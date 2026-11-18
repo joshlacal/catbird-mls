@@ -719,6 +719,25 @@ impl AppliedAccountDeletion {
     }
 }
 
+/// Consult the marker in the same storage transaction that would expose a live frame.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn suppress_local_frame(
+    tx: &crate::storage::SqlReadTx<'_>,
+    cid: &str,
+    did: &str,
+    device_id: &str,
+    seq: i64,
+    issued_at_ms: Option<i64>,
+) -> Result<bool, crate::error::MLSError> {
+    let Some(raw) = tx.get_labyrinth_state(&super::chat_wire::account_deletion_key(cid, did))?
+    else {
+        return Ok(false);
+    };
+    Ok(AppliedAccountDeletion::decode(&raw).is_none_or(|marker| {
+        marker.covers(seq, issued_at_ms) || marker.self_deleted_device_post_entry(seq, device_id)
+    }))
+}
+
 /// Keep every distinct signed deletion. Clock skew and delayed relays mean two
 /// sequence/time cutoffs cannot safely be represented by their independent maxima.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

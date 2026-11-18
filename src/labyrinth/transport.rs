@@ -449,17 +449,34 @@ impl GatewayXrpcTransport {
             .map_err(signing_error)?;
         let mut headers = write_headers(&json, &signature);
         headers.extend(extra_headers.iter().cloned());
-        decode_response(
-            self.gateway
-                .submit_labyrinth(LabyrinthRequest {
-                    nsid: nsid.to_owned(),
-                    method: "POST".into(),
-                    path: format!("/xrpc/{nsid}"),
-                    body: Some(payload.to_vec()),
-                    headers,
-                })
-                .await,
-        )
+        let response = self
+            .gateway
+            .submit_labyrinth(LabyrinthRequest {
+                nsid: nsid.to_owned(),
+                method: "POST".into(),
+                path: format!("/xrpc/{nsid}"),
+                body: Some(payload.to_vec()),
+                headers,
+            })
+            .await;
+        let status = response.as_ref().ok().map(|r| r.status);
+        let data = decode_response(response)?;
+        if nsid == "blue.catbird.labyrinth.deleteAccountData"
+            && extra_headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("Catbird-Require-Erasure-Completion") && value == "1"
+            })
+            && (status != Some(200)
+                || serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .is_none_or(|value| value["erasureCompletion"] != "confirmed"))
+        {
+            return Err(XrpcTransportError {
+                status: status.unwrap_or(0),
+                error: Some("PeerErasureUnverified".into()),
+                message: None,
+            });
+        }
+        Ok(data)
     }
 
     pub async fn resolve_sequencer_receipt_key_for(
@@ -969,7 +986,17 @@ impl DsDirectoryStore {
         &self,
         prepared: &PreparedAccountDeletion,
     ) -> labyrinth::Result<()> {
-        let extra = [
+        self.submit_account_erasure(prepared, false)
+            .await
+            .map_err(map_xrpc_error)
+    }
+
+    pub(crate) async fn submit_account_erasure(
+        &self,
+        prepared: &PreparedAccountDeletion,
+        require_completion: bool,
+    ) -> Result<(), XrpcTransportError> {
+        let mut extra = vec![
             (
                 KEY_PROOF_HEADER.to_owned(),
                 URL_SAFE_NO_PAD.encode(&prepared.key_proof),
@@ -979,6 +1006,9 @@ impl DsDirectoryStore {
                 URL_SAFE_NO_PAD.encode(&prepared.revocation_proof),
             ),
         ];
+        if require_completion {
+            extra.push(("Catbird-Require-Erasure-Completion".into(), "1".into()));
+        }
         self.transport
             .procedure_at_with_headers(
                 "blue.catbird.labyrinth.deleteAccountData",
@@ -989,7 +1019,6 @@ impl DsDirectoryStore {
             )
             .await
             .map(|_| ())
-            .map_err(map_xrpc_error)
     }
 
     async fn fetch_head(

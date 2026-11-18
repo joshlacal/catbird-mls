@@ -2667,6 +2667,14 @@ impl CatbirdMlsClient {
                 &metadata_snapshot_json,
                 now_ms,
             )?;
+            tx.put_labyrinth_state(
+                &super::live_sync::live_integrity::opening_receipt_key(
+                    effective_convo_id,
+                    first_message_id,
+                ),
+                opening_receipt_json.as_bytes(),
+                now_ms,
+            )?;
             tx.upsert_request(&RequestRow {
                 request_id: request_id.clone(),
                 conversation_id: effective_convo_id.clone(),
@@ -2739,6 +2747,11 @@ impl CatbirdMlsClient {
                 &serde_json::to_string(&staged_opening)
                     .map_err(|e| MLSError::Internal(e.to_string()))?,
                 now_ms,
+            )?;
+            super::live_sync::live_integrity::reapply_opening_deletion(
+                tx,
+                effective_convo_id,
+                &self.normalized_did,
             )?;
             // The attempt is resolved in the same write that applies its bootstrap.
             if !tx.delete_pending_op_if_payload(
@@ -4925,24 +4938,34 @@ impl CatbirdMlsClient {
                 &queued.message_id,
                 self.hooks.now_ms(),
             )?;
-            tx.insert_message(&row)?;
-            tx.put_labyrinth_state(
-                &format!(
-                    "native.message:{}:{}",
-                    queued.conversation_id, queued.message_id
-                ),
-                &serde_json::to_vec(&queued)?,
-                self.hooks.now_ms(),
+            let suppressed = crate::client::deletion_authority::suppress_local_frame(
+                tx,
+                &queued.conversation_id,
+                &queued.sender_did,
+                &queued.sender_device_id,
+                seq,
+                receipt["issuedAtMs"].as_i64(),
             )?;
-            super::archive_policy::observe_frame(tx, &queued)?;
-            tx.put_labyrinth_state(
-                &format!(
-                    "push.verified_receipt:{}:{}",
-                    queued.conversation_id, queued.message_id
-                ),
-                b"1",
-                self.hooks.now_ms(),
-            )?;
+            if !suppressed {
+                tx.insert_message(&row)?;
+                tx.put_labyrinth_state(
+                    &format!(
+                        "native.message:{}:{}",
+                        queued.conversation_id, queued.message_id
+                    ),
+                    &serde_json::to_vec(&queued)?,
+                    self.hooks.now_ms(),
+                )?;
+                super::archive_policy::observe_frame(tx, &queued)?;
+                tx.put_labyrinth_state(
+                    &format!(
+                        "push.verified_receipt:{}:{}",
+                        queued.conversation_id, queued.message_id
+                    ),
+                    b"1",
+                    self.hooks.now_ms(),
+                )?;
+            }
             let mut gap = false;
             if let Some(mut c) = tx.get_conversation(&queued.conversation_id)? {
                 if ordered_seq.is_some() || seq == c.last_seq.saturating_add(1) {
@@ -4953,10 +4976,11 @@ impl CatbirdMlsClient {
                 c.updated_at_ms = self.hooks.now_ms();
                 tx.upsert_conversation(&c)?;
             }
-            if !(send_retry
-                && crate::planted::is_planted_bug_active(
-                    crate::planted::PlantedBug::P4SkipLabyrinthEnqueueAfterSendRetry,
-                ))
+            if !suppressed
+                && !(send_retry
+                    && crate::planted::is_planted_bug_active(
+                        crate::planted::PlantedBug::P4SkipLabyrinthEnqueueAfterSendRetry,
+                    ))
             {
                 tx.dequeue_labyrinth_item(&queued.message_id)?;
                 enqueue_labyrinth_archive(tx, &queued)?;
@@ -6667,6 +6691,17 @@ impl CatbirdMlsClient {
             }
             let staged: QueuedLabyrinthArchivePayload = serde_json::from_str(&staged_str)
                 .map_err(|e| MLSError::Internal(format!("parse c33_pending_opening: {e}")))?;
+            if staged.conversation_id != conversation_id {
+                return Err(MLSError::InvalidState("MismatchedRequestOpening".into()));
+            }
+            super::live_sync::live_integrity::reapply_opening_deletion(
+                tx,
+                conversation_id,
+                &staged.sender_did,
+            )?;
+            if tx.get_account_meta(&key)?.is_none() {
+                return Ok(false);
+            }
             super::archive_policy::enqueue(tx, &staged)?;
             tx.put_account_meta(&key, "archived", now_ms)?;
             Ok(true)

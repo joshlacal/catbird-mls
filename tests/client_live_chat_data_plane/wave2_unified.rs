@@ -700,6 +700,31 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
         assert_ne!(restored.sender_device_id, "unverified");
         Ok(())
     }).unwrap();
+    // Earlier clients retained valid evidence but left stale display coordinates on disk.
+    alice_d2
+        .db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute(
+                    "UPDATE messages SET group_id = X'00', epoch = 9090 WHERE message_id = ?1",
+                    [&push_msg_id],
+                )
+                .map_err(|error| MLSError::Internal(error.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    alice_d2
+        .verify_and_reindex_history(&dm_cid)
+        .expect("repair indexed opening beside verified receipt");
+    alice_d2
+        .db()
+        .read_tx(|tx| {
+            let row = tx.get_message(&push_msg_id)?.unwrap();
+            assert_ne!(row.group_id, vec![0]);
+            assert_ne!(row.epoch, 9090);
+            Ok(())
+        })
+        .unwrap();
     let post_verify_msgs = alice_d2
         .list_messages(&dm_cid, None, 50)
         .expect("messages after verify_and_reindex_history");
@@ -938,6 +963,85 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
             .is_some_and(Vec::is_empty),
         "verified deletion must leave zero unverified account deletion entries: {evidence}"
     );
+}
+
+#[test]
+fn previously_applied_deletion_suppresses_a_delayed_live_delivery_from_an_active_sibling() {
+    use catbird_mls::client::deletion_authority::{AppliedAccountDeletion, StoredAccountDeletion};
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "late-delivery-alice", ALICE_DID, &new_id());
+    let bob = enrolled(&tmp, &ds, "late-delivery-bob", BOB_DID, &new_id());
+    let cid = new_id();
+    alice.create_group(&cid, DS_DID, vec![BOB_DID.into()], Some("Late delivery".into()), Some("group".into())).unwrap();
+    join_invited_group(&alice, &[&bob]);
+    let mid = new_id();
+    let delivered = bob.send_message(&cid, &mid, "covered by earlier archive verification").unwrap();
+    // Simulate the persisted result of a previous archive pass while the live cursor is behind.
+    // Bob's still-authorized device differs from the erasure actor.
+    let marker = StoredAccountDeletion::Signed(AppliedAccountDeletion {
+        seq: delivered.seq + 1, signed_at_ms: chrono::Utc::now().timestamp_millis(),
+        operation_id: hex::encode([7;16]), actor_device_id: Some(new_id()),
+    });
+    alice.db().write_tx(|tx| tx.put_labyrinth_state(&chat_wire::account_deletion_key(&cid, BOB_DID), &marker.encode().unwrap(), 0)).unwrap();
+    alice.sync().expect("consume the MLS delivery without reviving the plaintext");
+    alice.db().read_tx(|tx| {
+        assert!(tx.get_conversation(&cid)?.unwrap().last_seq >= delivered.seq);
+        assert!(tx.get_message(&mid)?.is_none());
+        assert!(tx.get_labyrinth_state(&format!("native.message:{cid}:{mid}"))?.is_none());
+        assert!(tx.list_labyrinth_queue(Some(&cid), 100)?.iter().all(|row| row.item_id != mid));
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn hosted_account_erasure_requires_confirmed_peer_status_and_keeps_the_retry_signer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = SharedMockDs::new();
+    let dev = new_id();
+    let alice = enrolled(&tmp, &ds, "hosted-erasure", ALICE_DID, &dev);
+    alice.setup_recovery_code().expect("initialize mailbox");
+    let mut journal = None;
+    for (status, body, reason) in [
+        (
+            503,
+            json!({"error":"PeerErasurePending"}),
+            Some("PeerErasurePending"),
+        ),
+        (
+            503,
+            json!({"error":"PeerErasureUnverified"}),
+            Some("PeerErasureUnverified"),
+        ),
+        (200, json!({}), Some("PeerErasureUnverified")),
+        (
+            202,
+            json!({"erasureCompletion":"confirmed"}),
+            Some("PeerErasureUnverified"),
+        ),
+        (200, json!({"erasureCompletion":"confirmed"}), None),
+        (200, json!({"erasureCompletion":"confirmed"}), None),
+    ] {
+        ds.inner.lock().unwrap().hosted_erasure_reply = Some((status, body));
+        let result = alice.delete_account_data_for_hosted_account();
+        match reason {
+            Some(expected) => assert!(
+                matches!(result, Err(MLSError::InvalidState(ref code)) if code == expected),
+                "{result:?}"
+            ),
+            None => result.expect("confirmed peer erasure allows retryable provider step"),
+        }
+        assert!(!alice.is_handle_closed());
+        let saved = alice
+            .db()
+            .read_tx(|tx| tx.get_account_meta("delete_account_retry_state"))
+            .unwrap()
+            .unwrap();
+        if let Some(prior) = &journal {
+            assert_eq!(prior, &saved);
+        }
+        journal = Some(saved);
+    }
 }
 
 #[test]

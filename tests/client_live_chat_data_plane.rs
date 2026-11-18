@@ -204,6 +204,7 @@ struct MockDsState {
     // Every request as (session account, URL, body), for exact-replay and no-network checks.
     http_log: Vec<(String, String, Vec<u8>)>,
     // One-shot XRPC refusals: (route suffix, status, error code, `Retry-After`).
+    hosted_erasure_reply: Option<(u16, Value)>,
     xrpc_failures: Vec<(&'static str, u16, &'static str, Option<&'static str>)>,
     // Answer the next prepare with a signed expiry receipt: "valid", "badSignature" or
     // "wrongRequestId" (`expired_prepare_receipt`).
@@ -336,6 +337,7 @@ impl SharedMockDs {
                 account_deletions: BTreeMap::new(),
                 conversation_state_errors: BTreeMap::new(),
                 http_log: Vec::new(),
+                hosted_erasure_reply: None,
                 xrpc_failures: Vec::new(),
                 next_prepare_receipt: None,
                 send_order: BTreeMap::new(),
@@ -1047,6 +1049,18 @@ impl SharedMockDs {
                 Ok(verified) => verified,
                 Err(message) => return xrpc_error(401, "InvalidSignature", message),
             };
+            if req.headers.iter().any(|header| {
+                header
+                    .name
+                    .eq_ignore_ascii_case("Catbird-Require-Erasure-Completion")
+                    && header.value == "1"
+            }) {
+                if let Some((status, value)) = &g.hosted_erasure_reply {
+                    let mut response = ok_json(value.clone())?;
+                    response.status = *status;
+                    return Ok(response);
+                }
+            }
             let key_proof = device_key_proof(
                 &self.archive_auth,
                 account,

@@ -1317,9 +1317,17 @@ fn select_restore_copy<'a>(copies: &'a [RestoreCopy], local: Option<&MessageRow>
         };
     };
     let mut matching = copies.iter().filter(|(row, _, _)| {
-        local.conversation_id == row.conversation_id && local.seq == row.seq && local.epoch == row.epoch
-            && local.sender_did == row.sender_did && local.sender_device_id == row.sender_device_id
-            && (local_gap || super::chat_wire::archive_frame_matches_local_plaintext(&local.plaintext_json, &row.plaintext_json))
+        local.conversation_id == row.conversation_id
+            && local.group_id == row.group_id
+            && local.seq == row.seq
+            && local.epoch == row.epoch
+            && local.sender_did == row.sender_did
+            && local.sender_device_id == row.sender_device_id
+            && (local_gap
+                || super::chat_wire::archive_frame_matches_local_plaintext(
+                    &local.plaintext_json,
+                    &row.plaintext_json,
+                ))
     });
     let first = matching.next()?;
     (!local_gap || matching.next().is_none()).then_some(first)
@@ -4018,9 +4026,21 @@ impl CatbirdMlsClient {
                     continue;
                 }
                 let local = tx.get_message(message_id)?;
-                let has_local_evidence = tx
-                    .get_labyrinth_state(&format!("native.message:{conversation_id}:{message_id}"))?
-                    .is_some();
+                let raw_evidence = tx.get_labyrinth_state(&format!(
+                    "native.message:{conversation_id}:{message_id}"
+                ))?;
+                let retained_receipt = raw_evidence
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_slice::<NativeArchiveEvidence>(raw).ok())
+                    .filter(|evidence| {
+                        evidence.conversation_id == conversation_id
+                            && evidence.message_id == *message_id
+                    })
+                    .and_then(|evidence| evidence.sequencer_receipt_json)
+                    .and_then(|json| {
+                        serde_json::from_str::<super::chat_wire::StoredArchivedReceipt>(&json).ok()
+                    });
+                let has_local_evidence = retained_receipt.is_some();
                 let mut gap_key = None;
                 for key in [
                     super::chat_wire::undecryptable_evidence_key(
@@ -4050,7 +4070,14 @@ impl CatbirdMlsClient {
                         .map(|(placeholder, _)| placeholder)
                 };
                 let gap = direct_gap || bound_placeholder.is_some();
-                if let Some(copy) = select_restore_copy(group, effective_local, gap) {
+                // Earlier reindex versions wrote verified evidence beside an unchanged stale
+                // display row. The same freshly verified receipt also identifies the repair copy.
+                let receipt_copy = retained_receipt
+                    .as_ref()
+                    .and_then(|receipt| group.iter().find(|(_, _, signed)| signed == receipt));
+                if let Some(copy) =
+                    receipt_copy.or_else(|| select_restore_copy(group, effective_local, gap))
+                {
                     chosen_by_id.insert(
                         message_id.clone(),
                         (
@@ -4097,7 +4124,7 @@ impl CatbirdMlsClient {
                 }
             }
             let mut count = 0u32;
-            for ((row, evidence, _), gap_key, replaced_placeholder_id) in
+            for ((row, evidence, evidence_receipt), gap_key, replaced_placeholder_id) in
                 chosen_by_id.into_values()
             {
                 if let Some(placeholder_id) = replaced_placeholder_id {
@@ -4112,10 +4139,11 @@ impl CatbirdMlsClient {
                             ))
                         })?;
                 }
-                let existing = tx.get_message(&row.message_id)?;
-                if existing.is_none() || gap_key.is_some() {
-                    tx.insert_message(row)?;
-                }
+                tx.insert_message_with_commitment(
+                    row,
+                    Some(&evidence_receipt.archive_commitment),
+                    evidence.sequencer_receipt_json.as_deref(),
+                )?;
                 if let Some(gap_key) = gap_key {
                     tx.conn()
                         .execute("DELETE FROM labyrinth_state WHERE state_key = ?1", [&gap_key])
@@ -4556,6 +4584,14 @@ impl CatbirdMlsClient {
     /// for `device` + `deviceRevocation`, purges remote OwnerMailbox/PDS/DS state with both
     /// proofs attached, and finally wipes local SQLCipher + Keychain state.
     pub fn delete_account_data(&self) -> Result<(), MLSError> {
+        self.delete_account_data_impl(false)
+    }
+
+    pub fn delete_account_data_for_hosted_account(&self) -> Result<(), MLSError> {
+        self.delete_account_data_impl(true)
+    }
+
+    fn delete_account_data_impl(&self, require_peer_completion: bool) -> Result<(), MLSError> {
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
         }
@@ -4764,12 +4800,31 @@ impl CatbirdMlsClient {
                 revocation_proof,
             };
             self.native_archive_run(async {
-                deps.delete_account_remote_prepared(&prepared)
-                    .await
-                    .map_err(|e| native_archive_error(crate::labyrinth::map_error(e)))
+                let cleanup = if require_peer_completion {
+                    deps.confirm_hosted_account_erasure(&prepared)
+                        .await
+                        .map_err(|error| {
+                            let code = if error.error.as_deref() == Some("PeerErasurePending") {
+                                "PeerErasurePending"
+                            } else {
+                                "PeerErasureUnverified"
+                            };
+                            MLSError::InvalidState(code.into())
+                        })?;
+                    deps.finish_confirmed_account_erasure().await
+                } else {
+                    deps.delete_account_remote_prepared(&prepared).await
+                };
+                cleanup.map_err(|e| native_archive_error(crate::labyrinth::map_error(e)))
             })?;
         }
-        self.sign_out_and_wipe()
+        if require_peer_completion {
+            // The provider may still reject or expire the account confirmation. Keep the
+            // operation and signing authority until the caller completes provider deletion.
+            Ok(())
+        } else {
+            self.sign_out_and_wipe()
+        }
     }
 
     fn extract_own_device_views(resp: &serde_json::Value) -> Vec<&serde_json::Value> {

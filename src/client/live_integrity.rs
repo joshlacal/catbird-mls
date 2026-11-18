@@ -1,5 +1,6 @@
 //! Device authority and bounded effects of sequenced account deletions.
 
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use super::{chat_wire, CatbirdMlsClient};
@@ -7,6 +8,7 @@ use crate::client::deletion_authority::{
     self as authority, AppliedAccountDeletion, DeletionActorWrite, StoredAccountDeletion,
     UnverifiedAccountDeletion, UnverifiedDeletionReason,
 };
+use crate::client::QueuedLabyrinthArchivePayload;
 use crate::error::MLSError;
 use crate::storage::SqlTx;
 
@@ -64,6 +66,205 @@ fn stored_receipt_issued_at_ms(raw: &str) -> Option<i64> {
         .map(|receipt| receipt.issued_at_ms)
 }
 
+/// Keep the authenticated issue coordinates even when a sibling device has no archive duty.
+pub(crate) fn opening_receipt_key(cid: &str, message_id: &str) -> String {
+    format!("c33_opening_receipt:{cid}:{message_id}")
+}
+
+fn opening_receipt(
+    raw: &[u8],
+    cid: &str,
+    message_id: &str,
+    sender: &str,
+) -> Option<chat_wire::StoredArchivedReceipt> {
+    let receipt: chat_wire::StoredArchivedReceipt = serde_json::from_slice(raw).ok()?;
+    (receipt.conversation_id == cid
+        && receipt.entry_id == message_id
+        && receipt.sender_device_did_url.split_once('#')?.0 == sender)
+        .then_some(receipt)
+}
+
+fn opening_covered(
+    tx: &SqlTx<'_>,
+    cid: &str,
+    did: &str,
+    mid: &str,
+    staged: Option<&QueuedLabyrinthArchivePayload>,
+    marker: &StoredAccountDeletion,
+) -> Result<bool, MLSError> {
+    let blocked = |seq, issued, device: &str| {
+        marker.covers(seq, issued) || marker.self_deleted_device_post_entry(seq, device)
+    };
+    let from_receipt = |raw: &[u8]| {
+        let receipt = opening_receipt(raw, cid, mid, did)?;
+        let seq = i64::try_from(receipt.seq).ok()?;
+        Some(blocked(
+            seq,
+            Some(receipt.issued_at_ms),
+            receipt.sender_device_did_url.split_once('#')?.1,
+        ))
+    };
+    if let Some(result) = tx
+        .get_labyrinth_state(&opening_receipt_key(cid, mid))?
+        .as_deref()
+        .and_then(from_receipt)
+    {
+        return Ok(result);
+    }
+    let from_frame = |frame: &QueuedLabyrinthArchivePayload| {
+        if frame.conversation_id != cid || frame.sender_did != did || frame.message_id != mid {
+            return None;
+        }
+        Some(
+            frame
+                .sequencer_receipt_json
+                .as_deref()
+                .and_then(|s| from_receipt(s.as_bytes()))
+                .unwrap_or_else(|| blocked(frame.seq, None, &frame.sender_device_id)),
+        )
+    };
+    if let Some(result) = staged.and_then(from_frame) {
+        return Ok(result);
+    }
+    let frame = |raw: &[u8]| {
+        serde_json::from_slice(raw)
+            .ok()
+            .as_ref()
+            .and_then(from_frame)
+    };
+    if let Some(result) = tx
+        .get_labyrinth_state(&format!("native.message:{cid}:{mid}"))?
+        .as_deref()
+        .and_then(frame)
+    {
+        return Ok(result);
+    }
+    let queued: Option<Vec<u8>> = tx
+        .conn()
+        .query_row(
+            "SELECT payload_bytes FROM labyrinth_queue WHERE conversation_id = ?1 AND item_id = ?2",
+            rusqlite::params![cid, mid],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| MLSError::Internal(format!("read queued request opening: {e}")))?;
+    if let Some(result) = queued.as_deref().and_then(frame) {
+        return Ok(result);
+    }
+    if let Some(row) = tx
+        .get_message(mid)?
+        .filter(|row| row.conversation_id == cid && row.sender_did == did)
+    {
+        // Legacy sibling imports only kept their receive time, which can follow the deletion.
+        return Ok(blocked(row.seq, None, &row.sender_device_id));
+    }
+    // Older clients could erase all signed coordinates and leave only the preview.
+    Ok(true)
+}
+
+fn scrub_request_openings(
+    tx: &SqlTx<'_>,
+    cid: &str,
+    did: &str,
+    marker: &StoredAccountDeletion,
+) -> Result<(), MLSError> {
+    let key = format!("c33_pending_opening:{cid}");
+    let staged: Option<QueuedLabyrinthArchivePayload> = tx
+        .get_account_meta(&key)?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let staged = staged
+        .as_ref()
+        .filter(|frame| frame.conversation_id == cid && frame.sender_did == did);
+    let opening_ids: Vec<String> = {
+        let mut query = tx
+            .conn()
+            .prepare(
+                "SELECT DISTINCT first_message_id FROM requests
+            WHERE conversation_id = ?1 AND sender_did = ?2 AND first_message_id IS NOT NULL",
+            )
+            .map_err(|e| MLSError::Internal(format!("select request openings: {e}")))?;
+        let rows = query
+            .query_map(rusqlite::params![cid, did], |row| row.get(0))
+            .map_err(|e| MLSError::Internal(format!("select request openings: {e}")))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| MLSError::Internal(format!("read request openings: {e}")))?
+    };
+    let mut opening_ids: std::collections::BTreeSet<_> = opening_ids.into_iter().collect();
+    if let Some(stage) = staged {
+        opening_ids.insert(stage.message_id.clone());
+    }
+    for mid in opening_ids {
+        if !opening_covered(tx, cid, did, &mid, staged, marker)? {
+            continue;
+        }
+        tx.conn()
+            .execute(
+                "UPDATE requests SET payload_json = '{}' WHERE conversation_id = ?1
+            AND sender_did = ?2 AND first_message_id = ?3",
+                rusqlite::params![cid, did, mid],
+            )
+            .map_err(|e| MLSError::Internal(format!("clear request opening preview: {e}")))?;
+        if staged.is_some_and(|stage| stage.message_id == mid) {
+            tx.delete_account_meta(&key)?;
+        }
+        tx.conn().execute("DELETE FROM messages WHERE conversation_id = ?1 AND sender_did = ?2 AND message_id = ?3",
+            rusqlite::params![cid, did, mid]).map_err(|e| MLSError::Internal(format!("clear request opening message: {e}")))?;
+        let evidence_key = format!("native.message:{cid}:{mid}");
+        if let Some(raw) = tx.get_labyrinth_state(&evidence_key)? {
+            if serde_json::from_slice::<Value>(&raw)
+                .ok()
+                .is_some_and(|evidence| {
+                    evidence["sender_did"].as_str() == Some(did)
+                        || evidence["sequencer_receipt_json"]
+                            .as_str()
+                            .and_then(|receipt| opening_receipt(receipt.as_bytes(), cid, &mid, did))
+                            .is_some()
+                })
+            {
+                delete_state(tx, &evidence_key)?;
+            }
+        }
+        tx.conn()
+            .execute(
+                "DELETE FROM labyrinth_queue WHERE conversation_id = ?1 AND item_id = ?2
+            AND json_extract(CAST(payload_bytes AS TEXT), '$.sender_did') = ?3",
+                rusqlite::params![cid, mid, did],
+            )
+            .map_err(|e| MLSError::Internal(format!("clear queued request opening: {e}")))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn reapply_opening_deletion(
+    tx: &SqlTx<'_>,
+    cid: &str,
+    did: &str,
+) -> Result<(), MLSError> {
+    if let Some(raw) = tx.get_labyrinth_state(&chat_wire::account_deletion_key(cid, did))? {
+        let marker = AppliedAccountDeletion::decode(&raw)
+            .ok_or_else(|| MLSError::InvalidState("UnreadableAccountDeletionMarker".into()))?;
+        scrub_request_openings(tx, cid, did, &marker)?;
+    }
+    Ok(())
+}
+
+/// Repair persisted previews on first open after upgrade even if the sync cursor already advanced.
+pub(crate) fn migrate_opening_deletions(tx: &SqlTx<'_>, now_ms: i64) -> Result<(), MLSError> {
+    const MIGRATION: &str = "c33_opening_erasure_v1";
+    if tx.get_account_meta(MIGRATION)?.is_some() {
+        return Ok(());
+    }
+    const PREFIX: &str = "native.account_deleted:";
+    for (key, raw) in list_state_prefix(tx, PREFIX)? {
+        if let Some((cid, did)) = key[PREFIX.len()..].split_once(":did:") {
+            let marker = AppliedAccountDeletion::decode(&raw)
+                .ok_or_else(|| MLSError::InvalidState("UnreadableAccountDeletionMarker".into()))?;
+            scrub_request_openings(tx, cid, &format!("did:{did}"), &marker)?;
+        }
+    }
+    tx.put_account_meta(MIGRATION, "1", now_ms)
+}
+
 /// Issue time of a stored message: its sequencer receipt when this device holds one, else the
 /// local receive time.
 fn message_issued_at_ms(
@@ -79,6 +280,7 @@ fn message_issued_at_ms(
             evidence["sequencer_receipt_json"]
                 .as_str()
                 .and_then(stored_receipt_issued_at_ms)
+                .or_else(|| evidence["nse_verified_issued_at_ms"].as_i64())
         });
     let unavailable = tx
         .get_labyrinth_state(&chat_wire::unavailable_message_key(cid, message_id))?
@@ -96,6 +298,7 @@ pub(crate) fn purge_covered_messages(
     deleted_did: &str,
     marker: &StoredAccountDeletion,
 ) -> Result<usize, MLSError> {
+    scrub_request_openings(tx, cid, deleted_did, marker)?;
     let rows: Vec<(String, i64, i64)> = {
         let mut statement = tx
             .conn()
@@ -124,6 +327,10 @@ pub(crate) fn purge_covered_messages(
                     rusqlite::params![message_id, cid],
                 )
                 .map_err(|e| MLSError::Internal(format!("purge deleted sender message: {e}")))?;
+            tx.delete_pending_op(
+                crate::push::processor::NATIVE_ARCHIVE_RECEIPT_OP,
+                &message_id,
+            )?;
             delete_state(tx, &chat_wire::unavailable_message_key(cid, &message_id))?;
             // The retained native archive evidence carries the same canonical plaintext frame.
             // A verified deletion must erase it with the display row, not leave a restorable copy.

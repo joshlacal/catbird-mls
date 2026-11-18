@@ -335,7 +335,9 @@ impl MailboxDirectory for LocallyCheckedDirectory {
                 entry.removed_at.get_or_insert(u64::MAX);
             }
         }
-        if verified_deleted_ms.is_none() {
+        // An old deletion cannot excuse a missing device after this account returns.
+        // A terminal repository plus verified erasure is the only offline-history exception.
+        if verified_deleted_ms.is_none() || !is_tombstoned || had_pds_device_list {
             if let Some(shared_leaves) = self
                 .authority
                 .shared_group_leaf_keys(did)
@@ -828,6 +830,23 @@ impl SessionDeps {
             .await
     }
 
+    /// Confirm durable peer erasure before retracting account keys or changing any Space.
+    pub async fn confirm_hosted_account_erasure(
+        &self,
+        prepared: &PreparedAccountDeletion,
+    ) -> std::result::Result<(), super::transport::XrpcTransportError> {
+        self.ds_directory()
+            .submit_account_erasure(prepared, true)
+            .await
+    }
+
+    pub async fn finish_confirmed_account_erasure(&self) -> labyrinth::Result<()> {
+        let spaces = self.conversation_spaces()?;
+        self.purge_account_mailbox(None).await?;
+        self.delete_conversation_records(&spaces, self.space.is_some())
+            .await
+    }
+
     pub(crate) fn conversation_spaces(&self) -> labyrinth::Result<Vec<String>> {
         let key = thread_placement_key(&self.did);
         let Some(raw) = self
@@ -887,16 +906,23 @@ impl SessionDeps {
         prepared: Option<PreparedAccountDeletion>,
     ) -> labyrinth::Result<()> {
         let _ = placement;
+        let ds = match prepared {
+            Some(prepared) => self.ds_directory().with_prepared_deletion(prepared),
+            None => self.ds_directory(),
+        };
+        self.purge_account_mailbox(Some(Arc::new(ds))).await
+    }
+
+    async fn purge_account_mailbox(
+        &self,
+        directory: Option<Arc<DsDirectoryStore>>,
+    ) -> labyrinth::Result<()> {
         let space_mb = self.space_store().ok_or_else(|| {
             labyrinth::Error::Backend(
                 "personal Space deletion requires the account's Space connection".into(),
             )
         })?;
-        let ds = match prepared {
-            Some(prepared) => self.ds_directory().with_prepared_deletion(prepared),
-            None => self.ds_directory(),
-        };
-        let mailbox = SpaceMailbox::new(space_mb, Some(Arc::new(ds)));
+        let mailbox = SpaceMailbox::new(space_mb, directory);
         let pds = self
             .pds
             .as_ref()
@@ -2333,6 +2359,46 @@ impl LabyrinthSession {
 #[cfg(test)]
 mod history_error_tests {
     use super::history_error_counts;
+
+    #[tokio::test]
+    async fn returned_account_still_requires_every_live_shared_leaf() {
+        use super::{
+            LocalConversationAuthority, LocalGroupSnapshot, LocallyCheckedDirectory, Result,
+        };
+        use labyrinth::store::{memory::MemoryBackend, MailboxDirectory};
+
+        struct ReturnedAccount;
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl LocalConversationAuthority for ReturnedAccount {
+            async fn current_group_snapshot(
+                &self,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<Option<LocalGroupSnapshot>> {
+                Ok(None)
+            }
+            async fn authorized_chat_device_keys(&self, _: &str) -> Result<Option<Vec<[u8; 32]>>> {
+                Ok(Some(vec![[1; 32], [2; 32]]))
+            }
+            async fn shared_group_leaf_keys(&self, _: &str) -> Result<Option<Vec<[u8; 32]>>> {
+                Ok(Some(vec![[1; 32], [2; 32]]))
+            }
+            async fn verified_deleted_account_ms(&self, _: &str) -> Result<Option<u64>> {
+                Ok(Some(100))
+            }
+        }
+        let backend = MemoryBackend::new();
+        let did = "did:plc:returned";
+        backend.register_chat_device(did, [1; 32]);
+        let directory = LocallyCheckedDirectory {
+            inner: Box::new(backend.directory()),
+            authority: std::sync::Arc::new(ReturnedAccount),
+        };
+        assert!(directory.device_transport_keys(did).await.is_err());
+        backend.register_chat_device(did, [2; 32]);
+        assert_eq!(directory.device_transport_keys(did).await.unwrap().len(), 2);
+    }
 
     #[test]
     fn expected_not_recipient_is_separate_from_corruption() {

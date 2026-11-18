@@ -708,6 +708,9 @@ pub(crate) mod native_client {
                 &db_key_32,
                 OpenMode::App,
             )?);
+            db.write_tx(|tx| {
+                super::live_sync::live_integrity::migrate_opening_deletions(tx, hooks.now_ms())
+            })?;
             let keychain_bridge: Arc<dyn KeychainAccess> = Arc::new(ClientKeychainBridge {
                 keystore: Arc::clone(&keystore),
             });
@@ -2862,6 +2865,11 @@ pub(crate) mod native_client {
             Err(MLSError::InvalidState(
                 "Labyrinth feature is disabled".to_string(),
             ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn delete_account_data_for_hosted_account(&self) -> Result<(), MLSError> {
+            Err(MLSError::InvalidState("PeerErasureUnverified".into()))
         }
 
         #[cfg(not(feature = "labyrinth"))]

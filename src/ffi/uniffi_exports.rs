@@ -509,6 +509,11 @@ impl CatbirdMlsClient {
         self.retire_current_device()
     }
 
+    #[uniffi::method(name = "delete_account_data_for_hosted_account")]
+    pub fn ffi_delete_account_data_for_hosted_account(&self) -> Result<(), MLSError> {
+        self.delete_account_data_for_hosted_account()
+    }
+
     #[uniffi::method(name = "delete_account_data")]
     pub fn ffi_delete_account_data(&self) -> Result<(), MLSError> {
         self.delete_account_data()

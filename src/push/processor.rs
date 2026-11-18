@@ -1581,6 +1581,11 @@ pub fn process_push_notification_with_hooks(
                         &message_id,
                         &commitment,
                     )?;
+                    if preview_only && crate::client::deletion_authority::suppress_local_frame(
+                        tx, &wake.conversation_id, &verified_sender_did, &verified_device_id, entry.seq, None,
+                    )? {
+                        return Err(foreground_sync_required());
+                    }
                     if preview_only {
                         target_decrypted = Some((
                             message_id,
@@ -1655,6 +1660,13 @@ pub fn process_push_notification_with_hooks(
                         }
                         Some(counter.map_or_else(|| json!("unknown"), |counter| json!(counter)))
                     };
+                    if crate::client::deletion_authority::suppress_local_frame(
+                        tx, &wake.conversation_id, &verified_sender_did, &verified_device_id,
+                        entry.seq, verified_receipt.receipt["issuedAtMs"].as_i64(),
+                    )? {
+                        // Foreground verifies the canonical receipt and advances the cursor.
+                        return Err(foreground_sync_required());
+                    }
                     // The full archive payload with the authenticated receive-time roster; the
                     // app enqueues it once the entry's I13 receipt verifies.
                     let evidence = crate::client::QueuedLabyrinthArchivePayload {
@@ -1695,6 +1707,9 @@ pub fn process_push_notification_with_hooks(
                     };
                     crate::client::archive_policy::observe_frame_tighten_only(tx, &evidence)?;
                     let mut evidence = serde_json::to_value(&evidence)?;
+                    // Relay receipts can have different entry IDs from the canonical receipt.
+                    // The verified issue time remains available to enforce deletion during handoff.
+                    evidence["nse_verified_issued_at_ms"] = verified_receipt.receipt["issuedAtMs"].clone();
                     if let Some(recorded) = recorded_send_counter {
                         evidence[chat_wire::NSE_SEND_COUNTER_RECORDED] = recorded;
                     }

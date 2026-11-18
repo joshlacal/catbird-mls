@@ -920,6 +920,143 @@ fn deletion_uses_stored_receipt_time_for_message_and_queued_copy() {
 }
 
 #[test]
+fn c33_deletion_scrubs_request_copies_and_preserves_consent_and_uncovered_openings() {
+    use crate::client::live_sync::live_integrity::{
+        migrate_opening_deletions, opening_receipt_key, reapply_opening_deletion,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (client, _, _, _, _) = client_with_bob_leaf(&tmp);
+    let now = SIGNED_AT_MS + authority::DELETION_CLOCK_SKEW_MS;
+    let marker = authority::StoredAccountDeletion::Signed(authority::AppliedAccountDeletion {
+        seq: 6,
+        signed_at_ms: SIGNED_AT_MS,
+        operation_id: DELETION_OP.into(),
+        actor_device_id: Some(DEV_B1.into()),
+    });
+    let receipt =
+        |mid: &str, sender: &str, seq: u64, issued_at_ms: i64| chat_wire::StoredArchivedReceipt {
+            sequencer_did: SEQUENCER_DID.into(),
+            conversation_id: CONVO_ID.into(),
+            group_id: vec![2; 32],
+            epoch: 1,
+            sender_device_did_url: format!("{sender}#{DEV_B1}"),
+            entry_id: mid.into(),
+            archive_commitment: vec![3; 32],
+            seq,
+            issued_at_ms,
+            key_id: "test".into(),
+            signature: vec![4; 64],
+            generation: 0,
+            original_sender_attestation: None,
+        };
+    let stage_key = format!("c33_pending_opening:{CONVO_ID}");
+    let first = crate::client::QueuedLabyrinthArchivePayload {
+        version: 1,
+        message_id: BOB_M1.into(),
+        conversation_id: CONVO_ID.into(),
+        group_id_hex: "02".into(),
+        epoch: 1,
+        expected_member_dids: vec![],
+        seq: 3,
+        sender_did: BOB_DID.into(),
+        sender_device_id: DEV_B1.into(),
+        sequencer_did: SEQUENCER_DID.into(),
+        space_uri: None,
+        plaintext_json: "old preview".into(),
+        labyrinth_frame_json: "old plaintext".into(),
+        mls_ciphertext_b64: String::new(),
+        frame_nonce_b64: None,
+        sequencer_receipt_json: Some(
+            serde_json::to_string(&receipt(BOB_M1, BOB_DID, 3, now)).unwrap(),
+        ),
+        original_sender_attestation_json: None,
+        created_at_ms: now + 100,
+    };
+    let store_stage = |tx: &crate::storage::SqlTx<'_>| {
+        tx.put_account_meta(&stage_key, &serde_json::to_string(&first)?, now)?;
+        tx.put_labyrinth_state(
+            &format!("native.message:{CONVO_ID}:{BOB_M1}"),
+            &serde_json::to_vec(&first)?,
+            now,
+        )
+    };
+    client
+        .db
+        .write_tx(|tx| {
+            for (mid, did, consent) in [
+                (BOB_M1, BOB_DID, "accepted"),
+                (BOB_M2, BOB_DID, "outgoingPending"),
+                (BOB_M3, ALICE_DID, "incomingPending"),
+                ("legacy-orphan", BOB_DID, "incomingPending"),
+            ] {
+                tx.upsert_request(&crate::storage::RequestRow {
+                    request_id: mid.into(),
+                    conversation_id: CONVO_ID.into(),
+                    sender_did: did.into(),
+                    recipient_did: ALICE_DID.into(),
+                    consent: consent.into(),
+                    first_message_id: Some(mid.into()),
+                    first_message_archived: false,
+                    payload_json: "visible preview".into(),
+                    expires_at_ms: 0,
+                    updated_at_ms: now,
+                })?;
+            }
+            store_stage(tx)?;
+            tx.enqueue_labyrinth_item(&crate::storage::LabyrinthQueueRow {
+                item_id: BOB_M1.into(),
+                conversation_id: CONVO_ID.into(),
+                group_id_hex: "02".into(),
+                seq: 3,
+                payload_bytes: serde_json::to_vec(&first)?,
+                created_at_ms: now + 100,
+            })?;
+            tx.put_labyrinth_state(
+                &opening_receipt_key(CONVO_ID, BOB_M2),
+                &serde_json::to_vec(&receipt(BOB_M2, BOB_DID, 4, now + 1))?,
+                now,
+            )?;
+            tx.put_labyrinth_state(
+                &chat_wire::account_deletion_key(CONVO_ID, BOB_DID),
+                &marker.encode().unwrap(),
+                now,
+            )?;
+            tx.delete_account_meta("c33_opening_erasure_v1")?;
+            migrate_opening_deletions(tx, now)?;
+            let rows = tx.list_requests(None)?;
+            for (mid, expected, consent) in [
+                (BOB_M1, "{}", "accepted"),
+                (BOB_M2, "visible preview", "outgoingPending"),
+                (BOB_M3, "visible preview", "incomingPending"),
+                ("legacy-orphan", "{}", "incomingPending"),
+            ] {
+                let row = rows.iter().find(|r| r.request_id == mid).unwrap();
+                assert_eq!(row.payload_json, expected);
+                assert_eq!(row.consent, consent);
+            }
+            assert!(tx.get_account_meta(&stage_key)?.is_none());
+            assert!(tx
+                .get_labyrinth_state(&format!("native.message:{CONVO_ID}:{BOB_M1}"))?
+                .is_none());
+            assert!(tx.list_labyrinth_queue(Some(CONVO_ID), 10)?.is_empty());
+            store_stage(tx)?;
+            reapply_opening_deletion(tx, CONVO_ID, BOB_DID)?;
+            assert!(tx.get_account_meta(&stage_key)?.is_none());
+            store_stage(tx)
+        })
+        .unwrap();
+    client.archive_accepted_opening_messages(CONVO_ID).unwrap();
+    client
+        .db
+        .read_tx(|tx| {
+            assert!(tx.get_account_meta(&stage_key)?.is_none());
+            assert!(tx.list_labyrinth_queue(Some(CONVO_ID), 10)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn forged_unsigned_and_genuine_deletions_hold_cursor_without_purging() {
     let tmp = tempfile::tempdir().unwrap();
     let (client, state, alice_signer, bob_signer, group_id) = client_with_bob_leaf(&tmp);

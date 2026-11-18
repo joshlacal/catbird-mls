@@ -917,6 +917,32 @@ impl CatbirdMlsClient {
                     )?;
                 }
             }
+            if crate::client::deletion_authority::suppress_local_frame(
+                tx,
+                cid,
+                &message.sender_did,
+                &message.sender_device_id,
+                entry_seq,
+                receipt["issuedAtMs"].as_i64(),
+            )? {
+                tx.conn()
+                    .execute(
+                        "DELETE FROM messages WHERE conversation_id=?1 AND message_id=?2",
+                        rusqlite::params![cid, message_id],
+                    )
+                    .map_err(|e| map_rusqlite_err("clear deleted cached message", &e))?;
+                tx.conn()
+                    .execute(
+                        "DELETE FROM labyrinth_state WHERE state_key=?1",
+                        [&state_key],
+                    )
+                    .map_err(|e| map_rusqlite_err("clear deleted cached frame", &e))?;
+                tx.dequeue_labyrinth_item(message_id)?;
+                tx.delete_pending_op(NATIVE_ARCHIVE_RECEIPT_OP, message_id)?;
+                convo.last_seq = convo.last_seq.max(entry_seq);
+                convo.updated_at_ms = now_ms;
+                return tx.upsert_conversation(&convo);
+            }
             evidence["sequencer_receipt_json"] = json!(stored_receipt);
             if completes {
                 evidence["seq"] = json!(entry_seq);
@@ -2177,6 +2203,11 @@ impl CatbirdMlsClient {
                 now_ms,
             )?;
 
+            tx.put_labyrinth_state(
+                &live_integrity::opening_receipt_key(cid, first_message_id),
+                dr_rcpt_json.as_bytes(),
+                now_ms,
+            )?;
             tx.upsert_request(&RequestRow {
                 request_id: request_id.to_string(),
                 conversation_id: cid.to_string(),
@@ -2260,6 +2291,7 @@ impl CatbirdMlsClient {
                     now_ms,
                 )?;
             }
+            live_integrity::reapply_opening_deletion(tx, cid, sender_did)?;
             Ok(true)
         })?;
         if !imported {
@@ -5594,6 +5626,18 @@ impl CatbirdMlsClient {
                         return Err(MLSError::Cryptography(
                             "I13: receipt generation mismatch".into(),
                         ));
+                    }
+                    if crate::client::deletion_authority::suppress_local_frame(
+                        tx,
+                        cid,
+                        sender_did,
+                        sender_dev_id,
+                        entry_seq,
+                        rcpt_val["issuedAtMs"].as_i64(),
+                    )? {
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = now_ms;
+                        return tx.upsert_conversation(&c);
                     }
                     let inner: crate::messaging::receive::PrivateMessagePlaintextEnvelope =
                         serde_json::from_slice(&plaintext).map_err(|e| {
