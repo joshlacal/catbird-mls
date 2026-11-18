@@ -15045,3 +15045,133 @@ fn direct_request_creation_cas_contention_terminates_after_four_attempts() {
         "CAS loop must execute at most 4 attempts"
     );
 }
+
+#[test]
+fn live_remove_recovery_method_retires_old_bundle_and_preserves_replacement_code() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let bob_orig_dev = new_id();
+    let bob_orig = enrolled(&tmp, &ds, "bob-rot-orig", BOB_DID, &bob_orig_dev);
+
+    // 1. Mint initial recovery code on Bob's original device and acknowledge its receipt.
+    let initial = bob_orig
+        .setup_recovery_code_with_receipt()
+        .expect("setup initial recovery code");
+    bob_orig
+        .acknowledge_recovery_generation(initial.recovery_generation)
+        .expect("acknowledge initial generation");
+
+    let before_methods = bob_orig
+        .list_recovery_methods()
+        .expect("list initial recovery methods");
+    assert_eq!(before_methods.len(), 1);
+    let old_method = &before_methods[0];
+    assert_eq!(old_method.mechanism, "code");
+    assert!(!old_method.revoked);
+    let old_vdevice_id = old_method.vdevice_id.clone();
+    assert_eq!(old_vdevice_id.len(), 16);
+
+    // Reject malformed vdevice_id lengths fail-closed before touching mailbox state.
+    assert!(matches!(
+        bob_orig.remove_recovery_method(vec![0u8; 15]),
+        Err(MLSError::InvalidInput { .. })
+    ));
+
+    // 2. Mint fresh replacement recovery code BEFORE retiring the exposed code, keeping
+    //    the replacement receipt unacknowledged during old-method removal.
+    let replacement = bob_orig
+        .setup_recovery_code_with_receipt()
+        .expect("setup replacement recovery code");
+    assert!(replacement.recovery_generation > initial.recovery_generation);
+    assert_ne!(replacement.code, initial.code);
+
+    let both_methods = bob_orig
+        .list_recovery_methods()
+        .expect("list both active recovery methods");
+    assert_eq!(both_methods.len(), 2);
+    let new_vdevice_id = both_methods
+        .iter()
+        .find(|m| m.vdevice_id != old_vdevice_id)
+        .expect("distinct replacement method ID")
+        .vdevice_id
+        .clone();
+
+    // 3. Retire the old method by exact verified vdevice_id.
+    let epoch_before = bob_orig
+        .labyrinth_status()
+        .expect("status before")
+        .epoch_seq;
+    let outcome = bob_orig
+        .remove_recovery_method(old_vdevice_id.clone())
+        .expect("remove old recovery method");
+    assert!(
+        outcome.status.epoch_seq > epoch_before,
+        "removing a recovery method must advance the mailbox epoch"
+    );
+    assert!(outcome.rekeyed_recovery_code.is_none());
+    assert!(outcome.status.has_recovery_code);
+    assert_eq!(
+        outcome.status.recovery_generation,
+        replacement.recovery_generation,
+        "unacknowledged replacement receipt generation must remain intact across old-method removal"
+    );
+    assert!(outcome.status.recovery_needs_attention);
+
+    // Replacement receipt can still be acknowledged cleanly at its recorded generation.
+    let acked = bob_orig
+        .acknowledge_recovery_generation(replacement.recovery_generation)
+        .expect("acknowledge replacement generation after old-method removal");
+    assert!(!acked.recovery_needs_attention);
+
+    // 4. Verify only the replacement method remains active and the old bundle is gone.
+    let after_methods = bob_orig
+        .list_recovery_methods()
+        .expect("list methods after removal");
+    assert_eq!(after_methods.len(), 1);
+    assert_eq!(after_methods[0].vdevice_id, new_vdevice_id);
+    assert!(!after_methods[0].revoked);
+    assert!(
+        bob_orig.remove_recovery_method(old_vdevice_id).is_err(),
+        "deleted virtual device bundle must not be removable a second time"
+    );
+
+    // 5. Verify a fresh device CANNOT restore with the retired code, and CAN restore with the replacement code.
+    let bob_stale = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("bob-rot-stale").to_string_lossy().into(),
+            account_did: BOB_DID.into(),
+            device_id: new_id(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(BOB_DID),
+        None,
+    )
+    .expect("open bob_stale");
+    assert!(
+        bob_stale.restore_with_recovery_code(&initial.code).is_err(),
+        "retired recovery code must fail to restore after remove_recovery_method"
+    );
+
+    let bob_fresh = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().join("bob-rot-fresh").to_string_lossy().into(),
+            account_did: BOB_DID.into(),
+            device_id: new_id(),
+            home_ds_did: DS_DID.into(),
+            home_ds_endpoint: DS_URL.into(),
+            pds_endpoint: PDS_URL.into(),
+        },
+        Arc::new(MemKeyStore::new()),
+        ds.for_account(BOB_DID),
+        None,
+    )
+    .expect("open bob_fresh");
+    let restored = bob_fresh
+        .restore_with_recovery_code(&replacement.code)
+        .expect("replacement recovery code must restore cleanly");
+    assert!(restored.backup_enabled);
+    assert!(restored.epoch_seq > outcome.status.epoch_seq);
+}

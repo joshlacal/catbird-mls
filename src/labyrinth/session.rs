@@ -360,8 +360,9 @@ impl MailboxDirectory for LocallyCheckedDirectory {
                         .map(|entry| entry.key)
                         .collect();
                     for leaf_key in shared_leaves {
-                        let accounted_as_revoked = reported.iter().any(|entry| entry.key == leaf_key)
-                            && revoked_times.contains_key(&leaf_key);
+                        let accounted_as_revoked =
+                            reported.iter().any(|entry| entry.key == leaf_key)
+                                && revoked_times.contains_key(&leaf_key);
                         if !active_reported.contains(&leaf_key) && !accounted_as_revoked {
                             return Err(labyrinth::Error::Backend(
                                 "chat device directory omits or revokes a live shared MLS group leaf"
@@ -2168,6 +2169,24 @@ impl LabyrinthSession {
             Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
                 if self.try_heal_squat(seq).await {
                     self.lab.revoke_device(&XVerifyingKey(device_key)).await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        };
+        self.finish_rotation(out, &recovery_methods)
+    }
+
+    pub async fn remove_recovery_method(
+        &mut self,
+        vdevice_id: [u8; 16],
+    ) -> Result<SessionRotationReport> {
+        let recovery_methods = self.lab.list_recovery_methods().await.unwrap_or_default();
+        let out = match self.lab.remove_recovery_method(&vdevice_id).await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab.remove_recovery_method(&vdevice_id).await
                 } else {
                     Err(labyrinth::Error::EpochSquatted { seq, reason })
                 }

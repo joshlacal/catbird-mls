@@ -2677,6 +2677,16 @@ pub(crate) mod native_client {
         }
 
         #[cfg(not(feature = "labyrinth"))]
+        pub fn remove_recovery_method(
+            &self,
+            _vdevice_id: Vec<u8>,
+        ) -> Result<LabyrinthRevocationOutcome, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".into(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
         pub fn acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
             Err(MLSError::InvalidState(
                 "Labyrinth feature is disabled".into(),

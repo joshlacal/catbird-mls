@@ -350,6 +350,14 @@ impl CatbirdMlsClient {
         self.list_recovery_methods()
     }
 
+    #[uniffi::method(name = "remove_recovery_method")]
+    pub fn ffi_remove_recovery_method(
+        &self,
+        vdevice_id: Vec<u8>,
+    ) -> Result<LabyrinthRevocationOutcome, MLSError> {
+        self.remove_recovery_method(vdevice_id)
+    }
+
     #[uniffi::method(name = "acknowledge_recovery_attention")]
     pub fn ffi_acknowledge_recovery_attention(&self) -> Result<LabyrinthBackupStatus, MLSError> {
         self.acknowledge_recovery_attention()
