@@ -436,7 +436,7 @@ fn apply_served_entries(client: &CatbirdMlsClient, signer: &SignatureKeyPair) {
         ..EntryPass::default()
     };
     client
-        .apply_conversation_entries(DEV_A1, signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap();
 }
 
@@ -798,7 +798,7 @@ fn a_valid_local_leaf_deletion_is_quarantined_without_nonrevocation_proof() {
         ..EntryPass::default()
     };
     assert!(client
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass, &mut Vec::new())
         .unwrap_err()
         .to_string()
         .contains("AccountDeletionUnverified"));
@@ -1072,7 +1072,7 @@ fn forged_unsigned_and_genuine_deletions_hold_cursor_without_purging() {
             max_seq: convo.last_seq,
             ..EntryPass::default()
         };
-        client.apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+        client.apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass, &mut Vec::new())
     };
     let cursor = || {
         client
@@ -1267,7 +1267,7 @@ fn deletion_operation_dedupe_is_rechecked_in_the_apply_transaction() {
         ..EntryPass::default()
     };
     client
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass, &mut Vec::new())
         .expect("replayed accountDeletedEntry must advance sync cursor after quarantining evidence");
     let convo_after = client
         .db
@@ -1336,7 +1336,7 @@ fn a_deletion_sequenced_for_another_conversation_is_kept_as_evidence_only() {
         ..EntryPass::default()
     };
     let error = client
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo, &mut pass, &mut Vec::new())
         .unwrap_err();
     assert!(error.to_string().contains("account deletion"), "{error}");
     assert_eq!(

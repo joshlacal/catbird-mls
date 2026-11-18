@@ -2150,7 +2150,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap();
     assert_eq!(
         alice
@@ -2207,7 +2207,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap();
     assert_eq!(
         alice
@@ -2384,7 +2384,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     let err_dev = alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap_err();
     assert!(!matches!(err_dev, MLSError::ForkDetected { .. }));
     assert!(
@@ -2426,7 +2426,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     let err_key = alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap_err();
     assert!(!matches!(err_key, MLSError::ForkDetected { .. }));
     assert!(
@@ -2476,7 +2476,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     let err_stale_bob = alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap_err();
     assert!(
         err_stale_bob.to_string().contains("deserialize app msg"),
@@ -2505,7 +2505,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     let err_stale_sib = alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap_err();
     assert!(
         err_stale_sib.to_string().contains("deserialize app msg"),
@@ -2539,7 +2539,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     let repeated_page = alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .expect_err("an exclusive page repeating its cursor cannot advance the stream");
     assert!(repeated_page.to_string().contains("no sequence progress"));
 
@@ -2569,7 +2569,7 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         ..EntryPass::default()
     };
     let err_redeliver = alice
-        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
+        .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass, &mut Vec::new())
         .unwrap_err();
     assert!(
         err_redeliver.to_string().contains("deserialize app msg"),
