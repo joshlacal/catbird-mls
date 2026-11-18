@@ -723,7 +723,8 @@ impl AppliedAccountDeletion {
 /// sequence/time cutoffs cannot safely be represented by their independent maxima.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum StoredAccountDeletion {    SeqOnly(i64),
+pub enum StoredAccountDeletion {
+    SeqOnly(i64),
     Signed(AppliedAccountDeletion),
     History {
         #[serde(default, rename = "legacySeq", skip_serializing_if = "Option::is_none")]

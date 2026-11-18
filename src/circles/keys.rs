@@ -80,10 +80,18 @@ impl std::fmt::Debug for OpenedCircleKey {
     }
 }
 
-/// The DID authority of an `at://<did>/...` URI, if it has one.
-fn space_authority(space_uri: &str) -> Option<&str> {
-    let authority = space_uri.strip_prefix("at://")?.split('/').next()?;
-    authority.starts_with("did:").then_some(authority)
+/// Parse current Space URIs and the direct Circle record URI stored by older clients.
+fn circle_space_uri(raw: &str) -> Option<atproto_spaces::SpaceUri> {
+    use atproto_spaces::SpaceUri;
+    if let Ok(space) = SpaceUri::parse_hedged(raw) {
+        return Some(space);
+    }
+    let mut parts = raw.strip_prefix("at://")?.split('/');
+    let (authority, collection, rkey) = (parts.next()?, parts.next()?, parts.next()?);
+    if collection != "blue.catbird.circle.encrypted" || parts.next().is_some() {
+        return None;
+    }
+    SpaceUri::new(authority, collection, rkey).ok()
 }
 
 /// The caller's owner DID is only trusted when it is the Space's authority.
@@ -92,7 +100,7 @@ pub fn require_owner_is_space_authority(
     space_uri: &str,
     owner_did: &str,
 ) -> Result<(), CircleError> {
-    if space_authority(space_uri) == Some(owner_did) {
+    if circle_space_uri(space_uri).is_some_and(|space| space.authority == owner_did) {
         Ok(())
     } else {
         Err(CircleError::UntrustedSender {

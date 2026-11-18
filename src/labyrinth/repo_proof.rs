@@ -1078,6 +1078,91 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn block_response(cid: Cid, block: &[u8]) -> Vec<u8> {
+        let header = serde_ipld_dagcbor::to_vec(&CarHeader {
+            version: 1,
+            roots: vec![],
+        })
+        .unwrap();
+        let mut response = vec![];
+        write_uvarint(&mut response, header.len() as u64);
+        response.extend(header);
+        let cid_bytes = cid.to_bytes();
+        write_uvarint(&mut response, (cid_bytes.len() + block.len()) as u64);
+        response.extend(cid_bytes);
+        response.extend(block);
+        response
+    }
+
+    #[test]
+    fn range_inventory_requests_every_intersecting_subtree_and_skips_its_neighbors() {
+        let did = "did:plc:inventory";
+        let rev = "3lb2zzzzzzzzz";
+        let signer = SpaceSigningKey::random_p256();
+        let omitted = compute_dagcbor_cid(&[0]);
+        let record = compute_dagcbor_cid(&[1]);
+        let entry = |path: &str, child| MstEntry {
+            p: 0,
+            k: path.as_bytes().to_vec(),
+            v: record,
+            t: child,
+        };
+        let leaf = serde_ipld_dagcbor::to_vec(&MstNodeData {
+            l: None,
+            e: vec![entry("blue.catbird.chat.deviceRevocation/first", None)],
+        })
+        .unwrap();
+        let leaf_cid = compute_dagcbor_cid(&leaf);
+        let tree = serde_ipld_dagcbor::to_vec(&MstNodeData {
+            l: Some(omitted),
+            e: vec![
+                entry("app.bsky.feed.post/before", Some(leaf_cid)),
+                entry("com.atproto.test/after", Some(omitted)),
+            ],
+        })
+        .unwrap();
+        let data = compute_dagcbor_cid(&tree);
+        let unsigned = UnsignedAtprotoCommitV3 {
+            did,
+            version: 3,
+            data,
+            rev,
+            prev: None,
+        };
+        let signature =
+            sign_space_key_raw(&signer, &serde_ipld_dagcbor::to_vec(&unsigned).unwrap());
+        let commit = serde_ipld_dagcbor::to_vec(&SignedAtprotoCommitV3Encode {
+            did,
+            version: 3,
+            data,
+            rev,
+            prev: None,
+            sig: &signature,
+        })
+        .unwrap();
+        let head = compute_dagcbor_cid(&commit);
+        let build = || {
+            let mut inventory =
+                RevocationInventory::new(did, &head.to_string(), rev, &signer.verifying_key())
+                    .unwrap();
+            inventory.ingest(&block_response(head, &commit)).unwrap();
+            assert_eq!(inventory.next_block(), Some(data.to_string()));
+            inventory.ingest(&block_response(data, &tree)).unwrap();
+            assert_eq!(inventory.next_block(), Some(leaf_cid.to_string()));
+            inventory
+        };
+        assert!(
+            build().finish().is_err(),
+            "the in-range child must be fetched"
+        );
+        let mut complete = build();
+        complete.ingest(&block_response(leaf_cid, &leaf)).unwrap();
+        assert_eq!(
+            complete.finish().unwrap(),
+            vec![("first".into(), record.to_string())]
+        );
+    }
+
     #[test]
     fn inventory_requires_current_signed_head_and_covers_empty_collections() {
         let did = "did:plc:inventory";
@@ -1111,19 +1196,7 @@ mod tests {
         while let Some(requested) = partial.next_block() {
             let cid: Cid = requested.parse().unwrap();
             let block = &blocks[&cid];
-            let header = serde_ipld_dagcbor::to_vec(&CarHeader {
-                version: 1,
-                roots: vec![],
-            })
-            .unwrap();
-            let mut response = vec![];
-            write_uvarint(&mut response, header.len() as u64);
-            response.extend(header);
-            let cid_bytes = cid.to_bytes();
-            write_uvarint(&mut response, (cid_bytes.len() + block.len()) as u64);
-            response.extend(cid_bytes);
-            response.extend(block);
-            partial.ingest(&response).unwrap();
+            partial.ingest(&block_response(cid, block)).unwrap();
             count += 1;
         }
         assert_eq!(

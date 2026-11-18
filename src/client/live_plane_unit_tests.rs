@@ -621,7 +621,7 @@ fn seed_active_two_member_group(
                 avatar_sym_key: None,
                 avatar_sha256: None,
                 avatar_mime_type: None,
-                metadata_json: r#"{"title":"Initial Title","description":"Initial Description"}"#
+                metadata_json: r#"{"version":1,"title":"Initial Title","description":"Initial Description"}"#
                     .into(),
                 updated_at_ms: now_ms,
             })?;

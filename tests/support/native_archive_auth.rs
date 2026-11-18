@@ -387,7 +387,12 @@ impl NativeArchiveAuthFixture {
             return Ok(reply(501, json!({"error":"MethodNotImplemented"})));
         }
         let served = nsid == "com.atproto.identity.resolveDid"
-            || matches!(nsid, "com.atproto.sync.getRecord" | "com.atproto.sync.getLatestCommit" | "com.atproto.sync.getRepo")
+            || matches!(
+                nsid,
+                "com.atproto.sync.getRecord"
+                    | "com.atproto.sync.getLatestCommit"
+                    | "com.atproto.sync.getRepo"
+            )
             || nsid.starts_with("com.atproto.repo.")
             || nsid.starts_with("com.atproto.space.")
             || matches!(

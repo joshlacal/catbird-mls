@@ -4557,6 +4557,11 @@ impl CatbirdMlsClient {
                 .outbox_flush_lock
                 .lock()
                 .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
+            if self.is_device_pending_approval()? {
+                return Err(MLSError::PendingDeviceAccess {
+                    reason: "DevicePendingApproval".into(),
+                });
+            }
             let deps = self.native_archive_deps()?;
             let own_device_id = self
                 .canonical_uuid_v4_device_id()
@@ -5762,17 +5767,18 @@ mod native_restore_tests {
     /// live sync recorded decides. Every copy attributed to the deleted account that its receipt
     /// orders before the entry is hidden, in Space and owner history alike: its own copy, another
     /// member's published witness copy of a message it never archived, and re-archived owner
-    /// copies. Other members' messages, and its messages sequenced after the entry, stay.
+    /// copies. If a legacy marker cannot identify the deleted actor, a later frame from that
+    /// account requires a verified backfill before it can be shown.
     #[test]
     fn a_sequenced_account_deletion_hides_every_published_copy_of_its_messages() {
-        use super::CatbirdMlsClient;
+        use super::{CatbirdMlsClient, MLSError};
         use crate::storage::{MlsAccountDb, OpenMode};
         fn visible(
             db: &MlsAccountDb,
             lab: &mut Labyrinth,
             deletion_cid: &str,
             owner: bool,
-        ) -> Vec<String> {
+        ) -> Result<Vec<String>, MLSError> {
             let history = if owner {
                 block_on_sync(lab.load_owner_thread(CONVERSATION))
             } else {
@@ -5786,9 +5792,8 @@ mod native_restore_tests {
                 deletion_cid,
                 &std::collections::BTreeSet::new(),
                 &mut messages,
-            )
-            .unwrap();
-            messages.into_iter().map(|m| m.message_id).collect()
+            )?;
+            Ok(messages.into_iter().map(|m| m.message_id).collect())
         }
         let w = World::new();
         let mut alice = w.join(ALICE, 1);
@@ -5805,19 +5810,31 @@ mod native_restore_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = MlsAccountDb::open_native(dir.path().join("deleted.db"), &[7; 32], OpenMode::App).unwrap();
         // Published copies stay visible until this device holds the deletion entry.
-        assert_eq!(visible(&db, &mut bob, CONVERSATION, false), ["a1", "a2", "b1"]);
-        assert_eq!(visible(&db, &mut bob, CONVERSATION, true), ["a1", "a2", "b1"]);
+        assert_eq!(
+            visible(&db, &mut bob, CONVERSATION, false).unwrap(),
+            ["a1", "a2", "b1"]
+        );
+        assert_eq!(
+            visible(&db, &mut bob, CONVERSATION, true).unwrap(),
+            ["a1", "a2", "b1"]
+        );
 
         let deleted_at = i64::try_from(w.net.append_chat_entry(CONVERSATION)).unwrap();
         db.write_tx(|tx| super::super::live_sync::record_account_deletion(tx, CONVERSATION, ALICE, deleted_at, 1)).unwrap();
         let a3 = w.sequence(ALICE, "a3", "after the deletion");
         archive(&mut alice, "a3", &a3, 200);
         assert_eq!(
-            visible(&db, &mut bob, "00000000-0000-4000-8000-00000000ffff", false),
+            visible(&db, &mut bob, "00000000-0000-4000-8000-00000000ffff", false).unwrap(),
             ["a1", "a2", "b1", "a3"],
             "another conversation's authority hides no archive copy"
         );
-        assert_eq!(visible(&db, &mut bob, CONVERSATION, false), ["b1", "a3"]);
-        assert_eq!(visible(&db, &mut bob, CONVERSATION, true), ["b1"]);
+        assert!(
+            matches!(
+                visible(&db, &mut bob, CONVERSATION, false),
+                Err(MLSError::Cryptography(_))
+            ),
+            "the legacy seq-only marker must quarantine a later frame with an unresolved actor"
+        );
+        assert_eq!(visible(&db, &mut bob, CONVERSATION, true).unwrap(), ["b1"]);
     }
 }

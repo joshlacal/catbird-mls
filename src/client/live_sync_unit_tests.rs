@@ -1273,10 +1273,10 @@ fn finish_received_archive_evidence_validates_outer_sender_own_device_and_counte
         vec![],
         "3, one uncounted entry, then 5 is contiguous"
     );
-    // Within the epoch a counter that does not increase is still refused.
+    // A regressed counter is recorded alongside the authenticated message.
     let m_back = "33333333-3333-4333-8333-333333333336";
     let r_back = stage_cached_message(m_back, BOB_DID, DEV_B1, 8);
-    assert!(client
+    client
         .finish_received_archive_evidence(
             CONVO_ID,
             m_back,
@@ -1287,7 +1287,21 @@ fn finish_received_archive_evidence_validates_outer_sender_own_device_and_counte
             Some(5),
             DEV_A1,
         )
-        .is_err());
+        .unwrap();
+    let evidence = client
+        .db
+        .read_tx(|tx| crate::client::send_counter::list_send_counter_evidence(tx, CONVO_ID))
+        .unwrap();
+    let anomaly = evidence.last().unwrap();
+    assert_eq!(
+        (
+            anomaly.kind.as_str(),
+            anomaly.last,
+            anomaly.received,
+            anomaly.seq
+        ),
+        ("regressed", 5, 5, 8)
+    );
 }
 
 #[test]
@@ -2524,9 +2538,10 @@ fn apply_conversation_entries_reset_pruned_redelivery_fork_and_counter_boundarie
         max_seq: convo_row.last_seq,
         ..EntryPass::default()
     };
-    alice
+    let repeated_page = alice
         .apply_conversation_entries(DEV_A1, &alice_signer, &convo_row, &mut pass)
-        .unwrap();
+        .expect_err("an exclusive page repeating its cursor cannot advance the stream");
+    assert!(repeated_page.to_string().contains("no sequence progress"));
 
     alice
         .db

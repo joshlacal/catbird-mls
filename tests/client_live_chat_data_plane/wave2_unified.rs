@@ -236,6 +236,21 @@ fn pending_approval_blocks_leaf_fulfillment_verifies_pds_key_on_approve_and_hold
         alice_d2.is_device_pending_approval().expect("d2 pending"),
         "second device should enter pending_approval before existing-device approval"
     );
+    let requests_before = ds.inner.lock().unwrap().http_log.len();
+    assert!(matches!(
+        alice_d2.delete_account_data(),
+        Err(MLSError::PendingDeviceAccess { .. })
+    ));
+    assert!(alice_d2
+        .db()
+        .read_tx(|tx| tx.get_account_meta("delete_account_retry_state"))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ds.inner.lock().unwrap().http_log.len(),
+        requests_before,
+        "pending deletion cannot send any network request"
+    );
     assert!(
         !ds.inner
             .lock()
@@ -494,6 +509,11 @@ fn multidevice_direct_onboarding_auto_history_restore_auto_ack_and_sibling_push_
         &alice_d2_keys,
     );
     alice_d2.enroll_device(&scopes).expect("enroll alice_d2");
+    let genesis_before = ds.inner.lock().unwrap().labyrinth_epochs[ALICE_DID].clone();
+    let setup_error = alice_d2.setup_recovery_code_with_receipt().err()
+        .expect("a fresh device with existing archived messages cannot create another genesis");
+    assert!(setup_error.to_string().contains("already has history"), "{setup_error}");
+    assert_eq!(ds.inner.lock().unwrap().labyrinth_epochs[ALICE_DID], genesis_before);
     alice_d2
         .restore_with_recovery_code(&code)
         .expect("alice_d2 restore mailbox");
