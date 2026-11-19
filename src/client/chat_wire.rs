@@ -46,7 +46,7 @@ pub fn json_bytes(v: &Value) -> Result<Vec<u8>, MLSError> {
         .as_str()
         .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
         .ok_or_else(|| MLSError::invalid_input("expected base64 string or $bytes object"))?;
-    STANDARD
+    crate::atproto_bytes::BYTES_DECODER
         .decode(raw.trim())
         .map_err(|e| MLSError::invalid_input(format!("invalid base64 bytes: {e}")))
 }
@@ -3492,6 +3492,46 @@ pub fn build_space_apply_writes_for_queue_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device record as the reference PDS returns it: key bytes in unpadded base64.
+    #[test]
+    fn device_records_from_the_reference_pds_are_accepted() {
+        let did = "did:plc:peer";
+        let key = [7u8; 32];
+        let padded = STANDARD.encode(key);
+        let unpadded = padded.trim_end_matches('=').to_string();
+        assert_ne!(
+            padded, unpadded,
+            "a 32-byte key needs padding in strict base64"
+        );
+
+        assert_eq!(json_bytes(&json!({ "$bytes": unpadded })).unwrap(), key);
+        assert_eq!(json_bytes(&json!({ "$bytes": padded })).unwrap(), key);
+        assert_eq!(json_bytes(&json!(unpadded)).unwrap(), key);
+        assert!(json_bytes(&json!({ "$bytes": "not base64!" })).is_err());
+
+        let record = |rkey: &str, bytes: &str| {
+            json!({
+                "uri": format!("at://{did}/blue.catbird.chat.device/{rkey}"),
+                "cid": "bafyreibogus",
+                "value": {
+                    "$type": "blue.catbird.chat.device",
+                    "algorithm": "ed25519",
+                    "createdAt": "2026-11-19T12:47:00.000Z",
+                    "mlsSignaturePublicKey": { "$bytes": bytes },
+                },
+            })
+        };
+        let entries = parse_pds_device_entries(
+            did,
+            &[record("reference-pds", &unpadded), record("swan", &padded)],
+        );
+        let found: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(rkey, key, _)| (rkey.as_str(), key.as_slice()))
+            .collect();
+        assert_eq!(found, vec![("reference-pds", &key[..]), ("swan", &key[..])]);
+    }
 
     const SEQUENCER: &str = "did:web:sequencer.example.com";
     const CONVERSATION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";

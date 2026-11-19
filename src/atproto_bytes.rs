@@ -1,6 +1,17 @@
 /// Custom serde module for handling ATProto bytes format: { "$bytes": "base64..." }
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use serde::{Deserialize, Deserializer, Serializer};
+
+/// Decodes standard-alphabet base64 with or without padding.
+///
+/// atproto leaves padding optional in `$bytes`. The reference PDS writes it unpadded; Swan
+/// and mls-ds write it padded. A decoder that insists on either one silently drops every
+/// record the other kind of server returns.
+pub(crate) const BYTES_DECODER: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 
 #[derive(serde::Deserialize)]
 struct BytesWrapper {
@@ -32,7 +43,7 @@ where
     D: Deserializer<'de>,
 {
     let wrapper = BytesWrapper::deserialize(deserializer)?;
-    base64::engine::general_purpose::STANDARD
+    BYTES_DECODER
         .decode(&wrapper.bytes)
         .map_err(serde::de::Error::custom)
 }
@@ -80,7 +91,7 @@ pub mod option {
         match opt_wrapper {
             None => Ok(None),
             Some(wrapper) => {
-                let bytes = base64::engine::general_purpose::STANDARD
+                let bytes = super::BYTES_DECODER
                     .decode(&wrapper.bytes)
                     .map_err(serde::de::Error::custom)?;
                 Ok(Some(bytes))
@@ -104,6 +115,20 @@ mod tests {
         let json = r#"{"data": {"$bytes": "SGVsbG8gV29ybGQ="}}"#;
         let result: TestStruct = serde_json::from_str(json).unwrap();
         assert_eq!(result.data, b"Hello World");
+    }
+
+    /// The reference PDS writes `$bytes` without padding; Swan and mls-ds write it padded.
+    #[test]
+    fn deserializes_bytes_with_or_without_padding() {
+        for encoded in ["SGVsbG8gV29ybGQ=", "SGVsbG8gV29ybGQ"] {
+            let json = format!(r#"{{"data": {{"$bytes": "{encoded}"}}}}"#);
+            let required: TestStruct = serde_json::from_str(&json).unwrap();
+            assert_eq!(required.data, b"Hello World");
+            let optional: TestOptionalStruct = serde_json::from_str(&json).unwrap();
+            assert_eq!(optional.data, Some(b"Hello World".to_vec()));
+        }
+        let malformed = r#"{"data": {"$bytes": "SGVsbG8gV29ybGQ=="}}"#;
+        assert!(serde_json::from_str::<TestStruct>(malformed).is_err());
     }
 
     #[test]
