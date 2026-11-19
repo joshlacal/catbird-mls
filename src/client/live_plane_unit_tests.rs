@@ -3993,3 +3993,70 @@ fn did_web_resolution_fails_closed_on_non_success_without_cached_document() {
         .iter()
         .all(|url| !url.starts_with(custom_ds) && !url.contains("resolveDid")));
 }
+
+/// A PDS refuses `createRecord` for a taken record key with 400 (Swan), 409, or 500 (the
+/// reference PDS). Each must lead to reading the record back, never to accepting it unseen.
+#[test]
+fn create_only_publication_reads_back_the_record_however_the_duplicate_is_refused() {
+    const COLLECTION: &str = "blue.catbird.chat.declaration";
+    let existing = json!({ "$type": COLLECTION, "protocolVersion": "1" });
+    let scripted = |duplicate_status: u16, found: Option<Value>| {
+        let (transport, state) = PlaneMockTransport::new();
+        let (dir, client, _signer) = new_plane_client(ALICE_DID, DEV_A1, transport);
+        let mut st = state.lock().unwrap();
+        st.route_handlers.push((
+            "/xrpc/com.atproto.repo.createRecord".to_string(),
+            Box::new(move |_| {
+                http_json(duplicate_status, &json!({ "error": "InternalServerError" }))
+            }),
+        ));
+        st.route_handlers.push((
+            "/xrpc/com.atproto.repo.getRecord".to_string(),
+            Box::new(move |_| match &found {
+                Some(value) => http_json(
+                    200,
+                    &json!({
+                        "uri": format!("at://{ALICE_DID}/{COLLECTION}/self"),
+                        "value": value,
+                    }),
+                ),
+                None => http_json(400, &json!({ "error": "RecordNotFound" })),
+            }),
+        ));
+        drop(st);
+        (dir, client)
+    };
+
+    for duplicate_status in [400u16, 409, 500] {
+        let (_dir, client) = scripted(duplicate_status, Some(existing.clone()));
+        client
+            .publish_pds_record_create_only(COLLECTION, "self", b"{}".to_vec(), |found| {
+                *found == existing
+            })
+            .unwrap_or_else(|error| panic!("duplicate answered {duplicate_status}: {error:?}"));
+
+        let conflict = client
+            .publish_pds_record_create_only(COLLECTION, "self", b"{}".to_vec(), |_| false)
+            .unwrap_err();
+        assert!(
+            format!("{conflict:?}").contains("EnrollmentPdsRecordConflict"),
+            "duplicate answered {duplicate_status}: {conflict:?}"
+        );
+    }
+
+    // A server failure with nothing published is still a failure.
+    let (_dir, client) = scripted(500, None);
+    let failure = client
+        .publish_pds_record_create_only(COLLECTION, "self", b"{}".to_vec(), |_| true)
+        .unwrap_err();
+    assert!(
+        matches!(&failure, MLSError::InvalidState(code) if code == "InternalServerError"),
+        "{failure:?}"
+    );
+
+    // Any other refusal is reported without a read-back.
+    let (_dir, client) = scripted(403, Some(existing.clone()));
+    assert!(client
+        .publish_pds_record_create_only(COLLECTION, "self", b"{}".to_vec(), |_| true)
+        .is_err());
+}

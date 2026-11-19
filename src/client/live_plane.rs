@@ -364,6 +364,16 @@ struct ChatProtocolFailure<'a> {
     error: std::borrow::Cow<'a, str>,
 }
 
+/// Whether a refused `createRecord` may mean the record key is already taken.
+///
+/// Swan answers a duplicate key with 400 and some servers with 409. The reference PDS
+/// answers 500: its repository layer throws an untyped error ("There is already a value at
+/// key") that `createRecord` does not map. The caller then reads the existing record back
+/// and requires it to match, so a genuine server failure still ends in an error.
+pub(super) fn create_refusal_may_mean_record_exists(status: u16) -> bool {
+    matches!(status, 400 | 409 | 500)
+}
+
 pub(super) fn chat_response_error(
     context: impl std::fmt::Display,
     resp: &PlatformHttpResponse,
@@ -1610,7 +1620,7 @@ impl CatbirdMlsClient {
         if resp.status < 400 {
             return Ok(());
         }
-        if matches!(resp.status, 400 | 409) {
+        if create_refusal_may_mean_record_exists(resp.status) {
             let get_url = format!(
                 "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
                 self.pds_base(),
