@@ -1964,6 +1964,28 @@ fn process_push_notification_verified_fetch_offline_preview_error_propagation_an
     assert!(!offline_preview.from_cache);
     assert_eq!(offline_preview.body, "Inline preview text");
 
+    // 1b. The wake production delivers carries no message id: the gateway forwards only the
+    //     conversation, generation, sequence and ciphertext, and the extension fills the gap
+    //     with `msg-<seq>`. The id then comes from the message's own authenticated data.
+    let wake_without_message_id = PushWakePayload {
+        message_id: format!("msg-{}", inline_wake.entry_seq),
+        sender_did: None,
+        ..inline_wake.clone()
+    };
+    let preview_without_message_id = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        None,
+        &wake_without_message_id,
+    )
+    .unwrap();
+    assert!(!preview_without_message_id.fallback_generic);
+    assert!(!preview_without_message_id.receipt_verified);
+    assert_eq!(preview_without_message_id.body, "Inline preview text");
+    assert_eq!(preview_without_message_id.message_id, inline_mid);
+    assert_eq!(preview_without_message_id.sender_did, fixture.bob_did);
+
     // 2. Non-application inline wake (`kind = "commit"`, `!fetch_required`) falls back generically.
     let commit_inline_wake = PushWakePayload {
         kind: "commit".into(),

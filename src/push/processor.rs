@@ -1114,10 +1114,16 @@ pub fn process_push_notification_with_hooks(
         None
     };
     let network = transport.as_ref().zip(chat_dpop_token.as_ref());
+    // The wake a gateway delivers names no message id, only the conversation, generation and
+    // sequence. That is enough: a canonical application message carries its own id in its
+    // authenticated data, which is where the preview's id comes from. An id the wake does
+    // supply is still cross-checked against it below.
     let inline_preview = if !wake.fetch_required
         && fetched_entry_kind_matches(&wake.kind, crate::chat_v2::wire::APPLICATION_ENTRY_KIND)
     {
-        supplied_message_id.zip(wake.inline_ciphertext.as_ref())
+        wake.inline_ciphertext
+            .as_ref()
+            .map(|ciphertext| (supplied_message_id.unwrap_or_default(), ciphertext))
     } else {
         None
     };
