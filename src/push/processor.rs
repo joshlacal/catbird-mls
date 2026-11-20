@@ -1342,7 +1342,12 @@ pub fn process_push_notification_with_hooks(
             if entry.seq <= current_convo.last_seq {
                 continue;
             }
-            if entry.seq != current_convo.last_seq.saturating_add(1) {
+            // Stored entries must be contiguous. A wake-only preview stores nothing (its
+            // transaction is rolled back), so it may be ahead of what this device has synced:
+            // otherwise only the first message since the app was last open could ever show
+            // text. MLS decides whether it can be read: a later message of the same epoch
+            // decrypts, one behind an unseen commit does not and falls back.
+            if entry.seq != current_convo.last_seq.saturating_add(1) && !preview_only {
                 return Err(foreground_sync_required());
             }
             let is_application = fetched_entry_kind_matches(

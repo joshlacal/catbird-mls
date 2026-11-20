@@ -1986,6 +1986,42 @@ fn process_push_notification_verified_fetch_offline_preview_error_propagation_an
     assert_eq!(preview_without_message_id.message_id, inline_mid);
     assert_eq!(preview_without_message_id.sender_did, fixture.bob_did);
 
+    // 1c. A second message arrives before the app has opened to sync the first. Its sequence is
+    //     no longer the next one this device has stored, and a preview stores nothing, so every
+    //     message after the first would otherwise fall back. It decrypts all the same: MLS
+    //     accepts a later message of the same epoch ahead of an earlier one.
+    let later_wake = PushWakePayload {
+        entry_seq: inline_wake.entry_seq + 1,
+        message_id: format!("msg-{}", inline_wake.entry_seq + 1),
+        sender_did: None,
+        inline_ciphertext: Some(live_ct.clone()),
+        ..inline_wake.clone()
+    };
+    let later_preview = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        None,
+        &later_wake,
+    )
+    .unwrap();
+    assert!(!later_preview.fallback_generic);
+    assert!(!later_preview.receipt_verified);
+    assert_eq!(later_preview.body, "Verified live push text");
+    assert_eq!(later_preview.message_id, live_mid);
+    assert_eq!(later_preview.seq, inline_wake.entry_seq + 1);
+    // Still nothing stored: the first message previews again exactly as before.
+    let first_again = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore.clone(),
+        None,
+        &wake_without_message_id,
+    )
+    .unwrap();
+    assert_eq!(first_again.body, "Inline preview text");
+    assert!(!first_again.receipt_verified);
+
     // 2. Non-application inline wake (`kind = "commit"`, `!fetch_required`) falls back generically.
     let commit_inline_wake = PushWakePayload {
         kind: "commit".into(),
