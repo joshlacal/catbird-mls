@@ -929,12 +929,46 @@ impl NativeArchiveAuthFixture {
             .or_else(|| params.get("rkey").map(String::as_str));
         let mut world = self.world.lock().unwrap();
         match nsid {
+            // Epoch snapshots are immutable: created once, never overwritten.
+            "com.atproto.repo.createRecord" => {
+                if account != repo {
+                    return Ok(reply(403, json!({"error": "NotAuthorized"})));
+                }
+                let body = body.unwrap();
+                let rkey = rkey.ok_or_else(|| failure("mailbox rkey missing"))?;
+                if world.mailbox_keys.contains_key(&(repo.into(), rkey.into())) {
+                    return Ok(reply(
+                        400,
+                        json!({"error": "InvalidRequest", "message": "Record already exists"}),
+                    ));
+                }
+                let record = record(
+                    body.get("record")
+                        .ok_or_else(|| failure("mailbox record missing"))?,
+                )?;
+                let cid = record.cid.clone();
+                world
+                    .mailbox_keys
+                    .insert((repo.into(), rkey.into()), record);
+                Ok(reply(
+                    200,
+                    json!({"uri": format!("at://{repo}/{}/{rkey}", labyrinth::records::nsid::MAILBOX_KEYS), "cid": cid}),
+                ))
+            }
             "com.atproto.repo.putRecord" => {
                 if account != repo {
                     return Ok(reply(403, json!({"error": "NotAuthorized"})));
                 }
                 let body = body.unwrap();
                 let rkey = rkey.ok_or_else(|| failure("mailbox rkey missing"))?;
+                // The production gateway's `Y-6` / `B4` rule: only the `self` pointer may be
+                // overwritten; an epoch snapshot must be made with `createRecord`.
+                if rkey != "self" {
+                    return Ok(reply(
+                        403,
+                        json!({"error": "Forbidden", "message": "Overwriting immutable blue.catbird.labyrinth.mailboxKeys epoch snapshots is forbidden"}),
+                    ));
+                }
                 let current = world.mailbox_keys.get(&(repo.into(), rkey.into()));
                 if body
                     .get("swapRecord")

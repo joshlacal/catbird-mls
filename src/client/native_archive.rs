@@ -450,20 +450,34 @@ impl labyrinth::store::pds::PublicRepoBackend for NativeArchiveGateway {
         let mut body = serde_json::json!({
             "repo": did, "collection": labyrinth::records::nsid::MAILBOX_KEYS, "rkey": rkey, "record": record,
         });
-        if let Some(cid) = swap_cid {
-            body["swapRecord"] = cid.into();
-        }
+        // Only the `self` pointer is ever overwritten. A per-epoch snapshot is written once
+        // and never changed, so it is created, not put: the gateway refuses `putRecord` on
+        // any other rkey of this collection (`Y-6` / `B4`), and `createRecord` cannot
+        // overwrite a snapshot that already exists.
+        let method = if rkey == labyrinth::store::pds::SELF_RKEY {
+            if let Some(cid) = swap_cid {
+                body["swapRecord"] = cid.into();
+            }
+            "com.atproto.repo.putRecord"
+        } else {
+            if swap_cid.is_some() {
+                return Err(labyrinth::Error::Malformed(
+                    "mailboxKeys epoch snapshots are create-only",
+                ));
+            }
+            "com.atproto.repo.createRecord"
+        };
         let response = self.pds_json(
             &self.config.pds_endpoint,
             "POST",
-            "/xrpc/com.atproto.repo.putRecord".into(),
+            format!("/xrpc/{method}"),
             Some(serde_json::to_vec(&body).map_err(|e| labyrinth::Error::Backend(e.to_string()))?),
         )?;
         response["cid"]
             .as_str()
             .filter(|cid| !cid.is_empty())
             .map(str::to_owned)
-            .ok_or(labyrinth::Error::Malformed("putRecord missing CID"))
+            .ok_or(labyrinth::Error::Malformed("mailboxKeys write missing CID"))
     }
 
     async fn get_mailbox_keys(

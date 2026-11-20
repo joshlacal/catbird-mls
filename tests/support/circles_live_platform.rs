@@ -297,6 +297,14 @@ impl LiveTransport {
                         json!({ "error": "AuthRequired", "message": "not your repo" }),
                     );
                 }
+                // The production gateway's `Y-6` / `B4` rule: only the `self` pointer of
+                // `mailboxKeys` may be overwritten; an epoch snapshot needs `createRecord`.
+                if key.1 == "blue.catbird.labyrinth.mailboxKeys" && key.2 != "self" {
+                    return reply(
+                        403,
+                        json!({ "error": "Forbidden", "message": "Overwriting immutable blue.catbird.labyrinth.mailboxKeys epoch snapshots is forbidden" }),
+                    );
+                }
                 if let Some(swap) = body["swapRecord"].as_str() {
                     if st.repo.get(&key).map(|(_, cid)| cid.as_str()) != Some(swap) {
                         return reply(
