@@ -11,7 +11,9 @@ use labyrinth::mailbox::{EpochPublic, MailboxKeys};
 use labyrinth::recovery_share::RecoveryShares;
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PublicRepoBackend};
-use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, SpaceRpc};
+use labyrinth::store::space::{
+    SpaceMailboxStore, SpaceRef, SpaceRpc, MAILBOX_SKEY, MAILBOX_SPACE_TYPE,
+};
 use labyrinth::store::{
     keys_valid_for, ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend,
     MaybeSync, MemberDeviceKey, SequencerReceiptKey, ThreadStore, TimeRange, VouchAt,
@@ -1088,11 +1090,51 @@ impl SessionDeps {
         Ok(Some(s))
     }
 
+    /// Creates the account's personal mailbox Space on its PDS if it is not there yet.
+    ///
+    /// A PDS does not create a Space on first use: the Spaces reference PDS and Swan both
+    /// answer `SpaceNotFound` for one that was never created, and the first thing `enable`
+    /// does is read the mailbox. Without this step no account could ever enable its backup.
+    /// The policy is `personalspace`: only the account itself can read or write it. A Space
+    /// that already exists (another device, or an earlier attempt, created it) is left as
+    /// it is.
+    async fn ensure_mailbox_space(&self) -> Result<()> {
+        let Some(space) = &self.space else {
+            return Ok(());
+        };
+        let body = serde_json::json!({
+            "spaceType": MAILBOX_SPACE_TYPE,
+            "skey": MAILBOX_SKEY,
+            "policy": { "$type": "com.atproto.personalspace.policy" },
+        });
+        let body = serde_json::to_vec(&body).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("labyrinth: createSpace request: {e}"))
+        })?;
+        match space
+            .procedure("com.atproto.space.createSpace", &body)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.error.as_deref() == Some("SpaceAlreadyExists") => Ok(()),
+            Err(e) => Err(OrchestratorError::Api(format!(
+                "labyrinth: createSpace for the history mailbox failed: HTTP {} {}{}",
+                e.status,
+                e.error.as_deref().unwrap_or("no error name"),
+                e.message
+                    .as_deref()
+                    .map(|m| format!(": {m}"))
+                    .unwrap_or_default(),
+            ))),
+        }
+    }
+
     /// Opens the saved session, or initializes the account's Space mailbox (`D4` auto-enrollment).
     pub async fn enable(self) -> Result<LabyrinthSession> {
         if let Some(s) = self.clone().open().await? {
             return Ok(s);
         }
+        // Before the first read: a mailbox that does not exist cannot even be found empty.
+        self.ensure_mailbox_space().await?;
         if self.recovery_presence().await?.requires_recovery() {
             return Err(OrchestratorError::InvalidInput(
                 "labyrinth: this account already has history; restore it with a passkey, another device, or a recovery code".into(),

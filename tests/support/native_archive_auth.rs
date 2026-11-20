@@ -44,6 +44,8 @@ struct World {
     ops: BTreeMap<(String, String), Vec<Value>>,
     repo_revisions: BTreeMap<(String, String), String>,
     blobs: BTreeMap<(String, String), Vec<u8>>,
+    /// Space URIs created through `createSpace`.
+    created_spaces: BTreeSet<String>,
     spent_delegations: BTreeSet<String>,
     sequence: u64,
     committed_space_writes: usize,
@@ -774,6 +776,32 @@ impl NativeArchiveAuthFixture {
                         .ok_or_else(|| failure("applyWrites body missing"))?,
                 )?,
             ),
+            "com.atproto.space.createSpace" => {
+                let body = parse(
+                    request
+                        .body
+                        .as_deref()
+                        .ok_or_else(|| failure("createSpace body missing"))?,
+                )?;
+                let (Some(space_type), Some(skey), Some(_policy)) = (
+                    body["spaceType"].as_str(),
+                    body["skey"].as_str(),
+                    body["policy"]["$type"].as_str(),
+                ) else {
+                    return Ok(reply(400, json!({"error": "InvalidRequest"})));
+                };
+                let space = format!("at://{account}/space/{space_type}/{skey}");
+                if !self
+                    .world
+                    .lock()
+                    .unwrap()
+                    .created_spaces
+                    .insert(space.clone())
+                {
+                    return Ok(reply(400, json!({"error": "SpaceAlreadyExists"})));
+                }
+                Ok(reply(200, json!({"space": space})))
+            }
             "com.atproto.space.deleteRecord" => {
                 let body = parse(
                     request

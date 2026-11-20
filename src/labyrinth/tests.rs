@@ -1299,3 +1299,172 @@ async fn fault_line_2_transient_pds_outage_during_deleted_convo_owner_rescue_ret
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].frame, b"do not drop me on pds 503");
 }
+
+/// A PDS that has no mailbox Space until `createSpace`, as the Spaces reference PDS and
+/// Swan both behave: reads and writes of a Space that was never created answer
+/// `SpaceNotFound`.
+struct UncreatedMailboxRpc {
+    inner: Arc<dyn labyrinth::store::space::SpaceRpc>,
+    created: std::sync::atomic::AtomicBool,
+    /// Every `createSpace` body received, in order.
+    creations: Mutex<Vec<serde_json::Value>>,
+    /// Calls other than `createSpace` that arrived before the Space existed.
+    early_calls: Mutex<Vec<String>>,
+    /// When set, `createSpace` is refused with this error name.
+    refuse_create: Option<&'static str>,
+}
+
+impl UncreatedMailboxRpc {
+    fn new(inner: Arc<dyn labyrinth::store::space::SpaceRpc>) -> Self {
+        Self {
+            inner,
+            created: std::sync::atomic::AtomicBool::new(false),
+            creations: Mutex::new(Vec::new()),
+            early_calls: Mutex::new(Vec::new()),
+            refuse_create: None,
+        }
+    }
+
+    fn missing(&self, nsid: &str) -> Option<labyrinth::store::space::SpaceError> {
+        if self.created.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.early_calls.lock().unwrap().push(nsid.to_owned());
+        Some(labyrinth::store::space::SpaceError::named(
+            400,
+            "SpaceNotFound",
+            "Space not found",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl labyrinth::store::space::SpaceRpc for UncreatedMailboxRpc {
+    async fn query(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+    ) -> Result<Vec<u8>, labyrinth::store::space::SpaceError> {
+        if let Some(error) = self.missing(nsid) {
+            return Err(error);
+        }
+        self.inner.query(nsid, params).await
+    }
+
+    async fn procedure(
+        &self,
+        nsid: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, labyrinth::store::space::SpaceError> {
+        use labyrinth::store::space::SpaceError;
+        use std::sync::atomic::Ordering;
+
+        if nsid == "com.atproto.space.createSpace" {
+            let body: serde_json::Value =
+                serde_json::from_slice(payload).expect("createSpace body is JSON");
+            self.creations.lock().unwrap().push(body);
+            if let Some(code) = self.refuse_create {
+                return Err(SpaceError::named(400, code, "refused"));
+            }
+            if self.created.swap(true, Ordering::SeqCst) {
+                return Err(SpaceError::named(
+                    400,
+                    "SpaceAlreadyExists",
+                    "Space already exists",
+                ));
+            }
+            return Ok(
+                br#"{"space":"at://did:plc:fixture/space/blue.catbird.labyrinth.mailbox/self"}"#
+                    .to_vec(),
+            );
+        }
+        if let Some(error) = self.missing(nsid) {
+            return Err(error);
+        }
+        self.inner.procedure(nsid, payload).await
+    }
+}
+
+fn mailbox_space_deps(did: &str, seed: u8) -> (SessionDeps, Arc<UncreatedMailboxRpc>) {
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState::default()));
+    let deps = build_deps(did, "dev-m1", seed, ds_state, &space_host, &pds_host, None);
+    let rpc = Arc::new(UncreatedMailboxRpc::new(
+        deps.space.clone().expect("fixture has a Space client"),
+    ));
+    (deps, rpc)
+}
+
+#[tokio::test]
+async fn enable_creates_the_personal_mailbox_space_before_using_it() {
+    let did = "did:plc:mailboxspaceowner00000000000";
+    let (mut deps, rpc) = mailbox_space_deps(did, 61);
+    deps.space = Some(rpc.clone());
+
+    deps.clone()
+        .enable()
+        .await
+        .expect("a new account enables its backup on a PDS with no mailbox Space yet");
+
+    assert_eq!(
+        *rpc.creations.lock().unwrap(),
+        vec![serde_json::json!({
+            "spaceType": "blue.catbird.labyrinth.mailbox",
+            "skey": "self",
+            "policy": { "$type": "com.atproto.personalspace.policy" },
+        })],
+        "exactly one owner-only mailbox Space is created, keyed `self`"
+    );
+    assert!(
+        rpc.early_calls.lock().unwrap().is_empty(),
+        "nothing reads or writes the mailbox before it exists: {:?}",
+        rpc.early_calls.lock().unwrap()
+    );
+    assert_eq!(deps.list_mailbox_devices().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn enable_accepts_a_mailbox_space_that_already_exists() {
+    let did = "did:plc:mailboxspaceexists0000000000";
+    let (mut deps, rpc) = mailbox_space_deps(did, 62);
+    // The Space exists (another device, or an earlier attempt, created it) but is empty.
+    rpc.created.store(true, std::sync::atomic::Ordering::SeqCst);
+    deps.space = Some(rpc.clone());
+
+    deps.clone()
+        .enable()
+        .await
+        .expect("`SpaceAlreadyExists` is not a failure");
+
+    assert_eq!(rpc.creations.lock().unwrap().len(), 1);
+    assert_eq!(deps.list_mailbox_devices().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn enable_reports_a_refused_mailbox_space_creation_and_writes_nothing() {
+    let did = "did:plc:mailboxspacerefused000000000";
+    let (mut deps, rpc) = mailbox_space_deps(did, 63);
+    let mut refusing = UncreatedMailboxRpc::new(rpc.inner.clone());
+    refusing.refuse_create = Some("NotAuthorized");
+    let refusing = Arc::new(refusing);
+    deps.space = Some(refusing.clone());
+
+    let error = deps
+        .clone()
+        .enable()
+        .await
+        .err()
+        .expect("a refused createSpace fails enable");
+
+    let text = error.to_string();
+    assert!(
+        text.contains("createSpace") && text.contains("NotAuthorized"),
+        "the failure names the step and the server's reason: {text}"
+    );
+    assert!(
+        refusing.early_calls.lock().unwrap().is_empty(),
+        "nothing is read or written after a refused creation: {:?}",
+        refusing.early_calls.lock().unwrap()
+    );
+}
