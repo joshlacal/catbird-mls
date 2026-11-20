@@ -2,6 +2,16 @@ use std::future::Future;
 
 // Native adapters for the shared, verified Labyrinth session. Included in native_client.
 const PENDING_DEVICE_ACTIVATION_REFRESH_STATE: &str = "pending_device_activation_refresh";
+/// When `flush_labyrinth_queue` last completed a full pass (decimal Unix ms). Absent after a
+/// failed pass. Read only to decide whether an empty-queue pass may stay local.
+#[cfg(feature = "labyrinth")]
+const IDLE_ARCHIVE_REFRESH_STATE: &str = "idle_archive_refresh_at_ms";
+/// An empty-queue pass reopens the session against the servers at most this often. The reopen
+/// is what adopts another device's epoch rotation, heals a PDS/mls-ds head split or a squatted
+/// epoch, and notices this device's revocation while nothing is queued; every pass with queued
+/// work, and every other archive operation, still does all of that at once.
+#[cfg(feature = "labyrinth")]
+const IDLE_ARCHIVE_REFRESH_INTERVAL_MS: i64 = 10 * 60 * 1000;
 
 #[cfg(feature = "labyrinth")]
 struct NativeArchiveClock(crate::sim_hooks::SimClientHooks);
@@ -1925,6 +1935,66 @@ impl CatbirdMlsClient {
         }
     }
 
+    /// Whether an empty-queue flush may return without opening the session: local state
+    /// records no held or failed directory publication and no pending device activation
+    /// refresh, and a full pass succeeded less than `IDLE_ARCHIVE_REFRESH_INTERVAL_MS` ago.
+    /// Anything unreadable, and a refresh time ahead of the clock, counts as not fresh.
+    fn idle_archive_refresh_is_fresh(&self) -> Result<bool, MLSError> {
+        let refreshed_at_ms = self.db.read_tx(|tx| {
+            let status = tx
+                .get_labyrinth_state("status_json")?
+                .and_then(|raw| serde_json::from_slice::<LabyrinthBackupStatus>(&raw).ok());
+            let Some(status) = status else {
+                return Ok(None);
+            };
+            if status.pending_directory_epoch.is_some()
+                || status.directory_publication_error.is_some()
+                || tx
+                    .get_labyrinth_state(PENDING_DEVICE_ACTIVATION_REFRESH_STATE)?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+            Ok(tx
+                .get_labyrinth_state(IDLE_ARCHIVE_REFRESH_STATE)?
+                .and_then(|raw| String::from_utf8(raw).ok())
+                .and_then(|raw| raw.parse::<i64>().ok()))
+        })?;
+        let Some(refreshed_at_ms) = refreshed_at_ms else {
+            return Ok(false);
+        };
+        Ok(self
+            .hooks
+            .now_ms()
+            .checked_sub(refreshed_at_ms)
+            .is_some_and(|age_ms| (0..IDLE_ARCHIVE_REFRESH_INTERVAL_MS).contains(&age_ms)))
+    }
+
+    /// Record the outcome of a full flush pass for `idle_archive_refresh_is_fresh`. A failed
+    /// pass forgets the last success, so no later empty-queue pass skips the retry.
+    fn record_idle_archive_refresh(&self, succeeded: bool) {
+        let recorded = self.db.write_tx(|tx| {
+            if succeeded {
+                let now_ms = self.hooks.now_ms();
+                return tx.put_labyrinth_state(
+                    IDLE_ARCHIVE_REFRESH_STATE,
+                    now_ms.to_string().as_bytes(),
+                    now_ms,
+                );
+            }
+            tx.conn()
+                .execute(
+                    "DELETE FROM labyrinth_state WHERE state_key = ?1",
+                    [IDLE_ARCHIVE_REFRESH_STATE],
+                )
+                .map_err(|e| MLSError::Internal(format!("clear idle archive refresh: {e}")))?;
+            Ok(())
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the archive flush outcome");
+        }
+    }
+
     fn save_native_archive_status(
         &self,
         session: &crate::labyrinth::LabyrinthSession,
@@ -2806,12 +2876,17 @@ impl CatbirdMlsClient {
         {
             return Ok(0);
         }
+        // Nothing queued and nothing held: opening the session would only re-read the mailbox,
+        // epoch heads and device keys (15-20 round trips) under the archive lifecycle lock.
+        if conversations.is_empty() && self.idle_archive_refresh_is_fresh()? {
+            return Ok(0);
+        }
         if crate::buggify!("between_labyrinth_enqueue_and_flush") {
             return Err(MLSError::Internal(
                 "sim buggify: between_labyrinth_enqueue_and_flush".into(),
             ));
         }
-        self.native_archive_run(async {
+        let flushed = self.native_archive_run(async {
             let (deps, gateway) = self.native_archive_deps_with_gateway()?;
             let mut session = deps.clone().enable().await.map_err(native_archive_error)?;
             let mut count = 0;
@@ -2988,7 +3063,9 @@ impl CatbirdMlsClient {
                 Some(error) => Err(error),
                 None => Ok(count),
             }
-        })
+        });
+        self.record_idle_archive_refresh(flushed.is_ok());
+        flushed
     }
 
     /// Hide the sender's local timeline row and, when the frame was eligible for backup,

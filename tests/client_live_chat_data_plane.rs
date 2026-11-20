@@ -19,6 +19,8 @@ use p256::ecdsa::signature::Signer as _;
 mod archive_policy;
 #[path = "fixtures/direct_request_i13.rs"]
 mod direct_request_i13;
+#[path = "client_live_chat_data_plane/idle_flush.rs"]
+mod idle_flush;
 #[path = "client_live_chat_data_plane/leaf_recovery_signed.rs"]
 mod leaf_recovery_signed;
 #[allow(dead_code)]
