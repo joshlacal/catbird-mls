@@ -943,8 +943,16 @@ impl SessionDeps {
         let Some(space) = self.space.as_ref() else {
             return Ok(());
         };
+        // Name the authority and the type: the session's grant covers this account's
+        // mailbox, and a PDS refuses an unfiltered listing under such a grant.
         let body = space
-            .query("com.atproto.space.listSpaces", &[])
+            .query(
+                "com.atproto.space.listSpaces",
+                &[
+                    ("spaceDid", self.did.clone()),
+                    ("spaceType", MAILBOX_SPACE_TYPE.to_owned()),
+                ],
+            )
             .await
             .map_err(|e| {
                 let detail = match (&e.error, &e.message) {

@@ -828,8 +828,16 @@ impl ResolvingSpaceThreadStore {
     pub async fn owned_conversation_spaces(
         space_rpc: &dyn SpaceRpc,
     ) -> labyrinth::Result<Vec<String>> {
+        // Name the type: the session's grant covers conversation Spaces, not every type,
+        // and a PDS refuses an unfiltered listing under such a grant.
         let body = space_rpc
-            .query("com.atproto.space.listSpaces", &[])
+            .query(
+                "com.atproto.space.listSpaces",
+                &[(
+                    "spaceType",
+                    labyrinth::store::space::CONVERSATION_SPACE_TYPE.to_owned(),
+                )],
+            )
             .await
             .map_err(labyrinth::store::space::map_space_error)?;
         let parsed: serde_json::Value = serde_json::from_slice(&body)

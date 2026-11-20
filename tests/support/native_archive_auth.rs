@@ -833,12 +833,23 @@ impl NativeArchiveAuthFixture {
                 ))
             }
             "com.atproto.space.listSpaces" => {
+                // A session's grants name concrete space types, so a PDS refuses a listing
+                // that names neither a type nor an authority (Swan 401, the reference 403).
+                let space_type = params.get("spaceType");
+                let space_did = params.get("spaceDid");
+                if space_type.is_none() && space_did.is_none() {
+                    return Ok(reply(401, json!({"error": "Unauthorized"})));
+                }
                 let world = self.world.lock().unwrap();
                 let spaces: BTreeSet<_> = world
                     .records
                     .keys()
                     .filter(|(_, repo, _, _)| repo == account)
                     .map(|(space, _, _, _)| space)
+                    .filter(|space| {
+                        space_type.is_none_or(|t| space.contains(&format!("/space/{t}/")))
+                            && space_did.is_none_or(|d| space.starts_with(&format!("at://{d}/")))
+                    })
                     .collect();
                 Ok(reply(
                     200,
