@@ -510,6 +510,30 @@ fn space_unreachable() -> OrchestratorError {
     )
 }
 
+/// The account's public key publisher as the mailbox Space store holds it. The store ends
+/// its purge by retracting the published keys and has no way to say "these cannot be
+/// retracted". A publisher that answers so (the gateway keeps the public key records
+/// create-only) leaves nothing more to remove, so the purge of everything else stands.
+struct MailboxSpaceKeyPublisher(PdsPublisher);
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl KeyPublisher for MailboxSpaceKeyPublisher {
+    async fn publish(
+        &self,
+        record: &labyrinth::records::MailboxKeysRecord,
+    ) -> labyrinth::Result<()> {
+        self.0.publish(record).await
+    }
+
+    async fn retract(&self) -> labyrinth::Result<()> {
+        match self.0.retract().await {
+            Err(labyrinth::Error::NotSupported(_)) => Ok(()),
+            other => other,
+        }
+    }
+}
+
 struct TransportClock(Arc<GatewayXrpcTransport>);
 
 impl labyrinth::client::Clock for TransportClock {
@@ -607,7 +631,10 @@ impl SessionDeps {
     fn space_store(&self) -> Option<SpaceMailboxStore> {
         let space = self.space.as_ref()?.clone();
         let publisher: Box<dyn KeyPublisher> = match &self.pds {
-            Some(pds) => Box::new(PdsPublisher::new(pds.clone(), &self.did)),
+            Some(pds) => Box::new(MailboxSpaceKeyPublisher(PdsPublisher::new(
+                pds.clone(),
+                &self.did,
+            ))),
             None => Box::new(self.ds_directory()),
         };
         let transport = self.transport.clone();

@@ -886,6 +886,13 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
     // deletion remains quarantined until historical non-revocation can be proved:
     // survivors retain the cursor, plaintext and exact unverified evidence.
     let deletion_cursor = last_seq(&alice_d1, &grp_cid);
+    // Carol has published public mailbox keys. The gateway keeps that collection
+    // create-only, so the deletion below can never remove them and must not stop there.
+    let carol_public_keys = ds.archive_auth.mailbox_keys_rkeys(CAROL_DID);
+    assert!(
+        carol_public_keys.iter().any(|rkey| rkey == "self"),
+        "carol published her mailbox keys before deleting: {carol_public_keys:?}"
+    );
     ds.inner.lock().unwrap().xrpc_failures.push((
         "/blue.catbird.labyrinth.deleteAccountData",
         500,
@@ -905,6 +912,11 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
         .delete_account_data()
         .expect("carol delete_account_data succeeds on retry");
     assert!(carol.is_handle_closed());
+    assert_eq!(
+        ds.archive_auth.mailbox_keys_rkeys(CAROL_DID),
+        carol_public_keys,
+        "the create-only public key records are left in place, not retracted"
+    );
     {
         let g = ds.inner.lock().unwrap();
         assert!(

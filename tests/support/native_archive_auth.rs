@@ -317,6 +317,19 @@ impl NativeArchiveAuthFixture {
             .map(|record| (record.value.clone(), record.cid.clone()))
     }
 
+    /// The rkeys of every public `mailboxKeys` record stored in the repository of `did`.
+    #[allow(dead_code)]
+    pub fn mailbox_keys_rkeys(&self, did: &str) -> Vec<String> {
+        self.world
+            .lock()
+            .unwrap()
+            .mailbox_keys
+            .keys()
+            .filter(|(owner, _)| owner == did)
+            .map(|(_, rkey)| rkey.clone())
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub fn did_document(&self, did: &str, pds_endpoint: &str) -> Result<Value, MLSError> {
         let mut doc = json!({
@@ -1033,22 +1046,13 @@ impl NativeArchiveAuthFixture {
                 if account != repo {
                     return Ok(reply(403, json!({"error": "NotAuthorized"})));
                 }
-                let rkey = rkey.ok_or_else(|| failure("mailbox rkey missing"))?;
-                let key = (repo.into(), rkey.into());
-                if body
-                    .and_then(|v| v["swapRecord"].as_str())
-                    .is_some_and(|expected| {
-                        world
-                            .mailbox_keys
-                            .get(&key)
-                            .map(|record| record.cid.as_str())
-                            != Some(expected)
-                    })
-                {
-                    return Ok(reply(400, json!({"error": "InvalidSwap"})));
-                }
-                world.mailbox_keys.remove(&key);
-                Ok(reply(200, json!({})))
+                rkey.ok_or_else(|| failure("mailbox rkey missing"))?;
+                // The production gateway keeps this collection create-only: it refuses
+                // `deleteRecord` for every rkey, the `self` pointer included.
+                Ok(reply(
+                    403,
+                    json!({"error": "Forbidden", "message": "Deleting blue.catbird.labyrinth.mailboxKeys records is forbidden"}),
+                ))
             }
             _ => Err(failure(format!("unsupported mailbox endpoint: {nsid}"))),
         }

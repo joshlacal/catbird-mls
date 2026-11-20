@@ -554,10 +554,28 @@ impl labyrinth::store::pds::PublicRepoBackend for NativeArchiveGateway {
                 let cid = record["cid"]
                     .as_str()
                     .ok_or(labyrinth::Error::Malformed("mailboxKeys CID"))?;
-                self.pds_json(&self.config.pds_endpoint, "POST", "/xrpc/com.atproto.repo.deleteRecord".into(),
-                    Some(serde_json::to_vec(&serde_json::json!({
-                        "repo": did, "collection": labyrinth::records::nsid::MAILBOX_KEYS, "rkey": rkey, "swapRecord": cid,
-                    })).map_err(|e| labyrinth::Error::Backend(e.to_string()))?))?;
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "repo": did, "collection": labyrinth::records::nsid::MAILBOX_KEYS, "rkey": rkey, "swapRecord": cid,
+                }))
+                .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+                match self.pds_json(
+                    &self.config.pds_endpoint,
+                    "POST",
+                    "/xrpc/com.atproto.repo.deleteRecord".into(),
+                    Some(body),
+                ) {
+                    Ok(_) => {}
+                    // The gateway keeps this collection create-only (a transparency rule), so it
+                    // refuses to delete any of its records. They hold public keys only, and an
+                    // account deletion must not stop here: report the records as not retractable,
+                    // which the deletion counts and continues past.
+                    Err(labyrinth::Error::Forbidden) => {
+                        return Err(labyrinth::Error::NotSupported(
+                            "the gateway keeps public mailbox key records create-only",
+                        ))
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             cursor = page["cursor"].as_str().map(str::to_owned);
             match &cursor {
