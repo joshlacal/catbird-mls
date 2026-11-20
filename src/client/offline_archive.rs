@@ -1086,6 +1086,7 @@ impl CatbirdMlsClient {
             })?;
             let mut st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+            st.archive_established = true;
             st.epoch_seq = st.epoch_seq.max(active_seq);
             if is_passkey {
                 tx.put_labyrinth_state(
@@ -1459,6 +1460,7 @@ impl CatbirdMlsClient {
             })?;
             let mut st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+            st.archive_established = true;
             st.epoch_seq = new_epoch_seq;
             st.has_recovery_code = true;
             if !st.active_device_ids.contains(&self.config.device_id) {
@@ -1954,6 +1956,27 @@ impl CatbirdMlsClient {
                     break;
                 }
             }
+        }
+
+        if total_committed > 0 {
+            // The offline test archive stands in for the flush that creates the archive.
+            let now_ms = self.hooks.now_ms();
+            self.db.write_tx(|tx| {
+                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                })?;
+                let mut st: LabyrinthBackupStatus =
+                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                if st.archive_established {
+                    return Ok(());
+                }
+                st.archive_established = true;
+                tx.put_labyrinth_state(
+                    "status_json",
+                    &serde_json::to_vec(&st).map_err(|e| MLSError::Internal(e.to_string()))?,
+                    now_ms,
+                )
+            })?;
         }
 
         if let Some(err) = first_err {

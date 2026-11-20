@@ -87,7 +87,16 @@ pub struct LabyrinthRotationExclusion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct LabyrinthBackupStatus {
+    // The owner's intent to back up: it gates queueing and flushing. It says nothing about
+    // whether an archive exists on the server; see `archive_established`. (A plain comment:
+    // a doc comment here would change the generated bindings of an existing field.)
     pub backup_enabled: bool,
+    /// True once this device has opened or created the account's archive on the server: a
+    /// session verified the mailbox Space with its device and epoch records. Never reset.
+    /// Until then `epoch_seq` and `active_device_ids` are first-open placeholders.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub archive_established: bool,
     pub mailbox_space_uri: String,
     pub has_recovery_code: bool,
     pub has_passkey_prf: bool,
@@ -744,6 +753,7 @@ pub(crate) mod native_client {
                 if tx.get_labyrinth_state("status_json")?.is_none() {
                     let initial = LabyrinthBackupStatus {
                         backup_enabled: true,
+                        archive_established: false,
                         mailbox_space_uri: mailbox_uri.clone(),
                         has_recovery_code: false,
                         has_passkey_prf: false,
@@ -2391,6 +2401,7 @@ pub(crate) mod native_client {
                         .map_err(|e| MLSError::Internal(e.to_string()))?;
                     #[cfg(feature = "labyrinth")]
                     {
+                        st.archive_established = true;
                         st.epoch_seq = rotated_remote.new_epoch;
                         st.rotation_exclusions = rotated_remote.exclusions.clone();
                     }
@@ -2472,6 +2483,7 @@ pub(crate) mod native_client {
                 st.active_device_ids.retain(|d| d != target_device_id);
                 #[cfg(feature = "labyrinth")]
                 {
+                    st.archive_established = true;
                     st.epoch_seq = rotated_remote.new_epoch;
                     st.rotation_exclusions = rotated_remote.exclusions.clone();
                     st.recovery_needs_attention =

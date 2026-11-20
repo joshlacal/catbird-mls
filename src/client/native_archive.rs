@@ -2025,6 +2025,8 @@ impl CatbirdMlsClient {
             let mut status: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
             let had_pending_publication = status.pending_directory_epoch.is_some();
+            // A session exists only after it opened or created the archive on the server.
+            status.archive_established = true;
             status.epoch_seq = session.latest_epoch();
             status.recovery_method_stale |= session.recovery_method_stale();
             status.has_recovery_code |= recovery_code;
@@ -2236,6 +2238,7 @@ impl CatbirdMlsClient {
             let mut st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
             let had_pending_publication = st.pending_directory_epoch.is_some();
+            st.archive_established = true;
             st.epoch_seq = latest_epoch.max(rotated_remote.new_epoch);
             st.rotation_exclusions = rotated_remote.exclusions.clone();
             st.recovery_method_stale = recovery_method_stale;
@@ -2468,6 +2471,7 @@ impl CatbirdMlsClient {
                     .ok_or_else(|| MLSError::InvalidState("archive status missing".into()))?;
                 let mut status: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                status.archive_established = true;
                 status.epoch_seq = session.latest_epoch();
                 status.pending_directory_epoch = session.pending_directory_epoch();
                 if session.directory_publish_attempted() {
@@ -6081,6 +6085,8 @@ impl CatbirdMlsClient {
             let mut st: LabyrinthBackupStatus =
                 serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
             st.active_device_ids.retain(|d| d != target_trimmed);
+            // With a chat key to revoke, an archive session opened before this point.
+            st.archive_established |= target_pubkey_opt.is_some();
             if let Some(seq) = new_epoch_seq {
                 st.epoch_seq = seq;
             }
