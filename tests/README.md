@@ -2,7 +2,7 @@
 
 Integration targets for `catbird-mls`. Run them from the repository root.
 
-The crate pins OpenMLS `=0.9.0-rc.3` (rev `e7c2437e845eb767d2cdd22eece2b3c5d484e4e7`). It also depends on the sibling `labyrinth` crate through the default `labyrinth` feature, so the toolchain must build edition-2024 crates (Rust 1.85 or later).
+The crate pins OpenMLS `=0.9.0-rc.3` (rev `679bdc31ef44dc919f28aee9ce442ec8eb0682c0`). It also depends on the sibling `labyrinth` crate through the default `labyrinth` feature, so the toolchain must build edition-2024 crates (Rust 1.85 or later).
 
 ## Client and archive contract targets
 

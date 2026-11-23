@@ -1,0 +1,18 @@
+[book]
+title = "Catbird MLS"
+description = "End-to-end encrypted chat for Catbird on AT Protocol: the catbird-mls client library, its security model and its API."
+authors = ["Josh LaCalamito"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/joshlacal/catbird-mls"
+edit-url-template = "https://github.com/joshlacal/catbird-mls/edit/main/docs/book/{path}"
+site-url = "/catbird-mls/"
+
+[output.html.search]
+enable = true

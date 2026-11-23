@@ -1,0 +1,120 @@
+name: Docs
+
+# Builds the Catbird MLS book (docs/book, mdBook) and the rustdoc API
+# reference, and publishes them together with GitHub Pages at
+# https://joshlacal.github.io/catbird-mls/ (the API under /api/).
+#
+# Pull requests build the site to catch broken pages but never deploy, so
+# nothing from a fork can publish. Deploys run only for pushes to main and by
+# hand.
+#
+# Needs Settings > Pages > Build and deployment > Source set to "GitHub
+# Actions".
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'docs/book/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docs-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MDBOOK_VERSION: 0.4.52
+  # Sibling repositories that Cargo.toml takes by path. These are the commits
+  # of the latest CatbirdMLSCore release (Scripts/ffi-release-inputs.json);
+  # move them together with it.
+  CATBIRD_ATPROTO_REV: e3356fd4f3349de1d647e3558964d08449c03b13
+  LABYRINTH_REV: a484e9ef14ddb42d7d7212f1c9eb468ee152acd7
+
+jobs:
+  build-site:
+    name: Build book and API reference
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Check out sibling repositories
+        run: |
+          set -euo pipefail
+          for pair in "catbird-atproto:$CATBIRD_ATPROTO_REV" "labyrinth:$LABYRINTH_REV"; do
+            name="${pair%%:*}"; rev="${pair#*:}"
+            git init -q "../$name"
+            git -C "../$name" fetch -q --depth 1 "https://github.com/joshlacal/$name" "$rev"
+            git -C "../$name" checkout -q FETCH_HEAD
+          done
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cmake pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build the book
+        run: mdbook build docs/book
+      - name: Build the API reference
+        env:
+          # A transitive git dependency stalls under libgit2; use the git CLI.
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: cargo doc --no-deps --locked
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          site=target/book
+          test -f "$site/index.html"
+          rm -rf "$site/api"
+          cp -R target/doc "$site/api"
+          test -f "$site/api/catbird_mls/index.html"
+          # rustdoc has no page at its root; send it to the crate.
+          cat > "$site/api/index.html" <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <title>Catbird MLS API reference</title>
+          <link rel="canonical" href="catbird_mls/">
+          <meta http-equiv="refresh" content="0; url=catbird_mls/">
+          </head>
+          <body>
+          <p><a href="catbird_mls/">Catbird MLS API reference</a></p>
+          </body>
+          </html>
+          HTML
+          touch "$site/.nojekyll"
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: target/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build-site
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
