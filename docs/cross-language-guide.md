@@ -1,3 +1,5 @@
+> **Out of date.** This guide describes an earlier API (`CatbirdMls`, `OrchestratorStorageCallback`, `WasmCatbirdClient`) that the library no longer exposes. All platforms now use `CatbirdMlsClient` with the `PlatformKeyStore`, `PlatformTransport` and `PlatformChangeObserver` traits. See the [Catbird MLS book](https://joshlacal.github.io/catbird-mls/guide/integrating.html), or `docs/book/` in this repository.
+
 # catbird-mls Cross-Language Usage Guide
 
 ## 1. Overview

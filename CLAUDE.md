@@ -2,7 +2,7 @@
 
 ## Overview
 
-`catbird-mls` is the core MLS (Messaging Layer Security) SDK for all Catbird clients. It implements OpenMLS group cryptography (pinned at `=0.9.0-rc.3`, rev `e7c2437e845eb767d2cdd22eece2b3c5d484e4e7`; do not change the pin), the `CatbirdMlsClient` SDK with its Labyrinth history archive, a platform-agnostic orchestrator (sync, recovery, messaging policy), and UniFFI bindings, so Swift and Kotlin call one Rust library. It also contains voice encoding (Opus/OGG) and blob crypto (AES-256-GCM), which makes it a monolith that should eventually be split. The spec that governs all behavior is `docs/MLS_CLIENT_PROTOCOL.md` in the Catbird+Petrel workspace root, not in this repo.
+`catbird-mls` is the core MLS (Messaging Layer Security) SDK for all Catbird clients. It implements OpenMLS group cryptography (pinned at `=0.9.0-rc.3`, rev `679bdc31ef44dc919f28aee9ce442ec8eb0682c0`; do not change the pin), the `CatbirdMlsClient` SDK with its Labyrinth history archive, a platform-agnostic orchestrator (sync, recovery, messaging policy), and UniFFI bindings, so Swift and Kotlin call one Rust library. It also contains voice encoding (Opus/OGG) and blob crypto (AES-256-GCM), which makes it a monolith that should eventually be split. The spec that governs all behavior is `docs/MLS_CLIENT_PROTOCOL.md` in the Catbird+Petrel workspace root, not in this repo.
 
 ## Build & Test Commands
 
