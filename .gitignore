@@ -28,3 +28,4 @@ build/
 **/*.rs.bk
 /_trash/
 
+_site/
