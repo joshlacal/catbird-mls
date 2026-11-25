@@ -259,7 +259,7 @@ mod native_archive_space_auth {
             }) {
                 return Err("native_space_conflicting_auth_headers".into());
             }
-            let space = SpaceUri::parse_hedged(required(&params, "space")?)
+            let space = SpaceUri::parse(required(&params, "space")?)
                 .map_err(|e| format!("native_space_invalid_space: {e}"))?;
             let writer = if writer_endpoint {
                 required(&params, "repo")?.to_owned()
@@ -720,7 +720,7 @@ mod native_archive_space_auth {
                 now,
             ))
             .map_err(|e| format!("native_space_invalid_credential: {e}"))?;
-            let claims_space = SpaceUri::parse_hedged(&claims.sub).ok().map(|s| s.raw);
+            let claims_space = SpaceUri::parse(&claims.sub).ok().map(|s| s.raw);
             if claims.iss != space.authority
                 || claims_space.as_deref() != Some(space.raw.as_str())
                 || claims.cnf_kid.as_deref() != Some(kid.as_str())
@@ -816,7 +816,7 @@ mod native_archive_space_auth {
             {
                 return Err("not a Space denial".into());
             }
-            let claims_space = SpaceUri::parse_hedged(&claims.sub).ok().map(|s| s.raw);
+            let claims_space = SpaceUri::parse(&claims.sub).ok().map(|s| s.raw);
             if claims.iss != space.authority
                 || claims_space.as_deref() != Some(space.raw.as_str())
                 || claims.aud != self.config.account_did
@@ -1570,7 +1570,7 @@ mod native_archive_space_auth {
                     .map_err(|e| format!("native_space_list_coordinates: {e}"))?;
                 let stub_uri_norm = stub.uri.as_deref().map(|u| {
                     if let Some((prefix, rest)) = u.split_once(&format!("/{}/", context.writer)) {
-                        if let Ok(parsed) = SpaceUri::parse_hedged(prefix) {
+                        if let Ok(parsed) = SpaceUri::parse(prefix) {
                             return format!("{}/{}/{rest}", parsed.raw, context.writer);
                         }
                     }
@@ -1579,7 +1579,7 @@ mod native_archive_space_auth {
                 let stub_space_norm = stub
                     .space
                     .as_deref()
-                    .and_then(|s| SpaceUri::parse_hedged(s).ok().map(|p| p.raw));
+                    .and_then(|s| SpaceUri::parse(s).ok().map(|p| p.raw));
                 if params
                     .get("collection")
                     .is_some_and(|c| c != &stub.collection)
@@ -1937,7 +1937,7 @@ mod native_archive_space_auth {
         let envelope_uri = if let Some((prefix, rest)) =
             envelope.uri.split_once(&format!("/{}/", context.writer))
         {
-            if let Ok(parsed) = SpaceUri::parse_hedged(prefix) {
+            if let Ok(parsed) = SpaceUri::parse(prefix) {
                 format!("{}/{}/{rest}", parsed.raw, context.writer)
             } else {
                 envelope.uri.clone()
@@ -1973,7 +1973,7 @@ mod native_archive_space_auth {
         commit: &Commit,
     ) -> Result<(), String> {
         let (key_share, secret) = negotiated;
-        let commit_space = SpaceUri::parse_hedged(&commit.space)
+        let commit_space = SpaceUri::parse(&commit.space)
             .ok()
             .map(|s| s.raw);
         if commit_space.as_deref() != Some(context.space.raw.as_str())
