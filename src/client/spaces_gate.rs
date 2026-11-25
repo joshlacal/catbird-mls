@@ -137,6 +137,32 @@ fn repo_scope_granted(granted_scopes: &[String], required: &str) -> bool {
     })
 }
 
+const SPACE_DEFAULT_ACTIONS: [&str; 4] = ["read", "create", "update", "delete"];
+
+fn decode_scope_param_value(raw: &str) -> Option<String> {
+    if !raw.contains('%') {
+        return Some(raw.to_string());
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn scope_granted(granted_scopes: &[String], required: &str, account_did: &str) -> bool {
     if required.starts_with("repo:") {
         return repo_scope_granted(granted_scopes, required);
@@ -154,6 +180,12 @@ fn scope_granted(granted_scopes: &[String], required: &str, account_did: &str) -
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .collect();
+    let normalized_account_did = account_did
+        .trim()
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     granted_scopes.iter().any(|grant| {
         let Some((granted_family, query)) = grant.trim().split_once('?') else {
             return false;
@@ -161,49 +193,81 @@ fn scope_granted(granted_scopes: &[String], required: &str, account_did: &str) -
         if granted_family != family {
             return false;
         }
-        let mut params = Vec::new();
-        let mut authority = None;
-        let mut skey = None;
+        let mut params: Vec<(&str, String)> = Vec::new();
+        let mut authority: Option<String> = None;
+        let mut skey: Option<String> = None;
+        let mut has_explicit_action = false;
         for pair in query.split('&') {
-            let Some((key, value)) = pair.split_once('=') else {
+            let Some((key, raw_value)) = pair.split_once('=') else {
+                return false;
+            };
+            let Some(value) = decode_scope_param_value(raw_value) else {
                 return false;
             };
             if value.is_empty() {
                 return false;
             }
             match key {
-                "authority" if authority.is_none() => authority = Some(value),
-                "skey" if skey.is_none() => skey = Some(value),
+                "authority" if authority.is_none() => authority = Some(value.clone()),
+                "skey" if skey.is_none() => skey = Some(value.clone()),
                 "collection"
                     if value == "*"
                         || value
                             .bytes()
                             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-')) => {}
                 "action"
-                    if matches!(value, "read" | "read_self" | "create" | "update" | "delete") => {}
-                "manage" if matches!(value, "create" | "update" | "delete") => {}
+                    if matches!(
+                        value.as_str(),
+                        "read" | "read_self" | "create" | "update" | "delete"
+                    ) =>
+                {
+                    has_explicit_action = true;
+                }
+                "manage" if matches!(value.as_str(), "create" | "update" | "delete") => {}
                 _ => return false,
             }
             params.push((key, value));
         }
-        let authority = authority.unwrap_or("self");
+        // Per @atproto/oauth-scopes SpacePermission grammar, omitting `action` means
+        // the default action set (`read`, `create`, `update`, `delete`); `collection`
+        // still defaults to empty (no write collections).
+        if !has_explicit_action {
+            for default_action in SPACE_DEFAULT_ACTIONS {
+                params.push(("action", default_action.to_string()));
+            }
+        }
+        let authority = authority.as_deref().unwrap_or("self");
         let any_authority = required.contains(&("authority", "*"));
         let authority_matches = if any_authority {
             authority == "*"
         } else {
-            authority == "self" || authority == account_did || authority == "*"
+            authority == "self"
+                || authority == "*"
+                || (!normalized_account_did.is_empty()
+                    && authority.to_ascii_lowercase() == normalized_account_did)
         };
         if !authority_matches {
             return false;
         }
         let personal = family == "space:blue.catbird.labyrinth.mailbox";
-        if skey.is_some_and(|key| key != "*" && !(personal && key == "self")) {
+        if skey
+            .as_deref()
+            .is_some_and(|key| key != "*" && !(personal && key == "self"))
+        {
             return false;
         }
         required.iter().all(|&(key, value)| {
             key == "authority"
-                || params.contains(&(key, value))
-                || key == "collection" && params.contains(&("collection", "*"))
+                || params.iter().any(|(pk, pv)| *pk == key && pv == value)
+                || (key == "action"
+                    && value == "read_self"
+                    && params
+                        .iter()
+                        .any(|(pk, pv)| *pk == "action" && pv == "read"))
+                || (key == "collection"
+                    && params
+                        .iter()
+                        .any(|(pk, pv)| *pk == "collection" && pv == "*"))
         })
     })
 }
@@ -332,6 +396,30 @@ mod tests {
                 .iter()
                 .any(|required| scope_granted(&[legacy.into()], required, did)));
         }
+
+        // Verify canonical @atproto/oauth-scopes SpacePermission output from token responses:
+        // server resolves authority=self to the user's DID and omits default actions
+        // (read, create, update, delete) while retaining explicit collections and manage ops.
+        let canonical_mailbox = format!(
+            "space:blue.catbird.labyrinth.mailbox?authority={did}&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete"
+        );
+        let canonical_convo = "space:blue.catbird.labyrinth.conversation?authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek";
+        let percent_encoded_convo = canonical_convo.replace("authority=*", "authority=%2A");
+        assert!(scope_granted(
+            &[canonical_mailbox],
+            REQUIRED_LABYRINTH_OAUTH_SCOPES[5],
+            did
+        ));
+        assert!(scope_granted(
+            &[canonical_convo.to_string()],
+            REQUIRED_LABYRINTH_OAUTH_SCOPES[6],
+            did
+        ));
+        assert!(scope_granted(
+            &[percent_encoded_convo],
+            REQUIRED_LABYRINTH_OAUTH_SCOPES[6],
+            did
+        ));
 
         // Verify repo scope rules & subsumption (`Y-6` / `D-12`):
         // `mailboxKeys` requires full CRUD (`putRecord` updates on epoch rotation),
