@@ -5682,15 +5682,20 @@ impl CatbirdMlsClient {
 
     /// Clean single-device sign-out (`#29` §c / `Y-8`): leaves active MLS conversations when
     /// this device is the account's sole active device, best-effort removes this device's PDS
-    /// `blue.catbird.chat.device/<device_id>` record, and wipes local SQLCipher + Keychain
-    /// state WITHOUT touching the account's `OwnerMailbox` Space or recovery methods.
+    /// `blue.catbird.chat.device/<device_id>` record, revokes this device on `mls-ds`, and wipes
+    /// local SQLCipher + Keychain state WITHOUT touching the account's `OwnerMailbox` Space or
+    /// recovery methods.
+    ///
+    /// The `mls-ds` self-revocation matters: a wiped device whose row stays `active` keeps
+    /// vetoing every pending sibling's recovery while it still looks awake, and then holds it
+    /// behind the full notice period, although nothing can ever approve from it again.
     pub fn retire_current_device(&self) -> Result<(), MLSError> {
         if self.is_handle_closed() {
             return Err(MLSError::ContextClosed);
         }
         let _ = self.flush_labyrinth_queue();
         if let Some(own_device_id) = self.canonical_uuid_v4_device_id() {
-            if let Ok((signer, _)) = self.load_enrolled_signer_and_auth_gen() {
+            if let Ok((signer, auth_gen)) = self.load_enrolled_signer_and_auth_gen() {
                 let own_devices_opt = self
                     .query_signed_chat_ds(
                         "blue.catbird.chat.getOwnDevices",
@@ -5754,9 +5759,44 @@ impl CatbirdMlsClient {
                         );
                     }
                 }
+                if let Err(error) = self.revoke_own_device_on_ds(&own_device_id, &signer, auth_gen)
+                {
+                    tracing::warn!(%error, "sign-out could not revoke this device on mls-ds");
+                }
             }
         }
         self.sign_out_and_wipe()
+    }
+
+    /// Best-effort `chat.revokeDevice` with this device as both actor and target. A pending
+    /// device is refused by the server, which is harmless: it was never an approver.
+    fn revoke_own_device_on_ds(
+        &self,
+        own_device_id: &str,
+        signer: &SignatureKeyPair,
+        auth_gen: i64,
+    ) -> Result<(), MLSError> {
+        let key_id = crate::orchestrator::canonical_transport::derive_key_id(signer.public());
+        let revoke_body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#deviceRevocationBody",
+            "signatureDomain": "CATBIRD-CHAT-DEVICE-REVOKE\0",
+            "actorDid": self.normalized_did,
+            "actorDeviceId": own_device_id,
+            "authGeneration": auth_gen,
+            "targetDeviceId": own_device_id,
+            "targetAuthGeneration": auth_gen,
+            "idempotencyKey": self.hooks.uuid_v4().to_string(),
+            "keyId": key_id,
+            "signedAt": self.hooks.now_rfc3339_millis(),
+        });
+        self.submit_signed_chat_op(
+            own_device_id,
+            Some(auth_gen),
+            crate::orchestrator::canonical_transport::CanonicalOperation::RevokeDevice,
+            &revoke_body,
+            signer,
+        )
+        .map(|_| ())
     }
 
     /// Unified account device inventory combining `mls-ds` `getOwnDevices` (`deviceName`,

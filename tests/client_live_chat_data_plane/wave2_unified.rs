@@ -872,6 +872,18 @@ fn unified_revoke_device_retire_current_device_and_fail_closed_delete_account_da
         .retire_current_device()
         .expect("bob_d2 retire_current_device");
     assert!(bob_d2.is_handle_closed());
+    // A wiped device must not stay active on mls-ds: its row would keep
+    // blocking a pending sibling's recovery although it can never approve.
+    assert_eq!(
+        ds.inner
+            .lock()
+            .unwrap()
+            .device_statuses
+            .get(&(BOB_DID.to_string(), bob_d2_dev.clone()))
+            .map(String::as_str),
+        Some("revoked"),
+        "retire_current_device must revoke its own mls-ds device row"
+    );
     alice_d1.sync().expect("alice_d1 syncs after bob_d2 retire");
     bob_d1
         .sync()
