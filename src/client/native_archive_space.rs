@@ -622,7 +622,66 @@ mod native_archive_space_auth {
             Err("native_space_invalid_entropy".into())
         }
 
+        /// Exchange a fresh Space credential, replaying a recent server refusal instead of
+        /// asking again. Only HTTP refusals are remembered: a transport failure, a closed
+        /// context or a membership denial is never cached.
         fn space_credential(
+            &self,
+            space: &SpaceUri,
+            personal: bool,
+            authority: DidDocument,
+        ) -> Result<Result<Credential, PlatformHttpResponse>, String> {
+            let cache_key = format!(
+                "{}|{}",
+                if personal { "personal" } else { "relay" },
+                space.raw
+            );
+            let now = self.hooks.now_secs();
+            {
+                let mut failures = self
+                    .credential_failures
+                    .lock()
+                    .map_err(|_| "native_space_credential_failure_cache_poisoned")?;
+                match failures.get(&cache_key) {
+                    Some((retry_at, error)) if *retry_at > now => return Err(error.clone()),
+                    Some(_) => {
+                        failures.remove(&cache_key);
+                    }
+                    None => {}
+                }
+            }
+            let result = self.space_credential_uncached(space, personal, authority);
+            let mut failures = self
+                .credential_failures
+                .lock()
+                .map_err(|_| "native_space_credential_failure_cache_poisoned")?;
+            match &result {
+                Err(error) if is_credential_refusal(error) => {
+                    if failures.len() >= MAX_CREDENTIAL_FAILURES
+                        && !failures.contains_key(&cache_key)
+                    {
+                        failures.retain(|_, (retry_at, _)| *retry_at > now);
+                        if failures.len() >= MAX_CREDENTIAL_FAILURES {
+                            failures.pop_first();
+                        }
+                    }
+                    failures.insert(
+                        cache_key,
+                        (
+                            now.saturating_add(CREDENTIAL_FAILURE_BACKOFF_SECS),
+                            error.clone(),
+                        ),
+                    );
+                }
+                Ok(_) => {
+                    failures.remove(&cache_key);
+                }
+                Err(_) => {}
+            }
+            result
+        }
+
+        fn space_credential_uncached(
             &self,
             space: &SpaceUri,
             personal: bool,
@@ -2076,6 +2135,18 @@ mod native_archive_space_auth {
         Ok(response)
     }
 
+    /// How long a server refusal of a credential exchange is replayed before asking again.
+    const CREDENTIAL_FAILURE_BACKOFF_SECS: u64 = 30;
+    /// Upper bound on remembered refusals, so a long session cannot grow the cache unbounded.
+    const MAX_CREDENTIAL_FAILURES: usize = 256;
+
+    /// A credential exchange the server answered with an error status (see `require_success`).
+    fn is_credential_refusal(error: &str) -> bool {
+        (error.starts_with("native_space_getDelegationToken: HTTP ")
+            || error.starts_with("native_space_authorizeSpaceSync: HTTP "))
+            && !error.contains(": HTTP 401 ")
+    }
+
     fn require_success(response: &PlatformHttpResponse, operation: &str) -> Result<(), String> {
         if !(200..300).contains(&response.status) {
             #[derive(Deserialize)]
@@ -2494,6 +2565,13 @@ mod native_archive_space_auth {
                         .headers
                         .iter()
                         .all(|h| !h.name.eq_ignore_ascii_case("authorization")));
+                    if fault == "delegation_invalid_request" {
+                        return Ok(PlatformHttpResponse {
+                            status: 400,
+                            headers: vec![],
+                            body: br#"{"error":"InvalidRequest"}"#.to_vec(),
+                        });
+                    }
                     return Ok(response(json!({"token": "pds-oauth-delegation"})));
                 }
                 if matches!(
@@ -3028,6 +3106,7 @@ mod native_archive_space_auth {
                 signer: Arc::new(NativeArchiveSigner(signer)),
                 hooks,
                 verified_inventories: Mutex::new(BTreeMap::new()),
+                credential_failures: Mutex::new(BTreeMap::new()),
             };
             (directory, gateway, host)
         }
@@ -3380,6 +3459,82 @@ mod native_archive_space_auth {
                 error.starts_with("native_space_authorizeSpaceSync: HTTP 401"),
                 "{error}"
             );
+        }
+
+        fn count_requests(host: &Host, nsid: &str) -> usize {
+            host.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.contains(&format!("/xrpc/{nsid}")))
+                .count()
+        }
+
+        #[test]
+        fn native_space_auth_replays_a_recent_credential_refusal_instead_of_asking_again() {
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "delegation_invalid_request";
+            let first =
+                block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false)))
+                    .unwrap_err();
+            assert_eq!(
+                first, "native_space_getDelegationToken: HTTP 400 InvalidRequest",
+                "{first}"
+            );
+            for _ in 0..5 {
+                let again =
+                    block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false)))
+                        .unwrap_err();
+                assert_eq!(again, first);
+            }
+            assert_eq!(
+                count_requests(&host, "com.atproto.space.getDelegationToken"),
+                1,
+                "a refused exchange must not be retried inside the backoff window"
+            );
+
+            // Once the window passes, the next read asks the server again.
+            for (retry_at, _) in gateway.credential_failures.lock().unwrap().values_mut() {
+                *retry_at = NOW;
+            }
+            *host.fault.lock().unwrap() = "";
+            block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false))).unwrap();
+            assert_eq!(
+                count_requests(&host, "com.atproto.space.getDelegationToken"),
+                2
+            );
+            assert!(gateway.credential_failures.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn native_space_auth_backoff_is_per_space_and_exchange_kind() {
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "delegation_invalid_request";
+            block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false)))
+                .unwrap_err();
+            // The personal mailbox exchange is a different key and still asks the server.
+            block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, true)))
+                .unwrap_err();
+            assert_eq!(
+                count_requests(&host, "com.atproto.space.getDelegationToken"),
+                2
+            );
+        }
+
+        #[test]
+        fn native_space_auth_does_not_remember_an_auth_failure() {
+            // A 401 can clear once the platform refreshes its session, so it is retried at once.
+            let (_directory, gateway, host) = gateway();
+            *host.fault.lock().unwrap() = "credential_auth_failed";
+            for _ in 0..2 {
+                block_on_sync(gateway.execute_authenticated_space(request(GET_RECORD, false)))
+                    .unwrap_err();
+            }
+            assert_eq!(
+                count_requests(&host, "blue.catbird.chat.relaySpaceCredential"),
+                2
+            );
+            assert!(gateway.credential_failures.lock().unwrap().is_empty());
         }
 
         fn pin_group(gateway: &NativeArchiveGateway, group: [u8; 32]) {
