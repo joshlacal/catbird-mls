@@ -368,6 +368,36 @@ fn rewrite_legacy_space_uris(conn: &mut Connection) -> Result<(), MLSError> {
         }
     }
 
+    // Staged C33 openings: `account_meta` `c33_pending_opening:{cid}` carries the archive's
+    // top-level `space_uri`, which is enqueued unchanged once the opening is accepted.
+    let rows: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT key, uri FROM (\
+                 SELECT key, CASE WHEN json_valid(value_json) \
+                 THEN json_extract(value_json, '$.space_uri') END AS uri \
+                 FROM account_meta WHERE key GLOB 'c33_pending_opening:*') \
+                 WHERE uri LIKE 'at://%/space/%'",
+            )
+            .map_err(|e| map_rusqlite_err("space uri rewrite c33 openings", &e))?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| map_rusqlite_err("space uri rewrite c33 openings", &e))?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| map_rusqlite_err("space uri rewrite c33 openings", &e))?
+    };
+    for (key, uri) in rows {
+        if let Some(new_uri) = from_legacy_space_uri(&uri) {
+            tx.execute(
+                "UPDATE account_meta SET value_json = \
+                 json_set(value_json, '$.space_uri', ?2) WHERE key = ?1",
+                rusqlite::params![key, new_uri],
+            )
+            .map_err(|e| map_rusqlite_err("space uri rewrite c33 openings", &e))?;
+        }
+    }
+
     tx.execute(
         "INSERT OR REPLACE INTO account_meta(key, value_json, updated_at_ms) VALUES(?1, '1', 0)",
         [SPACE_URI_REWRITE_MARKER_KEY],

@@ -9,6 +9,7 @@ const OLD: &str = "at://did:web:ds.example/space/blue.catbird.labyrinth.conversa
 const NEW: &str = "at:space/did:web:ds.example/blue.catbird.labyrinth.conversation/c1-0";
 const PINS_KEY: &str = "native.placements:threads:did:plc:alice";
 const OTHER_KEY: &str = "native.message:c1:m1";
+const C33_KEY: &str = "c33_pending_opening:c1";
 
 #[test]
 fn open_rewrites_stored_alpha_space_uris() {
@@ -33,6 +34,14 @@ fn open_rewrites_stored_alpha_space_uris() {
             let pins = format!(r#"{{"c1":{{"space":"{OLD}","generation":0}}}}"#);
             tx.put_labyrinth_state(PINS_KEY, pins.as_bytes(), 0)?;
             tx.put_labyrinth_state(OTHER_KEY, OLD.as_bytes(), 0)?;
+            let opening = format!(r#"{{"space_uri":"{OLD}","signed":"{OLD}"}}"#);
+            tx.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO account_meta(key, value_json, updated_at_ms) \
+                     VALUES(?1, ?2, 0)",
+                    rusqlite::params![C33_KEY, opening],
+                )
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
             // Pretend this database predates the rewrite.
             tx.conn()
                 .execute(
@@ -53,6 +62,18 @@ fn open_rewrites_stored_alpha_space_uris() {
         let pins: serde_json::Value = serde_json::from_slice(&pins).expect("pins json");
         assert_eq!(pins["c1"]["space"], NEW);
         assert_eq!(pins["c1"]["generation"], 0);
+        let opening: String = tx
+            .conn()
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key = ?1",
+                [C33_KEY],
+                |row| row.get(0),
+            )
+            .map_err(|e| MLSError::Internal(e.to_string()))?;
+        let opening: serde_json::Value = serde_json::from_str(&opening).expect("opening json");
+        assert_eq!(opening["space_uri"], NEW);
+        // Only `space_uri` is rewritten; other fields keep their values.
+        assert_eq!(opening["signed"], OLD);
         // Stores outside the rewrite's list are left alone.
         assert_eq!(
             tx.get_labyrinth_state(OTHER_KEY)?.as_deref(),
