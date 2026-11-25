@@ -108,6 +108,10 @@ struct NativeArchiveGateway {
     signer: Arc<NativeArchiveSigner>,
     hooks: crate::sim_hooks::SimClientHooks,
     verified_inventories: Mutex<std::collections::BTreeMap<String, VerifiedArchiveInventory>>,
+    /// Space credential exchanges the server just refused, keyed by Space and exchange kind,
+    /// with the refusal and when it may be retried. A refusal is replayed until then so one
+    /// broken Space cannot turn every read into a fresh delegation-token request.
+    credential_failures: Mutex<std::collections::BTreeMap<String, (u64, String)>>,
 }
 
 #[cfg(feature = "labyrinth")]
@@ -1825,6 +1829,7 @@ impl CatbirdMlsClient {
             signer: signer.clone(),
             hooks: self.hooks.clone(),
             verified_inventories: Mutex::new(std::collections::BTreeMap::new()),
+            credential_failures: Mutex::new(std::collections::BTreeMap::new()),
         });
         let transport = Arc::new(
             crate::labyrinth::GatewayXrpcTransport::new(
@@ -6372,6 +6377,7 @@ impl CatbirdMlsClient {
                 signer: rogue_arc_signer.clone(),
                 hooks: self.hooks.clone(),
                 verified_inventories: Mutex::new(std::collections::BTreeMap::new()),
+                credential_failures: Mutex::new(std::collections::BTreeMap::new()),
             });
             let rogue_xrpc = Arc::new(
                 crate::labyrinth::GatewayXrpcTransport::new(
