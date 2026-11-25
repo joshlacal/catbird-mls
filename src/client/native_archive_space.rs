@@ -2298,7 +2298,7 @@ mod native_archive_space_auth {
                     "wrong_requester" => claims["aud"] = WRITER.into(),
                     "wrong_space" => {
                         claims["sub"] =
-                            format!("at://{}/space/{}/other-0", space.authority, space.space_type)
+                            format!("at:space/{}/{}/other-0", space.authority, space.space_type)
                                 .into()
                     }
                     "wrong_conversation" => claims["conversationId"] = "other".into(),
@@ -2378,7 +2378,7 @@ mod native_archive_space_auth {
                 headers: vec![
                     PlatformHttpHeader {
                         name: RECORD_MAC_HEADER.into(),
-                        value: "uri=\"at://...\"".into(),
+                        value: "uri=\"at:space/...\"".into(),
                     },
                     PlatformHttpHeader {
                         name: SIGNATURE_INPUT_HEADER.into(),
@@ -2546,7 +2546,7 @@ mod native_archive_space_auth {
                     let other_kid = encode_p256_did_key(&self.kem.public_key());
                     let subject = if fault == "wrong_space" {
                         format!(
-                            "at://{}/space/{}/other",
+                            "at:space/{}/{}/other",
                             space.authority, space.space_type
                         )
                     } else {

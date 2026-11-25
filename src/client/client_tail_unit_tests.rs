@@ -1185,7 +1185,7 @@ fn setup_push_unit_fixture(authorize_bob_in_alice_db: bool, two_bob_devices: boo
                     last_seq: 1,
                     sequencer_did: "did:web:ds.example".into(),
                     space_uri: Some(format!(
-                        "at://did:web:ds.example/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
+                        "at:space/did:web:ds.example/blue.catbird.labyrinth.conversation/{conversation_id}-0"
                     )),
                     title: Some("Unit Push Group".into()),
                     unread_count: 0,

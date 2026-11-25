@@ -1,9 +1,9 @@
 //! Clean-slate Spaces-only Labyrinth 1.1 encrypted chat history (`feature = "labyrinth"`).
 //!
 //! Personal mailboxes live strictly in each account's personal Space on its PDS
-//! (`at://{did}/space/blue.catbird.labyrinth.mailbox/self`), and conversation
+//! (`at:space/{did}/blue.catbird.labyrinth.mailbox/self`), and conversation
 //! history lives strictly in each conversation's Option A Space on the
-//! sequencing `mls-ds` (`at://{authorityDid}/space/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`).
+//! sequencing `mls-ds` (`at:space/{authorityDid}/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`).
 //! `mls-ds` stores zero mailboxes, sender batches, MEKs, attachment manifests,
 //! or ORF state (`G6`, `I14`, `2A`).
 

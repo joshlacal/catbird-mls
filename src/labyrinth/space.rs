@@ -336,7 +336,7 @@ impl SpaceRpc for SpaceXrpcTransport {
 /// Clean-slate mailbox placement (`Spaces-only` per Spec §3.2 `G6`, `I14`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Placement {
-    /// The account's personal Space on its PDS (`at://{did}/space/blue.catbird.labyrinth.mailbox/self`).
+    /// The account's personal Space on its PDS (`at:space/{did}/blue.catbird.labyrinth.mailbox/self`).
     #[default]
     Space,
 }
@@ -672,7 +672,7 @@ impl MailboxStore for SpaceMailbox {
 
 /// Conversation [`ThreadStore`] backed by [`labyrinth::store::space::SpaceThreadStore`]
 /// that resolves and pins each conversation's Option A Space URI
-/// (`at://{sequencerDid}/space/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`)
+/// (`at:space/{sequencerDid}/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`)
 /// from persisted `ThreadPlacement` pins or `blue.catbird.chat.getConversationState`.
 pub struct ResolvingSpaceThreadStore {
     did: String,

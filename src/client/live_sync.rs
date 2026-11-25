@@ -79,7 +79,7 @@ pub(crate) fn conversation_space_uri(sequencer_did: &str, cid: &str, generation:
     atproto_spaces::SpaceUri::new(sequencer_did, "blue.catbird.labyrinth.conversation", &rkey)
         .map(|u| u.to_string())
         .unwrap_or_else(|_| {
-            format!("at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{rkey}")
+            format!("at:space/{sequencer_did}/blue.catbird.labyrinth.conversation/{rkey}")
         })
 }
 
@@ -1605,8 +1605,11 @@ impl CatbirdMlsClient {
             let space_uri = row
                 .space_uri
                 .as_deref()
-                .and_then(|uri| uri.strip_prefix("at://")?.split_once('/'))
-                .map(|(_, path)| format!("at://{authority}/{path}"))
+                .and_then(|uri| atproto_spaces::SpaceUri::parse_hedged(uri).ok())
+                .and_then(|uri| {
+                    atproto_spaces::SpaceUri::new(authority, &uri.space_type, &uri.rkey).ok()
+                })
+                .map(|uri| uri.to_string())
                 .unwrap_or_else(|| conversation_space_uri(authority, cid, row.generation));
             tx.conn()
                 .execute(

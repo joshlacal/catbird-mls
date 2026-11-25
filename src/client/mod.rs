@@ -371,7 +371,7 @@ pub struct QueuedLabyrinthArchivePayload {
 pub fn personal_mailbox_space_uri(account_did: &str) -> String {
     atproto_spaces::SpaceUri::new(account_did, "blue.catbird.labyrinth.mailbox", "self")
         .map(|u| u.to_string())
-        .unwrap_or_else(|_| format!("at://{account_did}/space/blue.catbird.labyrinth.mailbox/self"))
+        .unwrap_or_else(|_| format!("at:space/{account_did}/blue.catbird.labyrinth.mailbox/self"))
 }
 
 /// Generate a 40-character GF(32) Labyrinth recovery code and derive its 16-byte virtual device ID (`Spec §6.7`, `D4`).

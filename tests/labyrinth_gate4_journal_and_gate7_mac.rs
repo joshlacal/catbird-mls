@@ -207,7 +207,7 @@ async fn gate7_space_mac_verifier_and_mek_conversation_group_binding() {
             .public_key(),
     );
     let space_uri =
-        "at://did:web:ds.catbird.blue/space/blue.catbird.labyrinth.conversation/convo-1-0";
+        "at:space/did:web:ds.catbird.blue/blue.catbird.labyrinth.conversation/convo-1-0";
     let repo_did = "did:plc:alice0000000000000000000";
     let collection = "blue.catbird.labyrinth.messageBatch";
     let rkey = "batch-001";

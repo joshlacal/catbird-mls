@@ -358,7 +358,7 @@ fn setup_alice_and_bob_group(authorize_bob_in_alice_db: bool) -> TwoPeerGroupFix
                     last_seq: 1,
                     sequencer_did: "did:web:ds.example".to_string(),
                     space_uri: Some(
-                        format!("at://did:web:ds.example/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"),
+                        format!("at:space/did:web:ds.example/blue.catbird.labyrinth.conversation/{conversation_id}-0"),
                     ),
                     title: Some("Initial Nest".to_string()),
                     unread_count: 0,
@@ -1486,7 +1486,7 @@ fn catbird_mls_client_enforces_i8_i9_i15_d3_d4_and_pq_otc() {
     assert!(receipt.labyrinth_backup_enabled);
     assert_eq!(
         receipt.mailbox_space_uri,
-        "at://did:plc:sdkuser00000000000000000/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/did:plc:sdkuser00000000000000000/blue.catbird.labyrinth.mailbox/self"
     );
 
     // Group + message + D3 admin-only removal + Labyrinth 40-char recovery code + PQ OTC + I9 background close!

@@ -13,6 +13,15 @@
 //! checks reject anything else before reaching the FFI): 24-char `did:plc`
 //! DIDs, 13-char TID record keys for the post and reply refs, and a Space
 //! URI `at://<owner>/space/blue.catbird.circle.encrypted/<skey>`.
+//!
+//! LEGACY SPACE URI (2026-11-24): the committed fixtures still use the old
+//! `at://<owner>/space/...` form on purpose. The Space URI is bound into the
+//! Hawk AAD of every wrap in `rust_circle_key_record.json`, so it cannot be
+//! string-replaced to `at:space/<owner>/...`. To move to the new form, change
+//! `SPACE` and the prefix in `fixtures_use_canonical_tids_and_space_uri` to
+//! `at:space/<owner>/blue.catbird.circle.encrypted/<skey>`, regenerate all
+//! `rust_*` fixtures with the command above, and copy them to Catbird's
+//! CatbirdTests/Fixtures/CrossLanguage.
 
 #![cfg(feature = "labyrinth")]
 
@@ -39,6 +48,7 @@ const AUTHOR_KEYS: &str = include_str!("fixtures/rust_author_mailbox_keys.json")
 const MANIFEST: &str = include_str!("fixtures/rust_cross_language_manifest_TEST_ONLY.json");
 
 const CIRCLE_ID: &str = "3kcircleid22a";
+// LEGACY SPACE URI: AAD-bound in the committed fixtures; see the module docs.
 const SPACE: &str =
     "at://did:plc:ownerfixturecirclesaaaaa/space/blue.catbird.circle.encrypted/3l7circ2222aa";
 const OWNER: &str = "did:plc:ownerfixturecirclesaaaaa";

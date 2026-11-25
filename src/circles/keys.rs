@@ -616,17 +616,14 @@ mod tests {
     }
 
     /// The owner check reads the Space authority through the shared strict Space URI parser:
-    /// the hedged spelling names the same authority, and a URI that is not a Space URI names
+    /// the `at:space/` form names the authority, and a URI that is not a Space URI names
     /// none.
     ///
     /// Fail-before: a hand-split `at://` prefix refused the hedged spelling and accepted any
     /// `at://<did>/...` string.
     #[test]
     fn space_authority_comes_from_the_shared_space_uri_parser() {
-        for space in [
-            "at://did:plc:owner/space/blue.catbird.circle.encrypted/3kcircle",
-            "at:space/did:plc:owner/blue.catbird.circle.encrypted/3kcircle",
-        ] {
+        for space in ["at:space/did:plc:owner/blue.catbird.circle.encrypted/3kcircle"] {
             assert_eq!(
                 require_owner_is_space_authority(space, OWNER),
                 Ok(()),
@@ -635,10 +632,10 @@ mod tests {
         }
         for malformed in [
             "at://did:plc:owner",
-            "at://did:plc:owner/space/blue.catbird.circle.encrypted",
-            "at://did:plc:owner/space/blue.catbird.circle.encrypted/3kcircle?x=1",
+            "at:space/did:plc:owner/blue.catbird.circle.encrypted",
+            "at:space/did:plc:owner/blue.catbird.circle.encrypted/3kcircle?x=1",
             "at://did:plc:owner/notspace/blue.catbird.circle.encrypted/3kcircle",
-            "at://did:plc:owner/space/not an nsid/3kcircle",
+            "at:space/did:plc:owner/not an nsid/3kcircle",
         ] {
             assert!(
                 require_owner_is_space_authority(malformed, OWNER).is_err(),
@@ -847,14 +844,14 @@ mod tests {
         let expected: &[u8] = b"catbird.circle.key.v1:circle_id=3k2abcdefgh2a;key_version=7;\
 recipient_epoch=1111111111111111111111111111111111111111111111111111111111111111;\
 sender_epoch=2222222222222222222222222222222222222222222222222222222222222222;\
-space=at://did:plc:x/space/blue.catbird.circle.encrypted/abc";
+space=at:space/did:plc:x/blue.catbird.circle.encrypted/abc";
         assert_eq!(
             circle_key_aad(
                 "3k2abcdefgh2a",
                 7,
                 &[0x11; 32],
                 &[0x22; 32],
-                "at://did:plc:x/space/blue.catbird.circle.encrypted/abc",
+                "at:space/did:plc:x/blue.catbird.circle.encrypted/abc",
             ),
             expected
         );

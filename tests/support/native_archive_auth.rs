@@ -803,7 +803,7 @@ impl NativeArchiveAuthFixture {
                 ) else {
                     return Ok(reply(400, json!({"error": "InvalidRequest"})));
                 };
-                let space = format!("at://{account}/space/{space_type}/{skey}");
+                let space = format!("at:space/{account}/{space_type}/{skey}");
                 if !self
                     .world
                     .lock()
@@ -860,8 +860,8 @@ impl NativeArchiveAuthFixture {
                     .filter(|(_, repo, _, _)| repo == account)
                     .map(|(space, _, _, _)| space)
                     .filter(|space| {
-                        space_type.is_none_or(|t| space.contains(&format!("/space/{t}/")))
-                            && space_did.is_none_or(|d| space.starts_with(&format!("at://{d}/")))
+                        space_type.is_none_or(|t| space.split('/').nth(2) == Some(t.as_str()))
+                            && space_did.is_none_or(|d| space.split('/').nth(1) == Some(d.as_str()))
                     })
                     .collect();
                 Ok(reply(

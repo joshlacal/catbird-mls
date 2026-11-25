@@ -212,6 +212,171 @@ fn enforce_local_state_format(
     Ok(())
 }
 
+/// Rewrites stored alpha-form Space URIs (`at://{did}/space/...`) to `at:space/{did}/...`
+/// once per database, in one transaction. Only values still in the old form change, so an
+/// interrupted run finishes on the next open. Signed or encrypted bytes are never touched.
+/// TODO: remove before beta.
+fn rewrite_legacy_space_uris(conn: &mut Connection) -> Result<(), MLSError> {
+    use super::space_uri_rewrite::{
+        from_legacy_space_uri, rewrite_json_space_uris, SPACE_URI_REWRITE_MARKER_KEY,
+    };
+
+    let done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_meta WHERE key = ?1)",
+            [SPACE_URI_REWRITE_MARKER_KEY],
+            |row| row.get(0),
+        )
+        .map_err(|e| map_rusqlite_err("space uri rewrite marker", &e))?;
+    if done {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| map_rusqlite_err("space uri rewrite BEGIN", &e))?;
+
+    // conversations.space_uri: a plain Space URI column.
+    let rows: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT conversation_id, space_uri FROM conversations \
+                 WHERE space_uri LIKE 'at://%/space/%'",
+            )
+            .map_err(|e| map_rusqlite_err("space uri rewrite conversations", &e))?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| map_rusqlite_err("space uri rewrite conversations", &e))?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| map_rusqlite_err("space uri rewrite conversations", &e))?
+    };
+    for (conversation_id, uri) in rows {
+        if let Some(new_uri) = from_legacy_space_uri(&uri) {
+            tx.execute(
+                "UPDATE conversations SET space_uri = ?2 WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id, new_uri],
+            )
+            .map_err(|e| map_rusqlite_err("space uri rewrite conversations", &e))?;
+        }
+    }
+
+    // pending_ops: the queued archive's `$.archive.space_uri`, nothing else in the payload.
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT op_kind, op_key, uri FROM (\
+                 SELECT op_kind, op_key, CASE WHEN json_valid(payload_json) \
+                 THEN json_extract(payload_json, '$.archive.space_uri') END AS uri \
+                 FROM pending_ops) WHERE uri LIKE 'at://%/space/%'",
+            )
+            .map_err(|e| map_rusqlite_err("space uri rewrite pending_ops", &e))?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| map_rusqlite_err("space uri rewrite pending_ops", &e))?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| map_rusqlite_err("space uri rewrite pending_ops", &e))?
+    };
+    for (op_kind, op_key, uri) in rows {
+        if let Some(new_uri) = from_legacy_space_uri(&uri) {
+            tx.execute(
+                "UPDATE pending_ops SET payload_json = \
+                 json_set(payload_json, '$.archive.space_uri', ?3) \
+                 WHERE op_kind = ?1 AND op_key = ?2",
+                rusqlite::params![op_kind, op_key, new_uri],
+            )
+            .map_err(|e| map_rusqlite_err("space uri rewrite pending_ops", &e))?;
+        }
+    }
+
+    // labyrinth_queue: the outbox envelope's top-level `space_uri` only.
+    let rows: Vec<(String, Vec<u8>)> = {
+        let mut stmt = tx
+            .prepare("SELECT item_id, payload_bytes FROM labyrinth_queue")
+            .map_err(|e| map_rusqlite_err("space uri rewrite labyrinth_queue", &e))?;
+        let mapped = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
+            .map_err(|e| map_rusqlite_err("space uri rewrite labyrinth_queue", &e))?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| map_rusqlite_err("space uri rewrite labyrinth_queue", &e))?
+    };
+    for (item_id, payload) in rows {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        let Some(new_uri) = value
+            .get("space_uri")
+            .and_then(serde_json::Value::as_str)
+            .and_then(from_legacy_space_uri)
+        else {
+            continue;
+        };
+        value["space_uri"] = serde_json::Value::String(new_uri);
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|e| MLSError::Internal(format!("space uri rewrite labyrinth_queue: {e}")))?;
+        tx.execute(
+            "UPDATE labyrinth_queue SET payload_bytes = ?2 WHERE item_id = ?1",
+            rusqlite::params![item_id, encoded],
+        )
+        .map_err(|e| map_rusqlite_err("space uri rewrite labyrinth_queue", &e))?;
+    }
+
+    // Conversation Space pins and writer revision floors: JSON bookkeeping keyed or valued by
+    // Space URI, in `labyrinth_state` (native vault) and `account_meta` (MLS placement vault).
+    for (select, update) in [
+        (
+            "SELECT state_key, CAST(value_bytes AS BLOB) FROM labyrinth_state \
+             WHERE state_key LIKE 'native.placements:%' \
+             OR state_key LIKE 'native.writer_rev_floors:%'",
+            "UPDATE labyrinth_state SET value_bytes = ?2 WHERE state_key = ?1",
+        ),
+        (
+            "SELECT key, CAST(value_json AS BLOB) FROM account_meta \
+             WHERE key LIKE 'direct_request_value_v2:labyrinthMailboxPlacement:%'",
+            "UPDATE account_meta SET value_json = CAST(?2 AS TEXT) WHERE key = ?1",
+        ),
+    ] {
+        let rows: Vec<(String, Vec<u8>)> = {
+            let mut stmt = tx
+                .prepare(select)
+                .map_err(|e| map_rusqlite_err("space uri rewrite pins", &e))?;
+            let mapped = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))
+                .map_err(|e| map_rusqlite_err("space uri rewrite pins", &e))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| map_rusqlite_err("space uri rewrite pins", &e))?
+        };
+        for (key, raw) in rows {
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if !rewrite_json_space_uris(&mut value) {
+                continue;
+            }
+            let encoded = serde_json::to_vec(&value)
+                .map_err(|e| MLSError::Internal(format!("space uri rewrite pins: {e}")))?;
+            tx.execute(update, rusqlite::params![key, encoded])
+                .map_err(|e| map_rusqlite_err("space uri rewrite pins", &e))?;
+        }
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO account_meta(key, value_json, updated_at_ms) VALUES(?1, '1', 0)",
+        [SPACE_URI_REWRITE_MARKER_KEY],
+    )
+    .map_err(|e| map_rusqlite_err("space uri rewrite marker", &e))?;
+    tx.commit()
+        .map_err(|e| map_rusqlite_err("space uri rewrite COMMIT", &e))
+}
+
 fn open_configured_connection(
     path: &Path,
     db_key_32: &[u8; 32],
@@ -286,6 +451,7 @@ fn open_configured_connection(
         .map_err(|e| map_rusqlite_err("sqlite_master schema check", &e))?;
 
     enforce_local_state_format(&mut conn, existing_unified_tables)?;
+    rewrite_legacy_space_uris(&mut conn)?;
 
     let initial_dv: i64 = conn
         .query_row("PRAGMA data_version;", [], |row| row.get(0))
