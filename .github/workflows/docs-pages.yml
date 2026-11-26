@@ -36,8 +36,8 @@ env:
   # Sibling repositories that Cargo.toml takes by path. These are the at:space/
   # commits the next CatbirdMLSCore release is built from
   # (Scripts/ffi-release-inputs.json); move them together with it.
-  CATBIRD_ATPROTO_REV: 6bc32e6da7b09b6b577d70eaeab381eaeda9a440
-  LABYRINTH_REV: ba2a0ecb7473b8d36dd09334a7bdc8a8b3a4bac5
+  CATBIRD_ATPROTO_REV: 4299c438ff92d13cd554cdf686ca74156c987f84
+  LABYRINTH_REV: f53b4c6dff681b8b81e3755dbaadb356803eb5ed
 
 jobs:
   build-site:
