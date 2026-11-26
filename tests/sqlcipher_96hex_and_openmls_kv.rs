@@ -97,7 +97,7 @@ fn i8_sqlcipher_96hex_plaintext_header_cold_reopen_never_bricks() {
                     last_seq: 1,
                     sequencer_did: "did:web:chat.catbird.blue".to_string(),
                     space_uri: Some(
-                        "at://did:web:chat.catbird.blue/space/blue.catbird.labyrinth.conversation/convo-1-0"
+                        "at:space/did:web:chat.catbird.blue/blue.catbird.labyrinth.conversation/convo-1-0"
                             .to_string(),
                     ),
                     title: Some("Clean Slate PQ Group".to_string()),

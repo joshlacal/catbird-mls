@@ -436,7 +436,7 @@ fn admin_reset_activates_and_its_echo_is_idempotent() {
     assert_eq!(
         reset.space_uri,
         Some(format!(
-            "at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-{}",
+            "at:space/{DS_DID}/blue.catbird.labyrinth.conversation/{cid}-{}",
             reset.generation
         )),
         "the successor generation's conversation Space"

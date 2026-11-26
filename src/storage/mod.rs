@@ -13,6 +13,7 @@ pub mod openmls_kv;
 pub mod orchestrator_backend;
 pub mod queries;
 pub mod schema;
+pub mod space_uri_rewrite;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use driver_native::{

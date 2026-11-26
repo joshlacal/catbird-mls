@@ -1068,7 +1068,7 @@ fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagina
     let ds_did = "did:web:chat.catbird.blue";
     let conv_id = "convo-700-scale";
     let convo_space = labyrinth::store::space::SpaceRef::parse(&format!(
-        "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_id}-0"
+        "at:space/{ds_did}/blue.catbird.labyrinth.conversation/{conv_id}-0"
     ))
     .unwrap();
     space_host.grant_space_member(&convo_space, alice);
@@ -1378,7 +1378,7 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     let ds_did = "did:web:chat.catbird.blue";
     let conv_id = "convo-uniffi-concurrent";
     let convo_space = labyrinth::store::space::SpaceRef::parse(&format!(
-        "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_id}-0"
+        "at:space/{ds_did}/blue.catbird.labyrinth.conversation/{conv_id}-0"
     ))
     .unwrap();
     space_host.grant_space_member(&convo_space, alice);
@@ -1694,7 +1694,7 @@ fn flush_labyrinth_queue_partial_batch_retry_preserves_deterministic_rkeys_witho
     let conv_primary = "convo-rkey-primary";
     let conv_fallback = "convo-rkey-fallback";
     let primary_space_uri =
-        format!("at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_primary}-0");
+        format!("at:space/{ds_did}/blue.catbird.labyrinth.conversation/{conv_primary}-0");
     let primary_space_ref = labyrinth::store::space::SpaceRef::parse(&primary_space_uri).unwrap();
     space_host.grant_space_member(&primary_space_ref, alice);
 
@@ -1778,7 +1778,7 @@ fn flush_labyrinth_queue_partial_batch_retry_preserves_deterministic_rkeys_witho
 
     // Repeat for 403 kick OwnerBatch fallback!
     let fallback_space_uri =
-        format!("at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_fallback}-0");
+        format!("at:space/{ds_did}/blue.catbird.labyrinth.conversation/{conv_fallback}-0");
     let fallback_space_ref = labyrinth::store::space::SpaceRef::parse(&fallback_space_uri).unwrap();
     space_host.grant_space_member(&fallback_space_ref, alice);
     space_host.revoke_space_member(&fallback_space_ref, alice);
@@ -1881,7 +1881,7 @@ fn flush_labyrinth_queue_isolates_per_conversation_503_across_120_rows() {
 
     for cid in [convo_stalled, convo_healthy] {
         let sref = labyrinth::store::space::SpaceRef::parse(&format!(
-            "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{cid}-0"
+            "at:space/{ds_did}/blue.catbird.labyrinth.conversation/{cid}-0"
         ))
         .unwrap();
         space_host.grant_space_member(&sref, alice);
@@ -2025,7 +2025,7 @@ fn flush_labyrinth_queue_aborts_in_flight_loop_immediately_when_handle_closes() 
     let ds_did = "did:web:chat.catbird.blue";
     let conv_id = "convo-close-mid-flush";
     let sref = labyrinth::store::space::SpaceRef::parse(&format!(
-        "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_id}-0"
+        "at:space/{ds_did}/blue.catbird.labyrinth.conversation/{conv_id}-0"
     ))
     .unwrap();
     space_host.grant_space_member(&sref, alice);

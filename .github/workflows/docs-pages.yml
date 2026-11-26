@@ -33,11 +33,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   MDBOOK_VERSION: 0.4.52
-  # Sibling repositories that Cargo.toml takes by path. These are the commits
-  # of the latest CatbirdMLSCore release (Scripts/ffi-release-inputs.json);
-  # move them together with it.
-  CATBIRD_ATPROTO_REV: e3356fd4f3349de1d647e3558964d08449c03b13
-  LABYRINTH_REV: a484e9ef14ddb42d7d7212f1c9eb468ee152acd7
+  # Sibling repositories that Cargo.toml takes by path. These are the at:space/
+  # commits the next CatbirdMLSCore release is built from
+  # (Scripts/ffi-release-inputs.json); move them together with it.
+  CATBIRD_ATPROTO_REV: 4299c438ff92d13cd554cdf686ca74156c987f84
+  LABYRINTH_REV: f53b4c6dff681b8b81e3755dbaadb356803eb5ed
 
 jobs:
   build-site:
@@ -76,9 +76,9 @@ jobs:
           # A transitive git dependency stalls under libgit2; use the git CLI.
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
           # tangled.org stalls and resets clones of jacquard ("curl 92 ...
-          # INTERNAL_ERROR"). Fetch it from the GitHub mirror, which carries
-          # the pinned rev 3287244a (Cargo.lock is unchanged), and keep
-          # HTTP/1.1 for any other git dependency.
+          # INTERNAL_ERROR"). Cargo.lock now takes jacquard from the
+          # joshlacal/jacquard fork directly; the redirect stays for any
+          # older lock, and HTTP/1.1 for any other git dependency.
           GIT_CONFIG_COUNT: '2'
           GIT_CONFIG_KEY_0: url.https://github.com/joshlacal/jacquard.insteadOf
           GIT_CONFIG_VALUE_0: https://tangled.org/nonbinary.computer/jacquard

@@ -1426,7 +1426,7 @@ mod proofs {
         );
 
         let base_uri = SpaceUri {
-            raw: String::from("at://did:web:a.b/space/a.b.c/x"),
+            raw: String::from("at:space/did:web:a.b/a.b.c/x"),
             authority: String::from(authority),
             space_type: String::from(space_type),
             rkey: String::from("x"),
@@ -1768,7 +1768,7 @@ mod tests {
             .expect("hedged URI must normalize");
         assert_eq!(
             uri.as_str(),
-            "at://did:plc:abc123xyz/space/app.bsky.space/3lb7skey"
+            "at:space/did:plc:abc123xyz/app.bsky.space/3lb7skey"
         );
         let hdr = format_accept_signature(MacProfile::Record, "did:key:zDnaerDaTF5BXEavCrfRZEk")
             .expect("format Accept-Signature");

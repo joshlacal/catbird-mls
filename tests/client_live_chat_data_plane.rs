@@ -5810,7 +5810,7 @@ fn forgotten_conversation_state_holds_owner_history_after_space_denial() {
             .map(str::to_owned)
             .unwrap_or_else(|| {
                 format!(
-                    "at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-{}",
+                    "at:space/{DS_DID}/blue.catbird.labyrinth.conversation/{cid}-{}",
                     conversation["coordinates"]["generation"].as_u64().unwrap()
                 )
             });
@@ -5938,7 +5938,7 @@ fn fresh_removed_restore_requires_owner_proof_and_authenticated_space_denial() {
             .map(str::to_owned)
             .unwrap_or_else(|| {
                 format!(
-                    "at://{DS_DID}/space/blue.catbird.labyrinth.conversation/{cid}-{}",
+                    "at:space/{DS_DID}/blue.catbird.labyrinth.conversation/{cid}-{}",
                     conversation["coordinates"]["generation"].as_u64().unwrap()
                 )
             });

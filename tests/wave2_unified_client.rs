@@ -32,7 +32,7 @@ const ALICE: &str = "did:plc:waveaaliceaaaaaaaaaaaaaa";
 const BOB: &str = "did:plc:waveabobbbbbbbbbbbbbbbbb";
 const CAROL: &str = "did:plc:waveacarolcccccccccccccc";
 const CIRCLE_SPACE: &str =
-    "at://did:plc:waveaaliceaaaaaaaaaaaaaa/space/app.bsky.circle/01982b6e-a100-7000-8000-000000000001";
+    "at:space/did:plc:waveaaliceaaaaaaaaaaaaaa/app.bsky.circle/01982b6e-a100-7000-8000-000000000001";
 const CIRCLE_ID: &str = "01982b6e-a100-7000-8000-000000000001";
 
 fn all_scopes() -> Vec<String> {
@@ -336,7 +336,7 @@ fn passkey_prf_registration_and_second_device_restore_roundtrip() {
         world.mailbox_keys(ALICE, "000000000001").is_some(),
         "rotated epoch 1 mailboxKeys must be published to PDS"
     );
-    let mailbox_space = format!("at://{ALICE}/space/blue.catbird.labyrinth.mailbox/self");
+    let mailbox_space = format!("at:space/{ALICE}/blue.catbird.labyrinth.mailbox/self");
     let epoch1_members: Vec<String> = world
         .archive_auth
         .space_record_rkeys(
@@ -584,7 +584,7 @@ fn peer_repin_enforces_72h_hold_and_rejects_unproposed_or_early_confirmation() {
                 circle_id: "01982b6e-a200-7000-8000-000000000002".to_owned(),
                 key_version: 1,
                 space_uri:
-                    "at://did:plc:waveabobbbbbbbbbbbbbbbbb/space/app.bsky.circle/01982b6e-a200-7000-8000-000000000002"
+                    "at:space/did:plc:waveabobbbbbbbbbbbbbbbbb/app.bsky.circle/01982b6e-a200-7000-8000-000000000002"
                         .to_owned(),
                 reason: "initial".to_owned(),
                 member_dids: Vec::new(),
@@ -890,7 +890,7 @@ fn concurrent_two_device_circle_owner_state_create_cas_preserves_acl_tombstone_a
         assert_eq!(ops[&acl_key].as_str(), Some("aclRemovePending:rotated"));
     }
 
-    let mailbox_space = format!("at://{ALICE}/space/blue.catbird.labyrinth.mailbox/self");
+    let mailbox_space = format!("at:space/{ALICE}/blue.catbird.labyrinth.mailbox/self");
     let remaining_rkeys = world.archive_auth.space_record_rkeys(
         &mailbox_space,
         ALICE,
@@ -1040,7 +1040,7 @@ async fn resolving_space_thread_store_find_meks_probes_batch_author_first_o1_wit
                         .get(&(repo.clone(), rkey.clone()))
                     {
                         Some(val) => Ok(serde_json::to_vec(&serde_json::json!({
-                            "uri": format!("at://{repo}/space/rec/{collection}/{rkey}"),
+                            "uri": format!("at:space/{repo}/rec/{collection}/{rkey}"),
                             "cid": "bafyreimek0000000000000000000000000000000000000000000000",
                             "value": val,
                         }))

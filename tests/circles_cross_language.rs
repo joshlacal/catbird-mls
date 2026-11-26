@@ -12,7 +12,10 @@
 //! Identifiers are in their real canonical forms (Swift's canonical-URI
 //! checks reject anything else before reaching the FFI): 24-char `did:plc`
 //! DIDs, 13-char TID record keys for the post and reply refs, and a Space
-//! URI `at://<owner>/space/blue.catbird.circle.encrypted/<skey>`.
+//! URI `at:space/<owner>/blue.catbird.circle.encrypted/<skey>`. The Space URI
+//! is bound into the Hawk AAD of every wrap in `rust_circle_key_record.json`,
+//! so changing its form means regenerating every `rust_*` fixture and copying
+//! them to Catbird's CatbirdTests/Fixtures/CrossLanguage.
 
 #![cfg(feature = "labyrinth")]
 
@@ -39,8 +42,9 @@ const AUTHOR_KEYS: &str = include_str!("fixtures/rust_author_mailbox_keys.json")
 const MANIFEST: &str = include_str!("fixtures/rust_cross_language_manifest_TEST_ONLY.json");
 
 const CIRCLE_ID: &str = "3kcircleid22a";
+// LEGACY SPACE URI: AAD-bound in the committed fixtures; see the module docs.
 const SPACE: &str =
-    "at://did:plc:ownerfixturecirclesaaaaa/space/blue.catbird.circle.encrypted/3l7circ2222aa";
+    "at:space/did:plc:ownerfixturecirclesaaaaa/blue.catbird.circle.encrypted/3l7circ2222aa";
 const OWNER: &str = "did:plc:ownerfixturecirclesaaaaa";
 const ALICE: &str = "did:plc:alicefixturecirclesaaaaa";
 const BOB: &str = "did:plc:bobfixturecirclesaaaaaaa";
@@ -106,7 +110,7 @@ fn fixtures_use_canonical_tids_and_space_uri() {
     let owner = m["owner_did"].as_str().unwrap();
     assert_eq!(
         space.strip_prefix(&format!(
-            "at://{owner}/space/blue.catbird.circle.encrypted/"
+            "at:space/{owner}/blue.catbird.circle.encrypted/"
         )),
         Some(space.rsplit('/').next().unwrap()),
         "{space}"

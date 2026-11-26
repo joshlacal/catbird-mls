@@ -1184,7 +1184,7 @@ async fn fault_line_5_did_document_url_ssrf_and_fail_closed_on_403_503_with_plac
         kicked_conv.to_owned(),
         ThreadPlacement {
             space: Some(format!(
-                "at://{foreign_ds}/space/blue.catbird.labyrinth.conversation/{kicked_conv}-0"
+                "at:space/{foreign_ds}/blue.catbird.labyrinth.conversation/{kicked_conv}-0"
             )),
             generation: 0,
             group_id: None,
@@ -1374,7 +1374,7 @@ impl labyrinth::store::space::SpaceRpc for UncreatedMailboxRpc {
                 ));
             }
             return Ok(
-                br#"{"space":"at://did:plc:fixture/space/blue.catbird.labyrinth.mailbox/self"}"#
+                br#"{"space":"at:space/did:plc:fixture/blue.catbird.labyrinth.mailbox/self"}"#
                     .to_vec(),
             );
         }
