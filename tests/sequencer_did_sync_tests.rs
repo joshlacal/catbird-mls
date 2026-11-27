@@ -189,7 +189,7 @@ async fn sync_parses_persists_and_repersist_sequencer_did_on_change() {
 }
 
 // ---------------------------------------------------------------------------
-// Typed wire contract (real catbird-atproto generated ConvoView)
+// Typed wire contract (generated ConvoView wire shape)
 // ---------------------------------------------------------------------------
 
 /// The conversation view struct (`ConversationView` via

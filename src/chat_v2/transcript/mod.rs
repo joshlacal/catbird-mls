@@ -10,7 +10,7 @@
 //!
 //! Worth stating plainly, because the shape of the wire format invites the
 //! opposite conclusion. A signed request body travels as JSON, and within that
-//! JSON a bytes field is bare STANDARD base64 — never jacquard's
+//! JSON a bytes field is bare STANDARD base64 — never the generated
 //! `{"$bytes": …}` DAG-JSON, which is authoritative only for responses and
 //! unsigned params. But the bytes that are actually signed are:
 //!

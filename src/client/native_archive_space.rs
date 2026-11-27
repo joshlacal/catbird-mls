@@ -233,7 +233,7 @@ mod native_archive_space_auth {
     struct OpsPage {
         ops: Vec<OpStub>,
     }
-    /// Record JSON exactly as served. Re-rendering jacquard `Data` pads atproto `$bytes`,
+    /// Record JSON exactly as served. Re-rendering a parsed value can change the served `$bytes` padding,
     /// which labyrinth's strict codec rejects; it is released only after verification.
     #[derive(Deserialize)]
     struct ServedValue {

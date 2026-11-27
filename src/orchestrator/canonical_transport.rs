@@ -560,7 +560,7 @@ fn ffi_error(error: impl std::fmt::Display) -> CleanChatTransportFfiError {
 /// sends them as the generated DTO JSON object, whose member names are the
 /// lexicon parameter names, so each member maps onto query pairs exactly as
 /// the query string spells them (arrays repeat the name; `null` is absent).
-fn query_params_from_json<P: petrel_core::FromQueryParams>(
+pub fn query_params_from_json<P: petrel_core::FromQueryParams>(
     body: &[u8],
 ) -> Result<P, TransportError> {
     let value: serde_json::Value = serde_json::from_slice(body)

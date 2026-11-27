@@ -23,7 +23,7 @@
 //! # Bytes are bare STANDARD base64 here
 //!
 //! This is the wire half of program invariant I-1. A bytes field arrives as a
-//! bare STANDARD-alphabet, padded base64 string — never jacquard's
+//! bare STANDARD-alphabet, padded base64 string — never the generated
 //! `{"$bytes": …}` DAG-JSON, which is authoritative only for responses and
 //! unsigned params. [`decode_standard_base64`] additionally re-encodes and
 //! compares, so a non-canonical encoding of the same bytes is refused rather
