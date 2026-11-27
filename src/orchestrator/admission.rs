@@ -1,5 +1,5 @@
 //! Authenticated admission policy is distinct from cryptographic MLS access.
-use catbird_atproto::blue_catbird::chat::ConversationState as CanonicalState;
+use crate::atproto::chat::defs::ConversationState as CanonicalState;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
@@ -28,9 +28,9 @@ pub fn validate_conversation_policy(state: &CanonicalState) -> Result<()> {
             return Err(invalid("coordinate range"));
         }
     }
-    if coordinate.group_id.len() != 32
-        || coordinate.group_context_hash.len() != 32
-        || coordinate.confirmation_tag.len() != 32
+    if coordinate.group_id.0.len() != 32
+        || coordinate.group_context_hash.0.len() != 32
+        || coordinate.confirmation_tag.0.len() != 32
         || !matches!(coordinate.lifecycle.as_str(), "active" | "superseded")
         || !matches!(state.conversation_kind.as_str(), "direct" | "group")
     {
@@ -118,7 +118,7 @@ pub fn validate_conversation_view(view: &ConversationView) -> Result<()> {
         super::canonical_transport::encode_conversation_state(state)
             .map_err(|error| invalid(&error.to_string()))?;
         if state.coordinates.conversation_id.as_str() != view.conversation_id
-            || hex::encode(&state.coordinates.group_id) != view.group_id
+            || hex::encode(&state.coordinates.group_id.0) != view.group_id
             || state.coordinates.epoch as u64 > view.epoch
         {
             return Err(invalid(
@@ -200,9 +200,10 @@ pub(crate) fn conversation_view_from_state_json(
         .or_else(|| coordinates.get("sequencerDid"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let canonical_state =
-        super::canonical_transport::decode_conversation_state(&serde_json::to_vec(state).ok()?)
-            .ok();
+    let canonical_state = super::canonical_transport::decode_conversation_state(
+        &crate::atproto::json::to_vec(state).ok()?,
+    )
+    .ok();
 
     Some(ConversationView {
         group_id,
@@ -267,7 +268,7 @@ fn retain_revoked_leaf_status(previous: &CanonicalState, incoming: &mut Canonica
                 && old.key_id == leaf.key_id
                 && old.device_status.as_str() == "revoked"
         }) {
-            leaf.device_status = "revoked".into();
+            leaf.device_status = crate::atproto::chat::defs::DeviceStatus::Revoked;
         }
     }
     if previous.coordinates == incoming.coordinates {
@@ -298,11 +299,11 @@ pub fn merge_protected_conversation_policy(
 /// Compare authenticated departure coordinates without turning inventory
 /// absence into removal authority. Call only after the departure was verified.
 pub fn merge_protected_conversation_departure(
-    previous: Option<&catbird_atproto::blue_catbird::chat::ConversationCoordinates>,
-    incoming: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
-) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>> {
+    previous: Option<&crate::atproto::chat::defs::ConversationCoordinates>,
+    incoming: &crate::atproto::chat::defs::ConversationCoordinates,
+) -> Result<Option<crate::atproto::chat::defs::ConversationCoordinates>> {
     let coordinate = super::canonical_transport::decode_conversation_coordinates(
-        &serde_json::to_vec(incoming).map_err(|e| invalid(&e.to_string()))?,
+        &crate::atproto::json::to_vec(incoming).map_err(|e| invalid(&e.to_string()))?,
     )
     .map_err(|e| invalid(&e.to_string()))?;
     if let Some(old) = previous {
@@ -400,7 +401,7 @@ where
         {
             // A policy from a different group must not overwrite a verified
             // local successor. Its generation fence remains in native storage.
-            if hex::encode(&retained.coordinates.group_id) == view.group_id {
+            if hex::encode(&retained.coordinates.group_id.0) == view.group_id {
                 view.epoch = view.epoch.max(retained.coordinates.epoch as u64);
                 view.members = retained
                     .participants
@@ -418,7 +419,7 @@ where
             } else if view.canonical_state.is_some() {
                 // An old inventory generation must not revive its old group
                 // after a newer authenticated generation was retained.
-                view.group_id = hex::encode(&retained.coordinates.group_id);
+                view.group_id = hex::encode(&retained.coordinates.group_id.0);
                 view.epoch = retained.coordinates.epoch as u64;
                 view.members = retained
                     .participants
@@ -444,7 +445,8 @@ where
         conversation_id: &str,
         value: &serde_json::Value,
     ) -> Result<()> {
-        let raw = serde_json::to_vec(value).map_err(|error| invalid(&error.to_string()))?;
+        let raw =
+            crate::atproto::json::to_vec(value).map_err(|error| invalid(&error.to_string()))?;
         let state = super::canonical_transport::decode_conversation_state(&raw)
             .map_err(|error| invalid(&error.to_string()))?;
         if state.coordinates.conversation_id.as_str() != conversation_id {
@@ -459,7 +461,7 @@ where
             .get(conversation_id)
             .cloned();
         if let Some(mut view) = previous {
-            if hex::encode(&state.coordinates.group_id) == view.group_id {
+            if hex::encode(&state.coordinates.group_id.0) == view.group_id {
                 view.epoch = view.epoch.max(state.coordinates.epoch as u64);
                 view.canonical_state = Some(state);
                 let view = self.restore_conversation_policy(&did, view)?;
@@ -486,7 +488,7 @@ where
         value: &serde_json::Value,
     ) -> Result<()> {
         let coordinate = super::canonical_transport::decode_conversation_coordinates(
-            &serde_json::to_vec(value).map_err(|error| invalid(&error.to_string()))?,
+            &crate::atproto::json::to_vec(value).map_err(|error| invalid(&error.to_string()))?,
         )
         .map_err(|error| invalid(&error.to_string()))?;
         if coordinate.conversation_id.as_str() != conversation_id {
@@ -603,7 +605,7 @@ where
         if !pending {
             return Ok(false);
         }
-        let group = state.coordinates.group_id.to_vec();
+        let group = state.coordinates.group_id.0.clone();
         let native_admitted = match self.mls_context().group_is_active(group.clone()) {
             Ok(true)
                 if self.mls_context().get_epoch(group.clone())?
@@ -723,7 +725,7 @@ pub(crate) mod native {
             else {
                 return Ok(false);
             };
-            let raw = serde_json::to_string(&PolicyRecord {
+            let raw = crate::atproto::json::to_string(&PolicyRecord {
                 user_did: user_did.into(),
                 state: state.clone(),
             })
@@ -746,7 +748,7 @@ pub(crate) mod native {
     #[serde(deny_unknown_fields)]
     struct DepartureRecord {
         user_did: String,
-        coordinate: catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+        coordinate: crate::atproto::chat::defs::ConversationCoordinates,
     }
     fn departure_key(user_did: &str, cid: &str) -> std::result::Result<String, MLSError> {
         Ok(format!("{}:departure", key(user_did, cid)?))
@@ -755,14 +757,13 @@ pub(crate) mod native {
         raw: &str,
         user_did: &str,
         cid: &str,
-    ) -> std::result::Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, MLSError>
-    {
+    ) -> std::result::Result<crate::atproto::chat::defs::ConversationCoordinates, MLSError> {
         let record: DepartureRecord = serde_json::from_str(raw).map_err(failed)?;
         if record.user_did != user_did || record.coordinate.conversation_id.as_str() != cid {
             return Err(MLSError::StorageFailed);
         }
         super::super::canonical_transport::decode_conversation_coordinates(
-            &serde_json::to_vec(&record.coordinate).map_err(failed)?,
+            &crate::atproto::json::to_vec(&record.coordinate).map_err(failed)?,
         )
         .map_err(failed)
     }
@@ -770,10 +771,8 @@ pub(crate) mod native {
         storage: &ManifestStorage,
         user_did: &str,
         cid: &str,
-    ) -> std::result::Result<
-        Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>,
-        MLSError,
-    > {
+    ) -> std::result::Result<Option<crate::atproto::chat::defs::ConversationCoordinates>, MLSError>
+    {
         let key = departure_key(user_did, cid)?;
         let raw: Option<String> = storage.with_connection(|conn| {
             conn.query_row(
@@ -790,10 +789,10 @@ pub(crate) mod native {
     pub(crate) fn put_departure(
         storage: &ManifestStorage,
         user_did: &str,
-        coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+        coordinate: &crate::atproto::chat::defs::ConversationCoordinates,
     ) -> std::result::Result<bool, MLSError> {
         let coordinate = super::super::canonical_transport::decode_conversation_coordinates(
-            &serde_json::to_vec(coordinate).map_err(failed)?,
+            &crate::atproto::json::to_vec(coordinate).map_err(failed)?,
         )
         .map_err(failed)?;
         let cid = coordinate.conversation_id.as_str();
@@ -819,7 +818,7 @@ pub(crate) mod native {
             else {
                 return Ok(false);
             };
-            let raw = serde_json::to_string(&DepartureRecord {
+            let raw = crate::atproto::json::to_string(&DepartureRecord {
                 user_did: user_did.into(),
                 coordinate,
             })
@@ -894,7 +893,11 @@ mod tests {
         let output = decode_conversations_inventory(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(!output.has_more);
         assert_eq!(output.snapshot_event_cursor.as_str(), "opaque-event-cursor");
-        let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = &output.items[0] else { panic!("state variant changed"); };
+        let crate::atproto::chat::defs::ConversationInventoryItem::ConversationInventoryState(item) =
+            &output.items[0]
+        else {
+            panic!("state variant changed");
+        };
         assert_eq!(item.state, state);
     }
 
@@ -917,13 +920,13 @@ mod tests {
         assert!(context.put_conversation_policy(did, &snapshot).unwrap());
         assert!(!context.put_conversation_policy(did, &state).unwrap());
         let mut conflict = snapshot.clone();
-        conflict.participants[1].status = "active".into();
+        conflict.participants[1].status = crate::atproto::chat::defs::ParticipantStatus::Active;
         assert!(context.put_conversation_policy(did, &conflict).is_err());
         conflict.coordinates.state_version += 1;
         assert!(context.put_conversation_policy(did, &conflict).unwrap());
         assert!(!context.put_conversation_policy(did, &snapshot).unwrap());
         let mut revoked = conflict.clone();
-        revoked.leaves[0].device_status = "revoked".into();
+        revoked.leaves[0].device_status = crate::atproto::chat::defs::DeviceStatus::Revoked;
         assert!(context.put_conversation_policy(did, &revoked).unwrap());
         let mut stale_active = conflict.clone();
         stale_active.snapshot_seq += 1;
@@ -977,11 +980,11 @@ mod tests {
             .unwrap());
         assert!(!context.put_conversation_departure(did, &old).unwrap());
         let mut conflict = coordinate.clone();
-        conflict.confirmation_tag = vec![9; 32].into();
+        conflict.confirmation_tag = petrel_core::Bytes(vec![9; 32]);
         assert!(context.put_conversation_departure(did, &conflict).is_err());
         conflict = coordinate.clone();
         conflict.state_version += 1;
-        conflict.group_id = vec![8; 32].into();
+        conflict.group_id = petrel_core::Bytes(vec![8; 32]);
         assert!(context.put_conversation_departure(did, &conflict).is_err());
         assert!(context
             .get_conversation_departure(policy.participants[0].user_did.as_str(), cid)
@@ -994,12 +997,12 @@ mod tests {
             context.get_conversation_departure(did, cid).unwrap(),
             Some(coordinate.clone())
         );
-        coordinate.lifecycle = "superseded".into();
+        coordinate.lifecycle = crate::atproto::chat::defs::Lifecycle::Superseded;
         coordinate.state_version += 1;
         assert!(context
             .put_conversation_departure(did, &coordinate)
             .unwrap());
-        coordinate.lifecycle = "active".into();
+        coordinate.lifecycle = crate::atproto::chat::defs::Lifecycle::Active;
         coordinate.state_version += 1;
         assert!(context
             .put_conversation_departure(did, &coordinate)

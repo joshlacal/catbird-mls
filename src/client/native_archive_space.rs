@@ -21,10 +21,6 @@ mod native_archive_space_auth {
         tokens::{verify_space_token, SpaceKeyResolver, SpaceTokenKind, SpaceVerifyingKey},
         SpaceUri,
     };
-    use catbird_atproto::com_atproto::space::{
-        get_record::GetRecordOutput, list_records::ListRecordsOutput,
-        list_repo_ops::ListRepoOpsOutput,
-    };
     use http::{HeaderMap, HeaderName, HeaderValue};
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
@@ -125,8 +121,48 @@ mod native_archive_space_auth {
         repo: String,
         rev: String,
         ver: u64,
-        #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
-        data: catbird_atproto::jacquard_common::deps::bytes::Bytes,
+        #[serde(with = "crate::atproto_bytes")]
+        data: Vec<u8>,
+    }
+
+    // Read shapes of `com.atproto.space.{getRecord,listRecords,listRepoOps}` as the
+    // deployed Space hosts serve them. Petrel's generated outputs follow the newer
+    // lexicon (`at:space/` Space refs, a required nullable `prev`), which deployed
+    // hosts do not send yet, so these mirror the pre-Petrel decoding: unknown
+    // fields are dropped and record values are AT Protocol data-model values.
+    #[derive(Clone, Debug, Deserialize)]
+    struct GetRecordOutput {
+        uri: String,
+        cid: String,
+        value: petrel_core::Value,
+    }
+    #[derive(Clone, Debug, Deserialize)]
+    struct ListRecordsOutput {
+        records: Vec<ListRecordsRecord>,
+    }
+    #[derive(Clone, Debug, Deserialize)]
+    struct ListRecordsRecord {
+        #[serde(default)]
+        value: Option<petrel_core::Value>,
+    }
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct ListRepoOpsOutput {
+        commit: Commit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        ops: Vec<ListRepoOpsEntry>,
+    }
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct ListRepoOpsEntry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cid: Option<String>,
+        collection: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev: Option<String>,
+        rev: String,
+        rkey: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<petrel_core::Value>,
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,12 +173,15 @@ mod native_archive_space_auth {
             repo: String,
             repo_rev: String,
             space_rev: String,
-            #[serde(with = "catbird_atproto::jacquard_common::serde_bytes_helper")]
-            data: catbird_atproto::jacquard_common::deps::bytes::Bytes,
+            #[serde(with = "crate::atproto_bytes")]
+            data: Vec<u8>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             prev_space_rev: Option<String>,
         },
-        #[serde(rename = "com.atproto.space.defs#repoRemoved", rename_all = "camelCase")]
+        #[serde(
+            rename = "com.atproto.space.defs#repoRemoved",
+            rename_all = "camelCase"
+        )]
         RepoRemoved {
             repo: String,
             space_rev: String,
@@ -443,7 +482,12 @@ mod native_archive_space_auth {
             let placements_key = self.writer_rev_floors_placements_key();
             let (raw_a, raw_b) = self
                 .db
-                .read_tx(|tx| Ok((tx.get_labyrinth_state(&key)?, tx.get_labyrinth_state(&placements_key)?)))
+                .read_tx(|tx| {
+                    Ok((
+                        tx.get_labyrinth_state(&key)?,
+                        tx.get_labyrinth_state(&placements_key)?,
+                    ))
+                })
                 .map_err(|e: crate::MLSError| e.to_string())?;
             let mut out = BTreeMap::new();
             for raw in [raw_a, raw_b].into_iter().flatten() {
@@ -480,8 +524,9 @@ mod native_archive_space_auth {
                     let mut merged: BTreeMap<(String, String), String> = BTreeMap::new();
                     for state_key in [&key, &placements_key] {
                         if let Some(raw) = tx.get_labyrinth_state(state_key)? {
-                            for (s, a, r) in serde_json::from_slice::<Vec<(String, String, String)>>(&raw)
-                                .unwrap_or_default()
+                            for (s, a, r) in
+                                serde_json::from_slice::<Vec<(String, String, String)>>(&raw)
+                                    .unwrap_or_default()
                             {
                                 if labyrinth::store::validate_writer_rev_floor(&s, &a, &r).is_ok() {
                                     let k = (s, a);
@@ -589,17 +634,9 @@ mod native_archive_space_auth {
             } else {
                 // For `did:web:*`, resolve through the account PDS so a direct `.well-known`
                 // connection never leaks Space interest to a foreign sequencer under D1.
-                let path = format!(
-                    "/xrpc/com.atproto.identity.resolveDid?did={}",
-                    encode(bare)
-                );
-                let resp = self.execute(
-                    &self.config.pds_endpoint,
-                    "GET".into(),
-                    path,
-                    vec![],
-                    None,
-                )?;
+                let path = format!("/xrpc/com.atproto.identity.resolveDid?did={}", encode(bare));
+                let resp =
+                    self.execute(&self.config.pds_endpoint, "GET".into(), path, vec![], None)?;
                 bounded(resp)?
             };
             require_success(&response, "resolveDid")?;
@@ -971,8 +1008,8 @@ mod native_archive_space_auth {
                     super::NATIVE_UNAUTHENTICATED_DENIAL
                 ));
             };
-            let space = SpaceUri::parse_hedged(space_str)
-                .map_err(|e| format!("native_space_uri: {e}"))?;
+            let space =
+                SpaceUri::parse_hedged(space_str).map_err(|e| format!("native_space_uri: {e}"))?;
             let authority = self.space_document(&space.authority)?;
             match self.space_credential(&space, false, authority)? {
                 Err(_) => Ok(true),
@@ -1183,7 +1220,7 @@ mod native_archive_space_auth {
                 let _: [u8; 32] = page
                     .commit
                     .data
-                    .as_ref()
+                    .as_slice()
                     .try_into()
                     .map_err(|_| "native_space_invalid_inventory_commitment")?;
                 if expected_commit.is_none() {
@@ -1221,7 +1258,7 @@ mod native_archive_space_auth {
                                 return Err("native_space_invalid_inventory_row".into());
                             }
                             let data_32: [u8; 32] = data
-                                .as_ref()
+                                .as_slice()
                                 .try_into()
                                 .map_err(|_| "native_space_invalid_inventory_repo_commitment")?;
                             active_repos.push(ActiveInventoryRepo {
@@ -1273,7 +1310,7 @@ mod native_archive_space_auth {
             let commit = expected_commit.ok_or("native_space_inventory_commit_missing")?;
             let expected_data: [u8; 32] = commit
                 .data
-                .as_ref()
+                .as_slice()
                 .try_into()
                 .map_err(|_| "native_space_invalid_inventory_commitment")?;
             let mut inventory_hash = LtHash::empty();
@@ -1289,11 +1326,7 @@ mod native_archive_space_auth {
             let mut verified = VerifiedArchiveInventory::default();
             let mut verified_bytes = 0usize;
             for row in &active_repos {
-                self.check_writer_rev_not_rolled_back(
-                    &context.space.raw,
-                    &row.did,
-                    &row.repo_rev,
-                )?;
+                self.check_writer_rev_not_rolled_back(&context.space.raw, &row.did, &row.repo_rev)?;
                 context.writer = row.did.clone();
                 context.kem_key = if row.did == authority {
                     authority_kem.clone()
@@ -1308,11 +1341,7 @@ mod native_archive_space_auth {
                 if verified_bytes > MAX_INVENTORY_BYTES {
                     return Err("native_space_inventory_cache_bytes_exceeded".into());
                 }
-                if verified
-                    .writers
-                    .insert(row.did.clone(), records)
-                    .is_some()
-                {
+                if verified.writers.insert(row.did.clone(), records).is_some() {
                     return Err("native_space_inventory_duplicate_writer".into());
                 }
             }
@@ -1384,7 +1413,7 @@ mod native_archive_space_auth {
                     .ok_or("native_space_missing_request_secret")?,
                 Some(&repo),
             )?;
-            if head.rev != row.repo_rev || head.data.as_ref() != expected_data.as_slice() {
+            if head.rev != row.repo_rev || head.data.as_slice() != expected_data.as_slice() {
                 return Err("native_space_inventory_oplog_head_mismatch".into());
             }
             let mut records = Vec::with_capacity(repo.records.len());
@@ -1460,14 +1489,11 @@ mod native_archive_space_auth {
             let inventory = inventories
                 .get(&context.space.raw)
                 .ok_or("native_space_inventory_snapshot_missing")?;
-            let record = inventory
-                .writers
-                .get(&context.writer)
-                .and_then(|records| {
-                    records
-                        .iter()
-                        .find(|record| record.collection == collection && record.rkey == rkey)
-                });
+            let record = inventory.writers.get(&context.writer).and_then(|records| {
+                records
+                    .iter()
+                    .find(|record| record.collection == collection && record.rkey == rkey)
+            });
             let Some(record) = record else {
                 response.status = 404;
                 response.body = serde_json::to_vec(&serde_json::json!({
@@ -1645,11 +1671,13 @@ mod native_archive_space_auth {
                     || stub_uri_norm
                         .as_deref()
                         .is_some_and(|uri| uri != expected_uri)
-                    || stub.repo.as_deref().is_some_and(|repo| repo != context.writer)
                     || stub
-                        .space
-                        .as_ref()
-                        .is_some_and(|_| stub_space_norm.as_deref() != Some(context.space.raw.as_str()))
+                        .repo
+                        .as_deref()
+                        .is_some_and(|repo| repo != context.writer)
+                    || stub.space.as_ref().is_some_and(|_| {
+                        stub_space_norm.as_deref() != Some(context.space.raw.as_str())
+                    })
                     || !seen.insert((&stub.collection, &stub.rkey))
                 {
                     return Err("native_space_list_coordinate_mismatch".into());
@@ -1661,13 +1689,8 @@ mod native_archive_space_auth {
                     ("rkey".into(), stub.rkey.clone()),
                 ]);
                 let path = query_path(GET_RECORD, &get_params);
-                let (record_response, negotiated) = self.space_read(
-                    context,
-                    GET_RECORD,
-                    &path,
-                    vec![],
-                    Some(MacProfile::Record),
-                )?;
+                let (record_response, negotiated) =
+                    self.space_read(context, GET_RECORD, &path, vec![], Some(MacProfile::Record))?;
                 require_success(&record_response, "listed getRecord")?;
                 let (full, value) = verify_record(
                     context,
@@ -1799,10 +1822,7 @@ mod native_archive_space_auth {
                         .record_uri(&context.writer, &op.collection, &op.rkey)
                         .map_err(|e| format!("native_space_op_coordinates: {e}"))?;
                     if op.rev.is_empty()
-                        || state
-                            .latest_rev
-                            .as_ref()
-                            .is_some_and(|rev| rev > &op.rev)
+                        || state.latest_rev.as_ref().is_some_and(|rev| rev > &op.rev)
                     {
                         return Err("native_space_nonmonotonic_ops".into());
                     }
@@ -1827,9 +1847,7 @@ mod native_archive_space_auth {
                             return Err("native_space_op_previous_cid_mismatch".into());
                         }
                         if let Some(cid) = old {
-                            state
-                                .lt_hash
-                                .remove_record(&op.collection, &op.rkey, &cid);
+                            state.lt_hash.remove_record(&op.collection, &op.rkey, &cid);
                         }
                     } else if prev.is_some() {
                         // Retained oplog starts after genesis (compacted or post-importRepo):
@@ -1869,7 +1887,7 @@ mod native_archive_space_auth {
                     return Err("native_space_requested_ops_not_found".into());
                 }
                 if !genesis_replay_complete
-                    || state.lt_hash.commitment().as_slice() != head.data.as_ref()
+                    || state.lt_hash.commitment().as_slice() != head.data.as_slice()
                 {
                     // Post-`importRepo`/`clearRecords` (`ops: []` + non-empty `LtHash`) or
                     // retention-compacted `listRepoOps`: fall back to an authenticated `getRepo`
@@ -1900,7 +1918,8 @@ mod native_archive_space_auth {
                             &owned_star
                         }
                     };
-                    if star_repo.rev != head.rev || star_repo.data.as_slice() != head.data.as_ref()
+                    if star_repo.rev != head.rev
+                        || star_repo.data.as_slice() != head.data.as_slice()
                     {
                         return Err("native_space_oplog_commitment_mismatch".into());
                     }
@@ -1924,12 +1943,11 @@ mod native_archive_space_auth {
                 }
                 // A current-state commitment cannot authenticate superseded values.
                 // The protocol omits those values; refuse a host that includes them.
-                let mut full: ListRepoOpsOutput =
+                let full: ListRepoOpsOutput =
                     decode(&response.body, "authenticated listRepoOps values")?;
-                for op in &mut full.ops {
-                    op.extra_data = None;
+                for op in &full.ops {
                     if let Some(value) = &op.value {
-                        let path = format!("{}/{}", op.collection.as_str(), op.rkey.as_ref());
+                        let path = format!("{}/{}", op.collection, op.rkey);
                         let current = state
                             .cid_by_path
                             .get(&path)
@@ -1938,13 +1956,12 @@ mod native_archive_space_auth {
                             .cid
                             .as_ref()
                             .ok_or("native_space_stale_op_value")?
-                            .as_str()
                             .parse()
                             .map_err(|_| "native_space_invalid_op_cid")?;
                         if current != &claimed {
                             return Err("native_space_stale_op_value".into());
                         }
-                        let bytes = serde_ipld_dagcbor::to_vec(value)
+                        let bytes = petrel_core::to_dag_cbor(value)
                             .map_err(|e| format!("native_space_encode_op_value: {e}"))?;
                         validate_canonical_dagcbor_record(&bytes)
                             .map_err(|e| format!("native_space_invalid_op_value: {e}"))?;
@@ -1953,8 +1970,6 @@ mod native_archive_space_auth {
                         }
                     }
                 }
-                full.extra_data = None;
-                full.commit.extra_data = None;
                 let mut body = serde_json::to_value(&full)
                     .map_err(|e| format!("native_space_encode_ops: {e}"))?;
                 let served: ServedOps = decode(&response.body, "authenticated listRepoOps JSON")?;
@@ -2012,17 +2027,19 @@ mod native_archive_space_auth {
         let headers = mac_headers(response, RECORD_MAC_HEADER)?;
         verify_record_mac(secret, key_share, &headers, &envelope.uri, &envelope.cid)
             .map_err(|e| format!("native_space_record_mac: {e}"))?;
-        let mut full: GetRecordOutput = decode(&response.body, "authenticated getRecord value")?;
-        let bytes = serde_ipld_dagcbor::to_vec(&full.value)
+        let full: GetRecordOutput = decode(&response.body, "authenticated getRecord value")?;
+        let bytes = petrel_core::to_dag_cbor(&full.value)
             .map_err(|e| format!("native_space_encode_record_value: {e}"))?;
         validate_canonical_dagcbor_record(&bytes)
             .map_err(|e| format!("native_space_invalid_record_value: {e}"))?;
         if compute_dagcbor_cid(&bytes).to_bytes() != cid {
             return Err("native_space_record_value_cid_mismatch".into());
         }
-        full.extra_data = None;
         let served: ServedValue = decode(&response.body, "authenticated getRecord JSON")?;
-        Ok((full, served.value.ok_or("native_space_missing_record_value")?))
+        Ok((
+            full,
+            served.value.ok_or("native_space_missing_record_value")?,
+        ))
     }
 
     fn verify_commit(
@@ -2032,9 +2049,7 @@ mod native_archive_space_auth {
         commit: &Commit,
     ) -> Result<(), String> {
         let (key_share, secret) = negotiated;
-        let commit_space = SpaceUri::parse(&commit.space)
-            .ok()
-            .map(|s| s.raw);
+        let commit_space = SpaceUri::parse(&commit.space).ok().map(|s| s.raw);
         if commit_space.as_deref() != Some(context.space.raw.as_str())
             || commit.repo != context.writer
             || commit.ver != 1
@@ -2043,7 +2058,7 @@ mod native_archive_space_auth {
         }
         let data: [u8; 32] = commit
             .data
-            .as_ref()
+            .as_slice()
             .try_into()
             .map_err(|_| "native_space_invalid_commit_data")?;
         let headers = mac_headers(response, COMMIT_MAC_HEADER)?;
@@ -2066,17 +2081,22 @@ mod native_archive_space_auth {
     ) -> Result<ParsedStarRepo, String> {
         let (key_share, secret) = negotiated;
         let headers = mac_headers(response, COMMIT_MAC_HEADER)?;
-        read_star_repo_authenticated(&response.body, &context.space.raw, &context.writer, |meta| {
-            verify_commit_mac(
-                secret,
-                key_share,
-                &headers,
-                &context.space.raw,
-                &context.writer,
-                &meta.rev,
-                &meta.data,
-            )
-        })
+        read_star_repo_authenticated(
+            &response.body,
+            &context.space.raw,
+            &context.writer,
+            |meta| {
+                verify_commit_mac(
+                    secret,
+                    key_share,
+                    &headers,
+                    &context.space.raw,
+                    &context.writer,
+                    &meta.rev,
+                    &meta.data,
+                )
+            },
+        )
         .map_err(|e| match e {
             atproto_spaces::SpacesError::MacMismatch(msg) => {
                 format!("native_space_star_mac: {msg}")
@@ -2114,9 +2134,7 @@ mod native_archive_space_auth {
                 .headers
                 .iter()
                 .filter(|h| h.name.eq_ignore_ascii_case(required_name));
-            let first = matching
-                .next()
-                .ok_or("native_space_missing_response_mac")?;
+            let first = matching.next().ok_or("native_space_missing_response_mac")?;
             if matching.next().is_some() {
                 return Err("native_space_duplicate_response_mac".into());
             }
@@ -2383,9 +2401,7 @@ mod native_archive_space_auth {
                     "wrong_reason" => claims["reason"] = "spaceDeleted".into(),
                     "wrong_typ" => header["typ"] = "atproto-space-credential+jwt".into(),
                     "wrong_kid" => header["kid"] = "#mls-receipt-1".into(),
-                    "extra_claim" => {
-                        claims["lxm"] = "com.atproto.space.authorizeSpaceSync".into()
-                    }
+                    "extra_claim" => claims["lxm"] = "com.atproto.space.authorizeSpaceSync".into(),
                     other => panic!("unknown refusal mutation {other}"),
                 }
                 let encode =
@@ -2505,9 +2521,9 @@ mod native_archive_space_auth {
         }
 
         fn value_bytes(value: &Value) -> Vec<u8> {
-            let data: catbird_atproto::types::value::Data =
-                serde_json::from_value(value.clone()).unwrap();
-            serde_ipld_dagcbor::to_vec(&data).unwrap()
+            let raw = serde_json::to_vec(value).unwrap();
+            let data: petrel_core::Value = petrel_core::from_json(&raw).unwrap();
+            petrel_core::to_dag_cbor(&data).unwrap()
         }
 
         impl PlatformTransport for Host {
@@ -2623,10 +2639,7 @@ mod native_archive_space_auth {
                     };
                     let other_kid = encode_p256_did_key(&self.kem.public_key());
                     let subject = if fault == "wrong_space" {
-                        format!(
-                            "at:space/{}/{}/other",
-                            space.authority, space.space_type
-                        )
+                        format!("at:space/{}/{}/other", space.authority, space.space_type)
                     } else {
                         space.raw
                     };
@@ -2656,47 +2669,47 @@ mod native_archive_space_auth {
                     assert_eq!(header(&request, "x-oauth-transport-test"), "preserved");
                     return Ok(response(json!({"results": []})));
                 }
-                let (read_nsid, read_query, accept_sig, relay_target) =
-                    if nsid == "blue.catbird.chat.relaySpaceRead" {
-                        assert!(request.url.starts_with("https://home.example/"));
-                        let body: Value =
-                            serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
-                        assert_eq!(body["spaceAudience"], body["targetDid"]);
-                        assert!(body["signatureInput"]
-                            .as_str()
-                            .unwrap()
-                            .contains("atproto-space-credential"));
-                        assert!(body["signature"]
-                            .as_str()
-                            .unwrap()
-                            .starts_with("atproto-space-credential=:"));
-                        (
-                            body["nsid"].as_str().unwrap().to_owned(),
-                            body["query"].as_str().unwrap().to_owned(),
-                            body["acceptSignature"].as_str().unwrap().to_owned(),
-                            Some(body["targetDid"].as_str().unwrap().to_owned()),
-                        )
-                    } else {
-                        assert!(request.url.starts_with("https://account-pds.example/"));
-                        assert!(header(&request, "authorization")
-                            .starts_with("Atproto-Space-Credential "));
-                        assert_eq!(header(&request, "atproto-space-audience"), ACCOUNT);
-                        assert!(header(&request, "signature")
-                            .starts_with("atproto-space-credential=:"));
-                        (
-                            nsid.into(),
-                            query.into(),
-                            header(&request, ACCEPT_SIGNATURE_HEADER).into(),
-                            None,
-                        )
-                    };
+                let (read_nsid, read_query, accept_sig, relay_target) = if nsid
+                    == "blue.catbird.chat.relaySpaceRead"
+                {
+                    assert!(request.url.starts_with("https://home.example/"));
+                    let body: Value =
+                        serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+                    assert_eq!(body["spaceAudience"], body["targetDid"]);
+                    assert!(body["signatureInput"]
+                        .as_str()
+                        .unwrap()
+                        .contains("atproto-space-credential"));
+                    assert!(body["signature"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("atproto-space-credential=:"));
+                    (
+                        body["nsid"].as_str().unwrap().to_owned(),
+                        body["query"].as_str().unwrap().to_owned(),
+                        body["acceptSignature"].as_str().unwrap().to_owned(),
+                        Some(body["targetDid"].as_str().unwrap().to_owned()),
+                    )
+                } else {
+                    assert!(request.url.starts_with("https://account-pds.example/"));
+                    assert!(
+                        header(&request, "authorization").starts_with("Atproto-Space-Credential ")
+                    );
+                    assert_eq!(header(&request, "atproto-space-audience"), ACCOUNT);
+                    assert!(header(&request, "signature").starts_with("atproto-space-credential=:"));
+                    (
+                        nsid.into(),
+                        query.into(),
+                        header(&request, ACCEPT_SIGNATURE_HEADER).into(),
+                        None,
+                    )
+                };
                 let params = parse_query(&LabyrinthSpaceRequest::get(
                     &read_nsid,
                     format!("/xrpc/{read_nsid}?{read_query}"),
                 ))
                 .unwrap();
-                let space =
-                    SpaceUri::parse_hedged(required(&params, "space").unwrap()).unwrap();
+                let space = SpaceUri::parse_hedged(required(&params, "space").unwrap()).unwrap();
                 let writer = params
                     .get("repo")
                     .map(String::as_str)
@@ -2758,9 +2771,7 @@ mod native_archive_space_auth {
                     let repo_data = repo_hash.commitment();
                     let many = matches!(
                         fault,
-                        "inventory_101"
-                            | "inventory_changed_commit"
-                            | "inventory_snapshot_changed"
+                        "inventory_101" | "inventory_changed_commit" | "inventory_snapshot_changed"
                     );
                     let cycle = fault == "inventory_cursor_cycle";
                     let logical_dids: Vec<String> = if many || cycle {
@@ -2791,12 +2802,7 @@ mod native_archive_space_auth {
                             } else {
                                 repo_data
                             };
-                            (
-                                did,
-                                REV.to_owned(),
-                                format!("3jzfcijpj{index:04}a"),
-                                data,
-                            )
+                            (did, REV.to_owned(), format!("3jzfcijpj{index:04}a"), data)
                         })
                         .collect();
                     let mut inventory_hash = LtHash::empty();
@@ -2960,16 +2966,9 @@ mod native_archive_space_auth {
                         hash.add_record(COLLECTION, "batch-0", &batch0_cid);
                     }
                     let data = hash.commitment();
-                    let (mut mac_headers, _) = sign_commit_mac(
-                        &secret,
-                        &share,
-                        &label,
-                        &space.raw,
-                        writer,
-                        REV,
-                        &data,
-                    )
-                    .unwrap();
+                    let (mut mac_headers, _) =
+                        sign_commit_mac(&secret, &share, &label, &space.raw, writer, REV, &data)
+                            .unwrap();
                     if fault == "bad_mac" {
                         mac_headers.signature = format!("{label}=:{}:", STANDARD.encode([0u8; 32]));
                     } else if fault == "capture_mac" {
@@ -2994,9 +2993,8 @@ mod native_archive_space_auth {
                                 "rev": REV
                             });
                             if fault.starts_with("ops_compacted") {
-                                let prior_cid = compute_dagcbor_cid(&value_bytes(
-                                    &json!({"superseded": true}),
-                                ));
+                                let prior_cid =
+                                    compute_dagcbor_cid(&value_bytes(&json!({"superseded": true})));
                                 op["prev"] = prior_cid.to_string().into();
                             }
                             if params.get("excludeValues").map(String::as_str) != Some("true") {
@@ -3167,16 +3165,18 @@ mod native_archive_space_auth {
                     .lock()
                     .unwrap()
                     .iter()
-                    .find_map(|r| match r.url.split_once("/xrpc/com.atproto.space.getBlob?") {
-                        Some((_, query)) => Some(query.to_owned()),
-                        None if r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead") => {
-                            let body: Value =
-                                serde_json::from_slice(r.body.as_deref().unwrap()).unwrap();
-                            (body["nsid"] == "com.atproto.space.getBlob")
-                                .then(|| body["query"].as_str().unwrap().to_owned())
-                        }
-                        None => None,
-                    })
+                    .find_map(
+                        |r| match r.url.split_once("/xrpc/com.atproto.space.getBlob?") {
+                            Some((_, query)) => Some(query.to_owned()),
+                            None if r.url.ends_with("/xrpc/blue.catbird.chat.relaySpaceRead") => {
+                                let body: Value =
+                                    serde_json::from_slice(r.body.as_deref().unwrap()).unwrap();
+                                (body["nsid"] == "com.atproto.space.getBlob")
+                                    .then(|| body["query"].as_str().unwrap().to_owned())
+                            }
+                            None => None,
+                        },
+                    )
                     .expect("getBlob reached the writer's PDS");
                 let sent = parse_query(&LabyrinthSpaceRequest::get(
                     "com.atproto.space.getBlob",
@@ -3268,10 +3268,9 @@ mod native_archive_space_auth {
         fn writer_inventory_pages_past_one_hundred_only_release_after_head_reconciliation() {
             let (_directory, gateway, host) = gateway();
             *host.fault.lock().unwrap() = "inventory_101";
-            let response = block_on_sync(
-                gateway.execute_authenticated_space(request(LIST_WRITERS, false)),
-            )
-            .unwrap();
+            let response =
+                block_on_sync(gateway.execute_authenticated_space(request(LIST_WRITERS, false)))
+                    .unwrap();
             let inventory: InventoryPage = serde_json::from_slice(&response.body).unwrap();
             assert!(inventory.complete);
             assert!(inventory.cursor.is_none());
@@ -3298,12 +3297,12 @@ mod native_archive_space_auth {
                         .is_some_and(|query| query.contains("cursor=inventory-page-100"))
             }));
             let last = inventory.repos[100].repo_did();
-            assert!(relay_bodies
-                .iter()
-                .any(|body| { body["nsid"] == GET_REPO && body["targetDid"].as_str() == Some(last) }));
-            assert!(relay_bodies
-                .iter()
-                .any(|body| { body["nsid"] == LIST_OPS && body["targetDid"].as_str() == Some(last) }));
+            assert!(relay_bodies.iter().any(|body| {
+                body["nsid"] == GET_REPO && body["targetDid"].as_str() == Some(last)
+            }));
+            assert!(relay_bodies.iter().any(|body| {
+                body["nsid"] == LIST_OPS && body["targetDid"].as_str() == Some(last)
+            }));
         }
 
         #[test]
@@ -3400,8 +3399,7 @@ mod native_archive_space_auth {
                 )
                 .unwrap_err();
                 assert!(
-                    error.starts_with("ArchiveInventoryIncomplete:")
-                        && error.contains(expected),
+                    error.starts_with("ArchiveInventoryIncomplete:") && error.contains(expected),
                     "{fault}: {error}"
                 );
             }
@@ -3593,10 +3591,9 @@ mod native_archive_space_auth {
                 accepted.config.home_ds_did = home_ds_did.into();
                 pin_group(&accepted, GROUP);
                 *host.fault.lock().unwrap() = "denied:valid";
-                let response = block_on_sync(
-                    accepted.execute_authenticated_space(request(GET_RECORD, false)),
-                )
-                .unwrap();
+                let response =
+                    block_on_sync(accepted.execute_authenticated_space(request(GET_RECORD, false)))
+                        .unwrap();
                 assert_eq!(response.status, 403, "{home_ds_did}");
                 assert!(
                     host.requests
@@ -3798,9 +3795,10 @@ mod native_archive_space_auth {
             {
                 let (_directory, gateway, host) = gateway();
                 *host.fault.lock().unwrap() = "ops_empty_after_import";
-                let inv_resp =
-                    block_on_sync(gateway.execute_authenticated_space(request(LIST_WRITERS, false)))
-                        .unwrap();
+                let inv_resp = block_on_sync(
+                    gateway.execute_authenticated_space(request(LIST_WRITERS, false)),
+                )
+                .unwrap();
                 assert_eq!(inv_resp.status, 200);
 
                 let ops_resp =
@@ -3817,9 +3815,10 @@ mod native_archive_space_auth {
             {
                 let (_directory, gateway, host) = gateway();
                 *host.fault.lock().unwrap() = "ops_compacted";
-                let inv_resp =
-                    block_on_sync(gateway.execute_authenticated_space(request(LIST_WRITERS, false)))
-                        .unwrap();
+                let inv_resp = block_on_sync(
+                    gateway.execute_authenticated_space(request(LIST_WRITERS, false)),
+                )
+                .unwrap();
                 assert_eq!(inv_resp.status, 200);
 
                 let ops_resp =

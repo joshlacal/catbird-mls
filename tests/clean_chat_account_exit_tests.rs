@@ -1331,13 +1331,14 @@ async fn generated_exit_output_roundtrip_accepts_fixed_reference_tags_and_real_b
         if close {
             assert!(entry["tombstone"].get("$type").is_none());
             assert!(response["result"]["tombstone"].get("$type").is_none());
-            let _: catbird_atproto::blue_catbird::chat::close_conversation::CloseConversationOutput = serde_json::from_value(response.clone()).unwrap();
+            let _: catbird_mls::atproto::chat::close_conversation::Output =
+                serde_json::from_value(response.clone()).unwrap();
         } else {
             assert_eq!(
                 response["result"]["$type"],
                 "blue.catbird.chat.defs#zeroLeafLeaveResult"
             );
-            let _: catbird_atproto::blue_catbird::chat::request_leave::RequestLeaveOutput =
+            let _: catbird_mls::atproto::chat::request_leave::Output =
                 serde_json::from_value(response.clone()).unwrap();
         }
         assert_terminal(&f).await;

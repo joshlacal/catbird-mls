@@ -405,16 +405,16 @@ where
         {
             return Err(invalid().into());
         }
-        let stats: Option<crate::atproto::blue_catbird::chat::DirectRequestKeyPoolStats<String>> =
-            own.get("directRequestKeyPool")
-                .filter(|s| !s.is_null())
-                .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid()))
-                .transpose()?;
+        let stats: Option<crate::atproto::chat::defs::DirectRequestKeyPoolStats> = own
+            .get("directRequestKeyPool")
+            .filter(|s| !s.is_null())
+            .map(|v| serde_json::from_value(v.clone()).map_err(|_| invalid()))
+            .transpose()?;
         if let Some(stats) = &stats {
-            let as_of = chrono::DateTime::parse_from_rfc3339(&stats.as_of.to_string())
+            let as_of = chrono::DateTime::parse_from_rfc3339(stats.as_of.as_str())
                 .map_err(|_| invalid())?
                 .timestamp();
-            let until = chrono::DateTime::parse_from_rfc3339(&stats.usable_until.to_string())
+            let until = chrono::DateTime::parse_from_rfc3339(stats.usable_until.as_str())
                 .map_err(|_| invalid())?
                 .timestamp();
             if stats.revision < 1

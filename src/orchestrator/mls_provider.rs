@@ -768,8 +768,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         &self,
         _user_did: &str,
         _conversation_id: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
-    {
+    ) -> Result<Option<crate::atproto::chat::defs::ConversationCoordinates>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "get_conversation_departure is required".into(),
         })
@@ -777,7 +776,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     fn put_conversation_departure(
         &self,
         _user_did: &str,
-        _coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+        _coordinate: &crate::atproto::chat::defs::ConversationCoordinates,
     ) -> Result<bool, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "put_conversation_departure is required".into(),
@@ -788,7 +787,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         &self,
         _user_did: &str,
         _conversation_id: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+    ) -> Result<Option<crate::atproto::chat::defs::ConversationState>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "get_conversation_policy is required".into(),
         })
@@ -797,7 +796,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     fn put_conversation_policy(
         &self,
         _user_did: &str,
-        _state: &catbird_atproto::blue_catbird::chat::ConversationState,
+        _state: &crate::atproto::chat::defs::ConversationState,
     ) -> Result<bool, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "put_conversation_policy is required".into(),

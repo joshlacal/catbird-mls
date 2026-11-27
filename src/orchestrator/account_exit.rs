@@ -1,6 +1,8 @@
 //! Exact account-exit intent and accepted proof, independent of MLS Commit journals.
 #[cfg(feature = "legacy-orchestrator")]
-use catbird_atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError;
+use crate::atproto::chat::get_conversation_state::Error as GetConversationStateError;
+#[cfg(feature = "legacy-orchestrator")]
+use crate::atproto::GeneratedXrpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -389,9 +391,11 @@ where
             // A closed CID cannot be re-invited. After zero-leaf leave, an
             // outside-interval denial can still hide newer sibling membership.
             Err(OrchestratorError::ServerError { status: 400, body })
-                if match serde_json::from_str::<GetConversationStateError>(&body) {
-                    Ok(GetConversationStateError::NotEntitled(_)) => true,
-                    Ok(GetConversationStateError::AccessOutsideMembershipInterval(_)) => close,
+                if match GeneratedXrpcError::<GetConversationStateError>::parse(body.as_bytes())
+                    .map(|error| error.error)
+                {
+                    Ok(GetConversationStateError::NotEntitled) => true,
+                    Ok(GetConversationStateError::AccessOutsideMembershipInterval) => close,
                     _ => false,
                 } => {}
             Err(OrchestratorError::ServerError {

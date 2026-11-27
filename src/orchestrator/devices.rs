@@ -268,7 +268,7 @@ where
                 String::from_utf8_lossy(&response.body)
             )));
         }
-        let output: crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String> =
+        let output: crate::atproto::chat::enroll_device::Output =
             serde_json::from_slice(&response.body).map_err(|e| {
                 OrchestratorError::Serialization(format!("enroll_device response: {e}"))
             })?;
@@ -278,7 +278,7 @@ where
             device_uuid: device_uuid.clone(),
             created_at: Some(chrono::Utc::now()),
             key_id: Some(output.device.key_id.to_string()),
-            signature_public_key: Some(output.device.signature_public_key.to_vec()),
+            signature_public_key: Some(output.device.signature_public_key.0.clone()),
             auth_generation: Some(output.device.auth_generation),
             status: Some("active".into()),
             available_package_count: Some(output.device.available_package_count as u32),
