@@ -643,9 +643,10 @@ fn owner_archive_error(error: labyrinth::Error) -> MLSError {
 /// `labyrinth_state` key: the author unsent `message_id`. No flush or kick rescue
 /// archives it again, from the queue or from cached evidence.
 #[cfg(feature = "labyrinth")]
-fn unsent_message_key(conversation_id: &str, message_id: &str) -> String {
-    format!("native.unsent:{conversation_id}:{message_id}")
-}
+use super::message_erase::{
+    deleted_for_me_key, erase_message_content, is_locally_erased, unsent_message_key,
+    DeletedForMeMarker, PendingDeleteForMe, NATIVE_DELETE_FOR_ME_OP,
+};
 
 /// This device's MLS groups: the independent authority `mls-ds` member-device
 /// answers are cross-checked against.
@@ -2822,10 +2823,7 @@ impl CatbirdMlsClient {
                         "owner archive conversation mismatch".into(),
                     ));
                 }
-                if tx
-                    .get_labyrinth_state(&unsent_message_key(conversation_id, &item.message_id))?
-                    .is_some()
-                {
+                if is_locally_erased(tx, conversation_id, &item.message_id)? {
                     continue;
                 }
                 let Some(message) = tx.get_message(&item.message_id)? else {
@@ -2893,7 +2891,10 @@ impl CatbirdMlsClient {
         let conversations = self
             .db
             .read_tx(|tx| tx.list_labyrinth_queue_conversations())?;
+        // Delete-for-me tombstones whose publish failed earlier ride the next flush.
+        let pending_deletes = self.pending_deletes_for_me()?;
         if conversations.is_empty()
+            && pending_deletes.is_empty()
             && self
                 .db
                 .read_tx(|tx| {
@@ -2905,7 +2906,10 @@ impl CatbirdMlsClient {
         }
         // Nothing queued and nothing held: opening the session would only re-read the mailbox,
         // epoch heads and device keys (15-20 round trips) under the archive lifecycle lock.
-        if conversations.is_empty() && self.idle_archive_refresh_is_fresh()? {
+        if conversations.is_empty()
+            && pending_deletes.is_empty()
+            && self.idle_archive_refresh_is_fresh()?
+        {
             return Ok(0);
         }
         if crate::buggify!("between_labyrinth_enqueue_and_flush") {
@@ -2973,12 +2977,7 @@ impl CatbirdMlsClient {
                         let payloads = self.db.read_tx(|tx| {
                             let mut kept = Vec::with_capacity(payloads.len());
                             for payload in payloads {
-                                if tx
-                                    .get_labyrinth_state(&unsent_message_key(
-                                        &cid,
-                                        &payload.message_id,
-                                    ))?
-                                    .is_none()
+                                if !is_locally_erased(tx, &cid, &payload.message_id)?
                                     && super::archive_policy::should_enqueue(tx, &payload)?
                                 {
                                     kept.push(payload);
@@ -3085,6 +3084,16 @@ impl CatbirdMlsClient {
                     }
                 }
             }
+            if !pending_deletes.is_empty() {
+                if let Err(error) = self
+                    .publish_pending_deletes_for_me(&mut session, pending_deletes)
+                    .await
+                {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
             self.save_native_archive_status(&session, false)?;
             match first_error {
                 Some(error) => Err(error),
@@ -3103,6 +3112,14 @@ impl CatbirdMlsClient {
             .outbox_flush_lock
             .lock()
             .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
+        // Already erased: the marker and the erase share one transaction, so a marker means done.
+        if self.db.read_tx(|tx| {
+            Ok(tx
+                .get_labyrinth_state(&unsent_message_key(conversation_id, message_id))?
+                .is_some())
+        })? {
+            return Ok(0);
+        }
         let message = self
             .db
             .read_tx(|tx| tx.get_message(message_id))?
@@ -3139,9 +3156,12 @@ impl CatbirdMlsClient {
             }
         })?;
         if local_only {
+            // Marker and erase commit together: the row, its evidence and queued copies go.
             self.db.write_tx(|tx| {
-                tx.dequeue_labyrinth_item(message_id)?;
-                tx.put_labyrinth_state(
+                erase_message_content(
+                    tx,
+                    conversation_id,
+                    message_id,
                     &unsent_message_key(conversation_id, message_id),
                     b"unsent-local",
                     self.hooks.now_ms(),
@@ -3169,13 +3189,14 @@ impl CatbirdMlsClient {
                 .await
                 .map_err(native_archive_error)?
                 .map_err(|error| MLSError::Cryptography(format!("Labyrinth unsend: {error}")))?;
-            // The redaction is durable. Drop the queued copy and mark the message in one
-            // transaction: no later flush or kick rescue archives it, whether it is queued
-            // again by a replayed send journal or read from cached evidence. The evidence
-            // stays, because sync recognises this device's own echo by it.
+            // The redaction is durable. Erase the local content and write the marker in one
+            // transaction: no later flush, kick rescue, restore or reindex brings it back. The
+            // marker replaces the evidence for own-echo recognition in sync.
             self.db.write_tx(|tx| {
-                tx.dequeue_labyrinth_item(message_id)?;
-                tx.put_labyrinth_state(
+                erase_message_content(
+                    tx,
+                    conversation_id,
+                    message_id,
                     &unsent_message_key(conversation_id, message_id),
                     b"unsent",
                     self.hooks.now_ms(),
@@ -3187,6 +3208,263 @@ impl CatbirdMlsClient {
             conversation_id: conversation_id.to_owned(),
         });
         Ok(count)
+    }
+
+    /// Delete for me: erase `message_id`'s local content on this device now and, when the
+    /// frame was archived and backup is on, publish an owner tombstone to this account's
+    /// personal mailbox so its other devices erase it when they load history. Nothing is
+    /// written to or removed from the conversation Space; other members keep their copies.
+    ///
+    /// The local erase, the durable `native.deleted` marker and the pending tombstone publish
+    /// commit in one transaction before any network call. A failed publish stays queued and is
+    /// retried by `flush_labyrinth_queue`. Idempotent: a second call is `Ok(())`.
+    pub fn delete_message_for_me(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(), MLSError> {
+        let _guard = self
+            .outbox_flush_lock
+            .lock()
+            .map_err(|_| MLSError::lock_poisoned("archive lifecycle"))?;
+        if self
+            .db
+            .read_tx(|tx| is_locally_erased(tx, conversation_id, message_id))?
+        {
+            return Ok(());
+        }
+        let message = self
+            .db
+            .read_tx(|tx| tx.get_message(message_id))?
+            .filter(|row| row.conversation_id == conversation_id)
+            .ok_or_else(|| MLSError::invalid_input("message not found"))?;
+        if serde_json::from_str::<serde_json::Value>(&message.plaintext_json)
+            .ok()
+            .is_some_and(|value| value["messageType"] == "system")
+        {
+            return Err(MLSError::invalid_input(
+                "system messages cannot be deleted for me",
+            ));
+        }
+        // Read before the erase drops the evidence: only an archived frame has copies that
+        // another device of this account could restore, so only then is a tombstone needed.
+        let archived = self.db.read_tx(|tx| {
+            let evidence =
+                tx.get_labyrinth_state(&format!("native.message:{conversation_id}:{message_id}"))?;
+            match evidence
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<NativeArchiveEvidence>(bytes).ok())
+            {
+                Some(frame) => super::archive_policy::should_archive_frame(
+                    tx,
+                    conversation_id,
+                    message.seq,
+                    &frame.labyrinth_frame_json,
+                ),
+                None => Ok(false),
+            }
+        })?;
+        let publish = archived && self.labyrinth_status()?.backup_enabled;
+        let now_ms = self.hooks.now_ms();
+        let marker = DeletedForMeMarker {
+            v: 1,
+            at_ms: now_ms,
+            sender_did: message.sender_did.clone(),
+            published: false,
+        };
+        let pending = PendingDeleteForMe {
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            timestamp_ms: u64::try_from(message.created_at_ms.max(0)).unwrap_or(0),
+            sender_did: message.sender_did.clone(),
+        };
+        self.db.write_tx(|tx| {
+            erase_message_content(
+                tx,
+                conversation_id,
+                message_id,
+                &deleted_for_me_key(conversation_id, message_id),
+                &marker.to_bytes()?,
+                now_ms,
+            )?;
+            if publish {
+                tx.put_pending_op(
+                    NATIVE_DELETE_FOR_ME_OP,
+                    message_id,
+                    &serde_json::to_string(&pending)?,
+                    now_ms,
+                )?;
+            }
+            Ok(())
+        })?;
+        self.notify(PlatformChangeEvent::MessagesUpdated {
+            conversation_id: conversation_id.to_owned(),
+        });
+        if publish {
+            let published = self.native_archive_run(async {
+                let mut session = self
+                    .native_archive_deps()?
+                    .enable()
+                    .await
+                    .map_err(native_archive_error)?;
+                self.publish_pending_deletes_for_me(&mut session, vec![pending])
+                    .await
+            });
+            if let Err(error) = published {
+                tracing::warn!(
+                    conversation_id,
+                    %error,
+                    "delete for me: owner tombstone publish deferred; retried on flush"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Queued owner tombstones not yet in the personal mailbox.
+    fn pending_deletes_for_me(&self) -> Result<Vec<PendingDeleteForMe>, MLSError> {
+        self.db.read_tx(|tx| {
+            let mut statement = tx
+                .conn()
+                .prepare(
+                    "SELECT payload_json FROM pending_ops WHERE op_kind = ?1 ORDER BY created_at_ms, op_key",
+                )
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            let rows = statement
+                .query_map([NATIVE_DELETE_FOR_ME_OP], |row| row.get::<_, String>(0))
+                .map_err(|e| MLSError::Internal(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| MLSError::Internal(e.to_string()))?;
+            Ok(rows
+                .iter()
+                .filter_map(|raw| serde_json::from_str::<PendingDeleteForMe>(raw).ok())
+                .collect())
+        })
+    }
+
+    /// Publish each queued owner tombstone, then drop its pending op and mark it published.
+    /// Stops at the first failure; the rest stay queued.
+    async fn publish_pending_deletes_for_me(
+        &self,
+        session: &mut crate::labyrinth::LabyrinthSession,
+        items: Vec<PendingDeleteForMe>,
+    ) -> Result<u32, MLSError> {
+        let mut published = 0u32;
+        for item in items {
+            self.pin_native_conversation(&item.conversation_id)?;
+            session
+                .delete_native_message_for_me(
+                    &item.conversation_id,
+                    &item.message_id,
+                    item.timestamp_ms,
+                    Some(item.sender_did.as_str()),
+                )
+                .await
+                .map_err(native_archive_error)?
+                .map_err(|error| {
+                    MLSError::Cryptography(format!("Labyrinth delete for me: {error}"))
+                })?;
+            let now_ms = self.hooks.now_ms();
+            self.db.write_tx(|tx| {
+                let key = deleted_for_me_key(&item.conversation_id, &item.message_id);
+                let mut marker = tx
+                    .get_labyrinth_state(&key)?
+                    .and_then(|raw| serde_json::from_slice::<DeletedForMeMarker>(&raw).ok())
+                    .unwrap_or(DeletedForMeMarker {
+                        v: 1,
+                        at_ms: now_ms,
+                        sender_did: item.sender_did.clone(),
+                        published: false,
+                    });
+                marker.published = true;
+                tx.put_labyrinth_state(&key, &marker.to_bytes()?, now_ms)?;
+                tx.delete_pending_op(NATIVE_DELETE_FOR_ME_OP, &item.message_id)?;
+                Ok(())
+            })?;
+            published += 1;
+        }
+        Ok(published)
+    }
+
+    /// Apply verified history deletions to local storage: author redactions (unsend by the
+    /// author, verified by Labyrinth) and this account's own delete-for-me tombstones. Each
+    /// erases the local content under its durable marker in one transaction.
+    fn apply_history_erasures(
+        &self,
+        conversation_id: &str,
+        redacted: &[labyrinth::client::RedactedMessage],
+        deleted_for_me: &[String],
+    ) -> Result<u32, MLSError> {
+        if redacted.is_empty() && deleted_for_me.is_empty() {
+            return Ok(0);
+        }
+        let now_ms = self.hooks.now_ms();
+        let erased = self.db.write_tx(|tx| {
+            let mut erased = 0u32;
+            for item in redacted {
+                // Only the verified author's own row is erased under a redaction.
+                let row = tx.get_message(&item.message_id)?;
+                if row
+                    .as_ref()
+                    .is_some_and(|row| row.sender_did != item.sender)
+                {
+                    continue;
+                }
+                if tx
+                    .get_labyrinth_state(&unsent_message_key(conversation_id, &item.message_id))?
+                    .is_some()
+                {
+                    continue;
+                }
+                if erase_message_content(
+                    tx,
+                    conversation_id,
+                    &item.message_id,
+                    &unsent_message_key(conversation_id, &item.message_id),
+                    b"unsent-peer",
+                    now_ms,
+                )?
+                .existed
+                {
+                    erased += 1;
+                }
+            }
+            for message_id in deleted_for_me {
+                let key = deleted_for_me_key(conversation_id, message_id);
+                if tx.get_labyrinth_state(&key)?.is_some() {
+                    continue;
+                }
+                let sender_did = tx
+                    .get_message(message_id)?
+                    .map(|row| row.sender_did)
+                    .unwrap_or_default();
+                let marker = DeletedForMeMarker {
+                    v: 1,
+                    at_ms: now_ms,
+                    sender_did,
+                    published: true,
+                };
+                if erase_message_content(
+                    tx,
+                    conversation_id,
+                    message_id,
+                    &key,
+                    &marker.to_bytes()?,
+                    now_ms,
+                )?
+                .existed
+                {
+                    erased += 1;
+                }
+            }
+            Ok(erased)
+        })?;
+        if erased > 0 {
+            self.notify(PlatformChangeEvent::MessagesUpdated {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+        Ok(erased)
     }
 
     pub fn rescue_conversation_on_kick(&self, conversation_id: &str) -> Result<u32, MLSError> {
@@ -3217,7 +3495,7 @@ impl CatbirdMlsClient {
             let mut items = std::collections::BTreeMap::new();
             let mut skipped = std::collections::BTreeSet::new();
             for id in ids {
-                if tx.get_labyrinth_state(&unsent_message_key(conversation_id, &id))?.is_some() {
+                if is_locally_erased(tx, conversation_id, &id)? {
                     continue;
                 }
                 let key = format!("native.message:{conversation_id}:{id}");
@@ -4085,7 +4363,7 @@ impl CatbirdMlsClient {
         };
         let (prefetched_state, preverified_deletions) =
             self.preverify_conversation_deletions(conversation_id)?;
-        let (mut history, rejected) = self.native_archive_run(async {
+        let restored = self.native_archive_run(async {
             let deps = self.native_archive_deps_preverified(preverified_deletions)?;
             // A verified local roster that excludes this account is sufficient removal proof.
             // Without MLS state, the home DS's ConversationNotFound or NotEntitled is only a lead
@@ -4128,7 +4406,7 @@ impl CatbirdMlsClient {
                 return session
                     .load_owner_history(conversation_id)
                     .await
-                    .map(|messages| (messages, 0))
+                    .map(|messages| (messages, 0, Vec::new(), Vec::new()))
                     .map_err(native_archive_error);
             }
             if let Some(conversation_unknown) = denial_lead {
@@ -4137,7 +4415,7 @@ impl CatbirdMlsClient {
                     .await
                     .map_err(native_archive_error)?;
                 if conversation_unknown && owner.is_empty() {
-                    return Ok((owner, 0));
+                    return Ok((owner, 0, Vec::new(), Vec::new()));
                 }
                 self.pin_native_conversation_from_owner_history(conversation_id, &owner)?;
             }
@@ -4154,8 +4432,15 @@ impl CatbirdMlsClient {
                 tracing::debug!(conversation_id, skipped = history.not_recipient,
                     "labyrinth restore: skipped authenticated records outside this account's recipient interval");
             }
-            Ok((history.messages, history.rejected))
+            Ok((
+                history.messages,
+                history.rejected,
+                history.redacted,
+                history.deleted_for_me,
+            ))
         })?;
+        let (mut history, rejected, redacted, deleted_for_me) = restored;
+        self.apply_history_erasures(conversation_id, &redacted, &deleted_for_me)?;
         if rejected > 0 {
             tracing::warn!(
                 conversation_id,
@@ -4180,6 +4465,10 @@ impl CatbirdMlsClient {
             let mut skipped = 0usize;
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
+                // Erased on this device: a restore never brings it back.
+                if is_locally_erased(tx, conversation_id, message_id)? {
+                    continue;
+                }
                 let local = tx.get_message(message_id)?;
                 // A placeholder under the original message id is the ordinary undecryptable
                 // case. A pruned entry has no message id on the wire, so its unavailable
@@ -4795,7 +5084,7 @@ impl CatbirdMlsClient {
         self.pin_native_conversation(conversation_id)?;
         let (prefetched_state, preverified_deletions) =
             self.preverify_conversation_deletions(conversation_id)?;
-        let mut history = self.native_archive_run(async {
+        let history = self.native_archive_run(async {
             let deps = self.native_archive_deps_preverified(preverified_deletions)?;
             let mut session = deps
                 .open()
@@ -4811,8 +5100,10 @@ impl CatbirdMlsClient {
                     "conversation archive contains corrupt or unverified frames".into(),
                 ));
             }
-            Ok::<_, MLSError>(page.messages)
+            Ok::<_, MLSError>((page.messages, page.redacted, page.deleted_for_me))
         })?;
+        let (mut history, redacted, deleted_for_me) = history;
+        self.apply_history_erasures(conversation_id, &redacted, &deleted_for_me)?;
         let tombstoned_dids =
             self.apply_listed_account_deletions(conversation_id, &history, prefetched_state)?;
         Self::hide_deleted_accounts(&self.db, conversation_id, &tombstoned_dids, &mut history)?;
@@ -4821,10 +5112,7 @@ impl CatbirdMlsClient {
             let mut chosen_by_id = std::collections::BTreeMap::new();
             for group in copies.values() {
                 let message_id = &group[0].0.message_id;
-                if tx
-                    .get_labyrinth_state(&unsent_message_key(conversation_id, message_id))?
-                    .is_some()
-                {
+                if is_locally_erased(tx, conversation_id, message_id)? {
                     continue;
                 }
                 let local = tx.get_message(message_id)?;
@@ -4918,9 +5206,7 @@ impl CatbirdMlsClient {
                         || tx
                             .get_labyrinth_state(&format!("native.message:{conversation_id}:{id}"))?
                             .is_some()
-                        || tx
-                            .get_labyrinth_state(&unsent_message_key(conversation_id, &id))?
-                            .is_some()
+                        || is_locally_erased(tx, conversation_id, &id)?
                     {
                         continue;
                     }

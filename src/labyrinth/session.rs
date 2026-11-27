@@ -471,6 +471,8 @@ pub struct HistoryPage {
     pub space_readable: bool,
     /// Messages their authors unsent (verified author redactions only).
     pub redacted: Vec<RedactedMessage>,
+    /// Message ids this account deleted for itself (owner tombstones in its own mailbox).
+    pub deleted_for_me: Vec<String>,
 }
 
 fn history_error_counts(items: &[labyrinth::client::Undecryptable]) -> (usize, usize) {
@@ -1988,6 +1990,26 @@ impl LabyrinthSession {
         self.try_finish(raw)
     }
 
+    /// Delete for me: seal an owner tombstone for `message_id` (sent at `timestamp_ms` by
+    /// `author`) into this account's personal mailbox. The conversation Space is untouched.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn delete_native_message_for_me(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+        timestamp_ms: u64,
+        author: Option<&str>,
+    ) -> Result<labyrinth::Result<()>> {
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            self.lab
+                .delete_for_me(conversation_id, message_id, timestamp_ms, author, &[])
+                .await
+        }
+        .await;
+        self.try_finish(raw)
+    }
+
     /// Native queue entries keep the verified receipt and blinded frame nonce;
     /// delegate MEK verification/distribution and sender sealing to Labyrinth.
     ///
@@ -2193,6 +2215,7 @@ impl LabyrinthSession {
             space_readable: h.space_readable,
             messages: h.messages,
             redacted: h.redacted,
+            deleted_for_me: h.deleted_for_me,
         })
     }
 
@@ -2222,6 +2245,7 @@ impl LabyrinthSession {
                 space_readable: p.history.space_readable,
                 messages: p.history.messages,
                 redacted: p.history.redacted,
+                deleted_for_me: p.history.deleted_for_me,
             },
             p.next,
         ))

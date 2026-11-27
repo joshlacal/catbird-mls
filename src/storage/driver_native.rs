@@ -462,6 +462,10 @@ fn open_configured_connection(
                 .map_err(|e| map_rusqlite_err("PushExtension busy_timeout", &e))?;
         }
     }
+    // Freed pages are zeroed, so an erased message (delete for me, unsend) leaves no
+    // plaintext in reusable pages of the database file.
+    conn.execute_batch("PRAGMA secure_delete = ON;")
+        .map_err(|e| map_rusqlite_err("secure_delete pragma", &e))?;
     configure_apple_fullfsync(&conn)
         .map_err(|e| map_rusqlite_err("Apple fullfsync pragmas", &e))?;
 
@@ -1408,7 +1412,9 @@ impl<'a> SqlReadTx<'a> {
                         sender_device_id, plaintext_json, created_at_ms, is_own \
                  FROM messages WHERE conversation_id = ?1 AND seq < ?2 \
                  AND NOT EXISTS (SELECT 1 FROM labyrinth_state AS state \
-                     WHERE state.state_key = 'native.unsent:' || messages.conversation_id || ':' || messages.message_id) \
+                     WHERE state.state_key IN ( \
+                         'native.unsent:' || messages.conversation_id || ':' || messages.message_id, \
+                         'native.deleted:' || messages.conversation_id || ':' || messages.message_id)) \
                  ORDER BY {order_clause} LIMIT ?3"
             );
             let mut stmt = self
@@ -1426,7 +1432,9 @@ impl<'a> SqlReadTx<'a> {
                         sender_device_id, plaintext_json, created_at_ms, is_own \
                  FROM messages WHERE conversation_id = ?1 \
                  AND NOT EXISTS (SELECT 1 FROM labyrinth_state AS state \
-                     WHERE state.state_key = 'native.unsent:' || messages.conversation_id || ':' || messages.message_id) \
+                     WHERE state.state_key IN ( \
+                         'native.unsent:' || messages.conversation_id || ':' || messages.message_id, \
+                         'native.deleted:' || messages.conversation_id || ':' || messages.message_id)) \
                  ORDER BY {order_clause} LIMIT ?2"
             );
             let mut stmt = self

@@ -5188,6 +5188,96 @@ impl CatbirdMlsClient {
                 });
                 let body = verified_application_body.as_ref().unwrap_or(body);
 
+                // Erased on this device (unsent or deleted for me): the durable marker, not the
+                // dropped evidence, recognises the entry. Its I13 receipt still verifies and
+                // binds this seq and sender before the cursor moves; nothing is stored.
+                let erased_sender = self
+                    .db
+                    .read_tx(|tx| super::message_erase::erased_marker_sender(tx, cid, msg_id))?;
+                if let Some(marker_sender) = erased_sender {
+                    let rcpt_val = entry
+                        .get("sequencerReceipt")
+                        .filter(|v| v.is_object())
+                        .ok_or_else(|| {
+                            MLSError::Cryptography(format!(
+                                "I13: erased applicationEntry {msg_id} missing sequencerReceipt"
+                            ))
+                        })?;
+                    let entry_id = entry
+                        .get("entryId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(msg_id);
+                    let kid = chat_wire::sequencer_receipt_kid(&convo.sequencer_did, rcpt_val)?;
+                    let rcpt_sec1 = self
+                        .resolve_sequencer_receipt_key(&convo.sequencer_did, kid)?
+                        .ok_or_else(|| {
+                            MLSError::Cryptography(format!(
+                                "I13: unable to resolve `{}` receipt method {kid}",
+                                convo.sequencer_did
+                            ))
+                        })?;
+                    let send_counter = body.get("sendCounter").and_then(Value::as_u64);
+                    let now_ms = self.hooks.now_ms();
+                    let skipped = self.db.write_tx(|tx| {
+                        let mut c = tx
+                            .get_conversation(cid)?
+                            .ok_or_else(|| MLSError::group_not_found(cid))?;
+                        let verified = chat_wire::verify_pruned_application_receipt(
+                            rcpt_val,
+                            &rcpt_sec1,
+                            &c.sequencer_did,
+                            cid,
+                            &c.group_id,
+                            entry_id,
+                            entry_seq,
+                        )?;
+                        if verified.generation != c.generation {
+                            return Err(MLSError::Cryptography(
+                                "I13: erased entry receipt generation mismatch".into(),
+                            ));
+                        }
+                        if outer_sender.is_some_and(|(did, device)| {
+                            did != verified.sender_did || device != verified.sender_device_id
+                        }) {
+                            return Err(MLSError::Cryptography(
+                                "erased entry outer sender mismatch".into(),
+                            ));
+                        }
+                        // A marker naming another sender does not cover this entry.
+                        if marker_sender
+                            .as_deref()
+                            .is_some_and(|sender| sender != verified.sender_did)
+                        {
+                            return Ok(false);
+                        }
+                        let own_device = verified.sender_did == self.normalized_did
+                            && verified.sender_device_id == canonical_dev_id;
+                        if !own_device {
+                            super::send_counter::record_peer_send_counter(
+                                tx,
+                                cid,
+                                verified.generation,
+                                verified.epoch,
+                                &verified.sender_did,
+                                &verified.sender_device_id,
+                                send_counter,
+                                entry_seq,
+                                now_ms,
+                            )?;
+                        }
+                        tx.delete_pending_op(NATIVE_ARCHIVE_RECEIPT_OP, msg_id)?;
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = now_ms;
+                        tx.upsert_conversation(&c)?;
+                        Ok(true)
+                    })?;
+                    if skipped {
+                        pass.max_seq = pass.max_seq.max(entry_seq);
+                        pass.applied = pass.applied.saturating_add(1);
+                        continue;
+                    }
+                }
+
                 let already_have = self.db.read_tx(|tx| tx.get_message(msg_id))?.is_some();
                 #[cfg(feature = "sim")]
                 let already_have = already_have

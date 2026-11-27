@@ -1671,6 +1671,13 @@ pub fn process_push_notification_with_hooks(
                         }
                         Some(counter.map_or_else(|| json!("unknown"), |counter| json!(counter)))
                     };
+                    // Erased on this device (unsent or deleted for me): never store its
+                    // plaintext here. Foreground sync verifies the receipt and moves the cursor.
+                    if crate::client::message_erase::is_locally_erased(
+                        tx, &wake.conversation_id, &message_id,
+                    )? {
+                        return Err(foreground_sync_required());
+                    }
                     if crate::client::deletion_authority::suppress_local_frame(
                         tx, &wake.conversation_id, &verified_sender_did, &verified_device_id,
                         entry.seq, verified_receipt.receipt["issuedAtMs"].as_i64(),

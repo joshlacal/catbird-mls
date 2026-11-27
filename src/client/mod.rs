@@ -18,6 +18,8 @@ pub mod did_url;
 mod live_plane;
 #[cfg(not(target_arch = "wasm32"))]
 mod live_sync;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod message_erase;
 pub mod send_counter;
 pub mod spaces_gate;
 pub mod traits;
