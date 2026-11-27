@@ -1645,14 +1645,18 @@ impl MLSContext {
                 false /* post-Phase-A: legacy 0xff00 path retired */,
                 // An explicit metadata reseal request means we ARE (re)writing
                 // metadata in this commit. Without this, a freshly-created group
-                // (no committed MetadataReference yet) plans no reference, so the
-                // add commit embeds nothing and the reseal branch below is
-                // skipped — added members get neither a reference nor a blob and
+                // (no committed MetadataReference yet) plans no reference and the
+                // reseal branch below is skipped — added members get no blob and
                 // see "Secure Chat". Forcing metadata_changed=true makes
-                // `next_metadata_version(None, false, true) -> Some(1)`, so a v1
-                // reference is embedded in the commit (carried in the Welcome) and
-                // the blob is sealed at the post-add epoch. Plain add_members
-                // (reseal=None) is unaffected.
+                // `next_metadata_version(None, false, true) -> Some(1)`, so the
+                // blob is sealed at the post-add epoch under the planned locator.
+                // The reference is NOT committed into the GroupContext: this
+                // legacy display-only path sends no AppDataUpdate proposal, and
+                // production leaves do not advertise AppDataDictionary. The
+                // reference goes back to the caller for its local cache only, so
+                // a titled add does not trip the FullMetadataSnapshotRequired
+                // guard on later legacy writes. Plain add_members (reseal=None)
+                // is unaffected.
                 metadata_reseal.is_some(),
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
