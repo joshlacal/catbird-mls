@@ -35,6 +35,37 @@ use catbird_mls::chat_v2::transcript::{
 
 static PINNED_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// Serializes every test that reads the wall clock through the process-wide
+/// `clock_gettime`/`gettimeofday` interposer below. `PINNED_TIME` is global,
+/// so without this lock a test pinned to the corpus instant could leak that
+/// instant into a parallel test: a KeyPackage built while the pin was set got
+/// `not_after` = pin + 84 days, and validating it after the pin was released
+/// failed with `Lifetime(Expired)` once real time passed that bound.
+static CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The instant the committed v0.9 corpus was generated at (2026-08-30 UTC).
+const CORPUS_PINNED_SECS: i64 = 1_788_070_000;
+
+struct PinnedClock {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for PinnedClock {
+    fn drop(&mut self) {
+        PINNED_TIME.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pins the interposed wall clock to `secs` for the guard's lifetime, holding
+/// `CLOCK_LOCK` so no other clock-dependent test observes the pin.
+fn pin_clock(secs: i64) -> PinnedClock {
+    let lock = CLOCK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    PINNED_TIME.store(secs, std::sync::atomic::Ordering::Relaxed);
+    PinnedClock { _lock: lock }
+}
+
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec_compat) -> i32 {
@@ -511,14 +542,7 @@ fn v09_fixture_dir() -> PathBuf {
 
 #[test]
 fn native_crypto_wire_v09_committed_corpus_replay_and_verification() {
-    struct PinnedTimeGuard;
-    impl Drop for PinnedTimeGuard {
-        fn drop(&mut self) {
-            PINNED_TIME.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    PINNED_TIME.store(1788070000, std::sync::atomic::Ordering::Relaxed);
-    let _time_guard = PinnedTimeGuard;
+    let _clock = pin_clock(CORPUS_PINNED_SECS);
 
     let fixture_dir = v09_fixture_dir();
     assert!(
@@ -944,6 +968,9 @@ fn native_crypto_wire_v09_committed_corpus_replay_and_verification() {
 
 #[test]
 fn native_crypto_wire_v09_live_two_party_flow() {
+    // The whole flow (KeyPackage lifetime, Welcome validation) runs on one
+    // injected instant, independent of real time and of sibling tests.
+    let _clock = pin_clock(CORPUS_PINNED_SECS);
     let alice_provider = Provider::new().expect("alice provider");
     let bob_provider = Provider::new().expect("bob provider");
     let (alice_signer, alice_pk) = fixed_signer(ALICE_SIGNING_SEED);
