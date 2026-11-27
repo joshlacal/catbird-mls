@@ -936,11 +936,15 @@ fn two_seeded_clients_produce_identical_full_http_wire_transcripts_and_enforce_i
             assert!(!calls
                 .iter()
                 .any(|call| call.url.contains("/xrpc/blue.catbird.chat.relaySpace")));
+            // The conversation Space is named in the canonical `at:space/{authority}/{type}/{skey}`
+            // form: authority = the sequencer DID passed to `create_group`, skey = `{cid}-{generation}`.
+            let conversation_space = format!(
+                "\"at:space/did:web:mls.catbird.test/blue.catbird.labyrinth.conversation/{convo_id}-0\""
+            );
             assert!(calls.iter().any(|call| {
                 call.url.ends_with("/xrpc/com.atproto.space.applyWrites")
                     && call.body.as_deref().is_some_and(|body| {
-                        String::from_utf8_lossy(body)
-                            .contains("/space/blue.catbird.labyrinth.conversation/")
+                        String::from_utf8_lossy(body).contains(&conversation_space)
                     })
             }));
         }

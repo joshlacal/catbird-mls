@@ -131,24 +131,34 @@ fn update_group_metadata_encrypted_returns_artifacts() {
     );
 }
 
+/// The display-only guard protects a full v2 snapshot: a `MetadataReference`
+/// committed into the GroupContext AppDataDictionary at component `0x8001`.
+/// Only the AppDataUpdate path writes one, and leaves advertise the
+/// AppDataDictionary capability only under `test-utils`, so this test is
+/// gated on that feature. Once such a snapshot exists, the legacy
+/// display-only rename and the legacy titled reseal must both be refused,
+/// because they would replace settings they do not know about.
+#[cfg(feature = "test-utils")]
 #[test]
 fn display_only_engine_rewrites_refuse_an_existing_full_snapshot() {
     let (alice, _adir) = make_context();
     let (bob, _bdir) = make_context();
-    let (carol, _cdir) = make_context();
     let created = alice.create_group(b"did:plc:alice".to_vec(), None).unwrap();
     let group_id = created.group_id;
-    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
+
+    // Write a full snapshot reference through the v2 AppDataUpdate path:
+    // stage the commit first, then merge the pending commit (the order a
+    // sender uses after the delivery service accepts the commit).
+    let reference = catbird_mls::metadata::build_metadata_reference(
+        1,
+        "00000000-0000-4000-8000-000000000001",
+        &[0u8; 32],
+    );
     alice
-        .add_members_with_metadata(
+        .stage_app_data_update_for_test(
             group_id.clone(),
-            vec![catbird_mls::KeyPackageData {
-                data: bob_kp.key_package_data,
-            }],
-            Some("Full snapshot".into()),
-            None,
-            None,
-            None,
+            catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID,
+            Some(serde_json::to_vec(&reference).unwrap()),
         )
         .unwrap();
     alice.merge_pending_commit(group_id.clone()).unwrap();
@@ -161,16 +171,15 @@ fn display_only_engine_rewrites_refuse_an_existing_full_snapshot() {
         None,
     );
     assert!(rewrite
-        .err()
-        .expect("rewrite must fail")
+        .expect_err("rewrite must fail")
         .to_string()
         .contains("FullMetadataSnapshotRequired"));
 
-    let carol_kp = carol.create_key_package(b"did:plc:carol".to_vec()).unwrap();
+    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
     let reseal = alice.add_members_with_metadata(
         group_id,
         vec![catbird_mls::KeyPackageData {
-            data: carol_kp.key_package_data,
+            data: bob_kp.key_package_data,
         }],
         Some("Full snapshot".into()),
         None,
@@ -182,6 +191,53 @@ fn display_only_engine_rewrites_refuse_an_existing_full_snapshot() {
         .expect("reseal must fail")
         .to_string()
         .contains("FullMetadataSnapshotRequired"));
+}
+
+/// Positive control for the guard above. A legacy titled add writes only a
+/// display-only metadata blob; it does not commit a `MetadataReference` into
+/// the GroupContext (production leaves do not advertise AppDataDictionary).
+/// The next legacy rename and the next titled add must therefore still work.
+/// This is the flow Android's group-detail rename uses after any titled add.
+#[test]
+fn display_only_reseal_does_not_lock_out_later_legacy_renames() {
+    let (alice, _adir) = make_context();
+    let (bob, _bdir) = make_context();
+    let (carol, _cdir) = make_context();
+    let created = alice.create_group(b"did:plc:alice".to_vec(), None).unwrap();
+    let group_id = created.group_id;
+    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
+    alice
+        .add_members_with_metadata(
+            group_id.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bob_kp.key_package_data,
+            }],
+            Some("Display only".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    alice.merge_pending_commit(group_id.clone()).unwrap();
+
+    alice
+        .update_group_metadata_encrypted(group_id.clone(), Some("Renamed".into()), None, None, None)
+        .expect("legacy rename after a display-only reseal must succeed");
+    alice.merge_pending_commit(group_id.clone()).unwrap();
+
+    let carol_kp = carol.create_key_package(b"did:plc:carol".to_vec()).unwrap();
+    alice
+        .add_members_with_metadata(
+            group_id,
+            vec![catbird_mls::KeyPackageData {
+                data: carol_kp.key_package_data,
+            }],
+            Some("Renamed".into()),
+            None,
+            None,
+            None,
+        )
+        .expect("second titled add after a display-only reseal must succeed");
 }
 
 /// Regression for Android H4 epoch drift: `commit_pending_proposals` must not
