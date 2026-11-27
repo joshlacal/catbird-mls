@@ -1914,6 +1914,56 @@ pub(crate) mod native_client {
             })
         }
 
+        /// Record that the user has read `conversation_id` through `read_through_seq` and
+        /// return the conversation's remaining unread count.
+        ///
+        /// `unread_count` is incremented as peer messages (and undecryptable-gap rows) land, so
+        /// it is recomputed here from the stored peer rows above the read point rather than
+        /// zeroed: a message that arrived after the reader's newest visible row stays unread.
+        /// Reading only ever lowers the count, so a delayed call that names an older read point
+        /// cannot bring already-read messages back.
+        /// This is purely local state; it needs no network, signer or archive session, so a
+        /// failed server acknowledgement or a disabled archive never leaves a read
+        /// conversation marked unread. The recount runs in one write transaction, so it never
+        /// races the read-modify-write increments, which also hold a write transaction.
+        pub fn mark_conversation_read(
+            &self,
+            conversation_id: &str,
+            read_through_seq: i64,
+        ) -> Result<i64, MLSError> {
+            let trimmed = conversation_id.trim();
+            if trimmed.is_empty() {
+                return Err(MLSError::invalid_input(
+                    "mark_conversation_read requires a conversation_id",
+                ));
+            }
+            let conv_id_db = uuid::Uuid::parse_str(trimmed)
+                .map(|uuid| uuid.hyphenated().to_string())
+                .unwrap_or_else(|_| trimmed.to_string());
+            let read_through_seq = read_through_seq.max(0);
+            self.db.write_tx(|tx| {
+                tx.conn()
+                    .execute(
+                        "UPDATE conversations SET unread_count = MIN(unread_count, ( \
+                            SELECT COUNT(*) FROM messages \
+                            WHERE messages.conversation_id = ?1 AND messages.is_own = 0 AND messages.seq > ?2 \
+                         )) WHERE conversation_id = ?1;",
+                        rusqlite::params![conv_id_db, read_through_seq],
+                    )
+                    .map_err(|e| MLSError::Internal(format!("mark conversation read: {e}")))?;
+                let remaining: Option<i64> = tx
+                    .conn()
+                    .query_row(
+                        "SELECT unread_count FROM conversations WHERE conversation_id = ?1;",
+                        rusqlite::params![conv_id_db],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| MLSError::Internal(format!("read unread_count: {e}")))?;
+                Ok(remaining.unwrap_or(0))
+            })
+        }
+
         /// Commit `acked_seq` locally BEFORE dispatching signed `blue.catbird.chat.acknowledgeEntries` (`I2`, `I6`, `I14`).
         pub fn acknowledge_entries_up_to(
             &self,
