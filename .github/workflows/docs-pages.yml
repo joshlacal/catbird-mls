@@ -37,6 +37,9 @@ env:
   # commits the next CatbirdMLSCore release is built from
   # (Scripts/ffi-release-inputs.json); move them together with it.
   CATBIRD_ATPROTO_REV: 4299c438ff92d13cd554cdf686ca74156c987f84
+  # Petrel Rust (AT Protocol types) and its Catbird overlay.
+  PETREL_REV: cd6dda0d25c1d2ab2365eb8f6ba2f4568960dd07
+  PETREL_CATBIRD_REV: 7658265cdc4eebd6cbb37b30fc1f385892168b19
   LABYRINTH_REV: f53b4c6dff681b8b81e3755dbaadb356803eb5ed
 
 jobs:
@@ -50,7 +53,7 @@ jobs:
       - name: Check out sibling repositories
         run: |
           set -euo pipefail
-          for pair in "catbird-atproto:$CATBIRD_ATPROTO_REV" "labyrinth:$LABYRINTH_REV"; do
+          for pair in "catbird-atproto:$CATBIRD_ATPROTO_REV" "labyrinth:$LABYRINTH_REV" "Petrel:$PETREL_REV" "PetrelCatbird:$PETREL_CATBIRD_REV"; do
             name="${pair%%:*}"; rev="${pair#*:}"
             git init -q "../$name"
             git -C "../$name" fetch -q --depth 1 "https://github.com/joshlacal/$name" "$rev"

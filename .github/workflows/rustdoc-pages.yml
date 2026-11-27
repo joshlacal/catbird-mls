@@ -37,6 +37,20 @@ jobs:
           ref: main
           path: catbird-atproto
           persist-credentials: false
+      # Sibling repos, referenced by relative path dependencies: Petrel Rust
+      # (AT Protocol types) and its Catbird overlay.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/Petrel
+          ref: cd6dda0d25c1d2ab2365eb8f6ba2f4568960dd07
+          path: Petrel
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/PetrelCatbird
+          ref: 7658265cdc4eebd6cbb37b30fc1f385892168b19
+          path: PetrelCatbird
+          persist-credentials: false
       # Sibling repo, referenced by a relative path dependency.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
