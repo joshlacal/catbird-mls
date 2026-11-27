@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: joshlacal/catbird-atproto
-          ref: main
+          ref: aed64f2c6decd58696f482b9d024dafc407d3aa2
           path: catbird-atproto
           persist-credentials: false
       # Sibling repos, referenced by relative path dependencies: Petrel Rust
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: joshlacal/Petrel
-          ref: cd6dda0d25c1d2ab2365eb8f6ba2f4568960dd07
+          ref: 76bf7c8beb83fbb861183d04948fa5a061698772
           path: Petrel
           persist-credentials: false
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: joshlacal/labyrinth
-          ref: main
+          ref: 9e457eff07373969de4240b849a900e46d42a122
           path: labyrinth
           persist-credentials: false
       - name: Install Rust toolchain
