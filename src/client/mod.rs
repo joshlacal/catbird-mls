@@ -2593,6 +2593,18 @@ pub(crate) mod native_client {
                             continue;
                         }
                     }
+                    // An unsent or deleted-for-me message, or an edit of one, is never
+                    // written back: the erase removed the row and the evidence the guards
+                    // below rely on, so the marker is the only thing left to stop it.
+                    if super::message_erase::is_frame_erased(
+                        tx,
+                        conversation_id,
+                        &msg.message_id,
+                        &msg.sender_did,
+                        &msg.plaintext_json,
+                    )? {
+                        continue;
+                    }
                     let mut gap_key = super::chat_wire::undecryptable_evidence_key(
                         conversation_id,
                         &msg.message_id,

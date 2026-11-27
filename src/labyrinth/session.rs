@@ -2164,6 +2164,15 @@ impl LabyrinthSession {
         &mut self,
         conversation_id: &str,
     ) -> Result<Vec<LoadedMessage>> {
+        Ok(self
+            .load_owner_history_page(conversation_id)
+            .await?
+            .messages)
+    }
+
+    /// The owner mailbox's copies of a conversation together with the erasures that apply
+    /// to them: verified author redactions and this account's delete-for-me tombstones.
+    pub async fn load_owner_history_page(&mut self, conversation_id: &str) -> Result<HistoryPage> {
         let raw = async {
             self.sync_epochs_healing_squats().await?;
             self.lab.load_owner_thread(conversation_id).await
@@ -2175,7 +2184,15 @@ impl LabyrinthSession {
                 "labyrinth: owner archive contains undecryptable messages".into(),
             ));
         }
-        Ok(history.messages)
+        Ok(HistoryPage {
+            undecryptable: 0,
+            not_recipient: 0,
+            rejected: history.rejected.len(),
+            space_readable: history.space_readable,
+            messages: history.messages,
+            redacted: history.redacted,
+            deleted_for_me: history.deleted_for_me,
+        })
     }
 
     pub async fn open_owner_record(

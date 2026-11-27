@@ -4432,20 +4432,24 @@ impl CatbirdMlsClient {
             };
             let mut session = deps.open().await.map_err(native_archive_error)?.ok_or_else(|| MLSError::InvalidState("archive is not enrolled".into()))?;
             if owner_only {
+                // The owner mailbox carries this account's delete-for-me tombstones. They
+                // must reach `apply_history_erasures` here too, or a message another device
+                // deleted after this one left the conversation stays on this device.
                 return session
-                    .load_owner_history(conversation_id)
+                    .load_owner_history_page(conversation_id)
                     .await
-                    .map(|messages| (messages, 0, Vec::new(), Vec::new()))
+                    .map(|page| (page.messages, 0, page.redacted, page.deleted_for_me))
                     .map_err(native_archive_error);
             }
             if let Some(conversation_unknown) = denial_lead {
-                let owner = session
-                    .load_owner_history(conversation_id)
+                let page = session
+                    .load_owner_history_page(conversation_id)
                     .await
                     .map_err(native_archive_error)?;
-                if conversation_unknown && owner.is_empty() {
-                    return Ok((owner, 0, Vec::new(), Vec::new()));
+                if conversation_unknown && page.messages.is_empty() {
+                    return Ok((page.messages, 0, page.redacted, page.deleted_for_me));
                 }
+                let owner = page.messages;
                 self.pin_native_conversation_from_owner_history(conversation_id, &owner)?;
             }
             let history = session.load_history(conversation_id, labyrinth::store::TimeRange::ALL).await.map_err(native_archive_error)?;
