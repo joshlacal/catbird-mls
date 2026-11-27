@@ -315,6 +315,15 @@ impl CatbirdMlsClient {
         self.close_conversation(&conversation_id)
     }
 
+    #[uniffi::method(name = "mark_conversation_read")]
+    pub fn ffi_mark_conversation_read(
+        &self,
+        conversation_id: String,
+        read_through_seq: i64,
+    ) -> Result<i64, MLSError> {
+        self.mark_conversation_read(&conversation_id, read_through_seq)
+    }
+
     #[uniffi::method(name = "acknowledge_entries_up_to")]
     pub fn ffi_acknowledge_entries_up_to(
         &self,

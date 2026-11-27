@@ -15181,3 +15181,79 @@ fn live_remove_recovery_method_retires_old_bundle_and_preserves_replacement_code
     assert!(restored.backup_enabled);
     assert!(restored.epoch_seq > outcome.status.epoch_seq);
 }
+
+/// Reading a conversation clears its unread count down to the peer messages that arrived after
+/// the newest message the reader saw, and an incoming message after that counts again.
+///
+/// Fail-before: nothing ever lowered `unread_count`. Opening a conversation only acknowledged
+/// entries and advanced the archive read state, so the list kept showing every received
+/// message as unread.
+#[test]
+fn mark_conversation_read_recounts_unread_above_read_point() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ds = SharedMockDs::new();
+    let alice = enrolled(&tmp, &ds, "alice", ALICE_DID, &new_id());
+    let bob = enrolled(&tmp, &ds, "bob", BOB_DID, &new_id());
+    let cid = new_id();
+    alice
+        .create_group(
+            &cid,
+            DS_DID,
+            vec![BOB_DID.to_string()],
+            None,
+            Some("opening".into()),
+        )
+        .expect("alice's request");
+    bob.sync().expect("bob imports the request");
+    let request = bob
+        .list_requests(Some("incomingPending"))
+        .unwrap()
+        .remove(0);
+    bob.accept_direct_request(&request.request_id)
+        .expect("bob accepts");
+    alice.sync().expect("alice syncs acceptance");
+
+    fn unread(client: &CatbirdMlsClient, cid: &str) -> i64 {
+        client
+            .list_conversations(None, 20)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.conversation_id == cid)
+            .expect("conversation listed")
+            .unread_count
+    }
+    fn max_peer_seq(client: &CatbirdMlsClient, cid: &str) -> i64 {
+        client
+            .list_messages(cid, None, 50)
+            .unwrap()
+            .iter()
+            .filter(|m| !m.is_own)
+            .map(|m| m.seq)
+            .max()
+            .expect("peer messages stored")
+    }
+
+    for text in ["one", "two"] {
+        alice.send_message(&cid, &new_id(), text).unwrap();
+    }
+    bob.sync().expect("bob receives two messages");
+    let before = unread(&bob, &cid);
+    assert!(before >= 2, "received messages count as unread, got {before}");
+
+    let read_through = max_peer_seq(&bob, &cid);
+    assert_eq!(bob.mark_conversation_read(&cid, read_through).unwrap(), 0);
+    assert_eq!(unread(&bob, &cid), 0, "the list reflects the read");
+
+    alice.send_message(&cid, &new_id(), "three").unwrap();
+    bob.sync().expect("bob receives a later message");
+    assert_eq!(unread(&bob, &cid), 1, "a message after the read point is unread");
+    assert_eq!(
+        bob.mark_conversation_read(&cid, read_through).unwrap(),
+        1,
+        "reading only through the earlier point leaves the newer message unread"
+    );
+    assert_eq!(
+        bob.mark_conversation_read(&cid, max_peer_seq(&bob, &cid)).unwrap(),
+        0
+    );
+}
