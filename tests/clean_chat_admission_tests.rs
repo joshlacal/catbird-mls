@@ -6,7 +6,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use catbird_atproto::blue_catbird::chat::ConversationState as CanonicalState;
+use catbird_mls::atproto::chat::defs::ConversationState as CanonicalState;
 use catbird_mls::orchestrator::{
     canonical_transport::{
         decode_conversation_state, encode_conversation_state, CanonicalOperation,

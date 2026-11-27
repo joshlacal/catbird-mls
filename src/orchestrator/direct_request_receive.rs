@@ -261,7 +261,11 @@ where
             return Err(invalid());
         }
         let document = self
-            .request_receipt_authority(&request.sender_did, &request.recipient_did, true)
+            .request_receipt_authority(
+                request.sender_did.as_str(),
+                request.recipient_did.as_str(),
+                true,
+            )
             .await?;
         let authority: Value = serde_json::from_slice(&document).map_err(|_| invalid())?;
         let receipt = crate::orchestrator::direct_request_bootstrap::verify_pruned_opening_entry(
@@ -278,7 +282,7 @@ where
             cid,
             owner,
             "OpeningPruned",
-            Some(&request.sender_did),
+            Some(request.sender_did.as_str()),
             &result["state"],
         )
     }

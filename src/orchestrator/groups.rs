@@ -5120,8 +5120,7 @@ where
             "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
             "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) }
         });
-        metadata_snapshot_json["nonce"] =
-            serde_json::json!({ "$bytes": STANDARD.encode(nonce) });
+        metadata_snapshot_json["nonce"] = serde_json::json!({ "$bytes": STANDARD.encode(nonce) });
         metadata_snapshot_json["ciphertext"] =
             serde_json::json!({ "$bytes": STANDARD.encode(&ciphertext) });
         metadata_snapshot_json["ciphertextSha256"] =
@@ -5827,7 +5826,7 @@ where
         )
         .map_err(|error| OrchestratorError::InvalidInput(error.to_string()))?;
         if typed_state.coordinates.conversation_id.as_str() != conversation_id
-            || hex::encode(&typed_state.coordinates.group_id) != *group_id
+            || hex::encode(&typed_state.coordinates.group_id.0) != *group_id
             || typed_state.coordinates.lifecycle.as_str() != "active"
         {
             return Err(OrchestratorError::InvalidInput(

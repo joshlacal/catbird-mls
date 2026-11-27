@@ -121,8 +121,12 @@ pub struct ConversationView {
     pub sequencer_did: Option<String>,
     /// Authenticated canonical policy snapshot. It never proves MLS admission;
     /// its immutable epoch may precede a verified local native epoch overlay.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_state: Option<catbird_atproto::blue_catbird::chat::ConversationState>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::atproto::json::serialize_padded"
+    )]
+    pub canonical_state: Option<crate::atproto::chat::defs::ConversationState>,
 }
 
 /// Native-fetched authorized inventory snapshot scoped to a single batch execution.

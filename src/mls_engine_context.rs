@@ -8974,7 +8974,7 @@ impl MlsCryptoContext for MLSContext {
         &self,
         user_did: &str,
         conversation_id: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+    ) -> Result<Option<crate::atproto::chat::defs::ConversationState>, MLSError> {
         self.check_suspended()?;
         let guard = self
             .inner
@@ -8992,8 +8992,7 @@ impl MlsCryptoContext for MLSContext {
         &self,
         user_did: &str,
         conversation_id: &str,
-    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
-    {
+    ) -> Result<Option<crate::atproto::chat::defs::ConversationCoordinates>, MLSError> {
         self.check_suspended()?;
         let guard = self
             .inner
@@ -9010,7 +9009,7 @@ impl MlsCryptoContext for MLSContext {
     fn put_conversation_departure(
         &self,
         user_did: &str,
-        coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+        coordinate: &crate::atproto::chat::defs::ConversationCoordinates,
     ) -> Result<bool, MLSError> {
         self.check_suspended()?;
         let guard = self
@@ -9028,7 +9027,7 @@ impl MlsCryptoContext for MLSContext {
     fn put_conversation_policy(
         &self,
         user_did: &str,
-        state: &catbird_atproto::blue_catbird::chat::ConversationState,
+        state: &crate::atproto::chat::defs::ConversationState,
     ) -> Result<bool, MLSError> {
         self.check_suspended()?;
         let guard = self

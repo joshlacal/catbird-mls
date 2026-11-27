@@ -17,10 +17,10 @@ fn signing_prior(coordinates: &Value) -> Result<Value> {
         "conversationId": typed.conversation_id,
         "generation": typed.generation,
         "stateVersion": typed.state_version,
-        "groupId": STANDARD.encode(&typed.group_id),
+        "groupId": STANDARD.encode(&typed.group_id.0),
         "epoch": typed.epoch,
-        "groupContextHash": STANDARD.encode(&typed.group_context_hash),
-        "confirmationTag": STANDARD.encode(&typed.confirmation_tag),
+        "groupContextHash": STANDARD.encode(&typed.group_context_hash.0),
+        "confirmationTag": STANDARD.encode(&typed.confirmation_tag.0),
         "lifecycle": typed.lifecycle,
     }))
 }

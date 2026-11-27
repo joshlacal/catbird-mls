@@ -9,45 +9,27 @@ use serde::de;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::atproto::blue_catbird::chat::{
-    accept_conversation::AcceptConversationRequest,
-    acknowledge_entries::AcknowledgeEntriesRequest,
-    acknowledge_welcome::AcknowledgeWelcomeRequest,
-    activate_reset::ActivateResetRequest,
-    approve_device::ApproveDeviceRequest,
-    cancel_leaf_recovery::CancelLeafRecoveryRequest,
-    cancel_leave::CancelLeaveRequest,
-    close_conversation::CloseConversationRequest,
-    create_conversation::CreateConversationRequest,
-    enroll_device::EnrollDeviceRequest,
-    get_conversation_state::GetConversationStateRequest,
-    get_conversations::{GetConversations, GetConversationsRequest},
-    get_device_key::GetDeviceKeyRequest,
-    get_devices::GetDevicesRequest,
-    get_entries::{GetEntries, GetEntriesRequest},
-    get_leaf_recovery_inbox::GetLeafRecoveryInboxRequest,
-    get_own_devices::GetOwnDevicesRequest,
-    get_pending_welcomes::GetPendingWelcomesRequest,
-    get_subscription_ticket::GetSubscriptionTicketRequest,
-    publish_typing::PublishTypingRequest,
-    register_push_gateway::RegisterPushGatewayRequest,
-    reject_welcome::RejectWelcomeRequest,
-    relay_space_credential::RelaySpaceCredentialRequest,
-    relay_space_read::RelaySpaceReadRequest,
-    replenish_key_packages::{ReplenishKeyPackages, ReplenishKeyPackagesRequest},
-    request_leaf_recovery::RequestLeafRecoveryRequest,
-    request_leave::RequestLeaveRequest,
-    request_reset::RequestResetRequest,
-    revoke_device::RevokeDeviceRequest,
-    send_message::SendMessageRequest,
-    submit_transition::SubmitTransitionRequest,
-    subscribe_events::SubscribeEventsEndpoint,
+use crate::atproto::chat::{
+    accept_conversation::AcceptConversation, acknowledge_entries::AcknowledgeEntries,
+    acknowledge_welcome::AcknowledgeWelcome, activate_reset::ActivateReset,
+    approve_device::ApproveDevice, cancel_leaf_recovery::CancelLeafRecovery,
+    cancel_leave::CancelLeave, close_conversation::CloseConversation,
+    create_conversation::CreateConversation, enroll_device::EnrollDevice,
+    get_conversation_state::GetConversationState, get_conversations::GetConversations,
+    get_device_key::GetDeviceKey, get_devices::GetDevices, get_entries::GetEntries,
+    get_leaf_recovery_inbox::GetLeafRecoveryInbox, get_own_devices::GetOwnDevices,
+    get_pending_welcomes::GetPendingWelcomes, get_subscription_ticket::GetSubscriptionTicket,
+    publish_typing::PublishTyping, register_push_gateway::RegisterPushGateway,
+    reject_welcome::RejectWelcome, relay_space_credential::RelaySpaceCredential,
+    relay_space_read::RelaySpaceRead, replenish_key_packages::ReplenishKeyPackages,
+    request_leaf_recovery::RequestLeafRecovery, request_leave::RequestLeave,
+    request_reset::RequestReset, revoke_device::RevokeDevice, send_message::SendMessage,
+    submit_transition::SubmitTransition, subscribe_events::SubscribeEvents,
 };
-use crate::atproto::jacquard_common::deps::bytes::Bytes;
-use crate::atproto::jacquard_common::xrpc::{SubscriptionEndpoint, XrpcEndpoint};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
+use petrel_core::{XrpcRequest, XrpcSubscription};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
@@ -200,14 +182,14 @@ pub enum TransportError {
 /// Each variant is the generated Jacquard DTO for that endpoint. Keeping the
 /// variants here avoids a hand-maintained parallel wire schema while giving
 /// native Rust and WASM callers one route-typed request surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatRequest {
-    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequest<String>),
-    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequest<String>),
-    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparation<String>),
-    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcome<String>),
-    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeys<String>),
+    PrepareDirectRequest(crate::atproto::chat::prepare_direct_request::Input),
+    PublishDirectRequest(crate::atproto::chat::publish_direct_request::Input),
+    CancelDirectRequestPreparation(crate::atproto::chat::cancel_direct_request_preparation::Input),
+    GetDirectRequestOutcome(crate::atproto::chat::get_direct_request_outcome::Parameters),
+    PublishDirectRequestKeys(crate::atproto::chat::publish_direct_request_keys::Input),
     AcceptConversation(AcceptConversationRequestBody),
     AcknowledgeEntries(AcknowledgeEntriesRequestBody),
     AcknowledgeWelcome(AcknowledgeWelcomeRequestBody),
@@ -215,13 +197,13 @@ pub enum CleanChatRequest {
     CancelLeafRecovery(CancelLeafRecoveryRequestBody),
     CancelLeave(CancelLeaveRequestBody),
     CloseConversation(CloseConversationRequestBody),
-    GetConversations(GetConversations<String>),
+    GetConversations(crate::atproto::chat::get_conversations::Parameters),
     CreateConversation(CreateConversationRequestBody),
     SendMessage(SendMessageRequestBody),
     GetConversationState(GetConversationStateRequestBody),
     GetDevices(GetDevicesRequestBody),
     GetDeviceKey(GetDeviceKeyRequestBody),
-    GetEntries(GetEntries<String>),
+    GetEntries(crate::atproto::chat::get_entries::Parameters),
     GetLeafRecoveryInbox(GetLeafRecoveryInboxRequestBody),
     GetOwnDevices(GetOwnDevicesRequestBody),
     GetPendingWelcomes(GetPendingWelcomesRequestBody),
@@ -242,232 +224,138 @@ pub enum CleanChatRequest {
     ApproveDevice(ApproveDeviceRequestBody),
 }
 
-pub type AcceptConversationRequestBody =
-    crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversation<String>;
-pub type AcknowledgeEntriesRequestBody =
-    crate::atproto::blue_catbird::chat::acknowledge_entries::AcknowledgeEntries<String>;
-pub type AcknowledgeWelcomeRequestBody =
-    crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcome<String>;
-pub type ActivateResetRequestBody =
-    crate::atproto::blue_catbird::chat::activate_reset::ActivateReset<String>;
-pub type CancelLeafRecoveryRequestBody =
-    crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecovery<String>;
-pub type CancelLeaveRequestBody =
-    crate::atproto::blue_catbird::chat::cancel_leave::CancelLeave<String>;
-pub type CloseConversationRequestBody =
-    crate::atproto::blue_catbird::chat::close_conversation::CloseConversation<String>;
-pub type CreateConversationRequestBody =
-    crate::atproto::blue_catbird::chat::create_conversation::CreateConversation<String>;
-pub type SendMessageRequestBody =
-    crate::atproto::blue_catbird::chat::send_message::SendMessage<String>;
-pub type GetConversationStateRequestBody =
-    crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationState<String>;
-pub type GetDevicesRequestBody =
-    crate::atproto::blue_catbird::chat::get_devices::GetDevices<String>;
-pub type GetDeviceKeyRequestBody =
-    crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKey<String>;
+pub type AcceptConversationRequestBody = crate::atproto::chat::accept_conversation::Input;
+pub type AcknowledgeEntriesRequestBody = crate::atproto::chat::acknowledge_entries::Input;
+pub type AcknowledgeWelcomeRequestBody = crate::atproto::chat::acknowledge_welcome::Input;
+pub type ActivateResetRequestBody = crate::atproto::chat::activate_reset::Input;
+pub type CancelLeafRecoveryRequestBody = crate::atproto::chat::cancel_leaf_recovery::Input;
+pub type CancelLeaveRequestBody = crate::atproto::chat::cancel_leave::Input;
+pub type CloseConversationRequestBody = crate::atproto::chat::close_conversation::Input;
+pub type CreateConversationRequestBody = crate::atproto::chat::create_conversation::Input;
+pub type SendMessageRequestBody = crate::atproto::chat::send_message::Input;
+pub type GetConversationStateRequestBody = crate::atproto::chat::get_conversation_state::Parameters;
+pub type GetDevicesRequestBody = crate::atproto::chat::get_devices::Parameters;
+pub type GetDeviceKeyRequestBody = crate::atproto::chat::get_device_key::Parameters;
 pub type GetLeafRecoveryInboxRequestBody =
-    crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInbox<String>;
-pub type GetOwnDevicesRequestBody =
-    crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevices<String>;
-pub type GetPendingWelcomesRequestBody =
-    crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomes<String>;
-pub type GetSubscriptionTicketRequestBody =
-    crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicket<String>;
-pub type PublishTypingRequestBody =
-    crate::atproto::blue_catbird::chat::publish_typing::PublishTyping<String>;
-pub type RegisterPushGatewayRequestBody =
-    crate::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGateway<String>;
-pub type RejectWelcomeRequestBody =
-    crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcome<String>;
-pub type RelaySpaceCredentialRequestBody =
-    crate::atproto::blue_catbird::chat::relay_space_credential::RelaySpaceCredential<String>;
-pub type RelaySpaceReadRequestBody =
-    crate::atproto::blue_catbird::chat::relay_space_read::RelaySpaceRead<String>;
-pub type ReplenishKeyPackagesRequestBody =
-    crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackages<String>;
-pub type RequestLeafRecoveryRequestBody =
-    crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecovery<String>;
-pub type EnrollDeviceRequestBody =
-    crate::atproto::blue_catbird::chat::enroll_device::EnrollDevice<String>;
-pub type RequestLeaveRequestBody =
-    crate::atproto::blue_catbird::chat::request_leave::RequestLeave<String>;
-pub type RequestResetRequestBody =
-    crate::atproto::blue_catbird::chat::request_reset::RequestReset<String>;
-pub type RevokeDeviceRequestBody =
-    crate::atproto::blue_catbird::chat::revoke_device::RevokeDevice<String>;
-pub type ApproveDeviceRequestBody =
-    crate::atproto::blue_catbird::chat::approve_device::ApproveDevice<String>;
-pub type SubmitTransitionRequestBody =
-    crate::atproto::blue_catbird::chat::submit_transition::SubmitTransition<String>;
-pub type SubscribeEventsRequestBody =
-    crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEvents<String>;
+    crate::atproto::chat::get_leaf_recovery_inbox::Parameters;
+pub type GetOwnDevicesRequestBody = crate::atproto::chat::get_own_devices::Parameters;
+pub type GetPendingWelcomesRequestBody = crate::atproto::chat::get_pending_welcomes::Parameters;
+pub type GetSubscriptionTicketRequestBody = crate::atproto::chat::get_subscription_ticket::Input;
+pub type PublishTypingRequestBody = crate::atproto::chat::publish_typing::Input;
+pub type RegisterPushGatewayRequestBody = crate::atproto::chat::register_push_gateway::Input;
+pub type RejectWelcomeRequestBody = crate::atproto::chat::reject_welcome::Input;
+pub type RelaySpaceCredentialRequestBody = crate::atproto::chat::relay_space_credential::Input;
+pub type RelaySpaceReadRequestBody = crate::atproto::chat::relay_space_read::Input;
+pub type ReplenishKeyPackagesRequestBody = crate::atproto::chat::replenish_key_packages::Input;
+pub type RequestLeafRecoveryRequestBody = crate::atproto::chat::request_leaf_recovery::Input;
+pub type EnrollDeviceRequestBody = crate::atproto::chat::enroll_device::Input;
+pub type RequestLeaveRequestBody = crate::atproto::chat::request_leave::Input;
+pub type RequestResetRequestBody = crate::atproto::chat::request_reset::Input;
+pub type RevokeDeviceRequestBody = crate::atproto::chat::revoke_device::Input;
+pub type ApproveDeviceRequestBody = crate::atproto::chat::approve_device::Input;
+pub type SubmitTransitionRequestBody = crate::atproto::chat::submit_transition::Input;
+pub type SubscribeEventsRequestBody = crate::atproto::chat::subscribe_events::Parameters;
 
-/// A generated clean-chat success body, selected by the canonical operation.
+/// The binary body of a successful `relaySpaceRead`, returned verbatim.
+///
+/// The lexicon declares a `*/*` output, which Petrel models as raw bytes with
+/// no generated `Output` type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
-pub enum CleanChatResponse {
-    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestOutput<String>),
-    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestOutput<String>),
-    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationOutput<String>),
-    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeOutput<String>),
-    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysOutput<String>),
-    AcceptConversation(
-        crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>,
-    ),
-    AcknowledgeEntries(
-        crate::atproto::blue_catbird::chat::acknowledge_entries::AcknowledgeEntriesOutput<String>,
-    ),
-    AcknowledgeWelcome(
-        crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>,
-    ),
-    ActivateReset(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>),
-    CancelLeafRecovery(
-        crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryOutput<String>,
-    ),
-    CancelLeave(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveOutput<String>),
-    CloseConversation(
-        crate::atproto::blue_catbird::chat::close_conversation::CloseConversationOutput<String>,
-    ),
-    GetConversations(
-        crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
-    ),
-    CreateConversation(
-        crate::atproto::blue_catbird::chat::create_conversation::CreateConversationOutput<String>,
-    ),
-    SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>),
-    GetConversationState(
-        crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<
-            String,
-        >,
-    ),
-    GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>),
-    GetDeviceKey(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyOutput<String>),
-    GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>),
-    GetLeafRecoveryInbox(
-        crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<
-            String,
-        >,
-    ),
-    GetOwnDevices(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>),
-    GetPendingWelcomes(
-        crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<String>,
-    ),
-    GetSubscriptionTicket(
-        crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<
-            String,
-        >,
-    ),
-    PublishTyping(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingOutput<String>),
-    RegisterPushGateway(
-        crate::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGatewayOutput<
-            String,
-        >,
-    ),
-    RejectWelcome(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeOutput<String>),
-    RelaySpaceCredential(
-        crate::atproto::blue_catbird::chat::relay_space_credential::RelaySpaceCredentialOutput<
-            String,
-        >,
-    ),
-    RelaySpaceRead(
-        crate::atproto::blue_catbird::chat::relay_space_read::RelaySpaceReadOutput,
-    ),
-    ReplenishKeyPackages(
-        crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
-            String,
-        >,
-    ),
-    RequestLeafRecovery(
-        crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryOutput<
-            String,
-        >,
-    ),
-    EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>),
-    RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>),
-    RequestReset(crate::atproto::blue_catbird::chat::request_reset::RequestResetOutput<String>),
-    RevokeDevice(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceOutput<String>),
-    SubmitTransition(
-        crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<String>,
-    ),
-    SubscribeEvents(
-        crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>,
-    ),
-    ApproveDevice(
-        crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceOutput<String>,
-    ),
+pub struct RelaySpaceReadOutput {
+    pub body: Vec<u8>,
 }
 
+/// A generated clean-chat success body, selected by the canonical operation.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum CleanChatResponse {
+    PrepareDirectRequest(crate::atproto::chat::prepare_direct_request::Output),
+    PublishDirectRequest(crate::atproto::chat::publish_direct_request::Output),
+    CancelDirectRequestPreparation(crate::atproto::chat::cancel_direct_request_preparation::Output),
+    GetDirectRequestOutcome(crate::atproto::chat::get_direct_request_outcome::Output),
+    PublishDirectRequestKeys(crate::atproto::chat::publish_direct_request_keys::Output),
+    AcceptConversation(crate::atproto::chat::accept_conversation::Output),
+    AcknowledgeEntries(crate::atproto::chat::acknowledge_entries::Output),
+    AcknowledgeWelcome(crate::atproto::chat::acknowledge_welcome::Output),
+    ActivateReset(crate::atproto::chat::activate_reset::Output),
+    CancelLeafRecovery(crate::atproto::chat::cancel_leaf_recovery::Output),
+    CancelLeave(crate::atproto::chat::cancel_leave::Output),
+    CloseConversation(crate::atproto::chat::close_conversation::Output),
+    GetConversations(crate::atproto::chat::get_conversations::Output),
+    CreateConversation(crate::atproto::chat::create_conversation::Output),
+    SendMessage(crate::atproto::chat::send_message::Output),
+    GetConversationState(crate::atproto::chat::get_conversation_state::Output),
+    GetDevices(crate::atproto::chat::get_devices::Output),
+    GetDeviceKey(crate::atproto::chat::get_device_key::Output),
+    GetEntries(crate::atproto::chat::get_entries::Output),
+    GetLeafRecoveryInbox(crate::atproto::chat::get_leaf_recovery_inbox::Output),
+    GetOwnDevices(crate::atproto::chat::get_own_devices::Output),
+    GetPendingWelcomes(crate::atproto::chat::get_pending_welcomes::Output),
+    GetSubscriptionTicket(crate::atproto::chat::get_subscription_ticket::Output),
+    PublishTyping(crate::atproto::chat::publish_typing::Output),
+    RegisterPushGateway(crate::atproto::chat::register_push_gateway::Output),
+    RejectWelcome(crate::atproto::chat::reject_welcome::Output),
+    RelaySpaceCredential(crate::atproto::chat::relay_space_credential::Output),
+    RelaySpaceRead(RelaySpaceReadOutput),
+    ReplenishKeyPackages(crate::atproto::chat::replenish_key_packages::Output),
+    RequestLeafRecovery(crate::atproto::chat::request_leaf_recovery::Output),
+    EnrollDevice(crate::atproto::chat::enroll_device::Output),
+    RequestLeave(crate::atproto::chat::request_leave::Output),
+    RequestReset(crate::atproto::chat::request_reset::Output),
+    RevokeDevice(crate::atproto::chat::revoke_device::Output),
+    SubmitTransition(crate::atproto::chat::submit_transition::Output),
+    SubscribeEvents(crate::atproto::chat::subscribe_events::Message),
+    ApproveDevice(crate::atproto::chat::approve_device::Output),
+}
+
+pub use crate::atproto::GeneratedXrpcError;
+
 /// A generated clean-chat error body, selected by the canonical operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CleanChatError {
-    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestError),
-    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestError),
-    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationError),
-    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeError),
-    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysError),
-    AcceptConversation(
-        crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError,
+    PrepareDirectRequest(GeneratedXrpcError<crate::atproto::chat::prepare_direct_request::Error>),
+    PublishDirectRequest(GeneratedXrpcError<crate::atproto::chat::publish_direct_request::Error>),
+    CancelDirectRequestPreparation(
+        GeneratedXrpcError<crate::atproto::chat::cancel_direct_request_preparation::Error>,
     ),
-    AcknowledgeEntries(
-        crate::atproto::blue_catbird::chat::acknowledge_entries::AcknowledgeEntriesError,
+    GetDirectRequestOutcome(
+        GeneratedXrpcError<crate::atproto::chat::get_direct_request_outcome::Error>,
     ),
-    AcknowledgeWelcome(
-        crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError,
+    PublishDirectRequestKeys(
+        GeneratedXrpcError<crate::atproto::chat::publish_direct_request_keys::Error>,
     ),
-    ActivateReset(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError),
-    CancelLeafRecovery(
-        crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryError,
-    ),
-    CancelLeave(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveError),
-    CloseConversation(
-        crate::atproto::blue_catbird::chat::close_conversation::CloseConversationError,
-    ),
-    GetConversations(crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError),
-    CreateConversation(
-        crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
-    ),
-    SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageError),
-    GetConversationState(
-        crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError,
-    ),
-    GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError),
-    GetDeviceKey(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyError),
-    GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesError),
-    GetLeafRecoveryInbox(
-        crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError,
-    ),
-    GetOwnDevices(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesError),
-    GetPendingWelcomes(
-        crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesError,
-    ),
-    GetSubscriptionTicket(
-        crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError,
-    ),
-    PublishTyping(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingError),
-    RegisterPushGateway(
-        crate::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGatewayError,
-    ),
-    RejectWelcome(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeError),
-    RelaySpaceCredential(
-        crate::atproto::blue_catbird::chat::relay_space_credential::RelaySpaceCredentialError,
-    ),
-    RelaySpaceRead(
-        crate::atproto::blue_catbird::chat::relay_space_read::RelaySpaceReadError,
-    ),
-    ReplenishKeyPackages(
-        crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
-    ),
-    RequestLeafRecovery(
-        crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryError,
-    ),
-    EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError),
-    RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError),
-    RequestReset(crate::atproto::blue_catbird::chat::request_reset::RequestResetError),
-    RevokeDevice(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceError),
-    SubmitTransition(crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError),
-    SubscribeEvents(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsError),
-    ApproveDevice(crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceError),
+    AcceptConversation(GeneratedXrpcError<crate::atproto::chat::accept_conversation::Error>),
+    AcknowledgeEntries(GeneratedXrpcError<crate::atproto::chat::acknowledge_entries::Error>),
+    AcknowledgeWelcome(GeneratedXrpcError<crate::atproto::chat::acknowledge_welcome::Error>),
+    ActivateReset(GeneratedXrpcError<crate::atproto::chat::activate_reset::Error>),
+    CancelLeafRecovery(GeneratedXrpcError<crate::atproto::chat::cancel_leaf_recovery::Error>),
+    CancelLeave(GeneratedXrpcError<crate::atproto::chat::cancel_leave::Error>),
+    CloseConversation(GeneratedXrpcError<crate::atproto::chat::close_conversation::Error>),
+    GetConversations(GeneratedXrpcError<crate::atproto::chat::get_conversations::Error>),
+    CreateConversation(GeneratedXrpcError<crate::atproto::chat::create_conversation::Error>),
+    SendMessage(GeneratedXrpcError<crate::atproto::chat::send_message::Error>),
+    GetConversationState(GeneratedXrpcError<crate::atproto::chat::get_conversation_state::Error>),
+    GetDevices(GeneratedXrpcError<crate::atproto::chat::get_devices::Error>),
+    GetDeviceKey(GeneratedXrpcError<crate::atproto::chat::get_device_key::Error>),
+    GetEntries(GeneratedXrpcError<crate::atproto::chat::get_entries::Error>),
+    GetLeafRecoveryInbox(GeneratedXrpcError<crate::atproto::chat::get_leaf_recovery_inbox::Error>),
+    GetOwnDevices(GeneratedXrpcError<crate::atproto::chat::get_own_devices::Error>),
+    GetPendingWelcomes(GeneratedXrpcError<crate::atproto::chat::get_pending_welcomes::Error>),
+    GetSubscriptionTicket(GeneratedXrpcError<crate::atproto::chat::get_subscription_ticket::Error>),
+    PublishTyping(GeneratedXrpcError<crate::atproto::chat::publish_typing::Error>),
+    RegisterPushGateway(GeneratedXrpcError<crate::atproto::chat::register_push_gateway::Error>),
+    RejectWelcome(GeneratedXrpcError<crate::atproto::chat::reject_welcome::Error>),
+    RelaySpaceCredential(GeneratedXrpcError<crate::atproto::chat::relay_space_credential::Error>),
+    RelaySpaceRead(GeneratedXrpcError<crate::atproto::chat::relay_space_read::Error>),
+    ReplenishKeyPackages(GeneratedXrpcError<crate::atproto::chat::replenish_key_packages::Error>),
+    RequestLeafRecovery(GeneratedXrpcError<crate::atproto::chat::request_leaf_recovery::Error>),
+    EnrollDevice(GeneratedXrpcError<crate::atproto::chat::enroll_device::Error>),
+    RequestLeave(GeneratedXrpcError<crate::atproto::chat::request_leave::Error>),
+    RequestReset(GeneratedXrpcError<crate::atproto::chat::request_reset::Error>),
+    RevokeDevice(GeneratedXrpcError<crate::atproto::chat::revoke_device::Error>),
+    SubmitTransition(GeneratedXrpcError<crate::atproto::chat::submit_transition::Error>),
+    SubscribeEvents(GeneratedXrpcError<crate::atproto::chat::subscribe_events::Error>),
+    ApproveDevice(GeneratedXrpcError<crate::atproto::chat::approve_device::Error>),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -668,6 +556,64 @@ fn ffi_error(error: impl std::fmt::Display) -> CleanChatTransportFfiError {
     }
 }
 
+/// Petrel's generated query `Parameters` have no serde form. The platform
+/// sends them as the generated DTO JSON object, whose member names are the
+/// lexicon parameter names, so each member maps onto query pairs exactly as
+/// the query string spells them (arrays repeat the name; `null` is absent).
+pub fn query_params_from_json<P: petrel_core::FromQueryParams>(
+    body: &[u8],
+) -> Result<P, TransportError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| TransportError::Decoding(error.to_string()))?;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    match &value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if key == "$type" {
+                    continue;
+                }
+                match value {
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            pairs.push((key.clone(), query_json_scalar(value)?));
+                        }
+                    }
+                    serde_json::Value::Null => {}
+                    value => pairs.push((key.clone(), query_json_scalar(value)?)),
+                }
+            }
+        }
+        _ => {
+            return Err(TransportError::Decoding(
+                "generated query request is not an object".into(),
+            ))
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    P::from_query_params(&borrowed).map_err(|error| TransportError::Decoding(error.to_string()))
+}
+
+fn query_json_scalar(value: &serde_json::Value) -> Result<String, TransportError> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Ok(value.to_string()),
+        _ => Err(TransportError::Decoding(
+            "generated query parameter is not a scalar".into(),
+        )),
+    }
+}
+
+fn parse_query_req<T: petrel_core::FromQueryParams, R>(
+    body: &[u8],
+    f: impl FnOnce(T) -> R,
+) -> Result<R, CleanChatTransportFfiError> {
+    query_params_from_json::<T>(body).map(f).map_err(ffi_error)
+}
+
 fn parse_json_req<T: serde::de::DeserializeOwned, R>(
     body: &[u8],
     f: impl FnOnce(T) -> R,
@@ -691,7 +637,7 @@ fn parse_ffi_request(
             parse_json_req(body, CleanChatRequest::CancelDirectRequestPreparation)
         }
         CanonicalOperation::GetDirectRequestOutcome => {
-            parse_json_req(body, CleanChatRequest::GetDirectRequestOutcome)
+            parse_query_req(body, CleanChatRequest::GetDirectRequestOutcome)
         }
         CanonicalOperation::PublishDirectRequestKeys => {
             parse_json_req(body, CleanChatRequest::PublishDirectRequestKeys)
@@ -714,24 +660,24 @@ fn parse_ffi_request(
             parse_json_req(body, CleanChatRequest::CloseConversation)
         }
         CanonicalOperation::GetConversations => {
-            parse_json_req(body, CleanChatRequest::GetConversations)
+            parse_query_req(body, CleanChatRequest::GetConversations)
         }
         CanonicalOperation::CreateConversation => {
             parse_json_req(body, CleanChatRequest::CreateConversation)
         }
         CanonicalOperation::SendMessage => parse_json_req(body, CleanChatRequest::SendMessage),
         CanonicalOperation::GetConversationState => {
-            parse_json_req(body, CleanChatRequest::GetConversationState)
+            parse_query_req(body, CleanChatRequest::GetConversationState)
         }
-        CanonicalOperation::GetDevices => parse_json_req(body, CleanChatRequest::GetDevices),
-        CanonicalOperation::GetDeviceKey => parse_json_req(body, CleanChatRequest::GetDeviceKey),
-        CanonicalOperation::GetEntries => parse_json_req(body, CleanChatRequest::GetEntries),
+        CanonicalOperation::GetDevices => parse_query_req(body, CleanChatRequest::GetDevices),
+        CanonicalOperation::GetDeviceKey => parse_query_req(body, CleanChatRequest::GetDeviceKey),
+        CanonicalOperation::GetEntries => parse_query_req(body, CleanChatRequest::GetEntries),
         CanonicalOperation::GetLeafRecoveryInbox => {
-            parse_json_req(body, CleanChatRequest::GetLeafRecoveryInbox)
+            parse_query_req(body, CleanChatRequest::GetLeafRecoveryInbox)
         }
-        CanonicalOperation::GetOwnDevices => parse_json_req(body, CleanChatRequest::GetOwnDevices),
+        CanonicalOperation::GetOwnDevices => parse_query_req(body, CleanChatRequest::GetOwnDevices),
         CanonicalOperation::GetPendingWelcomes => {
-            parse_json_req(body, CleanChatRequest::GetPendingWelcomes)
+            parse_query_req(body, CleanChatRequest::GetPendingWelcomes)
         }
         CanonicalOperation::GetSubscriptionTicket => {
             parse_json_req(body, CleanChatRequest::GetSubscriptionTicket)
@@ -761,7 +707,7 @@ fn parse_ffi_request(
             parse_json_req(body, CleanChatRequest::SubmitTransition)
         }
         CanonicalOperation::SubscribeEvents => {
-            parse_json_req(body, CleanChatRequest::SubscribeEvents)
+            parse_query_req(body, CleanChatRequest::SubscribeEvents)
         }
         CanonicalOperation::ApproveDevice => parse_json_req(body, CleanChatRequest::ApproveDevice),
     }
@@ -809,80 +755,114 @@ pub fn decode_clean_chat_response(
         CleanChatResponse::decode(operation.into(), &response_json).map_err(ffi_error)?;
     match response {
         CleanChatResponse::PrepareDirectRequest(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::PublishDirectRequest(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::CancelDirectRequestPreparation(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::GetDirectRequestOutcome(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::PublishDirectRequestKeys(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::AcceptConversation(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::AcknowledgeEntries(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::AcknowledgeWelcome(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::ActivateReset(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::CancelLeafRecovery(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::CancelLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::CancelLeave(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::CloseConversation(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::GetConversations(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetConversations(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::CreateConversation(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::SendMessage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::SendMessage(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::GetConversationState(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::GetDeviceKey(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetDevices(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetDeviceKey(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetEntries(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::GetLeafRecoveryInbox(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::GetOwnDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetOwnDevices(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::GetPendingWelcomes(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::GetSubscriptionTicket(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::PublishTyping(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::RegisterPushGateway(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::RejectWelcome(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::RelaySpaceCredential(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::RelaySpaceRead(value) => Ok(value.body.to_vec()),
         CleanChatResponse::ReplenishKeyPackages(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::RequestLeafRecovery(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatResponse::EnrollDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::RequestLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::RequestReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::RevokeDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::SubscribeEvents(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::ApproveDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::EnrollDevice(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::RequestLeave(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::RequestReset(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::RevokeDevice(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::SubmitTransition(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::SubscribeEvents(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::ApproveDevice(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
     }
 }
 
@@ -897,62 +877,116 @@ pub fn decode_clean_chat_error(
     let error = CleanChatError::decode(operation.into(), &error_json).map_err(ffi_error)?;
     match error {
         CleanChatError::PrepareDirectRequest(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::PublishDirectRequest(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::CancelDirectRequestPreparation(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::GetDirectRequestOutcome(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::PublishDirectRequestKeys(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatError::AcceptConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::AcknowledgeEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::AcknowledgeWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::CancelLeafRecovery(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::CancelLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::CloseConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::GetConversations(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::CreateConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::SendMessage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::AcceptConversation(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::AcknowledgeEntries(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::AcknowledgeWelcome(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::ActivateReset(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::CancelLeafRecovery(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::CancelLeave(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::CloseConversation(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetConversations(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::CreateConversation(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::SendMessage(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::GetConversationState(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatError::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::GetDeviceKey(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetDevices(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetDeviceKey(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetEntries(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::GetLeafRecoveryInbox(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatError::GetOwnDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::GetPendingWelcomes(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetOwnDevices(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetPendingWelcomes(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::GetSubscriptionTicket(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatError::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RegisterPushGateway(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::PublishTyping(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::RegisterPushGateway(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::RejectWelcome(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::RelaySpaceCredential(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatError::RelaySpaceRead(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::RelaySpaceRead(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::ReplenishKeyPackages(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
         }
-        CleanChatError::RequestLeafRecovery(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::EnrollDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RequestLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RequestReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RevokeDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::SubscribeEvents(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::ApproveDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::RequestLeafRecovery(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::EnrollDevice(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::RequestLeave(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::RequestReset(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::RevokeDevice(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::SubmitTransition(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::SubscribeEvents(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::ApproveDevice(value) => {
+            crate::atproto::json::to_vec(&value).map_err(ffi_error)
+        }
     }
 }
 
@@ -1069,79 +1103,139 @@ impl CleanChatResponse {
             };
         }
         match operation {
-            CanonicalOperation::PrepareDirectRequest => decode!(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestOutput<String>, PrepareDirectRequest),
-            CanonicalOperation::PublishDirectRequest => decode!(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestOutput<String>, PublishDirectRequest),
-            CanonicalOperation::CancelDirectRequestPreparation => decode!(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationOutput<String>, CancelDirectRequestPreparation),
-            CanonicalOperation::GetDirectRequestOutcome => decode!(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeOutput<String>, GetDirectRequestOutcome),
-            CanonicalOperation::PublishDirectRequestKeys => decode!(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysOutput<String>, PublishDirectRequestKeys),
-            CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>, AcceptConversation),
-            CanonicalOperation::AcknowledgeEntries => decode!(crate::atproto::blue_catbird::chat::acknowledge_entries::AcknowledgeEntriesOutput<String>, AcknowledgeEntries),
-            CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>, AcknowledgeWelcome),
-            CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>, ActivateReset),
-            CanonicalOperation::CancelLeafRecovery => decode!(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryOutput<String>, CancelLeafRecovery),
-            CanonicalOperation::CancelLeave => decode!(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveOutput<String>, CancelLeave),
-            CanonicalOperation::CloseConversation => decode!(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationOutput<String>, CloseConversation),
+            CanonicalOperation::PrepareDirectRequest => decode!(
+                crate::atproto::chat::prepare_direct_request::Output,
+                PrepareDirectRequest
+            ),
+            CanonicalOperation::PublishDirectRequest => decode!(
+                crate::atproto::chat::publish_direct_request::Output,
+                PublishDirectRequest
+            ),
+            CanonicalOperation::CancelDirectRequestPreparation => decode!(
+                crate::atproto::chat::cancel_direct_request_preparation::Output,
+                CancelDirectRequestPreparation
+            ),
+            CanonicalOperation::GetDirectRequestOutcome => decode!(
+                crate::atproto::chat::get_direct_request_outcome::Output,
+                GetDirectRequestOutcome
+            ),
+            CanonicalOperation::PublishDirectRequestKeys => decode!(
+                crate::atproto::chat::publish_direct_request_keys::Output,
+                PublishDirectRequestKeys
+            ),
+            CanonicalOperation::AcceptConversation => decode!(
+                crate::atproto::chat::accept_conversation::Output,
+                AcceptConversation
+            ),
+            CanonicalOperation::AcknowledgeEntries => decode!(
+                crate::atproto::chat::acknowledge_entries::Output,
+                AcknowledgeEntries
+            ),
+            CanonicalOperation::AcknowledgeWelcome => decode!(
+                crate::atproto::chat::acknowledge_welcome::Output,
+                AcknowledgeWelcome
+            ),
+            CanonicalOperation::ActivateReset => {
+                decode!(crate::atproto::chat::activate_reset::Output, ActivateReset)
+            }
+            CanonicalOperation::CancelLeafRecovery => decode!(
+                crate::atproto::chat::cancel_leaf_recovery::Output,
+                CancelLeafRecovery
+            ),
+            CanonicalOperation::CancelLeave => {
+                decode!(crate::atproto::chat::cancel_leave::Output, CancelLeave)
+            }
+            CanonicalOperation::CloseConversation => decode!(
+                crate::atproto::chat::close_conversation::Output,
+                CloseConversation
+            ),
             CanonicalOperation::GetConversations => decode!(
-                crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<
-                    String
-                >,
+                crate::atproto::chat::get_conversations::Output,
                 GetConversations
             ),
             CanonicalOperation::CreateConversation => decode!(
-                crate::atproto::blue_catbird::chat::create_conversation::CreateConversationOutput<
-                    String
-                >,
+                crate::atproto::chat::create_conversation::Output,
                 CreateConversation
             ),
-            CanonicalOperation::SendMessage => decode!(
-                crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>,
-                SendMessage
+            CanonicalOperation::SendMessage => {
+                decode!(crate::atproto::chat::send_message::Output, SendMessage)
+            }
+            CanonicalOperation::GetConversationState => decode!(
+                crate::atproto::chat::get_conversation_state::Output,
+                GetConversationState
             ),
-            CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>, GetConversationState),
-            CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>, GetDevices),
-            CanonicalOperation::GetDeviceKey => decode!(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyOutput<String>, GetDeviceKey),
-            CanonicalOperation::GetEntries => decode!(
-                crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
-                GetEntries
+            CanonicalOperation::GetDevices => {
+                decode!(crate::atproto::chat::get_devices::Output, GetDevices)
+            }
+            CanonicalOperation::GetDeviceKey => {
+                decode!(crate::atproto::chat::get_device_key::Output, GetDeviceKey)
+            }
+            CanonicalOperation::GetEntries => {
+                decode!(crate::atproto::chat::get_entries::Output, GetEntries)
+            }
+            CanonicalOperation::GetLeafRecoveryInbox => decode!(
+                crate::atproto::chat::get_leaf_recovery_inbox::Output,
+                GetLeafRecoveryInbox
             ),
-            CanonicalOperation::GetLeafRecoveryInbox => decode!(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<String>, GetLeafRecoveryInbox),
-            CanonicalOperation::GetOwnDevices => decode!(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>, GetOwnDevices),
-            CanonicalOperation::GetPendingWelcomes => decode!(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<String>, GetPendingWelcomes),
-            CanonicalOperation::GetSubscriptionTicket => decode!(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<String>, GetSubscriptionTicket),
-            CanonicalOperation::PublishTyping => decode!(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingOutput<String>, PublishTyping),
-            CanonicalOperation::RegisterPushGateway => decode!(crate::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGatewayOutput<String>, RegisterPushGateway),
-            CanonicalOperation::RejectWelcome => decode!(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeOutput<String>, RejectWelcome),
-            CanonicalOperation::RelaySpaceCredential => decode!(crate::atproto::blue_catbird::chat::relay_space_credential::RelaySpaceCredentialOutput<String>, RelaySpaceCredential),
-            CanonicalOperation::RelaySpaceRead => Ok(Self::RelaySpaceRead(
-                crate::atproto::blue_catbird::chat::relay_space_read::RelaySpaceReadOutput {
-                    body: Bytes::copy_from_slice(body),
-                },
-            )),
+            CanonicalOperation::GetOwnDevices => {
+                decode!(crate::atproto::chat::get_own_devices::Output, GetOwnDevices)
+            }
+            CanonicalOperation::GetPendingWelcomes => decode!(
+                crate::atproto::chat::get_pending_welcomes::Output,
+                GetPendingWelcomes
+            ),
+            CanonicalOperation::GetSubscriptionTicket => decode!(
+                crate::atproto::chat::get_subscription_ticket::Output,
+                GetSubscriptionTicket
+            ),
+            CanonicalOperation::PublishTyping => {
+                decode!(crate::atproto::chat::publish_typing::Output, PublishTyping)
+            }
+            CanonicalOperation::RegisterPushGateway => decode!(
+                crate::atproto::chat::register_push_gateway::Output,
+                RegisterPushGateway
+            ),
+            CanonicalOperation::RejectWelcome => {
+                decode!(crate::atproto::chat::reject_welcome::Output, RejectWelcome)
+            }
+            CanonicalOperation::RelaySpaceCredential => decode!(
+                crate::atproto::chat::relay_space_credential::Output,
+                RelaySpaceCredential
+            ),
+            CanonicalOperation::RelaySpaceRead => Ok(Self::RelaySpaceRead(RelaySpaceReadOutput {
+                body: body.to_vec(),
+            })),
             CanonicalOperation::ReplenishKeyPackages => decode!(
-                crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
-                    String
-                >,
+                crate::atproto::chat::replenish_key_packages::Output,
                 ReplenishKeyPackages
             ),
-            CanonicalOperation::RequestLeafRecovery => decode!(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryOutput<String>, RequestLeafRecovery),
-            CanonicalOperation::EnrollDevice => decode!(
-                crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>,
-                EnrollDevice
+            CanonicalOperation::RequestLeafRecovery => decode!(
+                crate::atproto::chat::request_leaf_recovery::Output,
+                RequestLeafRecovery
             ),
-            CanonicalOperation::RequestLeave => decode!(
-                crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>,
-                RequestLeave
-            ),
-            CanonicalOperation::RequestReset => decode!(crate::atproto::blue_catbird::chat::request_reset::RequestResetOutput<String>, RequestReset),
-            CanonicalOperation::RevokeDevice => decode!(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceOutput<String>, RevokeDevice),
+            CanonicalOperation::EnrollDevice => {
+                decode!(crate::atproto::chat::enroll_device::Output, EnrollDevice)
+            }
+            CanonicalOperation::RequestLeave => {
+                decode!(crate::atproto::chat::request_leave::Output, RequestLeave)
+            }
+            CanonicalOperation::RequestReset => {
+                decode!(crate::atproto::chat::request_reset::Output, RequestReset)
+            }
+            CanonicalOperation::RevokeDevice => {
+                decode!(crate::atproto::chat::revoke_device::Output, RevokeDevice)
+            }
             CanonicalOperation::SubmitTransition => decode!(
-                crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
-                    String
-                >,
+                crate::atproto::chat::submit_transition::Output,
                 SubmitTransition
             ),
-            CanonicalOperation::SubscribeEvents => decode!(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>, SubscribeEvents),
-            CanonicalOperation::ApproveDevice => decode!(crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceOutput<String>, ApproveDevice),
+            CanonicalOperation::SubscribeEvents => decode!(
+                crate::atproto::chat::subscribe_events::Message,
+                SubscribeEvents
+            ),
+            CanonicalOperation::ApproveDevice => {
+                decode!(crate::atproto::chat::approve_device::Output, ApproveDevice)
+            }
         }
     }
 }
@@ -1151,73 +1245,144 @@ impl CleanChatError {
     pub fn decode(operation: CanonicalOperation, body: &[u8]) -> Result<Self, TransportError> {
         macro_rules! decode {
             ($ty:path, $variant:ident) => {
-                serde_json::from_slice::<$ty>(body)
-                    .map(Self::$variant)
-                    .map_err(|error| TransportError::Decoding(error.to_string()))
+                GeneratedXrpcError::<$ty>::parse(body).map(Self::$variant)
             };
         }
         match operation {
-            CanonicalOperation::PrepareDirectRequest => decode!(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestError, PrepareDirectRequest),
-            CanonicalOperation::PublishDirectRequest => decode!(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestError, PublishDirectRequest),
-            CanonicalOperation::CancelDirectRequestPreparation => decode!(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationError, CancelDirectRequestPreparation),
-            CanonicalOperation::GetDirectRequestOutcome => decode!(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeError, GetDirectRequestOutcome),
-            CanonicalOperation::PublishDirectRequestKeys => decode!(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysError, PublishDirectRequestKeys),
-            CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError, AcceptConversation),
-            CanonicalOperation::AcknowledgeEntries => decode!(crate::atproto::blue_catbird::chat::acknowledge_entries::AcknowledgeEntriesError, AcknowledgeEntries),
-            CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError, AcknowledgeWelcome),
-            CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError, ActivateReset),
-            CanonicalOperation::CancelLeafRecovery => decode!(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryError, CancelLeafRecovery),
-            CanonicalOperation::CancelLeave => decode!(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveError, CancelLeave),
-            CanonicalOperation::CloseConversation => decode!(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationError, CloseConversation),
+            CanonicalOperation::PrepareDirectRequest => decode!(
+                crate::atproto::chat::prepare_direct_request::Error,
+                PrepareDirectRequest
+            ),
+            CanonicalOperation::PublishDirectRequest => decode!(
+                crate::atproto::chat::publish_direct_request::Error,
+                PublishDirectRequest
+            ),
+            CanonicalOperation::CancelDirectRequestPreparation => decode!(
+                crate::atproto::chat::cancel_direct_request_preparation::Error,
+                CancelDirectRequestPreparation
+            ),
+            CanonicalOperation::GetDirectRequestOutcome => decode!(
+                crate::atproto::chat::get_direct_request_outcome::Error,
+                GetDirectRequestOutcome
+            ),
+            CanonicalOperation::PublishDirectRequestKeys => decode!(
+                crate::atproto::chat::publish_direct_request_keys::Error,
+                PublishDirectRequestKeys
+            ),
+            CanonicalOperation::AcceptConversation => decode!(
+                crate::atproto::chat::accept_conversation::Error,
+                AcceptConversation
+            ),
+            CanonicalOperation::AcknowledgeEntries => decode!(
+                crate::atproto::chat::acknowledge_entries::Error,
+                AcknowledgeEntries
+            ),
+            CanonicalOperation::AcknowledgeWelcome => decode!(
+                crate::atproto::chat::acknowledge_welcome::Error,
+                AcknowledgeWelcome
+            ),
+            CanonicalOperation::ActivateReset => {
+                decode!(crate::atproto::chat::activate_reset::Error, ActivateReset)
+            }
+            CanonicalOperation::CancelLeafRecovery => decode!(
+                crate::atproto::chat::cancel_leaf_recovery::Error,
+                CancelLeafRecovery
+            ),
+            CanonicalOperation::CancelLeave => {
+                decode!(crate::atproto::chat::cancel_leave::Error, CancelLeave)
+            }
+            CanonicalOperation::CloseConversation => decode!(
+                crate::atproto::chat::close_conversation::Error,
+                CloseConversation
+            ),
             CanonicalOperation::GetConversations => decode!(
-                crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError,
+                crate::atproto::chat::get_conversations::Error,
                 GetConversations
             ),
             CanonicalOperation::CreateConversation => decode!(
-                crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
+                crate::atproto::chat::create_conversation::Error,
                 CreateConversation
             ),
-            CanonicalOperation::SendMessage => decode!(
-                crate::atproto::blue_catbird::chat::send_message::SendMessageError,
-                SendMessage
+            CanonicalOperation::SendMessage => {
+                decode!(crate::atproto::chat::send_message::Error, SendMessage)
+            }
+            CanonicalOperation::GetConversationState => decode!(
+                crate::atproto::chat::get_conversation_state::Error,
+                GetConversationState
             ),
-            CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError, GetConversationState),
-            CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError, GetDevices),
-            CanonicalOperation::GetDeviceKey => decode!(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyError, GetDeviceKey),
-            CanonicalOperation::GetEntries => decode!(
-                crate::atproto::blue_catbird::chat::get_entries::GetEntriesError,
-                GetEntries
+            CanonicalOperation::GetDevices => {
+                decode!(crate::atproto::chat::get_devices::Error, GetDevices)
+            }
+            CanonicalOperation::GetDeviceKey => {
+                decode!(crate::atproto::chat::get_device_key::Error, GetDeviceKey)
+            }
+            CanonicalOperation::GetEntries => {
+                decode!(crate::atproto::chat::get_entries::Error, GetEntries)
+            }
+            CanonicalOperation::GetLeafRecoveryInbox => decode!(
+                crate::atproto::chat::get_leaf_recovery_inbox::Error,
+                GetLeafRecoveryInbox
             ),
-            CanonicalOperation::GetLeafRecoveryInbox => decode!(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError, GetLeafRecoveryInbox),
-            CanonicalOperation::GetOwnDevices => decode!(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesError, GetOwnDevices),
-            CanonicalOperation::GetPendingWelcomes => decode!(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesError, GetPendingWelcomes),
-            CanonicalOperation::GetSubscriptionTicket => decode!(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError, GetSubscriptionTicket),
-            CanonicalOperation::PublishTyping => decode!(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingError, PublishTyping),
-            CanonicalOperation::RegisterPushGateway => decode!(crate::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGatewayError, RegisterPushGateway),
-            CanonicalOperation::RejectWelcome => decode!(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeError, RejectWelcome),
-            CanonicalOperation::RelaySpaceCredential => decode!(crate::atproto::blue_catbird::chat::relay_space_credential::RelaySpaceCredentialError, RelaySpaceCredential),
-            CanonicalOperation::RelaySpaceRead => decode!(crate::atproto::blue_catbird::chat::relay_space_read::RelaySpaceReadError, RelaySpaceRead),
+            CanonicalOperation::GetOwnDevices => {
+                decode!(crate::atproto::chat::get_own_devices::Error, GetOwnDevices)
+            }
+            CanonicalOperation::GetPendingWelcomes => decode!(
+                crate::atproto::chat::get_pending_welcomes::Error,
+                GetPendingWelcomes
+            ),
+            CanonicalOperation::GetSubscriptionTicket => decode!(
+                crate::atproto::chat::get_subscription_ticket::Error,
+                GetSubscriptionTicket
+            ),
+            CanonicalOperation::PublishTyping => {
+                decode!(crate::atproto::chat::publish_typing::Error, PublishTyping)
+            }
+            CanonicalOperation::RegisterPushGateway => decode!(
+                crate::atproto::chat::register_push_gateway::Error,
+                RegisterPushGateway
+            ),
+            CanonicalOperation::RejectWelcome => {
+                decode!(crate::atproto::chat::reject_welcome::Error, RejectWelcome)
+            }
+            CanonicalOperation::RelaySpaceCredential => decode!(
+                crate::atproto::chat::relay_space_credential::Error,
+                RelaySpaceCredential
+            ),
+            CanonicalOperation::RelaySpaceRead => decode!(
+                crate::atproto::chat::relay_space_read::Error,
+                RelaySpaceRead
+            ),
             CanonicalOperation::ReplenishKeyPackages => decode!(
-                crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
+                crate::atproto::chat::replenish_key_packages::Error,
                 ReplenishKeyPackages
             ),
-            CanonicalOperation::RequestLeafRecovery => decode!(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryError, RequestLeafRecovery),
-            CanonicalOperation::EnrollDevice => decode!(
-                crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError,
-                EnrollDevice
+            CanonicalOperation::RequestLeafRecovery => decode!(
+                crate::atproto::chat::request_leaf_recovery::Error,
+                RequestLeafRecovery
             ),
-            CanonicalOperation::RequestLeave => decode!(
-                crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError,
-                RequestLeave
-            ),
-            CanonicalOperation::RequestReset => decode!(crate::atproto::blue_catbird::chat::request_reset::RequestResetError, RequestReset),
-            CanonicalOperation::RevokeDevice => decode!(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceError, RevokeDevice),
+            CanonicalOperation::EnrollDevice => {
+                decode!(crate::atproto::chat::enroll_device::Error, EnrollDevice)
+            }
+            CanonicalOperation::RequestLeave => {
+                decode!(crate::atproto::chat::request_leave::Error, RequestLeave)
+            }
+            CanonicalOperation::RequestReset => {
+                decode!(crate::atproto::chat::request_reset::Error, RequestReset)
+            }
+            CanonicalOperation::RevokeDevice => {
+                decode!(crate::atproto::chat::revoke_device::Error, RevokeDevice)
+            }
             CanonicalOperation::SubmitTransition => decode!(
-                crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError,
+                crate::atproto::chat::submit_transition::Error,
                 SubmitTransition
             ),
-            CanonicalOperation::SubscribeEvents => decode!(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsError, SubscribeEvents),
-            CanonicalOperation::ApproveDevice => decode!(crate::atproto::blue_catbird::chat::approve_device::ApproveDeviceError, ApproveDevice),
+            CanonicalOperation::SubscribeEvents => decode!(
+                crate::atproto::chat::subscribe_events::Error,
+                SubscribeEvents
+            ),
+            CanonicalOperation::ApproveDevice => {
+                decode!(crate::atproto::chat::approve_device::Error, ApproveDevice)
+            }
         }
     }
 }
@@ -1278,7 +1443,7 @@ pub struct ReplenishKeyPackagesInput {
     pub idempotency_key: String,
     pub key_id: String,
     pub signature_domain: String,
-    pub key_packages: Vec<crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>>,
+    pub key_packages: Vec<crate::atproto::chat::defs::KeyPackageArtifact>,
     pub signed_at: String,
 }
 
@@ -1325,34 +1490,35 @@ pub(crate) fn replenish_key_packages(
     let signature = signer
         .sign(&transcript)
         .map_err(|_| TransportError::Signing)?;
-    let body = crate::atproto::blue_catbird::chat::KeyPackageReplenishmentBody::<String> {
+    let body = crate::atproto::chat::defs::KeyPackageReplenishmentBody {
         actor_device_id: input.actor_device_id,
-        actor_did: crate::atproto::jacquard_common::types::string::Did::<String>::new(
-            input.actor_did,
-        )
-        .map_err(|_| TransportError::Serialization("actorDid is not a valid DID".into()))?,
+        actor_did: petrel_core::Did::parse(input.actor_did)
+            .map_err(|_| TransportError::Serialization("actorDid is not a valid DID".into()))?,
         auth_generation: input.auth_generation,
         idempotency_key: input.idempotency_key,
         key_id: input.key_id,
         key_packages: input.key_packages,
         signature_domain: REPLENISH_SIGNATURE_DOMAIN.to_owned(),
-        signature_public_key: Bytes::from(signer.public().to_vec()),
+        signature_public_key: petrel_core::Bytes(signer.public().to_vec()),
         signed_at,
         extra_data: None,
     };
-    let signed = crate::atproto::blue_catbird::chat::SignedKeyPackageReplenishment::<String> {
-        body,
-        signature: Bytes::from(signature),
+    let signed = crate::atproto::chat::defs::SignedKeyPackageReplenishment {
+        body: crate::atproto::chat::defs::SignedKeyPackageReplenishmentBody::KeyPackageReplenishmentBody(
+            Box::new(body),
+        ),
+        signature: petrel_core::Bytes(signature),
         extra_data: None,
     };
-    let request = ReplenishKeyPackages::<String> {
+    let request = crate::atproto::chat::replenish_key_packages::Input {
         signed_request: signed,
-        extra_data: None,
     };
     Ok(PreparedRequest {
         operation: CanonicalOperation::ReplenishKeyPackages,
         method: "POST".into(),
-        path: ReplenishKeyPackagesRequest::PATH.to_owned(),
+        path: canonical_route(CanonicalOperation::ReplenishKeyPackages)
+            .path
+            .to_owned(),
         body: Some(serialize_json(&request)?),
     })
 }
@@ -2517,9 +2683,7 @@ fn remove_read_routing_extensions(state: &mut serde_json::Value) -> Result<(), T
     if let Some(did) = fields.remove("sequencerDid") {
         match did {
             serde_json::Value::Null => {}
-            serde_json::Value::String(did)
-                if crate::atproto::jacquard_common::types::string::Did::new(did.as_str())
-                    .is_ok() => {}
+            serde_json::Value::String(did) if petrel_core::Did::parse(did.as_str()).is_ok() => {}
             _ => {
                 return Err(TransportError::Serialization(
                     "sequencerDid must be a valid DID or null".into(),
@@ -2731,7 +2895,7 @@ fn normalize_read_type_tags(
 
 pub fn decode_conversation_state(
     raw: &[u8],
-) -> Result<catbird_atproto::blue_catbird::chat::ConversationState, TransportError> {
+) -> Result<crate::atproto::chat::defs::ConversationState, TransportError> {
     let mut input = parse_conversation_read_json(raw, false)?;
     normalize_read_type_tags(
         chat_definition("conversationState")?,
@@ -2749,7 +2913,7 @@ pub fn decode_conversation_state(
 
 pub fn decode_conversation_coordinates(
     raw: &[u8],
-) -> Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, TransportError> {
+) -> Result<crate::atproto::chat::defs::ConversationCoordinates, TransportError> {
     let mut input = parse_strict_signed_json(raw)?;
     normalize_read_type_tags(
         chat_definition("conversationCoordinates")?,
@@ -2813,11 +2977,11 @@ fn wrap_read_wire_bytes(
 
 /// Encode actual generated state through the same schema-aware byte mapping.
 pub fn encode_conversation_state(
-    state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    state: &crate::atproto::chat::defs::ConversationState,
 ) -> Result<Vec<u8>, TransportError> {
     super::admission::validate_conversation_policy(state)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
-    let raw = serde_json::to_vec(state)
+    let raw = crate::atproto::json::to_vec(state)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
     let mut input = parse_conversation_read_json(&raw, false)?;
     normalize_read_type_tags(
@@ -2838,10 +3002,7 @@ pub fn encode_conversation_state(
 /// variants. Only schema-defined item bytes are converted for generated Rust.
 pub fn decode_conversations_inventory(
     raw: &[u8],
-) -> Result<
-    catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput,
-    TransportError,
-> {
+) -> Result<crate::atproto::chat::get_conversations::Output, TransportError> {
     let input = parse_conversation_read_json(raw, true)?;
     let StrictSignedJson::Object(fields) = input else {
         return Err(TransportError::Serialization(
@@ -2883,11 +3044,13 @@ pub fn decode_conversations_inventory(
             })
             .collect::<Result<Vec<_>, TransportError>>()?,
     );
-    let output: catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput =
-        serde_json::from_value(output)
-            .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let output: crate::atproto::chat::get_conversations::Output = serde_json::from_value(output)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
     for item in &output.items {
-        if let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = item {
+        if let crate::atproto::chat::defs::ConversationInventoryItem::ConversationInventoryState(
+            item,
+        ) = item
+        {
             super::admission::validate_conversation_policy(&item.state)
                 .map_err(|error| TransportError::Serialization(error.to_string()))?;
         }
@@ -3305,10 +3468,10 @@ fn finish_signed_request(
     if signature.len() != 64 {
         return Err(TransportError::InvalidSigningAuthority);
     }
-    let mut generated_body = prepared.generated_body_json.clone();
-    if let serde_json::Value::Object(values) = &mut generated_body {
-        values.remove("$type");
-    }
+    // Petrel models each signed `body` as its lexicon's closed union, so the
+    // generated-type validation below keeps the member's `$type`. The wire
+    // body is `prepared.body_json`, built separately and unchanged.
+    let generated_body = prepared.generated_body_json.clone();
     let mut wrapper = serde_json::Map::new();
     if let Some(variant) = prepared.spec.variant {
         wrapper.insert("$type".into(), serde_json::Value::String(variant.into()));
@@ -3485,7 +3648,7 @@ impl Serialize for CanonicalValue {
 pub(crate) fn canonical_replenishment_transcript(
     input: &ReplenishKeyPackagesInput,
     public_key: &[u8],
-    signed_at: &crate::atproto::blue_catbird::chat::CanonicalDatetime,
+    signed_at: &crate::atproto::chat::defs::CanonicalDatetime,
     key_id: &str,
 ) -> Result<Vec<u8>, TransportError> {
     let device_id = canonical_uuid_bytes(&input.actor_device_id, "actorDeviceId")?;
@@ -3518,7 +3681,7 @@ pub(crate) fn canonical_replenishment_transcript(
             let mut value = BTreeMap::new();
             value.insert(
                 "bytes".into(),
-                CanonicalValue::Bytes(package.bytes.to_vec()),
+                CanonicalValue::Bytes(package.bytes.0.clone()),
             );
             value.insert(
                 "contentType".into(),
@@ -3530,11 +3693,11 @@ pub(crate) fn canonical_replenishment_transcript(
             );
             value.insert(
                 "keyPackageRef".into(),
-                CanonicalValue::Bytes(package.key_package_ref.to_vec()),
+                CanonicalValue::Bytes(package.key_package_ref.0.clone()),
             );
             value.insert(
                 "sha256".into(),
-                CanonicalValue::Bytes(package.sha256.to_vec()),
+                CanonicalValue::Bytes(package.sha256.0.clone()),
             );
             CanonicalValue::Map(value)
         })
@@ -3692,7 +3855,7 @@ fn validate_hostname(host: &str) -> bool {
 }
 
 pub(crate) fn validate_key_packages(
-    packages: &[crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>],
+    packages: &[crate::atproto::chat::defs::KeyPackageArtifact],
 ) -> Result<(), TransportError> {
     if !(1..=100).contains(&packages.len()) {
         return Err(TransportError::Serialization(
@@ -3701,9 +3864,9 @@ pub(crate) fn validate_key_packages(
     }
     let mut previous: Option<&[u8]> = None;
     for package in packages {
-        if !(8..=65_536).contains(&package.bytes.len())
-            || package.sha256.len() != 32
-            || package.key_package_ref.len() != 32
+        if !(8..=65_536).contains(&package.bytes.0.len())
+            || package.sha256.0.len() != 32
+            || package.key_package_ref.0.len() != 32
             || package.content_type != "keyPackage"
             || package.framing != "mlsMessage"
         {
@@ -3711,20 +3874,20 @@ pub(crate) fn validate_key_packages(
                 "keyPackageArtifact violates canonical bounds".into(),
             ));
         }
-        if previous.is_some_and(|prior| prior >= package.key_package_ref.as_ref()) {
+        if previous.is_some_and(|prior| prior >= package.key_package_ref.0.as_slice()) {
             return Err(TransportError::Serialization(
                 "keyPackageRef values must be strictly increasing".into(),
             ));
         }
-        previous = Some(package.key_package_ref.as_ref());
+        previous = Some(package.key_package_ref.0.as_slice());
     }
     Ok(())
 }
 
 fn parse_datetime(
     value: String,
-) -> Result<crate::atproto::blue_catbird::chat::CanonicalDatetime, TransportError> {
-    crate::atproto::blue_catbird::chat::CanonicalDatetime::from_str(&value)
+) -> Result<crate::atproto::chat::defs::CanonicalDatetime, TransportError> {
+    crate::atproto::chat::defs::CanonicalDatetime::from_str(&value)
         .map_err(|_| TransportError::Serialization("signedAt is not a canonical datetime".into()))
 }
 
@@ -3749,7 +3912,8 @@ pub(crate) fn validate_datetime(value: &str) -> Result<(), TransportError> {
 }
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>, TransportError> {
-    serde_json::to_vec(value).map_err(|error| TransportError::Serialization(error.to_string()))
+    crate::atproto::json::to_vec(value)
+        .map_err(|error| TransportError::Serialization(error.to_string()))
 }
 
 fn prepare_json_request<T: Serialize>(
@@ -3899,48 +4063,31 @@ pub(crate) fn encode_query(value: &str) -> String {
         .collect()
 }
 
-fn query_request<T: Serialize>(
+fn query_request<T: petrel_core::ToQueryParams>(
     auth: &TransportAuth,
     operation: CanonicalOperation,
     request: &T,
 ) -> Result<PreparedRequest, TransportError> {
-    let value = serde_json::to_value(request)
-        .map_err(|error| TransportError::Serialization(error.to_string()))?;
-    let Some(object) = value.as_object() else {
-        if value.is_null() {
-            return read_request(auth, operation, String::new());
-        }
-        return Err(TransportError::Serialization(
-            "generated query request is not an object".into(),
-        ));
-    };
-    if let Some(actor_device_id) = object
-        .get("actorDeviceId")
-        .and_then(serde_json::Value::as_str)
-    {
-        if actor_device_id != auth.device_id {
+    let mut pairs = Vec::new();
+    request.to_query_params(&mut pairs);
+    if let Some((_, actor_device_id)) = pairs.iter().find(|(key, _)| *key == "actorDeviceId") {
+        if *actor_device_id != auth.device_id {
             return Err(TransportError::DeviceBindingMismatch {
-                body: actor_device_id.to_owned(),
+                body: actor_device_id.clone(),
                 authenticated: auth.device_id.clone(),
             });
         }
     }
-    let mut fields = Vec::new();
-    for (key, value) in object {
-        if key == "$type" {
-            continue;
-        }
-        match value {
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    fields.push(format_query_field(key, value));
-                }
-            }
-            serde_json::Value::Null => {}
-            value => fields.push(format_query_field(key, value)),
-        }
-    }
-    read_request(auth, operation, fields.join("&"))
+    read_request(auth, operation, encode_query_pairs(&pairs))
+}
+
+/// Render generated query pairs in their generated order.
+fn encode_query_pairs(pairs: &[(&'static str, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{}={}", encode_query(key), encode_query(value)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn format_query_field(key: &str, value: &serde_json::Value) -> String {
@@ -3978,30 +4125,31 @@ pub(crate) fn get_conversations(
     limit: i64,
     page_cursor: Option<&str>,
 ) -> Result<PreparedRequest, TransportError> {
-    let request = GetConversations {
+    use crate::atproto::chat::get_conversations::{
+        Parameters, ParametersSupportedProtocolVersions,
+    };
+    let request = Parameters {
         actor_device_id: auth.device_id.clone(),
         limit,
         page_cursor: page_cursor.map(ToOwned::to_owned),
-        supported_protocol_versions: Some(vec![crate::atproto::blue_catbird::chat::get_conversations::GetConversationsSupportedProtocolVersions::_1, crate::atproto::blue_catbird::chat::get_conversations::GetConversationsSupportedProtocolVersions::_2]),
+        supported_protocol_versions: Some(vec![
+            ParametersSupportedProtocolVersions::Value1,
+            ParametersSupportedProtocolVersions::Value2,
+        ]),
     };
-    let value = serde_json::to_value(request)
-        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    // Pinned spelling and order of the pre-Petrel query string.
     let mut query = format!(
         "actorDeviceId={}&limit={}",
-        encode_query(value["actorDeviceId"].as_str().unwrap_or_default()),
-        value["limit"]
+        encode_query(&request.actor_device_id),
+        request.limit
     );
-    if let Some(cursor) = value["pageCursor"].as_str() {
+    if let Some(cursor) = &request.page_cursor {
         query.push_str("&pageCursor=");
         query.push_str(&encode_query(cursor));
     }
-    for version in value["supportedProtocolVersions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
+    for version in request.supported_protocol_versions.iter().flatten() {
         query.push_str("&supportedProtocolVersions=");
-        query.push_str(&encode_query(version.as_str().unwrap_or_default()));
+        query.push_str(&encode_query(version.as_str()));
     }
     read_request(auth, CanonicalOperation::GetConversations, query)
 }
@@ -4023,20 +4171,19 @@ pub(crate) fn get_entries(
     after_seq: i64,
     limit: i64,
 ) -> Result<PreparedRequest, TransportError> {
-    let request = GetEntries {
+    let request = crate::atproto::chat::get_entries::Parameters {
         actor_device_id: auth.device_id.clone(),
-        after_seq,
         conversation_id: conversation_id.to_owned(),
+        after_seq,
         limit,
     };
-    let value = serde_json::to_value(request)
-        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    // Pinned spelling and order of the pre-Petrel query string.
     let query = format!(
         "actorDeviceId={}&afterSeq={}&conversationId={}&limit={}",
-        encode_query(value["actorDeviceId"].as_str().unwrap_or_default()),
-        value["afterSeq"],
-        encode_query(value["conversationId"].as_str().unwrap_or_default()),
-        value["limit"]
+        encode_query(&request.actor_device_id),
+        request.after_seq,
+        encode_query(&request.conversation_id),
+        request.limit
     );
     read_request(auth, CanonicalOperation::GetEntries, query)
 }
@@ -4163,53 +4310,62 @@ pub struct CanonicalRoute {
     pub path: &'static str,
 }
 
-fn route(path: &'static str) -> CanonicalRoute {
-    let nsid = path
-        .strip_prefix("/xrpc/")
-        .expect("generated XRPC endpoint paths have /xrpc/ prefix");
+/// Petrel's generated endpoint markers carry the NSID only, so the `/xrpc/`
+/// path is built once per NSID and kept for the life of the process (bounded
+/// by the number of generated clean-chat endpoints).
+fn route(nsid: &'static str) -> CanonicalRoute {
+    static PATHS: OnceLock<std::sync::Mutex<BTreeMap<&'static str, &'static str>>> =
+        OnceLock::new();
+    let mut paths = PATHS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = *paths
+        .entry(nsid)
+        .or_insert_with(|| Box::leak(format!("/xrpc/{nsid}").into_boxed_str()));
     CanonicalRoute { nsid, path }
 }
 
 /// Resolve an operation through the generated canonical endpoint marker.
 pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
     match operation {
-        CanonicalOperation::PrepareDirectRequest => route(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestRequest::PATH),
-        CanonicalOperation::PublishDirectRequest => route(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestRequest::PATH),
-        CanonicalOperation::CancelDirectRequestPreparation => route(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationRequest::PATH),
-        CanonicalOperation::GetDirectRequestOutcome => route(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeRequest::PATH),
-        CanonicalOperation::PublishDirectRequestKeys => route(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysRequest::PATH),
-        CanonicalOperation::AcceptConversation => route(AcceptConversationRequest::PATH),
-        CanonicalOperation::AcknowledgeEntries => route(AcknowledgeEntriesRequest::PATH),
-        CanonicalOperation::AcknowledgeWelcome => route(AcknowledgeWelcomeRequest::PATH),
-        CanonicalOperation::ActivateReset => route(ActivateResetRequest::PATH),
-        CanonicalOperation::CancelLeafRecovery => route(CancelLeafRecoveryRequest::PATH),
-        CanonicalOperation::CancelLeave => route(CancelLeaveRequest::PATH),
-        CanonicalOperation::CloseConversation => route(CloseConversationRequest::PATH),
-        CanonicalOperation::GetConversations => route(GetConversationsRequest::PATH),
-        CanonicalOperation::CreateConversation => route(CreateConversationRequest::PATH),
-        CanonicalOperation::SendMessage => route(SendMessageRequest::PATH),
-        CanonicalOperation::GetConversationState => route(GetConversationStateRequest::PATH),
-        CanonicalOperation::GetDevices => route(GetDevicesRequest::PATH),
-        CanonicalOperation::GetDeviceKey => route(GetDeviceKeyRequest::PATH),
-        CanonicalOperation::GetEntries => route(GetEntriesRequest::PATH),
-        CanonicalOperation::GetLeafRecoveryInbox => route(GetLeafRecoveryInboxRequest::PATH),
-        CanonicalOperation::GetOwnDevices => route(GetOwnDevicesRequest::PATH),
-        CanonicalOperation::GetPendingWelcomes => route(GetPendingWelcomesRequest::PATH),
-        CanonicalOperation::GetSubscriptionTicket => route(GetSubscriptionTicketRequest::PATH),
-        CanonicalOperation::PublishTyping => route(PublishTypingRequest::PATH),
-        CanonicalOperation::RegisterPushGateway => route(RegisterPushGatewayRequest::PATH),
-        CanonicalOperation::RejectWelcome => route(RejectWelcomeRequest::PATH),
-        CanonicalOperation::RelaySpaceCredential => route(RelaySpaceCredentialRequest::PATH),
-        CanonicalOperation::RelaySpaceRead => route(RelaySpaceReadRequest::PATH),
-        CanonicalOperation::ReplenishKeyPackages => route(ReplenishKeyPackagesRequest::PATH),
-        CanonicalOperation::RequestLeafRecovery => route(RequestLeafRecoveryRequest::PATH),
-        CanonicalOperation::EnrollDevice => route(EnrollDeviceRequest::PATH),
-        CanonicalOperation::RequestLeave => route(RequestLeaveRequest::PATH),
-        CanonicalOperation::RequestReset => route(RequestResetRequest::PATH),
-        CanonicalOperation::RevokeDevice => route(RevokeDeviceRequest::PATH),
-        CanonicalOperation::SubmitTransition => route(SubmitTransitionRequest::PATH),
-        CanonicalOperation::SubscribeEvents => route(SubscribeEventsEndpoint::PATH),
-        CanonicalOperation::ApproveDevice => route(ApproveDeviceRequest::PATH),
+        CanonicalOperation::PrepareDirectRequest => route(<crate::atproto::chat::prepare_direct_request::PrepareDirectRequest as XrpcRequest>::NSID),
+        CanonicalOperation::PublishDirectRequest => route(<crate::atproto::chat::publish_direct_request::PublishDirectRequest as XrpcRequest>::NSID),
+        CanonicalOperation::CancelDirectRequestPreparation => route(<crate::atproto::chat::cancel_direct_request_preparation::CancelDirectRequestPreparation as XrpcRequest>::NSID),
+        CanonicalOperation::GetDirectRequestOutcome => route(<crate::atproto::chat::get_direct_request_outcome::GetDirectRequestOutcome as XrpcRequest>::NSID),
+        CanonicalOperation::PublishDirectRequestKeys => route(<crate::atproto::chat::publish_direct_request_keys::PublishDirectRequestKeys as XrpcRequest>::NSID),
+        CanonicalOperation::AcceptConversation => route(<AcceptConversation as XrpcRequest>::NSID),
+        CanonicalOperation::AcknowledgeEntries => route(<AcknowledgeEntries as XrpcRequest>::NSID),
+        CanonicalOperation::AcknowledgeWelcome => route(<AcknowledgeWelcome as XrpcRequest>::NSID),
+        CanonicalOperation::ActivateReset => route(<ActivateReset as XrpcRequest>::NSID),
+        CanonicalOperation::CancelLeafRecovery => route(<CancelLeafRecovery as XrpcRequest>::NSID),
+        CanonicalOperation::CancelLeave => route(<CancelLeave as XrpcRequest>::NSID),
+        CanonicalOperation::CloseConversation => route(<CloseConversation as XrpcRequest>::NSID),
+        CanonicalOperation::GetConversations => route(<GetConversations as XrpcRequest>::NSID),
+        CanonicalOperation::CreateConversation => route(<CreateConversation as XrpcRequest>::NSID),
+        CanonicalOperation::SendMessage => route(<SendMessage as XrpcRequest>::NSID),
+        CanonicalOperation::GetConversationState => route(<GetConversationState as XrpcRequest>::NSID),
+        CanonicalOperation::GetDevices => route(<GetDevices as XrpcRequest>::NSID),
+        CanonicalOperation::GetDeviceKey => route(<GetDeviceKey as XrpcRequest>::NSID),
+        CanonicalOperation::GetEntries => route(<GetEntries as XrpcRequest>::NSID),
+        CanonicalOperation::GetLeafRecoveryInbox => route(<GetLeafRecoveryInbox as XrpcRequest>::NSID),
+        CanonicalOperation::GetOwnDevices => route(<GetOwnDevices as XrpcRequest>::NSID),
+        CanonicalOperation::GetPendingWelcomes => route(<GetPendingWelcomes as XrpcRequest>::NSID),
+        CanonicalOperation::GetSubscriptionTicket => route(<GetSubscriptionTicket as XrpcRequest>::NSID),
+        CanonicalOperation::PublishTyping => route(<PublishTyping as XrpcRequest>::NSID),
+        CanonicalOperation::RegisterPushGateway => route(<RegisterPushGateway as XrpcRequest>::NSID),
+        CanonicalOperation::RejectWelcome => route(<RejectWelcome as XrpcRequest>::NSID),
+        CanonicalOperation::RelaySpaceCredential => route(<RelaySpaceCredential as XrpcRequest>::NSID),
+        CanonicalOperation::RelaySpaceRead => route(<RelaySpaceRead as XrpcRequest>::NSID),
+        CanonicalOperation::ReplenishKeyPackages => route(<ReplenishKeyPackages as XrpcRequest>::NSID),
+        CanonicalOperation::RequestLeafRecovery => route(<RequestLeafRecovery as XrpcRequest>::NSID),
+        CanonicalOperation::EnrollDevice => route(<EnrollDevice as XrpcRequest>::NSID),
+        CanonicalOperation::RequestLeave => route(<RequestLeave as XrpcRequest>::NSID),
+        CanonicalOperation::RequestReset => route(<RequestReset as XrpcRequest>::NSID),
+        CanonicalOperation::RevokeDevice => route(<RevokeDevice as XrpcRequest>::NSID),
+        CanonicalOperation::SubmitTransition => route(<SubmitTransition as XrpcRequest>::NSID),
+        CanonicalOperation::SubscribeEvents => route(<SubscribeEvents as XrpcSubscription>::NSID),
+        CanonicalOperation::ApproveDevice => route(<ApproveDevice as XrpcRequest>::NSID),
     }
 }
 
@@ -4339,7 +4495,7 @@ mod read_routing_extension_tests {
             let mut generated = serde_json::to_value(&expected).unwrap();
             generated["sequencerDid"] = wire["sequencerDid"].clone();
             generated["sequencerTerm"] = wire["sequencerTerm"].clone();
-            let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+            let generated: crate::atproto::chat::defs::ConversationState =
                 serde_json::from_value(generated).unwrap();
             assert_eq!(
                 generated.sequencer_did.as_ref().map(|d| d.as_ref()),
@@ -4388,7 +4544,7 @@ mod read_routing_extension_tests {
             let mut generated = serde_json::to_value(&expected).unwrap();
             generated["sequencerDid"] = wire["sequencerDid"].clone();
             generated["sequencerTerm"] = wire["sequencerTerm"].clone();
-            let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+            let generated: crate::atproto::chat::defs::ConversationState =
                 serde_json::from_value(generated).unwrap();
             assert_eq!(
                 decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
@@ -4491,7 +4647,7 @@ mod read_routing_extension_tests {
         for participant in generated["participants"].as_array_mut().unwrap() {
             participant["labyrinthHead"] = labyrinth_head();
         }
-        let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+        let generated: crate::atproto::chat::defs::ConversationState =
             serde_json::from_value(generated).unwrap();
         assert!(generated
             .participants

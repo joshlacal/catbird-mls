@@ -227,7 +227,7 @@ pub(crate) fn validate_fetched_key_package_batch(
     for did in requested_dids {
         if !did.starts_with("did:")
             || credential_root_did(did) != did
-            || catbird_atproto::types::string::Did::new(did.as_str()).is_err()
+            || petrel_core::Did::parse(did.as_str()).is_err()
         {
             return Err(super::error::OrchestratorError::InvalidInput(
                 "key-package request authority must contain syntactically valid bare DIDs"
@@ -287,7 +287,7 @@ pub(crate) fn leaf_key_package_request_did(leaf_identity: &[u8]) -> super::error
         .and_then(|identity| identity.split_once('#'))
         .ok_or_else(malformed)?;
     if !did.starts_with("did:")
-        || catbird_atproto::types::string::Did::new(did).is_err()
+        || petrel_core::Did::parse(did).is_err()
         || crate::chat_v2::ids::CanonicalUuid::parse(device).is_err()
     {
         return Err(malformed());
@@ -314,7 +314,7 @@ pub(crate) fn enforce_outbound_key_package_did_bindings(
     for did in expected_dids {
         if !did.starts_with("did:")
             || credential_root_did(did) != did
-            || catbird_atproto::types::string::Did::new(did.as_str()).is_err()
+            || petrel_core::Did::parse(did.as_str()).is_err()
         {
             return Err(super::error::OrchestratorError::InvalidInput(
                 "outbound key-package authority must contain syntactically valid bare DIDs"
@@ -332,7 +332,7 @@ pub(crate) fn enforce_outbound_key_package_did_bindings(
             ))
         })?;
         let root = credential_root_did(&identity);
-        if !root.starts_with("did:") || catbird_atproto::types::string::Did::new(root).is_err() {
+        if !root.starts_with("did:") || petrel_core::Did::parse(root).is_err() {
             return Err(super::error::OrchestratorError::InvalidInput(format!(
                 "outbound key package {index} does not claim a syntactically valid credential DID root"
             )));
@@ -1373,11 +1373,11 @@ mod tests {
 
     #[test]
     fn outbound_binding_does_not_globally_fold_method_specific_id_case() {
-        use catbird_atproto::types::string::Did;
+        use petrel_core::Did;
 
-        assert!(Did::new("did:method:Value").is_ok());
-        assert!(Did::new("did:method:value").is_ok());
-        assert!(Did::new("did:METHOD:value").is_err());
+        assert!(Did::parse("did:method:Value").is_ok());
+        assert!(Did::parse("did:method:value").is_ok());
+        assert!(Did::parse("did:METHOD:value").is_err());
 
         let error = enforce_outbound_key_package_did_bindings(
             &["did:method:Value".to_string()],

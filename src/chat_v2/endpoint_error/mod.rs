@@ -1,15 +1,15 @@
 //! Typed endpoint-error mapping for the clean chat protocol.
 //!
-//! Every generated endpoint declares its own `*Error` enum. Rather than write
+//! Every generated endpoint declares its own `Error` enum. Rather than write
 //! 32 hand-maintained `From` impls that must be revisited on every lexicon
-//! change, this module reads the discriminant through serde's own adjacent
-//! tagging — the exact mechanism the wire format uses — and resolves it against
-//! the closed [`ChatErrorCode`] set.
+//! change, this module reads the XRPC error body that a generated error
+//! serializes to (`GeneratedXrpcError`: `{"error", "message"?}`, the exact wire
+//! shape) and resolves the name against the closed [`ChatErrorCode`] set.
 //!
-//! That is a structural extraction, not string inspection: it reads the `error`
-//! tag serde emits from the variant's `#[serde(rename = ...)]`, which is by
-//! construction the wire spelling. Nothing here parses a rendered message, and
-//! nothing downstream is given the opportunity to.
+//! That is a structural extraction, not string inspection: the `error` field
+//! is the generated enum's declared wire name, by construction the wire
+//! spelling. Nothing here parses a rendered message, and nothing downstream is
+//! given the opportunity to.
 
 pub mod class;
 pub mod code;
@@ -168,13 +168,15 @@ impl core::error::Error for EndpointError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catbird_atproto::blue_catbird::chat;
+    use crate::atproto::chat;
+    use crate::atproto::GeneratedXrpcError;
 
     #[test]
     fn extracts_a_known_code_and_detail() {
-        let generated = chat::send_message::SendMessageError::RecipientNotReady(Some(
-            "peer has no leaf".into(),
-        ));
+        let generated = GeneratedXrpcError::new(
+            chat::send_message::Error::RecipientNotReady,
+            Some("peer has no leaf".into()),
+        );
         let typed = EndpointError::from_generated("blue.catbird.chat.sendMessage", &generated);
 
         assert_eq!(typed.code, ChatErrorCode::RecipientNotReady);
@@ -184,7 +186,7 @@ mod tests {
 
     #[test]
     fn extracts_a_code_with_no_detail() {
-        let generated = chat::send_message::SendMessageError::StaleCoordinates(None);
+        let generated = GeneratedXrpcError::new(chat::send_message::Error::StaleCoordinates, None);
         let typed = EndpointError::from_generated("blue.catbird.chat.sendMessage", &generated);
 
         assert_eq!(typed.code, ChatErrorCode::StaleCoordinates);
@@ -196,20 +198,23 @@ mod tests {
     fn works_across_different_endpoint_enums() {
         // One extraction path serves every endpoint; there are no per-endpoint
         // From impls to fall out of date when a lexicon changes.
-        let entries = chat::get_entries::GetEntriesError::NotEntitled(None);
+        let entries = GeneratedXrpcError::new(chat::get_entries::Error::NotEntitled, None);
         assert_eq!(
             EndpointError::from_generated("blue.catbird.chat.getEntries", &entries).code,
             ChatErrorCode::NotEntitled
         );
 
-        let recovery =
-            chat::request_leaf_recovery::RequestLeafRecoveryError::LeafRecoveryAlreadyOpen(None);
+        let recovery = GeneratedXrpcError::new(
+            chat::request_leaf_recovery::Error::LeafRecoveryAlreadyOpen,
+            None,
+        );
         assert_eq!(
             EndpointError::from_generated("blue.catbird.chat.requestLeafRecovery", &recovery).code,
             ChatErrorCode::LeafRecoveryAlreadyOpen
         );
 
-        let transition = chat::submit_transition::SubmitTransitionError::CoordinateOverflow(None);
+        let transition =
+            GeneratedXrpcError::new(chat::submit_transition::Error::CoordinateOverflow, None);
         assert_eq!(
             EndpointError::from_generated("blue.catbird.chat.submitTransition", &transition).code,
             ChatErrorCode::CoordinateOverflow
@@ -218,14 +223,15 @@ mod tests {
 
     #[test]
     fn account_expiry_is_the_only_login_outcome() {
-        let generated = chat::get_entries::GetEntriesError::AccountSessionExpired(None);
+        let generated =
+            GeneratedXrpcError::new(chat::get_entries::Error::AccountSessionExpired, None);
         let typed = EndpointError::from_generated("blue.catbird.chat.getEntries", &generated);
         assert_eq!(typed.code, ChatErrorCode::AccountSessionExpired);
         assert!(typed.requires_reauthentication());
 
         let missing = EndpointError::from_generated(
             "blue.catbird.chat.getEntries",
-            &chat::get_entries::GetEntriesError::DeviceNotRegistered(None),
+            &GeneratedXrpcError::new(chat::get_entries::Error::DeviceNotRegistered, None),
         );
         assert!(!missing.requires_reauthentication());
         assert!(missing.requires_device_recovery());
@@ -239,10 +245,10 @@ mod tests {
     fn unknown_server_codes_flow_through_the_other_arm() {
         // A server ahead of this client sends a code we do not know. It must
         // survive intact for telemetry and must classify conservatively.
-        let generated = chat::get_entries::GetEntriesError::Other {
-            error: "SomeFutureServerCode".into(),
-            message: Some("from a newer server".into()),
-        };
+        let generated = GeneratedXrpcError::new(
+            chat::get_entries::Error::Unknown("SomeFutureServerCode".into()),
+            Some("from a newer server".into()),
+        );
         let typed = EndpointError::from_generated("blue.catbird.chat.getEntries", &generated);
 
         assert_eq!(
@@ -260,16 +266,19 @@ mod tests {
         // extraction would silently start returning MissingErrorTag for
         // everything. Sweeping one endpoint's full variant set catches that.
         let all = [
-            chat::get_entries::GetEntriesError::AccessOutsideMembershipInterval(None),
-            chat::get_entries::GetEntriesError::ConversationNotFound(None),
-            chat::get_entries::GetEntriesError::CutoverRequired(None),
-            chat::get_entries::GetEntriesError::DeviceNotRegistered(None),
-            chat::get_entries::GetEntriesError::DeviceRevoked(None),
-            chat::get_entries::GetEntriesError::AccountSessionExpired(None),
-            chat::get_entries::GetEntriesError::DeviceBindingMismatch(None),
-            chat::get_entries::GetEntriesError::InvalidRequest(None),
-            chat::get_entries::GetEntriesError::NotEntitled(None),
-            chat::get_entries::GetEntriesError::ProtocolUpgradeRequired(None),
+            GeneratedXrpcError::new(
+                chat::get_entries::Error::AccessOutsideMembershipInterval,
+                None,
+            ),
+            GeneratedXrpcError::new(chat::get_entries::Error::ConversationNotFound, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::CutoverRequired, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::DeviceNotRegistered, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::DeviceRevoked, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::AccountSessionExpired, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::DeviceBindingMismatch, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::InvalidRequest, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::NotEntitled, None),
+            GeneratedXrpcError::new(chat::get_entries::Error::ProtocolUpgradeRequired, None),
         ];
         for generated in &all {
             let typed = EndpointError::from_generated("blue.catbird.chat.getEntries", generated);

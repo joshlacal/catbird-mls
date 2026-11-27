@@ -871,14 +871,15 @@ pub fn verify_car_record_proof(
         .map(|(proved, _)| proved)
 }
 
-/// Encode an ATProto JSON record value to canonical DAG-CBOR via `catbird_atproto::types::value::Data`
+/// Encode an ATProto JSON record value to canonical DAG-CBOR via [`petrel_core::Value`]
 /// and compute its CIDv1 (`0x71`, SHA-256).
 pub fn encode_atproto_json_record_dagcbor(
     value: &serde_json::Value,
 ) -> Result<(Cid, Vec<u8>), String> {
-    let typed: catbird_atproto::types::value::Data = serde_json::from_value(value.clone())
+    let raw = serde_json::to_vec(value).map_err(|e| format!("render ATProto JSON record: {e}"))?;
+    let typed: petrel_core::Value = petrel_core::from_json(&raw)
         .map_err(|e| format!("decode ATProto JSON record value: {e}"))?;
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed)
+    let dagcbor = petrel_core::to_dag_cbor(&typed)
         .map_err(|e| format!("encode ATProto DAG-CBOR record: {e}"))?;
     verify_canonical_dagcbor(&dagcbor)?;
     Ok((compute_dagcbor_cid(&dagcbor), dagcbor))

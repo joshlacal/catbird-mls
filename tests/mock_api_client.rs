@@ -652,16 +652,21 @@ impl MockDeliveryService {
             if wrapper["signedRequest"]["body"]["$type"]
                 == "blue.catbird.chat.defs#conversationCloseBody"
             {
-                let mut output: catbird_atproto::blue_catbird::chat::close_conversation::CloseConversationOutput = serde_json::from_value(accepted).unwrap();
+                let mut output: catbird_mls::atproto::chat::close_conversation::Output =
+                    serde_json::from_value(accepted).unwrap();
                 output.result.entry.extra_data = None;
                 output.result.entry.signed_request.extra_data = None;
-                output.result.entry.signed_request.body.extra_data = None;
+                let catbird_mls::atproto::chat::defs::SignedConversationCloseBody::ConversationCloseBody(
+                    body,
+                ) = &mut output.result.entry.signed_request.body;
+                body.extra_data = None;
                 output.result.entry.tombstone.extra_data = None;
                 output.result.tombstone.extra_data = None;
                 serde_json::to_value(output).unwrap()
             } else {
-                let mut output: catbird_atproto::blue_catbird::chat::request_leave::RequestLeaveOutput = serde_json::from_value(accepted).unwrap();
-                let catbird_atproto::blue_catbird::chat::LeaveOperationResult::ZeroLeafLeaveResult(
+                let mut output: catbird_mls::atproto::chat::request_leave::Output =
+                    serde_json::from_value(accepted).unwrap();
+                let catbird_mls::atproto::chat::defs::LeaveOperationResult::ZeroLeafLeaveResult(
                     result,
                 ) = &mut output.result
                 else {
@@ -669,7 +674,10 @@ impl MockDeliveryService {
                 };
                 result.entry.extra_data = None;
                 result.entry.signed_request.extra_data = None;
-                result.entry.signed_request.body.extra_data = None;
+                let catbird_mls::atproto::chat::defs::SignedZeroLeafLeaveBody::ZeroLeafLeaveBody(
+                    body,
+                ) = &mut result.entry.signed_request.body;
+                body.extra_data = None;
                 serde_json::to_value(output).unwrap()
             }
         } else {
@@ -4306,7 +4314,7 @@ impl MLSAPIClient for MockDeliveryService {
                                 // unverified host group mapping. Do not graft
                                 // a different generation's policy onto it.
                                 snapshot.coordinates.conversation_id.as_str() == view.conversation_id
-                                    && hex::encode(&snapshot.coordinates.group_id) == view.group_id
+                                    && hex::encode(&snapshot.coordinates.group_id.0) == view.group_id
                                     && snapshot.coordinates.epoch as u64 <= view.epoch
                             });
                     }

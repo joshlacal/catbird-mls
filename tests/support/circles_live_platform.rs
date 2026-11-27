@@ -246,9 +246,11 @@ fn ok(body: Value) -> Result<PlatformHttpResponse, MLSError> {
 }
 
 fn canonical_record_cid(value: &Value) -> Result<String, MLSError> {
-    let typed: catbird_atproto::types::value::Data = serde_json::from_value(value.clone())
+    let raw = serde_json::to_vec(value)
+        .map_err(|e| MLSError::Internal(format!("circles live fixture record render: {e}")))?;
+    let typed: petrel_core::Value = petrel_core::from_json(&raw)
         .map_err(|e| MLSError::Internal(format!("circles live fixture record decode: {e}")))?;
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed)
+    let dagcbor = petrel_core::to_dag_cbor(&typed)
         .map_err(|e| MLSError::Internal(format!("circles live fixture record encode: {e}")))?;
     Ok(compute_dagcbor_cid(&dagcbor).to_string())
 }

@@ -36,8 +36,11 @@ env:
   # Sibling repositories that Cargo.toml takes by path. These are the at:space/
   # commits the next CatbirdMLSCore release is built from
   # (Scripts/ffi-release-inputs.json); move them together with it.
-  CATBIRD_ATPROTO_REV: 4299c438ff92d13cd554cdf686ca74156c987f84
-  LABYRINTH_REV: f53b4c6dff681b8b81e3755dbaadb356803eb5ed
+  CATBIRD_ATPROTO_REV: aed64f2c6decd58696f482b9d024dafc407d3aa2
+  # Petrel Rust (AT Protocol types) and its Catbird overlay.
+  PETREL_REV: 76bf7c8beb83fbb861183d04948fa5a061698772
+  PETREL_CATBIRD_REV: 7658265cdc4eebd6cbb37b30fc1f385892168b19
+  LABYRINTH_REV: 9e457eff07373969de4240b849a900e46d42a122
 
 jobs:
   build-site:
@@ -50,7 +53,7 @@ jobs:
       - name: Check out sibling repositories
         run: |
           set -euo pipefail
-          for pair in "catbird-atproto:$CATBIRD_ATPROTO_REV" "labyrinth:$LABYRINTH_REV"; do
+          for pair in "catbird-atproto:$CATBIRD_ATPROTO_REV" "labyrinth:$LABYRINTH_REV" "Petrel:$PETREL_REV" "PetrelCatbird:$PETREL_CATBIRD_REV"; do
             name="${pair%%:*}"; rev="${pair#*:}"
             git init -q "../$name"
             git -C "../$name" fetch -q --depth 1 "https://github.com/joshlacal/$name" "$rev"
@@ -71,19 +74,17 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Build the book
         run: mdbook build docs/book
+      - name: Verify the Petrel dependency graph
+        run: |
+          cargo tree --locked --target all -e normal,build --prefix none --format '{p}' > dependencies.txt
+          if grep -E '^(jacquard([_-][^ ]*)?|catbird-atproto) v' dependencies.txt; then exit 1; fi
       - name: Build the API reference
         env:
           # A transitive git dependency stalls under libgit2; use the git CLI.
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-          # tangled.org stalls and resets clones of jacquard ("curl 92 ...
-          # INTERNAL_ERROR"). Cargo.lock now takes jacquard from the
-          # joshlacal/jacquard fork directly; the redirect stays for any
-          # older lock, and HTTP/1.1 for any other git dependency.
-          GIT_CONFIG_COUNT: '2'
-          GIT_CONFIG_KEY_0: url.https://github.com/joshlacal/jacquard.insteadOf
-          GIT_CONFIG_VALUE_0: https://tangled.org/nonbinary.computer/jacquard
-          GIT_CONFIG_KEY_1: http.version
-          GIT_CONFIG_VALUE_1: HTTP/1.1
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
           CARGO_NET_RETRY: '5'
         run: cargo doc --no-deps --locked
       - name: Assemble the site

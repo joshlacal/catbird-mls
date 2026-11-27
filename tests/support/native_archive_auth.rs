@@ -1505,11 +1505,11 @@ fn commitment(entries: &[(&RecordKey, &Record)]) -> Result<[u8; 32], MLSError> {
 }
 
 fn record(value: &Value) -> Result<Record, MLSError> {
-    let typed: catbird_atproto::types::value::Data =
-        serde_json::from_value(value.clone()).map_err(failure)?;
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).map_err(failure)?;
+    let raw = serde_json::to_vec(value).map_err(failure)?;
+    let typed: petrel_core::Value = petrel_core::from_json(&raw).map_err(failure)?;
+    let dagcbor = petrel_core::to_dag_cbor(&typed).map_err(failure)?;
     validate_canonical_dagcbor_record(&dagcbor).map_err(failure)?;
-    // Served as written: jacquard re-renders `$bytes` padded, which is not atproto JSON.
+    // Served exactly as written, never re-rendered from the decoded value.
     Ok(Record {
         value: value.clone(),
         cid: compute_dagcbor_cid(&dagcbor).to_string(),

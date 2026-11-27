@@ -2,10 +2,11 @@
 
 use serde_json::Value;
 
-use crate::atproto::blue_catbird::chat::{
-    get_leaf_recovery_inbox::GetLeafRecoveryInboxError,
-    request_leaf_recovery::RequestLeafRecoveryError,
+use crate::atproto::chat::{
+    get_leaf_recovery_inbox::Error as GetLeafRecoveryInboxError,
+    request_leaf_recovery::Error as RequestLeafRecoveryError,
 };
+use crate::atproto::GeneratedXrpcError;
 use crate::chat_v2::ids::uuid::CanonicalUuid;
 
 use super::api_client::MLSAPIClient;
@@ -22,8 +23,11 @@ use super::storage::MLSStorageBackend;
 pub(crate) fn already_open(response: &GatewayResponse) -> bool {
     response.status == 400
         && matches!(
-            serde_json::from_slice::<RequestLeafRecoveryError>(&response.body),
-            Ok(RequestLeafRecoveryError::LeafRecoveryAlreadyOpen(_))
+            GeneratedXrpcError::<RequestLeafRecoveryError>::parse(&response.body),
+            Ok(GeneratedXrpcError {
+                error: RequestLeafRecoveryError::LeafRecoveryAlreadyOpen,
+                ..
+            })
         )
 }
 
@@ -32,9 +36,12 @@ fn retryable_session_error(error: &OrchestratorError) -> bool {
         return false;
     };
     matches!(
-        serde_json::from_str::<GetLeafRecoveryInboxError>(body),
-        Ok(GetLeafRecoveryInboxError::InventorySessionMismatch(_)
-            | GetLeafRecoveryInboxError::InventorySessionExpired(_))
+        GeneratedXrpcError::<GetLeafRecoveryInboxError>::parse(body.as_bytes()),
+        Ok(GeneratedXrpcError {
+            error: GetLeafRecoveryInboxError::InventorySessionMismatch
+                | GetLeafRecoveryInboxError::InventorySessionExpired,
+            ..
+        })
     )
 }
 

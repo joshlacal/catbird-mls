@@ -57,7 +57,7 @@ pub mod voice;
 // ATProto serde helpers (standalone, no external dependency)
 pub mod atproto_bytes;
 
-pub use catbird_atproto as atproto;
+pub mod atproto;
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::{CatbirdMlsClient, GeneratedRecoveryCode};
 pub use client::{

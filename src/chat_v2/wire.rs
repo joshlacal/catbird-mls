@@ -11,8 +11,7 @@
 //! may treat an entry as trustworthy on the strength of this module.
 
 use super::append_log::AppendLogEntry;
-use catbird_atproto::blue_catbird::chat::ConversationEntry;
-use catbird_atproto::jacquard_common::BosStr;
+use crate::atproto::chat::defs::ConversationEntry;
 
 /// Applies `$body` to the inner entry of any `ConversationEntry` arm.
 ///
@@ -126,7 +125,7 @@ pub trait WireEntry {
     }
 }
 
-impl<S: BosStr> WireEntry for ConversationEntry<S> {
+impl WireEntry for ConversationEntry {
     fn entry_kind(&self) -> &'static str {
         match self {
             Self::DirectRequestEntry(_) => "blue.catbird.chat.defs#directRequestEntry",
@@ -152,7 +151,7 @@ impl<S: BosStr> WireEntry for ConversationEntry<S> {
     }
 }
 
-impl<S: BosStr> AppendLogEntry for ConversationEntry<S> {
+impl AppendLogEntry for ConversationEntry {
     fn raw_seq(&self) -> i64 {
         with_entry!(self, |entry| entry.seq)
     }
@@ -161,7 +160,11 @@ impl<S: BosStr> AppendLogEntry for ConversationEntry<S> {
         match self {
             Self::DirectRequestEntry(entry) => entry.conversation_id.as_ref(),
             Self::DirectRequestAcceptanceEntry(entry) => {
-                entry.signed_request.body.prior.conversation_id.as_ref()
+                match &entry.signed_request.body {
+                    crate::atproto::chat::defs::SignedDirectRequestAcceptanceBody::DirectRequestAcceptanceBody(
+                        body,
+                    ) => body.prior.conversation_id.as_ref(),
+                }
             }
             Self::AccountDeletedEntry(entry) => entry.conversation_id.as_ref(),
             Self::ApplicationEntry(entry) => entry.conversation_id.as_ref(),
