@@ -19,6 +19,8 @@ use p256::ecdsa::signature::Signer as _;
 mod archive_established;
 #[path = "client_live_chat_data_plane/archive_policy.rs"]
 mod archive_policy;
+#[path = "client_live_chat_data_plane/delete_scrub.rs"]
+mod delete_scrub;
 #[path = "fixtures/direct_request_i13.rs"]
 mod direct_request_i13;
 #[path = "client_live_chat_data_plane/idle_flush.rs"]

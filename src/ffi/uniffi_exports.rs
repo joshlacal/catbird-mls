@@ -451,6 +451,17 @@ impl CatbirdMlsClient {
         self.unsend_message(&conversation_id, &message_id)
     }
 
+    /// Delete for me: erase the message's local content on this device and queue an owner
+    /// tombstone so this account's other devices erase it too. Other members keep theirs.
+    #[uniffi::method(name = "delete_message_for_me")]
+    pub fn ffi_delete_message_for_me(
+        &self,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<(), MLSError> {
+        self.delete_message_for_me(&conversation_id, &message_id)
+    }
+
     #[uniffi::method(name = "rescue_conversation_on_kick")]
     pub fn ffi_rescue_conversation_on_kick(
         &self,

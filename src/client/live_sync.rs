@@ -2211,6 +2211,15 @@ impl CatbirdMlsClient {
                 dr_rcpt_json.as_bytes(),
                 now_ms,
             )?;
+            // An opening already erased here (deleted for me on another device of this
+            // account, then re-imported) keeps the request but none of its text.
+            let opening_erased = super::message_erase::is_frame_erased(
+                tx,
+                cid,
+                first_message_id,
+                sender_did,
+                &intro_json,
+            )?;
             tx.upsert_request(&RequestRow {
                 request_id: request_id.to_string(),
                 conversation_id: cid.to_string(),
@@ -2223,76 +2232,82 @@ impl CatbirdMlsClient {
                 },
                 first_message_id: Some(first_message_id.to_string()),
                 first_message_archived: false,
-                payload_json: intro_json.clone(),
+                payload_json: if opening_erased {
+                    "{}".to_owned()
+                } else {
+                    intro_json.clone()
+                },
                 expires_at_ms: (import_until as i64).saturating_mul(1000),
                 updated_at_ms: now_ms,
             })?;
-            tx.insert_message(&MessageRow {
-                message_id: first_message_id.to_string(),
-                conversation_id: cid.to_string(),
-                group_id: group_id.clone(),
-                epoch,
-                seq: entry_seq,
-                sender_did: sender_did.to_string(),
-                sender_device_id: sender_device_id.to_string(),
-                plaintext_json: intro_json.clone(),
-                created_at_ms: now_ms,
-                is_own: !is_incoming,
-            })?;
-
-            // Stage an incoming C33 opening so `accept_direct_request` archives it ONLY after
-            // consent. An own opening is the sending device's archive duty.
-            if let Some(opening) = opening.filter(|_| is_incoming) {
-                let staged_opening = QueuedLabyrinthArchivePayload {
-                    expected_member_dids: group
-                        .members()
-                        .map(|member| {
-                            root_did_from_credential_bytes(member.credential.serialized_content())
-                                .map(|(did, _)| did)
-                        })
-                        .collect::<Result<std::collections::BTreeSet<_>, _>>()?
-                        .into_iter()
-                        .collect(),
-                    version: 1,
+            if !opening_erased {
+                tx.insert_message(&MessageRow {
                     message_id: first_message_id.to_string(),
                     conversation_id: cid.to_string(),
-                    group_id_hex: hex::encode(&group_id),
+                    group_id: group_id.clone(),
                     epoch,
                     seq: entry_seq,
                     sender_did: sender_did.to_string(),
                     sender_device_id: sender_device_id.to_string(),
-                    sequencer_did: effective_seq_did,
-                    space_uri,
                     plaintext_json: intro_json.clone(),
-                    labyrinth_frame_json: String::from_utf8(opening.canonical_payload_bytes)
-                        .map_err(|e| {
-                            MLSError::Cryptography(format!("C33 canonical opening frame: {e}"))
-                        })?,
-                    mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
-                    frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
-                    sequencer_receipt_json: Some(dr_rcpt_json),
-                    original_sender_attestation_json: Some(
-                        serde_json::to_string(&bootstrap.original_sender_attestation).map_err(
-                            |error| {
-                                MLSError::Internal(format!(
-                                    "serialize C33 original sender attestation: {error}"
-                                ))
-                            },
-                        )?,
-                    ),
                     created_at_ms: now_ms,
-                };
-                tx.put_labyrinth_state(
-                    &format!("native.message:{cid}:{first_message_id}"),
-                    &serde_json::to_vec(&staged_opening)?,
-                    now_ms,
-                )?;
-                tx.put_account_meta(
-                    &format!("c33_pending_opening:{cid}"),
-                    &serde_json::to_string(&staged_opening)
-                        .map_err(|e| MLSError::Internal(e.to_string()))?,
-                    now_ms,
-                )?;
+                    is_own: !is_incoming,
+                })?;
+
+                // Stage an incoming C33 opening so `accept_direct_request` archives it ONLY after
+                // consent. An own opening is the sending device's archive duty.
+                if let Some(opening) = opening.filter(|_| is_incoming) {
+                    let staged_opening = QueuedLabyrinthArchivePayload {
+                        expected_member_dids: group
+                            .members()
+                            .map(|member| {
+                                root_did_from_credential_bytes(member.credential.serialized_content())
+                                    .map(|(did, _)| did)
+                            })
+                            .collect::<Result<std::collections::BTreeSet<_>, _>>()?
+                            .into_iter()
+                            .collect(),
+                        version: 1,
+                        message_id: first_message_id.to_string(),
+                        conversation_id: cid.to_string(),
+                        group_id_hex: hex::encode(&group_id),
+                        epoch,
+                        seq: entry_seq,
+                        sender_did: sender_did.to_string(),
+                        sender_device_id: sender_device_id.to_string(),
+                        sequencer_did: effective_seq_did,
+                        space_uri,
+                        plaintext_json: intro_json.clone(),
+                        labyrinth_frame_json: String::from_utf8(opening.canonical_payload_bytes)
+                            .map_err(|e| {
+                                MLSError::Cryptography(format!("C33 canonical opening frame: {e}"))
+                            })?,
+                        mls_ciphertext_b64: STANDARD.encode(&bootstrap.initial_ciphertext),
+                        frame_nonce_b64: Some(STANDARD.encode(opening.frame_nonce)),
+                        sequencer_receipt_json: Some(dr_rcpt_json),
+                        original_sender_attestation_json: Some(
+                            serde_json::to_string(&bootstrap.original_sender_attestation).map_err(
+                                |error| {
+                                    MLSError::Internal(format!(
+                                        "serialize C33 original sender attestation: {error}"
+                                    ))
+                                },
+                            )?,
+                        ),
+                        created_at_ms: now_ms,
+                    };
+                    tx.put_labyrinth_state(
+                        &format!("native.message:{cid}:{first_message_id}"),
+                        &serde_json::to_vec(&staged_opening)?,
+                        now_ms,
+                    )?;
+                    tx.put_account_meta(
+                        &format!("c33_pending_opening:{cid}"),
+                        &serde_json::to_string(&staged_opening)
+                            .map_err(|e| MLSError::Internal(e.to_string()))?,
+                        now_ms,
+                    )?;
+                }
             }
             live_integrity::reapply_opening_deletion(tx, cid, sender_did)?;
             Ok(true)
@@ -5188,6 +5203,99 @@ impl CatbirdMlsClient {
                 });
                 let body = verified_application_body.as_ref().unwrap_or(body);
 
+                // Erased on this device (unsent or deleted for me): the durable marker, not the
+                // dropped evidence, recognises the entry. Its I13 receipt still verifies and
+                // binds this seq and sender before the cursor moves; nothing is stored. A marker
+                // covers only the sender it names.
+                let any_marker = self
+                    .db
+                    .read_tx(|tx| super::message_erase::is_locally_erased(tx, cid, msg_id))?;
+                if any_marker {
+                    let rcpt_val = entry
+                        .get("sequencerReceipt")
+                        .filter(|v| v.is_object())
+                        .ok_or_else(|| {
+                            MLSError::Cryptography(format!(
+                                "I13: erased applicationEntry {msg_id} missing sequencerReceipt"
+                            ))
+                        })?;
+                    let entry_id = entry
+                        .get("entryId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(msg_id);
+                    let kid = chat_wire::sequencer_receipt_kid(&convo.sequencer_did, rcpt_val)?;
+                    let rcpt_sec1 = self
+                        .resolve_sequencer_receipt_key(&convo.sequencer_did, kid)?
+                        .ok_or_else(|| {
+                            MLSError::Cryptography(format!(
+                                "I13: unable to resolve `{}` receipt method {kid}",
+                                convo.sequencer_did
+                            ))
+                        })?;
+                    let send_counter = body.get("sendCounter").and_then(Value::as_u64);
+                    let now_ms = self.hooks.now_ms();
+                    let skipped = self.db.write_tx(|tx| {
+                        let mut c = tx
+                            .get_conversation(cid)?
+                            .ok_or_else(|| MLSError::group_not_found(cid))?;
+                        let verified = chat_wire::verify_pruned_application_receipt(
+                            rcpt_val,
+                            &rcpt_sec1,
+                            &c.sequencer_did,
+                            cid,
+                            &c.group_id,
+                            entry_id,
+                            entry_seq,
+                        )?;
+                        if verified.generation != c.generation {
+                            return Err(MLSError::Cryptography(
+                                "I13: erased entry receipt generation mismatch".into(),
+                            ));
+                        }
+                        if outer_sender.is_some_and(|(did, device)| {
+                            did != verified.sender_did || device != verified.sender_device_id
+                        }) {
+                            return Err(MLSError::Cryptography(
+                                "erased entry outer sender mismatch".into(),
+                            ));
+                        }
+                        // A marker naming another sender does not cover this entry.
+                        if !super::message_erase::is_erased_for(
+                            tx,
+                            cid,
+                            msg_id,
+                            &verified.sender_did,
+                        )? {
+                            return Ok(false);
+                        }
+                        let own_device = verified.sender_did == self.normalized_did
+                            && verified.sender_device_id == canonical_dev_id;
+                        if !own_device {
+                            super::send_counter::record_peer_send_counter(
+                                tx,
+                                cid,
+                                verified.generation,
+                                verified.epoch,
+                                &verified.sender_did,
+                                &verified.sender_device_id,
+                                send_counter,
+                                entry_seq,
+                                now_ms,
+                            )?;
+                        }
+                        tx.delete_pending_op(NATIVE_ARCHIVE_RECEIPT_OP, msg_id)?;
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = now_ms;
+                        tx.upsert_conversation(&c)?;
+                        Ok(true)
+                    })?;
+                    if skipped {
+                        pass.max_seq = pass.max_seq.max(entry_seq);
+                        pass.applied = pass.applied.saturating_add(1);
+                        continue;
+                    }
+                }
+
                 let already_have = self.db.read_tx(|tx| tx.get_message(msg_id))?.is_some();
                 #[cfg(feature = "sim")]
                 let already_have = already_have
@@ -5678,6 +5786,15 @@ impl CatbirdMlsClient {
                         sender_dev_id,
                         entry_seq,
                         rcpt_val["issuedAtMs"].as_i64(),
+                    )? {
+                        c.last_seq = c.last_seq.max(entry_seq);
+                        c.updated_at_ms = now_ms;
+                        return tx.upsert_conversation(&c);
+                    }
+                    // An edit of a message erased here for the same sender: verified above,
+                    // stored nowhere (no row, evidence or witness copy carries its new text).
+                    if super::message_erase::is_frame_erased(
+                        tx, cid, msg_id, sender_did, &json_str,
                     )? {
                         c.last_seq = c.last_seq.max(entry_seq);
                         c.updated_at_ms = now_ms;

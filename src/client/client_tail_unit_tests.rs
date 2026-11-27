@@ -398,6 +398,68 @@ fn open_enrolled_tail_client(
 }
 
 #[test]
+fn import_conversation_history_never_writes_back_an_erased_message_or_its_edit() {
+    let tmp = TempDir::new().unwrap();
+    let clock = Arc::new(FixedStepClock::new(1_700_000_000_000, 1));
+    let transport = Arc::new(TailTransport::new());
+    let client = open_enrolled_tail_client(&tmp, clock, 7, transport);
+
+    let cid = "a1234567-89ab-4cde-8123-456789abcdef";
+    let mk_msg = |id: &str, seq: i64, plaintext: String| MessageRow {
+        message_id: id.to_string(),
+        conversation_id: cid.to_string(),
+        group_id: vec![0x22; 32],
+        epoch: 1,
+        seq,
+        sender_did: "did:plc:peeruserbbbbbbbbbbbbbbbb".to_string(),
+        sender_device_id: BOB_DEV_1.to_string(),
+        plaintext_json: plaintext,
+        created_at_ms: 1_700_000_000_000 + seq,
+        is_own: false,
+    };
+
+    // A legacy plain-bytes unsent marker covers every sender; the erase left no row and no
+    // retained evidence behind, so only the marker can stop the import.
+    client
+        .db
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &crate::client::message_erase::unsent_message_key(cid, "m-erased"),
+                b"unsent",
+                1_700_000_000_000,
+            )
+        })
+        .unwrap();
+
+    let imported = client
+        .import_conversation_history(
+            cid,
+            vec![
+                mk_msg("m-erased", 1, r#"{"text":"erased-secret"}"#.to_string()),
+                mk_msg(
+                    "m-edit",
+                    2,
+                    r#"{"messageType":"edit","edit":{"targetMessageId":"m-erased","newText":"erased-secret-2"}}"#
+                        .to_string(),
+                ),
+                mk_msg("m-kept", 3, r#"{"text":"kept"}"#.to_string()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(imported, 1);
+
+    client
+        .db
+        .read_tx(|tx| {
+            assert!(tx.get_message("m-erased")?.is_none());
+            assert!(tx.get_message("m-edit")?.is_none());
+            assert!(tx.get_message("m-kept")?.is_some());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn import_conversation_history_skips_existing_replaces_gap_and_validates_conversation_id() {
     let tmp = TempDir::new().unwrap();
     let clock = Arc::new(FixedStepClock::new(1_700_000_000_000, 1));
