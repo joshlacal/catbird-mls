@@ -15256,4 +15256,12 @@ fn mark_conversation_read_recounts_unread_above_read_point() {
         bob.mark_conversation_read(&cid, max_peer_seq(&bob, &cid)).unwrap(),
         0
     );
+
+    // A delayed call that names an older read point must not bring read messages back.
+    assert_eq!(
+        bob.mark_conversation_read(&cid, read_through).unwrap(),
+        0,
+        "an out-of-order read never raises the unread count"
+    );
+    assert_eq!(unread(&bob, &cid), 0);
 }

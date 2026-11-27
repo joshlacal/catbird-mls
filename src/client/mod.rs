@@ -1920,6 +1920,8 @@ pub(crate) mod native_client {
         /// `unread_count` is incremented as peer messages (and undecryptable-gap rows) land, so
         /// it is recomputed here from the stored peer rows above the read point rather than
         /// zeroed: a message that arrived after the reader's newest visible row stays unread.
+        /// Reading only ever lowers the count, so a delayed call that names an older read point
+        /// cannot bring already-read messages back.
         /// This is purely local state; it needs no network, signer or archive session, so a
         /// failed server acknowledgement or a disabled archive never leaves a read
         /// conversation marked unread. The recount runs in one write transaction, so it never
@@ -1942,10 +1944,10 @@ pub(crate) mod native_client {
             self.db.write_tx(|tx| {
                 tx.conn()
                     .execute(
-                        "UPDATE conversations SET unread_count = ( \
+                        "UPDATE conversations SET unread_count = MIN(unread_count, ( \
                             SELECT COUNT(*) FROM messages \
                             WHERE messages.conversation_id = ?1 AND messages.is_own = 0 AND messages.seq > ?2 \
-                         ) WHERE conversation_id = ?1;",
+                         )) WHERE conversation_id = ?1;",
                         rusqlite::params![conv_id_db, read_through_seq],
                     )
                     .map_err(|e| MLSError::Internal(format!("mark conversation read: {e}")))?;
