@@ -1673,8 +1673,9 @@ pub fn process_push_notification_with_hooks(
                     };
                     // Erased on this device (unsent or deleted for me): never store its
                     // plaintext here. Foreground sync verifies the receipt and moves the cursor.
-                    if crate::client::message_erase::is_locally_erased(
-                        tx, &wake.conversation_id, &message_id,
+                    if crate::client::message_erase::is_frame_erased(
+                        tx, &wake.conversation_id, &message_id, &verified_sender_did,
+                        &plaintext_json,
                     )? {
                         return Err(foreground_sync_required());
                     }

@@ -246,7 +246,10 @@ fn live_entry_of_a_message_already_deleted_for_me_is_verified_and_not_stored() {
         .unwrap();
     put_deleted_marker(bob, cid, &id, ALICE_DID);
     bob.sync().expect("bob syncs past the deleted entry");
-    assert!(!has_row(bob, &id), "nothing is stored for an erased message");
+    assert!(
+        !has_row(bob, &id),
+        "nothing is stored for an erased message"
+    );
     assert!(labyrinth_state(bob, &format!("native.message:{cid}:{id}")).is_none());
     let after = new_id();
     alice.send_message(cid, &after, "later").unwrap();
@@ -255,8 +258,7 @@ fn live_entry_of_a_message_already_deleted_for_me_is_verified_and_not_stored() {
     assert_eq!(last_seq(bob, cid), last_seq(alice, cid));
 }
 
-/// A marker naming a different sender does not cover the entry: it is applied normally (and
-/// the marker still keeps it off the timeline).
+/// A marker naming a different sender does not cover the entry: it is applied and listed.
 #[test]
 fn deleted_marker_for_another_sender_does_not_skip_the_entry() {
     let f = send_order_fixture(false);
@@ -266,4 +268,138 @@ fn deleted_marker_for_another_sender_does_not_skip_the_entry() {
     put_deleted_marker(bob, cid, &id, EVE_DID);
     bob.sync().unwrap();
     assert!(has_row(bob, &id), "the entry is applied");
+    assert!(
+        visible(bob, cid, &id),
+        "a marker bound to eve does not hide alice's row"
+    );
+}
+
+fn put_unsent_marker(client: &CatbirdMlsClient, cid: &str, id: &str, sender: &str) {
+    let marker = json!({"v": 1, "kind": "unsent-peer", "senders": [sender]});
+    client
+        .db()
+        .write_tx(|tx| {
+            tx.put_labyrinth_state(
+                &format!("native.unsent:{cid}:{id}"),
+                &serde_json::to_vec(&marker).unwrap(),
+                1,
+            )
+        })
+        .unwrap();
+}
+
+/// Rows, archive state and queued copies whose text contains `needle`.
+fn rows_containing(client: &CatbirdMlsClient, needle: &str) -> i64 {
+    client
+        .db()
+        .read_tx(|tx| {
+            Ok(tx
+                .conn()
+                .query_row(
+                    "SELECT (SELECT count(*) FROM messages WHERE instr(plaintext_json, ?1) > 0)
+                     + (SELECT count(*) FROM labyrinth_state
+                        WHERE instr(CAST(value_bytes AS TEXT), ?1) > 0)
+                     + (SELECT count(*) FROM labyrinth_queue
+                        WHERE instr(CAST(payload_bytes AS TEXT), ?1) > 0)",
+                    [needle],
+                    |row| row.get(0),
+                )
+                .unwrap())
+        })
+        .unwrap()
+}
+
+/// Finding 1: Labyrinth verifies who signed a redaction, not that the signer wrote the id.
+/// Eve's verified redaction naming alice's message id leaves a marker bound to eve. It must
+/// not suppress alice's live entry, her restored copy on a fresh device, or a reindex.
+#[test]
+fn a_redaction_naming_another_senders_id_suppresses_nothing_of_theirs() {
+    let f = send_order_fixture(false);
+    let (cid, alice, bob) = (f.cid.as_str(), &f.alice, &f.bob);
+    bob.setup_recovery_code().expect("bob enrolls his archive");
+    let id = new_id();
+    alice.send_message(cid, &id, "alice wrote this").unwrap();
+    alice.flush_labyrinth_queue().unwrap();
+    put_unsent_marker(bob, cid, &id, EVE_DID);
+
+    bob.sync().unwrap();
+    assert!(has_row(bob, &id), "alice's live entry is stored");
+    assert!(visible(bob, cid, &id));
+
+    // As on a fresh device: no local row or evidence, only eve's marker.
+    bob.db()
+        .write_tx(|tx| {
+            tx.conn()
+                .execute("DELETE FROM messages WHERE message_id = ?1", [&id])
+                .unwrap();
+            tx.conn()
+                .execute(
+                    "DELETE FROM labyrinth_state WHERE state_key = ?1",
+                    [format!("native.message:{cid}:{id}")],
+                )
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    bob.restore_conversation_from_owner_mailbox(cid)
+        .expect("restore");
+    assert!(has_row(bob, &id), "alice's restored copy is kept");
+    assert!(visible(bob, cid, &id));
+    bob.verify_and_reindex_history(cid).expect("reindex");
+    assert!(has_row(bob, &id), "reindex keeps it");
+}
+
+fn edit_frame(target: &str, text: &str) -> String {
+    json!({
+        "version": 1,
+        "messageType": "edit",
+        "edit": {"targetMessageId": target, "newText": text},
+    })
+    .to_string()
+}
+
+/// Finding 2: an edit row carries the message's current text. Delete for me erases the
+/// author's edits with the message; a later edit of it is verified and stored nowhere; a
+/// restore and a reindex bring neither back.
+#[test]
+fn delete_for_me_erases_the_messages_edits_and_later_edits_are_not_stored() {
+    let f = send_order_fixture(false);
+    let (cid, alice, bob) = (f.cid.as_str(), &f.alice, &f.bob);
+    bob.setup_recovery_code().expect("bob enrolls his archive");
+    let id = new_id();
+    alice.send_message(cid, &id, "original text").unwrap();
+    let edit = new_id();
+    alice
+        .send_message(cid, &edit, &edit_frame(&id, "EDITED-SECRET"))
+        .unwrap();
+    alice.flush_labyrinth_queue().unwrap();
+    bob.sync().unwrap();
+    bob.flush_labyrinth_queue().unwrap();
+    assert!(has_row(bob, &edit));
+    assert!(rows_containing(bob, "EDITED-SECRET") > 0);
+
+    bob.delete_message_for_me(cid, &id).expect("delete for me");
+    assert!(!has_row(bob, &id));
+    assert!(!has_row(bob, &edit), "the edit row goes with the message");
+    assert_eq!(
+        rows_containing(bob, "EDITED-SECRET"),
+        0,
+        "no row, evidence or queued copy keeps the edited text"
+    );
+
+    let later = new_id();
+    alice
+        .send_message(cid, &later, &edit_frame(&id, "LATER-SECRET"))
+        .unwrap();
+    bob.sync().expect("bob syncs past the later edit");
+    assert!(!has_row(bob, &later));
+    assert_eq!(rows_containing(bob, "LATER-SECRET"), 0);
+    assert_eq!(last_seq(bob, cid), last_seq(alice, cid));
+
+    alice.flush_labyrinth_queue().unwrap();
+    bob.restore_conversation_from_owner_mailbox(cid).unwrap();
+    bob.verify_and_reindex_history(cid).unwrap();
+    assert!(!has_row(bob, &id) && !has_row(bob, &edit) && !has_row(bob, &later));
+    assert_eq!(rows_containing(bob, "EDITED-SECRET"), 0);
+    assert_eq!(rows_containing(bob, "LATER-SECRET"), 0);
 }

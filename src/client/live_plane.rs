@@ -6704,6 +6704,17 @@ impl CatbirdMlsClient {
             if staged.conversation_id != conversation_id {
                 return Err(MLSError::InvalidState("MismatchedRequestOpening".into()));
             }
+            // Deleted for me (or unsent) before acceptance: archive nothing, keep no text.
+            if super::message_erase::is_frame_erased(
+                tx,
+                conversation_id,
+                &staged.message_id,
+                &staged.sender_did,
+                &staged.plaintext_json,
+            )? {
+                tx.put_account_meta(&key, "", now_ms)?;
+                return Ok(false);
+            }
             super::live_sync::live_integrity::reapply_opening_deletion(
                 tx,
                 conversation_id,
